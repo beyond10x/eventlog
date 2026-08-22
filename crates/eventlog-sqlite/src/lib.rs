@@ -69,6 +69,42 @@ impl SqliteEventStore {
         Ok(store)
     }
 
+    /// Refuse a table of ours that somebody else made.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` **silently does nothing** when a table of that name already
+    /// exists, whatever shape it has. A module that kept its own `<prefix>_events` before moving
+    /// onto the log therefore gets the old table, and the failure surfaces later as a missing
+    /// column inside a wall of DDL — which names neither the file nor the collision.
+    ///
+    /// This is the same hazard
+    /// [M-022](https://github.com/daemonloom/daemonloom/blob/main/model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md)
+    /// records for `PRIMARY KEY` changes, and no test could have caught it: every test starts with
+    /// an empty database. A running deployment found it.
+    fn refuse_foreign_tables(&self, connection: &Connection) -> Result<(), EventLogError> {
+        let prefix = &self.prefix;
+        let events = format!("{prefix}_events");
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![events],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(sql) = existing else {
+            return Ok(());
+        };
+        if sql.contains("global_seq") {
+            return Ok(());
+        }
+        Err(EventLogError::Backend(format!(
+            "this database already has a table called {events} that this kit did not create, so \
+             its own tables cannot be made. It is almost certainly {prefix}'s previous store. \
+             Point this owner at a different database, or rename the old tables out of the way \
+             once you have decided what to do with what is in them."
+        )))
+    }
+
     fn create_tables(&self) -> Result<(), EventLogError> {
         let prefix = &self.prefix;
         let statements = format!(
@@ -149,11 +185,9 @@ impl SqliteEventStore {
                  PRIMARY KEY (tenant_id, stream_type, stream_id)
              );"
         );
-        self.connection
-            .lock()
-            .map_err(poisoned)?
-            .execute_batch(&statements)
-            .map_err(backend)
+        let connection = self.connection.lock().map_err(poisoned)?;
+        self.refuse_foreign_tables(&connection)?;
+        connection.execute_batch(&statements).map_err(backend)
     }
 }
 

@@ -147,3 +147,36 @@ fn the_claim_rule_holds_on_postgresql() {
     };
     eventlog_conformance::run_claims(&store);
 }
+
+/// The same refusal, where it matters most: a hosted deployment points the log at the database the
+/// module already had.
+#[test]
+fn a_table_of_ours_that_somebody_else_made_is_refused_by_name() {
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let mut client = Client::connect(&url, NoTls).expect("a connection");
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS previous_events;
+             CREATE TABLE previous_events (
+                 tenant_id TEXT NOT NULL,
+                 sequence BIGINT NOT NULL,
+                 body JSONB NOT NULL
+             );",
+        )
+        .expect("the previous store's table");
+
+    let Err(refused) = PostgresEventStore::connect(&url, "previous") else {
+        panic!("a table this kit did not create must not be silently adopted");
+    };
+    let message = refused.to_string();
+    assert!(
+        message.contains("previous_events"),
+        "the refusal names the table: {message}"
+    );
+    client
+        .batch_execute("DROP TABLE IF EXISTS previous_events")
+        .expect("cleaned up");
+}

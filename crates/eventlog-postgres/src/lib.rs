@@ -61,6 +61,46 @@ impl PostgresEventStore {
         Ok(store)
     }
 
+    /// Refuse a table of ours that somebody else made.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` **silently does nothing** when a table of that name already
+    /// exists, whatever shape it has. This matters more here than on SQLite: a hosted deployment
+    /// that moves a module onto the log points it at the database the module already had, and the
+    /// old `<prefix>_events` is sitting there.
+    fn refuse_foreign_tables(&self, client: &mut Client) -> Result<(), EventLogError> {
+        let prefix = &self.prefix;
+        let events = format!("{prefix}_events");
+        let existing: i64 = client
+            .query_one(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1",
+                &[&events],
+            )
+            .map_err(backend)?
+            .get(0);
+        if existing == 0 {
+            return Ok(());
+        }
+        let ours: i64 = client
+            .query_one(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1
+                   AND column_name = 'global_seq'",
+                &[&events],
+            )
+            .map_err(backend)?
+            .get(0);
+        if ours > 0 {
+            return Ok(());
+        }
+        Err(EventLogError::Backend(format!(
+            "this database already has a table called {events} that this kit did not create, so \
+             its own tables cannot be made. It is almost certainly {prefix}'s previous store. \
+             Point this owner at a different schema, or rename the old tables out of the way once \
+             you have decided what to do with what is in them."
+        )))
+    }
+
     fn create_tables(&self) -> Result<(), EventLogError> {
         let prefix = &self.prefix;
         let statements = format!(
@@ -141,11 +181,9 @@ impl PostgresEventStore {
                  PRIMARY KEY (tenant_id, stream_type, stream_id)
              );"
         );
-        self.client
-            .lock()
-            .map_err(poisoned)?
-            .batch_execute(&statements)
-            .map_err(backend)
+        let mut client = self.client.lock().map_err(poisoned)?;
+        self.refuse_foreign_tables(&mut client)?;
+        client.batch_execute(&statements).map_err(backend)
     }
 
     /// Drop this owner's tables, cursors included. For test setup only.

@@ -15,6 +15,7 @@ serde_json.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 eventlog-conformance.workspace = true
 serde.workspace = true
 time.workspace = true
