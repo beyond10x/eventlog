@@ -815,3 +815,153 @@ pub fn assert_vectors_fold<A: eventlog_core::Aggregate + PartialEq + std::fmt::D
         "history still folds, but no longer to the state it produced"
     );
 }
+
+/// The field names and value kinds of a stored body, without its values.
+///
+/// A vector records one run's identifiers and timestamps, which differ every run and mean nothing.
+/// What must not drift is the shape: a field that disappeared, was renamed, or changed type is
+/// what stops old bytes reading.
+#[must_use]
+pub fn shape(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), shape(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(shape).collect())
+        }
+        serde_json::Value::String(_) => serde_json::Value::String("string".to_owned()),
+        serde_json::Value::Number(_) => serde_json::Value::String("number".to_owned()),
+        serde_json::Value::Bool(_) => serde_json::Value::String("boolean".to_owned()),
+        serde_json::Value::Null => serde_json::Value::Null,
+    }
+}
+
+/// Every event an owner can emit has a committed vector.
+///
+/// A new event without one would ship unrecorded, and the first time anybody needed to prove its
+/// bytes still read would be the first time they could not.
+///
+/// # Panics
+/// Panics naming the event that has no vector.
+pub fn assert_every_event_has_a_vector(directory: &std::path::Path, declared: &[&str]) {
+    let committed: Vec<String> = load_vectors(directory)
+        .into_iter()
+        .map(|vector| vector.name)
+        .collect();
+    for name in declared {
+        assert!(
+            committed.iter().any(|found| found == name),
+            "no committed vector for {name}; a new event may not ship unrecorded"
+        );
+    }
+}
+
+/// Every committed vector still reads at the version it was written under.
+///
+/// This is where a missing upcaster surfaces: the old bytes are still out there and always will
+/// be.
+///
+/// # Panics
+/// Panics naming the vector that stopped reading.
+pub fn assert_every_vector_decodes(
+    directory: &std::path::Path,
+    decode: impl Fn(&EventVector) -> Result<(), EventLogError>,
+) {
+    for vector in load_vectors(directory) {
+        if let Err(error) = decode(&vector) {
+            panic!(
+                "{} v{} no longer decodes; an upcaster is missing: {error}",
+                vector.name, vector.schema_version
+            );
+        }
+    }
+}
+
+/// What the code writes today matches what is committed.
+///
+/// A payload that changed shape without a version bump fails here rather than in production,
+/// months later, when the oldest rows are read.
+///
+/// # Panics
+/// Panics naming the event whose shape or version moved.
+pub fn assert_committed_matches_emitted(
+    directory: &std::path::Path,
+    emitted: &std::collections::BTreeMap<String, EventVector>,
+) {
+    let committed: std::collections::BTreeMap<String, EventVector> = load_vectors(directory)
+        .into_iter()
+        .map(|vector| (vector.name.clone(), vector))
+        .collect();
+    for (name, fresh) in emitted {
+        let Some(stored) = committed.get(name) else {
+            panic!("{name} is emitted but has no committed vector");
+        };
+        assert_eq!(
+            fresh.schema_version, stored.schema_version,
+            "{name} changed schema version without a new vector"
+        );
+        assert_eq!(
+            shape(&fresh.data),
+            shape(&stored.data),
+            "{name} changed shape without a version bump; bump the version, write an upcaster, \
+             and commit the new vector beside the old one"
+        );
+    }
+}
+
+/// Write the vectors an owner emits today, without ever overwriting one.
+///
+/// A new event version is a new file beside the old one, because the old bytes are still out
+/// there.
+///
+/// # Panics
+/// Panics when the directory cannot be created or a file cannot be written.
+pub fn write_vectors(
+    directory: &std::path::Path,
+    emitted: &std::collections::BTreeMap<String, EventVector>,
+) {
+    std::fs::create_dir_all(directory).expect("a vectors directory");
+    for (name, vector) in emitted {
+        let path = directory.join(format!("{}-v{}.json", name, vector.schema_version));
+        if path.exists() {
+            continue;
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(vector).expect("serialisable"),
+        )
+        .expect("written");
+        println!("wrote {}", path.display());
+    }
+}
+
+/// Collect one of every event a tenant's feed holds, keyed by name.
+///
+/// # Panics
+/// Panics when the feed cannot be read.
+#[must_use]
+pub fn vectors_from_feed(
+    store: &dyn EventStore,
+    tenant: &TenantId,
+) -> std::collections::BTreeMap<String, EventVector> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut position = 0;
+    loop {
+        let page = store.read_feed(tenant, position, 200).expect("readable");
+        if page.events.is_empty() {
+            return found;
+        }
+        position = page.next_position;
+        for event in page.events {
+            found.entry(event.name.clone()).or_insert(EventVector {
+                name: event.name,
+                schema_version: event.schema_version,
+                data: event.data,
+            });
+        }
+    }
+}

@@ -7,8 +7,14 @@ use eventlog_core::{EventStore, Expected, StreamId, TenantId};
 use eventlog_postgres::PostgresEventStore;
 use postgres::{Client, NoTls};
 
+/// The database to exercise against, when one was given.
+///
+/// An empty value counts as unset. `Ok("")` from the environment would otherwise send the whole
+/// suite at an unusable connection string and report a connection failure as a test failure.
 fn url() -> Option<String> {
-    std::env::var("EVENTLOG_TEST_POSTGRES_URL").ok()
+    std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn store(prefix: &str) -> Option<PostgresEventStore> {
