@@ -39,3 +39,10 @@ fn the_inline_projection_exercise_passes_in_memory() {
         std::sync::Arc::new(SqliteEventStore::in_memory("corpus").expect("a store"));
     eventlog_conformance::run_inline_projections(&store);
 }
+
+#[test]
+fn the_paging_rule_holds_in_memory() {
+    let store: std::sync::Arc<dyn eventlog_core::EventStore> =
+        std::sync::Arc::new(SqliteEventStore::in_memory("corpus").expect("a store"));
+    eventlog_conformance::run_paging(&store);
+}

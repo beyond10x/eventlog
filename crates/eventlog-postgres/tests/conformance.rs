@@ -127,3 +127,14 @@ fn drop_projection_tables(store: &PostgresEventStore, tables: &[&str]) {
     }
     let _ = store;
 }
+
+#[test]
+fn the_paging_rule_holds_on_postgresql() {
+    let Some(store) = store("paging") else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    drop_projection_tables(&store, &["paging_p_tally"]);
+    let store: std::sync::Arc<dyn eventlog_core::EventStore> = std::sync::Arc::new(store);
+    eventlog_conformance::run_paging(&store);
+}

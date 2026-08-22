@@ -326,6 +326,14 @@ pub struct StreamSlice {
     pub end_of_stream: bool,
 }
 
+/// One page of a projection, with the cursor that continues it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionPage {
+    pub rows: Vec<(String, Value)>,
+    /// The key to resume from, or `None` when this page is the end.
+    pub next_cursor: Option<String>,
+}
+
 /// A window on one tenant's whole history, in commit order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeedPage {
@@ -538,6 +546,52 @@ pub trait EventStore: Send + Sync + 'static {
         after_key: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Value)>, EventLogError>;
+
+    /// One page of a projection, with the cursor that continues it.
+    ///
+    /// Five modules wrote this by hand and two of them got the cursor rule wrong until a test said
+    /// so, which is the argument for having one. The rule: fetch one more row than asked for,
+    /// return the asked-for number, and hand back the **last returned** key — not the last fetched
+    /// one, and `None` rather than a cursor when the page was short. A cursor on a short page
+    /// costs the caller an extra round trip that returns nothing; a cursor from the last fetched
+    /// key skips a row.
+    ///
+    /// `prefix` bounds the page to one contiguous run of keys — one corpus's items, one project's
+    /// entities, one owner's workspaces — because a projection is tenant-wide and a list is
+    /// usually not. It is exclusive of the prefix itself, so a projection whose keys are
+    /// `<owner>/<id>` passes `"<owner>/"` and gets every row under that owner and nothing else.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the store is unavailable.
+    fn projection_page(
+        &self,
+        projection: &ProjectionSpec,
+        tenant: &TenantId,
+        prefix: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ProjectionPage, EventLogError> {
+        let limit = bounded_limit(limit);
+        let prefix = prefix.unwrap_or("");
+        let after = cursor.map_or_else(|| prefix.to_owned(), str::to_owned);
+        let fetched = self.projection_list(projection, tenant, Some(&after), limit + 1)?;
+        let mut rows = Vec::with_capacity(limit);
+        let mut more = false;
+        for (key, body) in fetched {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if rows.len() == limit {
+                more = true;
+                break;
+            }
+            rows.push((key, body));
+        }
+        let next_cursor = more
+            .then(|| rows.last().map(|(key, _)| key.clone()))
+            .flatten();
+        Ok(ProjectionPage { rows, next_cursor })
+    }
 
     /// A stable identifier for this tenant's stream in this owner.
     ///

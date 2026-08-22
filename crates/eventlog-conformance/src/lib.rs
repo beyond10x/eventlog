@@ -965,3 +965,91 @@ pub fn vectors_from_feed(
         }
     }
 }
+
+/// The paging rule, which five modules each got slightly different.
+///
+/// # Panics
+/// Panics with the failing assertion.
+pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
+    use eventlog_core::Projector;
+
+    let tenant = TenantId::new("tenant-page").expect("valid tenant");
+    store
+        .register_inline(std::sync::Arc::new(Tally) as std::sync::Arc<dyn Projector>)
+        .expect("registered");
+    let body = json!({ "command": "create" });
+    for index in 0..5 {
+        let stream =
+            StreamId::new(tenant.clone(), "item", format!("item-{index}")).expect("valid stream");
+        store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[event("item.received", index)],
+                &meta(&format!("page-{index}"), &body),
+            )
+            .expect("append");
+    }
+    // A second kind, so a prefix has something to exclude.
+    let other = StreamId::new(tenant.clone(), "note", "note-1").expect("valid stream");
+    store
+        .append(
+            &other,
+            Expected::NoStream,
+            &[event("note.written", 9)],
+            &meta("page-note", &body),
+        )
+        .expect("append");
+
+    let page = store
+        .projection_page(&TALLY, &tenant, Some("item/"), None, 2)
+        .expect("pageable");
+    assert_eq!(page.rows.len(), 2);
+    assert_eq!(
+        page.next_cursor.as_deref(),
+        Some(page.rows[1].0.as_str()),
+        "the cursor is the last row returned, not the last row fetched"
+    );
+
+    let mut seen = vec![page.rows[0].0.clone(), page.rows[1].0.clone()];
+    let mut cursor = page.next_cursor;
+    while let Some(from) = cursor {
+        let next = store
+            .projection_page(&TALLY, &tenant, Some("item/"), Some(&from), 2)
+            .expect("pageable");
+        seen.extend(next.rows.iter().map(|(key, _)| key.clone()));
+        cursor = next.next_cursor;
+    }
+    assert_eq!(seen.len(), 5, "paging loses nothing and repeats nothing");
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 5);
+
+    let exact = store
+        .projection_page(&TALLY, &tenant, Some("item/"), None, 5)
+        .expect("pageable");
+    assert_eq!(exact.rows.len(), 5);
+    assert!(
+        exact.next_cursor.is_none(),
+        "a page that reached the end carries no cursor; one that did would cost the caller a \
+         round trip that returns nothing"
+    );
+
+    let everything = store
+        .projection_page(&TALLY, &tenant, None, None, 100)
+        .expect("pageable");
+    assert_eq!(
+        everything.rows.len(),
+        6,
+        "no prefix is every row this tenant has"
+    );
+    let bounded = store
+        .projection_page(&TALLY, &tenant, Some("item/"), None, 100)
+        .expect("pageable");
+    assert_eq!(
+        bounded.rows.len(),
+        5,
+        "a prefix bounds the page to one contiguous run of keys, and the note is not in it"
+    );
+}
