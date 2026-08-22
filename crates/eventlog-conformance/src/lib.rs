@@ -29,6 +29,7 @@ pub fn meta(key: &str, body: &serde_json::Value) -> CommandMeta {
         causation_id: None,
         causation_depth: 0,
         occurred_at: OffsetDateTime::UNIX_EPOCH,
+        claim: None,
     }
 }
 
@@ -892,23 +893,25 @@ pub fn assert_committed_matches_emitted(
     directory: &std::path::Path,
     emitted: &std::collections::BTreeMap<String, EventVector>,
 ) {
-    let committed: std::collections::BTreeMap<String, EventVector> = load_vectors(directory)
+    // Keyed by name *and* version: an event that has been through a version bump has a vector for
+    // each, and keying by name alone would silently compare today's bytes against the oldest file.
+    let committed: std::collections::BTreeMap<(String, u32), EventVector> = load_vectors(directory)
         .into_iter()
-        .map(|vector| (vector.name.clone(), vector))
+        .map(|vector| ((vector.name.clone(), vector.schema_version), vector))
         .collect();
     for (name, fresh) in emitted {
-        let Some(stored) = committed.get(name) else {
-            panic!("{name} is emitted but has no committed vector");
+        let Some(stored) = committed.get(&(name.clone(), fresh.schema_version)) else {
+            panic!(
+                "{name} is emitted at v{} with no committed vector for that version; write the \
+                 upcaster and commit the new vector beside the old one",
+                fresh.schema_version
+            );
         };
-        assert_eq!(
-            fresh.schema_version, stored.schema_version,
-            "{name} changed schema version without a new vector"
-        );
         assert_eq!(
             shape(&fresh.data),
             shape(&stored.data),
-            "{name} changed shape without a version bump; bump the version, write an upcaster, \
-             and commit the new vector beside the old one"
+            "{name} v{} changed shape without a version bump",
+            fresh.schema_version
         );
     }
 }
@@ -1051,5 +1054,76 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
         bounded.rows.len(),
         5,
         "a prefix bounds the page to one contiguous run of keys, and the note is not in it"
+    );
+}
+
+/// A claim scoped to the caller rather than to one stream.
+///
+/// The rule two modules rebuilt by hand: an owner that mints the record identifier itself lands
+/// two attempts at one create in two different streams, so the per-stream check cannot see they
+/// are the same request.
+///
+/// # Panics
+/// Panics with the failing assertion.
+pub fn run_claims(store: &dyn EventStore) {
+    use eventlog_core::Claim;
+
+    let tenant = TenantId::new("tenant-claim").expect("valid tenant");
+    let body = json!({ "title": "the same request" });
+    let digest = request_hash(&body).expect("hashable");
+    let claim = Claim::new("subject:alice/create", "key-1", &digest).expect("a claim");
+
+    assert!(
+        store
+            .recorded_claim(&tenant, &claim)
+            .expect("readable")
+            .is_none(),
+        "an unclaimed key has produced nothing"
+    );
+
+    // The store mints the identifier, so the first attempt lands in a stream nobody named.
+    let first = StreamId::new(tenant.clone(), "item", "minted-1").expect("valid stream");
+    let mut meta = meta("attempt-1", &body);
+    meta.claim = Some(claim.clone());
+    let written = store
+        .append(
+            &first,
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta,
+        )
+        .expect("append");
+    assert_eq!(written.first_version, 1);
+
+    let recorded = store
+        .recorded_claim(&tenant, &claim)
+        .expect("readable")
+        .expect("the claim points at what it produced");
+    assert_eq!(
+        recorded.stream, first,
+        "the claim names the stream the store minted, which the caller could not have known"
+    );
+    assert_eq!(recorded.first_version, 1);
+    assert_eq!(recorded.last_version, 1);
+
+    // The same key with a different body is a different request wearing the first one's name.
+    let changed =
+        Claim::new("subject:alice/create", "key-1", "a-different-digest").expect("a claim");
+    assert!(
+        matches!(
+            store.recorded_claim(&tenant, &changed),
+            Err(EventLogError::IdempotencyMismatch { .. })
+        ),
+        "a changed request must not be answered with the earlier result"
+    );
+
+    // A different scope is a different caller and shares nothing.
+    let other = Claim::new("subject:bob/create", "key-1", &digest).expect("a claim");
+    assert!(
+        store
+            .recorded_claim(&tenant, &other)
+            .expect("readable")
+            .is_none(),
+        "one caller's key is not another's"
     );
 }

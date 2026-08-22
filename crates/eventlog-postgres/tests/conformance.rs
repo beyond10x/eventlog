@@ -138,3 +138,12 @@ fn the_paging_rule_holds_on_postgresql() {
     let store: std::sync::Arc<dyn eventlog_core::EventStore> = std::sync::Arc::new(store);
     eventlog_conformance::run_paging(&store);
 }
+
+#[test]
+fn the_claim_rule_holds_on_postgresql() {
+    let Some(store) = store("claims") else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    eventlog_conformance::run_claims(&store);
+}

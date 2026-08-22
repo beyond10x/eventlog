@@ -172,6 +172,53 @@ impl NewEvent {
     }
 }
 
+/// A caller's claim on an idempotency key, across every stream.
+///
+/// The kit's own idempotency is scoped to one stream, which is right when the caller names the
+/// record it is writing to. It is not right when the *store* mints the identifier: two attempts at
+/// one create then land in two different streams, and a per-stream check cannot see they are the
+/// same request. Modules that mint identifiers rebuilt this by hand — twice, identically — before
+/// it lived here.
+///
+/// `scope` is whatever the owner scopes a key to, usually the caller. `digest` is of what the
+/// caller asked for, never of the record the store minted: the identifier is new on every attempt,
+/// so hashing it would make every retry a different request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub scope: String,
+    pub key: String,
+    pub digest: String,
+}
+
+impl Claim {
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] when a part is empty, over-long, or carries bytes that
+    /// cannot be stored and logged verbatim.
+    pub fn new(
+        scope: impl Into<String>,
+        key: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Result<Self, EventLogError> {
+        let value = Self {
+            scope: scope.into(),
+            key: key.into(),
+            digest: digest.into(),
+        };
+        validate_field("claim scope", &value.scope)?;
+        validate_field("claim key", &value.key)?;
+        validate_field("claim digest", &value.digest)?;
+        Ok(value)
+    }
+}
+
+/// What a caller's earlier claim on a key produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedCommand {
+    pub stream: StreamId,
+    pub first_version: u64,
+    pub last_version: u64,
+}
+
 /// Who issued a command, under which key, and what caused it.
 ///
 /// Carried on every event the command produces, so that every stored fact can name a person and an
@@ -196,6 +243,10 @@ pub struct CommandMeta {
     /// When the thing happened, as the caller understands it. The store stamps its own
     /// `recorded_at` and never orders by this one.
     pub occurred_at: OffsetDateTime,
+    /// A caller-scoped claim on this key, for an owner that mints the record identifier itself.
+    ///
+    /// Recorded in the append transaction, so the claim and the facts it produced cannot disagree.
+    pub claim: Option<Claim>,
 }
 
 impl CommandMeta {
@@ -390,6 +441,18 @@ pub trait EventStore: Send + Sync + 'static {
         events: &[NewEvent],
         meta: &CommandMeta,
     ) -> Result<AppendResult, EventLogError>;
+
+    /// What a caller's earlier claim on this key produced, if anything.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::IdempotencyMismatch`] when the key was claimed for a different
+    /// request — the same key with a different body is a different request wearing the first
+    /// one's name.
+    fn recorded_claim(
+        &self,
+        tenant: &TenantId,
+        claim: &Claim,
+    ) -> Result<Option<ClaimedCommand>, EventLogError>;
 
     /// What a command with this key already produced, if it has run before.
     ///
@@ -704,6 +767,7 @@ mod tests {
             causation_id: None,
             causation_depth: 0,
             occurred_at: OffsetDateTime::UNIX_EPOCH,
+            claim: None,
         }
     }
 

@@ -17,10 +17,10 @@ use std::{
 };
 
 use eventlog_core::{
-    AppendResult, CatchUpProgress, CommandMeta, EventLogError, EventStore, Expected, FeedPage,
-    Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector,
-    RecordedEvent, Snapshot, StreamId, StreamSlice, TenantId, bounded_limit, indexed_value,
-    new_event_id, redaction_tombstone, validate_append, validate_field,
+    AppendResult, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError, EventStore,
+    Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore,
+    Projector, RecordedEvent, Snapshot, StreamId, StreamSlice, TenantId, bounded_limit,
+    indexed_value, new_event_id, redaction_tombstone, validate_append, validate_field,
 };
 use postgres::{Client, GenericClient, NoTls, Row};
 use serde_json::Value;
@@ -99,6 +99,18 @@ impl PostgresEventStore {
                  recorded_at TIMESTAMPTZ NOT NULL,
                  PRIMARY KEY (tenant_id, stream_type, stream_id, idempotency_key)
              );
+             CREATE TABLE IF NOT EXISTS {prefix}_claims (
+                 tenant_id TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 claim_key TEXT NOT NULL,
+                 request_digest TEXT NOT NULL,
+                 stream_type TEXT NOT NULL,
+                 stream_id TEXT NOT NULL,
+                 first_version BIGINT NOT NULL,
+                 last_version BIGINT NOT NULL,
+                 recorded_at TIMESTAMPTZ NOT NULL,
+                 PRIMARY KEY (tenant_id, scope, claim_key)
+             );
              CREATE TABLE IF NOT EXISTS {prefix}_identity (
                  tenant_id TEXT NOT NULL PRIMARY KEY,
                  stream_identity TEXT NOT NULL
@@ -152,6 +164,7 @@ impl PostgresEventStore {
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {prefix}_events;
                  DROP TABLE IF EXISTS {prefix}_commands;
+                 DROP TABLE IF EXISTS {prefix}_claims;
                  DROP TABLE IF EXISTS {prefix}_snapshots;
                  DROP TABLE IF EXISTS {prefix}_projection_cursors;
                  DROP TABLE IF EXISTS {prefix}_blobs;
@@ -351,6 +364,30 @@ impl EventStore for PostgresEventStore {
             }
         }
 
+        if let Some(claim) = &meta.claim {
+            transaction
+                .execute(
+                    &format!(
+                        "INSERT INTO {prefix}_claims (
+                             tenant_id, scope, claim_key, request_digest, stream_type, stream_id,
+                             first_version, last_version, recorded_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+                    ),
+                    &[
+                        &stream.tenant().as_str(),
+                        &claim.scope,
+                        &claim.key,
+                        &claim.digest,
+                        &stream.stream_type(),
+                        &stream.stream_id(),
+                        &to_i64(first_version)?,
+                        &to_i64(last_version)?,
+                        &now,
+                    ],
+                )
+                .map_err(backend)?;
+        }
+
         transaction.commit().map_err(backend)?;
 
         Ok(AppendResult {
@@ -359,6 +396,43 @@ impl EventStore for PostgresEventStore {
             events: written,
             deduplicated: false,
         })
+    }
+
+    fn recorded_claim(
+        &self,
+        tenant: &TenantId,
+        claim: &Claim,
+    ) -> Result<Option<ClaimedCommand>, EventLogError> {
+        let prefix = &self.prefix;
+        let mut guard = self.client.lock().map_err(poisoned)?;
+        let row = guard
+            .query_opt(
+                &format!(
+                    "SELECT request_digest, stream_type, stream_id, first_version, last_version
+                     FROM {prefix}_claims
+                     WHERE tenant_id = $1 AND scope = $2 AND claim_key = $3"
+                ),
+                &[&tenant.as_str(), &claim.scope, &claim.key],
+            )
+            .map_err(backend)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let digest: String = row.get(0);
+        if digest != claim.digest {
+            return Err(EventLogError::IdempotencyMismatch {
+                key: claim.key.clone(),
+            });
+        }
+        let stream_type: String = row.get(1);
+        let stream_id: String = row.get(2);
+        let first_version: i64 = row.get(3);
+        let last_version: i64 = row.get(4);
+        Ok(Some(ClaimedCommand {
+            stream: StreamId::new(tenant.clone(), stream_type, stream_id)?,
+            first_version: to_u64(first_version)?,
+            last_version: to_u64(last_version)?,
+        }))
     }
 
     fn recorded_command(
@@ -633,6 +707,7 @@ impl EventStore for PostgresEventStore {
         for table in [
             "events",
             "commands",
+            "claims",
             "snapshots",
             "projection_cursors",
             "blobs",

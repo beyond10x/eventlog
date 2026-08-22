@@ -113,6 +113,7 @@ fn meta(key: &str) -> CommandMeta {
         causation_id: None,
         causation_depth: 0,
         occurred_at: OffsetDateTime::UNIX_EPOCH,
+        claim: None,
     }
 }
 

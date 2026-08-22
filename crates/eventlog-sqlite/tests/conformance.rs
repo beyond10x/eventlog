@@ -46,3 +46,9 @@ fn the_paging_rule_holds_in_memory() {
         std::sync::Arc::new(SqliteEventStore::in_memory("corpus").expect("a store"));
     eventlog_conformance::run_paging(&store);
 }
+
+#[test]
+fn the_claim_rule_holds_in_memory() {
+    let store = SqliteEventStore::in_memory("corpus").expect("a store");
+    eventlog_conformance::run_claims(&store);
+}
