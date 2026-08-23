@@ -1,6 +1,6 @@
-# daemonloom/eventlog
+# b10x eventlog
 
-The persistence kit every Daemonloom owner stores durable domain state in.
+The persistence kit every b10x owner stores durable domain state in.
 
 A command produces domain events, the events are the record, and every read is a fold over them —
 from a snapshot, from the log, or from both. State tables stop being authoritative and become

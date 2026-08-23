@@ -3,7 +3,7 @@
 //! One body of assertions every backend must pass.
 //!
 //! This exercise is the definition of correct behaviour; the backends are implementation details
-//! that agree with it. It exists because the only divergence ever found between Daemonloom store
+//! that agree with it. It exists because the only divergence ever found between b10x store
 //! backends was found by an exercise like this one and not by review.
 
 use eventlog_core::{

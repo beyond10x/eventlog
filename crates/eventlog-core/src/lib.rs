@@ -2,7 +2,7 @@
 
 //! What a durable fact is, and the port that stores one.
 //!
-//! Every mutation in a Daemonloom owner is a command that produces domain events, and every read
+//! Every mutation in a b10x owner is a command that produces domain events, and every read
 //! is a fold over those events. This crate holds the vocabulary that makes that one thing rather
 //! than six: the envelope a fact is recorded in, the stream it belongs to, the concurrency check
 //! that lets an aggregate hold an invariant, and the store port two backends implement.

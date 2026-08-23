@@ -9,9 +9,9 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "LicenseRef-Daemonloom-Proprietary"
-repository = "https://github.com/daemonloom/daemonloom"
-homepage = "https://github.com/daemonloom/daemonloom/tree/main/foundation/eventlog"
+license = "LicenseRef-B10x-Proprietary"
+repository = "https://github.com/beyond10x/eventlog"
+homepage = "https://github.com/beyond10x/eventlog"
 rust-version = "1.91"
 version = "0.1.0-dev.1"
 publish = false

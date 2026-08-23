@@ -1,4 +1,4 @@
-# daemonloom/eventlog — backlog
+# b10x eventlog — backlog
 
 One file per story (`EL-NNN-<slug>.md`); frontmatter carries `id`, `title`, `status` and
 `depends_on`. Status is one of `backlog | ready | in-progress | blocked | done`. The index below is
