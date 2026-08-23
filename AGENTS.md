@@ -1,14 +1,22 @@
-# Working on daemonloom/eventlog
+# Working on eventlog
 
-This component is the shared persistence kit. The root [`AGENTS.md`](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/AGENTS.md) applies
-throughout; this file adds component rules. Read `README.md`, then
+[github.com/beyond10x/eventlog](https://github.com/beyond10x/eventlog) is the canonical home of
+the eventlog kit, extracted from the daemonloom monorepo at
+[`e01ea676`](https://github.com/daemonloom/daemonloom/tree/e01ea676da18fb855814e7621514e0c98fc57c2c)
+with full history on 2026-08-23. The monorepo keeps a pinned git-submodule checkout at
+`foundation/eventlog`, consumed by the module crates via path dependencies. The gate is
+`bash scripts/gate.sh`.
+
+This repository is the shared persistence kit. Its rules originated in the monorepo root
+[`AGENTS.md`](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/AGENTS.md);
+this file carries the component rules. Read `README.md`, then
 [RFC 0020](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md), before changing
 anything here.
 
 ## What this component may hold
 
-- No domain type, no product concept, no policy. Every component may build-depend on these crates,
-  which is only safe while that stays true.
+- No domain type, no product concept, no policy. Every monorepo component may build-depend on
+  these crates, which is only safe while that stays true.
 - No third backend. In-memory is SQLite `:memory:`; a hand-written one is the defect class recorded
   in [M-022](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md).
 - No crate named `common`, `shared`, `utils`, `misc`, or `helpers`.
@@ -37,5 +45,6 @@ exercise drains with a bounded retry for exactly this reason.
 
 ## Validation
 
-Run the gate in `README.md` from this directory. The PostgreSQL exercise needs
-`EVENTLOG_TEST_POSTGRES_URL`; without it, it reports itself as not run rather than passing quietly.
+Run `bash scripts/gate.sh` from the repo root: locked workspace tests, `cargo fmt --all --check`,
+and clippy with `-D warnings`. The PostgreSQL exercise needs `EVENTLOG_TEST_POSTGRES_URL`; without
+it, it reports itself as not run rather than passing quietly.
