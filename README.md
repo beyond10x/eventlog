@@ -7,9 +7,9 @@ from a snapshot, from the log, or from both. State tables stop being authoritati
 projections that can be dropped and rebuilt.
 
 Accepted by
-[ADR 0055](../../architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md).
+[ADR 0055](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md).
 The design, including the normative physical schema, is
-[RFC 0020](../../architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md).
+[RFC 0020](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md).
 
 ## Crates
 
@@ -45,4 +45,4 @@ docker rm -f eventlog-test-pg
 ## Backlog
 
 [`docs/stories/`](docs/stories/README.md). The module conversions that consume this kit are
-[E-006](../../model/modules/docs/epics/E-006-every-module-persists-as-events.md).
+[E-006](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/model/modules/docs/epics/E-006-every-module-persists-as-events.md).

@@ -1,8 +1,8 @@
 # Working on daemonloom/eventlog
 
-This component is the shared persistence kit. The root [`AGENTS.md`](../../AGENTS.md) applies
+This component is the shared persistence kit. The root [`AGENTS.md`](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/AGENTS.md) applies
 throughout; this file adds component rules. Read `README.md`, then
-[RFC 0020](../../architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md), before changing
+[RFC 0020](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md), before changing
 anything here.
 
 ## What this component may hold
@@ -10,7 +10,7 @@ anything here.
 - No domain type, no product concept, no policy. Every component may build-depend on these crates,
   which is only safe while that stays true.
 - No third backend. In-memory is SQLite `:memory:`; a hand-written one is the defect class recorded
-  in [M-022](../../model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md).
+  in [M-022](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md).
 - No crate named `common`, `shared`, `utils`, `misc`, or `helpers`.
 
 ## Rules that are not negotiable in review
