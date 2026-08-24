@@ -1,7 +1,7 @@
 ---
 id: EL-006
 title: The store goes async
-status: in-progress
+status: done
 depends_on: [EL-001]
 ---
 
