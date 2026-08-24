@@ -13,6 +13,7 @@ eventlog-core.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 time.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 rusqlite.workspace = true
@@ -20,6 +21,7 @@ eventlog-conformance.workspace = true
 serde.workspace = true
 time.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

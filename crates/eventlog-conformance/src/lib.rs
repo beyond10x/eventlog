@@ -48,31 +48,31 @@ pub fn event(name: &str, value: i64) -> NewEvent {
 /// # Panics
 /// Panics with the failing assertion. This is a test exercise; a backend that does not pass it is
 /// not usable and the panic names which promise it broke.
-pub fn run(store: &dyn EventStore) {
+pub async fn run(store: &dyn EventStore) {
     let tenant = TenantId::new("tenant-a").expect("valid tenant");
     let other = TenantId::new("tenant-b").expect("valid tenant");
     let stream = StreamId::new(tenant.clone(), "item", "item-1").expect("valid stream");
     let twin = StreamId::new(other.clone(), "item", "item-1").expect("valid stream");
 
-    a_new_stream_starts_at_one(store, &stream);
-    a_stream_reads_back_in_order(store, &stream);
-    the_expected_version_is_enforced(store, &stream);
-    a_repeated_command_is_not_a_second_write(store, &stream);
-    a_reused_key_with_a_different_body_is_refused(store, &stream);
-    a_command_that_decided_nothing_is_refused(store, &stream);
-    the_same_stream_id_under_another_tenant_is_another_stream(store, &twin);
-    the_feed_is_resumable(store, &tenant);
-    the_feed_shows_one_tenant_only(store, &tenant, &other);
-    a_snapshot_round_trips(store, &stream);
-    bytes_live_outside_the_log_and_can_be_erased_alone(store, &tenant);
-    a_stream_identity_is_stable(store, &tenant, &other);
-    redaction_keeps_the_place_and_drops_the_snapshot(store, &stream);
-    forgetting_a_tenant_leaves_nothing(store, &other, &twin);
+    a_new_stream_starts_at_one(store, &stream).await;
+    a_stream_reads_back_in_order(store, &stream).await;
+    the_expected_version_is_enforced(store, &stream).await;
+    a_repeated_command_is_not_a_second_write(store, &stream).await;
+    a_reused_key_with_a_different_body_is_refused(store, &stream).await;
+    a_command_that_decided_nothing_is_refused(store, &stream).await;
+    the_same_stream_id_under_another_tenant_is_another_stream(store, &twin).await;
+    the_feed_is_resumable(store, &tenant).await;
+    the_feed_shows_one_tenant_only(store, &tenant, &other).await;
+    a_snapshot_round_trips(store, &stream).await;
+    bytes_live_outside_the_log_and_can_be_erased_alone(store, &tenant).await;
+    a_stream_identity_is_stable(store, &tenant, &other).await;
+    redaction_keeps_the_place_and_drops_the_snapshot(store, &stream).await;
+    forgetting_a_tenant_leaves_nothing(store, &other, &twin).await;
 }
 
-fn a_new_stream_starts_at_one(store: &dyn EventStore, stream: &StreamId) {
+async fn a_new_stream_starts_at_one(store: &dyn EventStore, stream: &StreamId) {
     assert_eq!(
-        store.stream_version(stream).expect("readable"),
+        store.stream_version(stream).await.expect("readable"),
         None,
         "a stream nobody wrote to has no version"
     );
@@ -84,6 +84,7 @@ fn a_new_stream_starts_at_one(store: &dyn EventStore, stream: &StreamId) {
             &[event("item.received", 1), event("item.extracted", 2)],
             &meta("key-1", &body),
         )
+        .await
         .expect("append to a new stream");
     assert_eq!(result.first_version, 1);
     assert_eq!(result.last_version, 2);
@@ -95,11 +96,14 @@ fn a_new_stream_starts_at_one(store: &dyn EventStore, stream: &StreamId) {
         result.events[0].event_id, result.events[1].event_id,
         "two facts are not the same fact"
     );
-    assert_eq!(store.stream_version(stream).expect("readable"), Some(2));
+    assert_eq!(
+        store.stream_version(stream).await.expect("readable"),
+        Some(2)
+    );
 }
 
-fn a_stream_reads_back_in_order(store: &dyn EventStore, stream: &StreamId) {
-    let slice = store.read_stream(stream, 0, 10).expect("readable");
+async fn a_stream_reads_back_in_order(store: &dyn EventStore, stream: &StreamId) {
+    let slice = store.read_stream(stream, 0, 10).await.expect("readable");
     assert_eq!(slice.events.len(), 2);
     assert_eq!(slice.events[0].name, "item.received");
     assert_eq!(slice.events[1].name, "item.extracted");
@@ -107,17 +111,18 @@ fn a_stream_reads_back_in_order(store: &dyn EventStore, stream: &StreamId) {
     assert!(slice.end_of_stream);
     assert_eq!(slice.next_version, 2);
 
-    let page = store.read_stream(stream, 0, 1).expect("readable");
+    let page = store.read_stream(stream, 0, 1).await.expect("readable");
     assert_eq!(page.events.len(), 1);
     assert!(!page.end_of_stream, "a partial read is not the end");
     let rest = store
         .read_stream(stream, page.next_version, 10)
+        .await
         .expect("readable");
     assert_eq!(rest.events.len(), 1);
     assert_eq!(rest.events[0].version, 2);
 }
 
-fn the_expected_version_is_enforced(store: &dyn EventStore, stream: &StreamId) {
+async fn the_expected_version_is_enforced(store: &dyn EventStore, stream: &StreamId) {
     let body = json!({ "command": "stale" });
     let error = store
         .append(
@@ -126,6 +131,7 @@ fn the_expected_version_is_enforced(store: &dyn EventStore, stream: &StreamId) {
             &[event("item.indexed", 3)],
             &meta("key-stale", &body),
         )
+        .await
         .expect_err("a stale expectation is refused");
     assert_eq!(
         error,
@@ -143,6 +149,7 @@ fn the_expected_version_is_enforced(store: &dyn EventStore, stream: &StreamId) {
             &[event("item.indexed", 3)],
             &meta("key-exists", &body),
         )
+        .await
         .expect_err("a stream that exists is not a new stream");
     assert!(matches!(error, EventLogError::Conflict { .. }));
 
@@ -153,11 +160,15 @@ fn the_expected_version_is_enforced(store: &dyn EventStore, stream: &StreamId) {
             &[event("item.indexed", 3)],
             &meta("key-2", &body),
         )
+        .await
         .expect("the current expectation is accepted");
-    assert_eq!(store.stream_version(stream).expect("readable"), Some(3));
+    assert_eq!(
+        store.stream_version(stream).await.expect("readable"),
+        Some(3)
+    );
 }
 
-fn a_repeated_command_is_not_a_second_write(store: &dyn EventStore, stream: &StreamId) {
+async fn a_repeated_command_is_not_a_second_write(store: &dyn EventStore, stream: &StreamId) {
     let body = json!({ "command": "retry" });
     let first = store
         .append(
@@ -166,6 +177,7 @@ fn a_repeated_command_is_not_a_second_write(store: &dyn EventStore, stream: &Str
             &[event("item.searchable", 4)],
             &meta("key-retry", &body),
         )
+        .await
         .expect("first attempt");
     let second = store
         .append(
@@ -174,6 +186,7 @@ fn a_repeated_command_is_not_a_second_write(store: &dyn EventStore, stream: &Str
             &[event("item.searchable", 4)],
             &meta("key-retry", &body),
         )
+        .await
         .expect("the retry is answered, not written again");
     assert!(second.deduplicated, "a retry is reported as one");
     assert_eq!(first.first_version, second.first_version);
@@ -183,13 +196,13 @@ fn a_repeated_command_is_not_a_second_write(store: &dyn EventStore, stream: &Str
         "a retry returns the fact that was stored, not a new one"
     );
     assert_eq!(
-        store.stream_version(stream).expect("readable"),
+        store.stream_version(stream).await.expect("readable"),
         Some(4),
         "a retry did not move the stream"
     );
 }
 
-fn a_reused_key_with_a_different_body_is_refused(store: &dyn EventStore, stream: &StreamId) {
+async fn a_reused_key_with_a_different_body_is_refused(store: &dyn EventStore, stream: &StreamId) {
     let changed = json!({ "command": "retry", "but": "different" });
     let error = store
         .append(
@@ -198,6 +211,7 @@ fn a_reused_key_with_a_different_body_is_refused(store: &dyn EventStore, stream:
             &[event("item.searchable", 9)],
             &meta("key-retry", &changed),
         )
+        .await
         .expect_err("the same key with a different body is refused");
     assert!(
         matches!(error, EventLogError::IdempotencyMismatch { .. }),
@@ -205,20 +219,21 @@ fn a_reused_key_with_a_different_body_is_refused(store: &dyn EventStore, stream:
     );
 }
 
-fn a_command_that_decided_nothing_is_refused(store: &dyn EventStore, stream: &StreamId) {
+async fn a_command_that_decided_nothing_is_refused(store: &dyn EventStore, stream: &StreamId) {
     let body = json!({ "command": "empty" });
     let error = store
         .append(stream, Expected::Any, &[], &meta("key-empty", &body))
+        .await
         .expect_err("an empty append is refused");
     assert!(matches!(error, EventLogError::Invalid(_)));
 }
 
-fn the_same_stream_id_under_another_tenant_is_another_stream(
+async fn the_same_stream_id_under_another_tenant_is_another_stream(
     store: &dyn EventStore,
     twin: &StreamId,
 ) {
     assert_eq!(
-        store.stream_version(twin).expect("readable"),
+        store.stream_version(twin).await.expect("readable"),
         None,
         "one tenant's history is not another tenant's"
     );
@@ -230,6 +245,7 @@ fn the_same_stream_id_under_another_tenant_is_another_stream(
             &[event("item.received", 1)],
             &meta("key-1", &body),
         )
+        .await
         .expect("the same key under another tenant is a different command");
     assert_eq!(
         result.first_version, 1,
@@ -238,8 +254,8 @@ fn the_same_stream_id_under_another_tenant_is_another_stream(
     assert!(!result.deduplicated);
 }
 
-fn the_feed_is_resumable(store: &dyn EventStore, tenant: &TenantId) {
-    let all = store.read_feed(tenant, 0, 100).expect("readable");
+async fn the_feed_is_resumable(store: &dyn EventStore, tenant: &TenantId) {
+    let all = store.read_feed(tenant, 0, 100).await.expect("readable");
     assert!(all.events.len() >= 4);
     assert!(!all.has_more);
     for pair in all.events.windows(2) {
@@ -249,11 +265,12 @@ fn the_feed_is_resumable(store: &dyn EventStore, tenant: &TenantId) {
         );
     }
 
-    let first = store.read_feed(tenant, 0, 2).expect("readable");
+    let first = store.read_feed(tenant, 0, 2).await.expect("readable");
     assert_eq!(first.events.len(), 2);
     assert!(first.has_more);
     let rest = store
         .read_feed(tenant, first.next_position, 100)
+        .await
         .expect("readable");
     assert_eq!(
         first.events.len() + rest.events.len(),
@@ -262,19 +279,23 @@ fn the_feed_is_resumable(store: &dyn EventStore, tenant: &TenantId) {
     );
 }
 
-fn the_feed_shows_one_tenant_only(store: &dyn EventStore, tenant: &TenantId, other: &TenantId) {
-    let mine = store.read_feed(tenant, 0, 100).expect("readable");
+async fn the_feed_shows_one_tenant_only(
+    store: &dyn EventStore,
+    tenant: &TenantId,
+    other: &TenantId,
+) {
+    let mine = store.read_feed(tenant, 0, 100).await.expect("readable");
     assert!(
         mine.events.iter().all(|event| event.tenant == *tenant),
         "a feed carries one tenant's facts and nobody else's"
     );
-    let theirs = store.read_feed(other, 0, 100).expect("readable");
+    let theirs = store.read_feed(other, 0, 100).await.expect("readable");
     assert_eq!(theirs.events.len(), 1);
 }
 
-fn a_stream_identity_is_stable(store: &dyn EventStore, tenant: &TenantId, other: &TenantId) {
-    let first = store.stream_identity(tenant).expect("readable");
-    let again = store.stream_identity(tenant).expect("readable");
+async fn a_stream_identity_is_stable(store: &dyn EventStore, tenant: &TenantId, other: &TenantId) {
+    let first = store.stream_identity(tenant).await.expect("readable");
+    let again = store.stream_identity(tenant).await.expect("readable");
     assert_eq!(
         first, again,
         "an identity a reader pins must not move under it"
@@ -282,47 +303,80 @@ fn a_stream_identity_is_stable(store: &dyn EventStore, tenant: &TenantId, other:
     assert!(!first.is_empty());
     assert_ne!(
         first,
-        store.stream_identity(other).expect("readable"),
+        store.stream_identity(other).await.expect("readable"),
         "two tenants are two streams"
     );
 }
 
-fn bytes_live_outside_the_log_and_can_be_erased_alone(store: &dyn EventStore, tenant: &TenantId) {
+async fn bytes_live_outside_the_log_and_can_be_erased_alone(
+    store: &dyn EventStore,
+    tenant: &TenantId,
+) {
     let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
-    assert!(store.get_blob(tenant, digest).expect("readable").is_none());
+    assert!(
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .is_none()
+    );
     store
         .put_blob(tenant, digest, b"the uploaded bytes")
+        .await
         .expect("writable");
     assert_eq!(
-        store.get_blob(tenant, digest).expect("readable").as_deref(),
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
         Some(&b"the uploaded bytes"[..])
     );
     // Writing the same digest twice is one file, not two.
     store
         .put_blob(tenant, digest, b"the uploaded bytes")
+        .await
         .expect("writable");
     assert_eq!(
-        store.get_blob(tenant, digest).expect("readable").as_deref(),
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
         Some(&b"the uploaded bytes"[..])
     );
-    store.delete_blob(tenant, digest).expect("deletable");
+    store.delete_blob(tenant, digest).await.expect("deletable");
     assert!(
-        store.get_blob(tenant, digest).expect("readable").is_none(),
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .is_none(),
         "bytes are erasable on their own, so erasing them leaves the fact that a file arrived"
     );
 }
 
-fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
-    assert!(store.load_snapshot(stream).expect("readable").is_none());
+async fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
+    assert!(
+        store
+            .load_snapshot(stream)
+            .await
+            .expect("readable")
+            .is_none()
+    );
     let snapshot = Snapshot {
         version: 4,
         state_schema_version: 1,
         state: json!({ "state": "searchable" }),
         recorded_at: OffsetDateTime::UNIX_EPOCH,
     };
-    store.save_snapshot(stream, &snapshot).expect("writable");
+    store
+        .save_snapshot(stream, &snapshot)
+        .await
+        .expect("writable");
     let loaded = store
         .load_snapshot(stream)
+        .await
         .expect("readable")
         .expect("a saved snapshot is there");
     assert_eq!(loaded.version, 4);
@@ -334,9 +388,10 @@ fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
         state: json!({ "state": "newer" }),
         recorded_at: OffsetDateTime::UNIX_EPOCH,
     };
-    store.save_snapshot(stream, &newer).expect("writable");
+    store.save_snapshot(stream, &newer).await.expect("writable");
     let loaded = store
         .load_snapshot(stream)
+        .await
         .expect("readable")
         .expect("still there");
     assert_eq!(
@@ -345,13 +400,17 @@ fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
     );
 }
 
-fn redaction_keeps_the_place_and_drops_the_snapshot(store: &dyn EventStore, stream: &StreamId) {
-    let before = store.read_stream(stream, 0, 100).expect("readable");
+async fn redaction_keeps_the_place_and_drops_the_snapshot(
+    store: &dyn EventStore,
+    stream: &StreamId,
+) {
+    let before = store.read_stream(stream, 0, 100).await.expect("readable");
     let target = before.events[1].clone();
     assert!(!target.is_redacted());
 
     let redacted = store
         .redact(stream, target.version, "the person asked")
+        .await
         .expect("redactable");
     assert_eq!(redacted.event_id, target.event_id, "the fact keeps its id");
     assert_eq!(redacted.version, target.version, "and its place");
@@ -360,11 +419,15 @@ fn redaction_keeps_the_place_and_drops_the_snapshot(store: &dyn EventStore, stre
     assert_eq!(redacted.data["reason"], json!("the person asked"));
 
     assert!(
-        store.load_snapshot(stream).expect("readable").is_none(),
+        store
+            .load_snapshot(stream)
+            .await
+            .expect("readable")
+            .is_none(),
         "a snapshot taken at or after a redacted version is a lie with a timestamp"
     );
 
-    let after = store.read_stream(stream, 0, 100).expect("readable");
+    let after = store.read_stream(stream, 0, 100).await.expect("readable");
     assert_eq!(
         after.events.len(),
         before.events.len(),
@@ -373,11 +436,16 @@ fn redaction_keeps_the_place_and_drops_the_snapshot(store: &dyn EventStore, stre
 
     let error = store
         .redact(stream, 9_999, "no such version")
+        .await
         .expect_err("there is nothing there to redact");
     assert_eq!(error, EventLogError::NotFound);
 }
 
-fn forgetting_a_tenant_leaves_nothing(store: &dyn EventStore, other: &TenantId, twin: &StreamId) {
+async fn forgetting_a_tenant_leaves_nothing(
+    store: &dyn EventStore,
+    other: &TenantId,
+    twin: &StreamId,
+) {
     store
         .save_snapshot(
             twin,
@@ -388,13 +456,15 @@ fn forgetting_a_tenant_leaves_nothing(store: &dyn EventStore, other: &TenantId, 
                 recorded_at: OffsetDateTime::UNIX_EPOCH,
             },
         )
+        .await
         .expect("writable");
-    store.forget_tenant(other).expect("forgettable");
-    assert_eq!(store.stream_version(twin).expect("readable"), None);
-    assert!(store.load_snapshot(twin).expect("readable").is_none());
+    store.forget_tenant(other).await.expect("forgettable");
+    assert_eq!(store.stream_version(twin).await.expect("readable"), None);
+    assert!(store.load_snapshot(twin).await.expect("readable").is_none());
     assert!(
         store
             .read_feed(other, 0, 100)
+            .await
             .expect("readable")
             .events
             .is_empty(),
@@ -409,6 +479,7 @@ fn forgetting_a_tenant_leaves_nothing(store: &dyn EventStore, other: &TenantId, 
             &[event("item.received", 1)],
             &meta("key-1", &body),
         )
+        .await
         .expect("the idempotency record went with the tenant");
     assert!(!result.deduplicated);
 }
@@ -423,14 +494,14 @@ fn forgetting_a_tenant_leaves_nothing(store: &dyn EventStore, other: &TenantId, 
 ///
 /// # Panics
 /// Panics when the events never became visible, which is a real failure rather than a slow one.
-pub fn drain_at_least(
+pub async fn drain_at_least(
     runner: &eventlog_core::CatchUpRunner,
     tenant: &TenantId,
     expected: u64,
 ) -> u64 {
     let mut applied = 0;
     for _ in 0..200 {
-        applied += runner.drain(tenant).expect("drained");
+        applied += runner.drain(tenant).await.expect("drained");
         if applied >= expected {
             return applied;
         }
@@ -460,27 +531,78 @@ impl eventlog_core::Projector for Tally {
         std::slice::from_ref(&TALLY)
     }
 
-    fn apply(
-        &self,
-        event: &eventlog_core::RecordedEvent,
-        store: &mut dyn eventlog_core::ProjectionStore,
-    ) -> Result<(), EventLogError> {
-        let key = format!("{}/{}", event.stream_type, event.stream_id);
-        let current = store
-            .get(&TALLY, &event.tenant, &key)?
-            .and_then(|row| row.get("count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0);
-        store.upsert(
-            &TALLY,
-            &event.tenant,
-            &key,
-            &json!({
-                "stream": event.stream_id,
-                "kind": event.stream_type,
-                "count": current + 1,
-                "last": event.name,
-            }),
-        )
+    fn apply<'a>(
+        &'a self,
+        event: &'a eventlog_core::RecordedEvent,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            let key = format!("{}/{}", event.stream_type, event.stream_id);
+            let current = store
+                .get(&TALLY, &event.tenant, &key)
+                .await?
+                .and_then(|row| row.get("count").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0);
+            store
+                .upsert(
+                    &TALLY,
+                    &event.tenant,
+                    &key,
+                    &json!({
+                        "stream": event.stream_id,
+                        "kind": event.stream_type,
+                        "count": current + 1,
+                        "last": event.name,
+                    }),
+                )
+                .await
+        })
+    }
+}
+
+/// A guard that reads the tally row and allows the write — the exercise's probe for "a guard may
+/// only read an inline projection".
+struct HoldsTallyRow {
+    tenant: TenantId,
+}
+
+impl eventlog_core::Guard for HoldsTallyRow {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            store
+                .get_for_update(&TALLY, &self.tenant, "item/item-1")
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+/// A guard that refuses the write once the tally row reaches its limit — the exercise for an
+/// invariant enforced inside the append transaction.
+struct TallyLimit {
+    tenant: TenantId,
+    limit: u64,
+}
+
+impl eventlog_core::Guard for TallyLimit {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            let count = store
+                .get_for_update(&TALLY, &self.tenant, "item/item-1")
+                .await?
+                .and_then(|row| row.get("count").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0);
+            if count >= self.limit {
+                return Err(EventLogError::Invalid("this one is full".to_owned()));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -488,8 +610,8 @@ impl eventlog_core::Projector for Tally {
 ///
 /// # Panics
 /// Panics with the failing assertion.
-pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
-    use eventlog_core::{CatchUpRunner, Guard, ProjectionStore, Projector};
+pub async fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
+    use eventlog_core::{CatchUpRunner, Projector};
 
     let tenant = TenantId::new("tenant-p").expect("valid tenant");
     let stream = StreamId::new(tenant.clone(), "item", "item-1").expect("valid stream");
@@ -501,6 +623,7 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
         std::sync::Arc::clone(store),
         std::sync::Arc::clone(&projector) as std::sync::Arc<dyn Projector>,
     )
+    .await
     .expect("a catch-up runner");
 
     store
@@ -510,19 +633,22 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
             &[event("item.received", 1), event("item.extracted", 2)],
             &meta("p-1", &body),
         )
+        .await
         .expect("append");
     assert!(
         store
             .projection_get(&TALLY, &tenant, "item/item-1")
+            .await
             .expect("readable")
             .is_none(),
         "a catch-up projection has not seen anything until it runs"
     );
 
-    let applied = drain_at_least(&runner, &tenant, 2);
+    let applied = drain_at_least(&runner, &tenant, 2).await;
     assert_eq!(applied, 2);
     let row = store
         .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
         .expect("readable")
         .expect("the runner wrote the row");
     assert_eq!(row["count"], json!(2));
@@ -536,10 +662,12 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
             &[event("item.indexed", 3)],
             &meta("p-2", &body),
         )
+        .await
         .expect("append");
-    assert_eq!(drain_at_least(&runner, &tenant, 1), 1, "no repeats");
+    assert_eq!(drain_at_least(&runner, &tenant, 1).await, 1, "no repeats");
     let row = store
         .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
         .expect("readable")
         .expect("there");
     assert_eq!(row["count"], json!(3));
@@ -547,27 +675,29 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
     // A declared field is queryable; an undeclared one is refused rather than scanned.
     let found = store
         .projection_find(&TALLY, &tenant, "kind", "item", 10)
+        .await
         .expect("findable");
     assert_eq!(found.len(), 1);
     assert!(
         store
             .projection_find(&TALLY, &tenant, "last", "item.indexed", 10)
+            .await
             .is_err(),
         "a field nobody declared is not an index that appears in production"
     );
 
     // A guard may not read a read model that lags.
-    let refused = store.append_guarded(
-        &stream,
-        Expected::Exact(3),
-        &[event("item.searchable", 4)],
-        &meta("p-guard", &body),
-        &(|projections: &mut dyn ProjectionStore| {
-            projections
-                .get_for_update(&TALLY, &tenant, "item/item-1")
-                .map(|_| ())
-        }) as &dyn Guard,
-    );
+    let refused = store
+        .append_guarded(
+            &stream,
+            Expected::Exact(3),
+            &[event("item.searchable", 4)],
+            &meta("p-guard", &body),
+            std::sync::Arc::new(HoldsTallyRow {
+                tenant: tenant.clone(),
+            }),
+        )
+        .await;
     assert!(
         matches!(refused, Err(EventLogError::Invalid(_))),
         "a guard over a catch-up projection is a limit enforced late, which is not a limit"
@@ -576,11 +706,13 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
     // A list is a page in key order, resumable by the last key returned.
     let page = store
         .projection_list(&TALLY, &tenant, None, 10)
+        .await
         .expect("listable");
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].0, "item/item-1");
     let after = store
         .projection_list(&TALLY, &tenant, Some(&page[0].0), 10)
+        .await
         .expect("listable");
     assert!(
         after.is_empty(),
@@ -588,10 +720,11 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
     );
 
     // Erasing a tenant takes its read models with it.
-    store.forget_tenant(&tenant).expect("forgettable");
+    store.forget_tenant(&tenant).await.expect("forgettable");
     assert!(
         store
             .projection_get(&TALLY, &tenant, "item/item-1")
+            .await
             .expect("readable")
             .is_none(),
         "a read model left behind after an erasure is the erased tenant, still readable"
@@ -603,10 +736,12 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
             &[event("item.received", 1), event("item.extracted", 2)],
             &meta("p-1", &body),
         )
+        .await
         .expect("append");
-    drain_at_least(&runner, &tenant, 2);
+    drain_at_least(&runner, &tenant, 2).await;
     let row = store
         .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
         .expect("readable")
         .expect("the cursor went with the tenant, so the new history was read");
     assert_eq!(
@@ -618,14 +753,20 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
     // Rebuilding from the log reproduces the same rows.
     let before = store
         .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
         .expect("readable")
         .expect("there");
     let replayed = store
-        .rebuild_projection(projector.as_ref(), &tenant)
+        .rebuild_projection(
+            std::sync::Arc::clone(&projector) as std::sync::Arc<dyn Projector>,
+            &tenant,
+        )
+        .await
         .expect("rebuildable");
     assert!(replayed >= 2, "the rebuild replayed the log it has");
     let after = store
         .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
         .expect("readable")
         .expect("there");
     assert_eq!(before, after, "a dropped read model comes back identical");
@@ -638,8 +779,8 @@ pub fn run_projections(store: &std::sync::Arc<dyn EventStore>) {
 ///
 /// # Panics
 /// Panics with the failing assertion.
-pub fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
-    use eventlog_core::{Guard, ProjectionStore, Projector};
+pub async fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
+    use eventlog_core::Projector;
 
     let tenant = TenantId::new("tenant-i").expect("valid tenant");
     let stream = StreamId::new(tenant.clone(), "item", "item-1").expect("valid stream");
@@ -647,8 +788,9 @@ pub fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
 
     store
         .register_inline(std::sync::Arc::new(Tally) as std::sync::Arc<dyn Projector>)
+        .await
         .expect("registered");
-    assert!(store.is_inline("tally"));
+    assert!(store.is_inline("tally").await);
 
     store
         .append(
@@ -657,25 +799,20 @@ pub fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
             &[event("item.received", 1)],
             &meta("i-1", &body),
         )
+        .await
         .expect("append");
     let row = store
         .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
         .expect("readable")
         .expect("an inline projection is written in the same transaction");
     assert_eq!(row["count"], json!(1), "read-your-writes, with no runner");
 
     // A guard reads the inline row inside the append transaction and refuses at the limit.
-    let limit = 2;
-    let guard = move |projections: &mut dyn ProjectionStore| {
-        let count = projections
-            .get_for_update(&TALLY, &tenant, "item/item-1")?
-            .and_then(|row| row.get("count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0);
-        if count >= limit {
-            return Err(EventLogError::Invalid("this one is full".to_owned()));
-        }
-        Ok(())
-    };
+    let guard = std::sync::Arc::new(TallyLimit {
+        tenant: tenant.clone(),
+        limit: 2,
+    });
 
     store
         .append_guarded(
@@ -683,17 +820,20 @@ pub fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
             Expected::Exact(1),
             &[event("item.extracted", 2)],
             &meta("i-2", &body),
-            &guard as &dyn Guard,
+            std::sync::Arc::clone(&guard) as std::sync::Arc<dyn eventlog_core::Guard>,
         )
+        .await
         .expect("under the limit");
 
-    let refused = store.append_guarded(
-        &stream,
-        Expected::Exact(2),
-        &[event("item.indexed", 3)],
-        &meta("i-3", &body),
-        &guard as &dyn Guard,
-    );
+    let refused = store
+        .append_guarded(
+            &stream,
+            Expected::Exact(2),
+            &[event("item.indexed", 3)],
+            &meta("i-3", &body),
+            guard,
+        )
+        .await;
     assert!(
         matches!(refused, Err(EventLogError::Invalid(_))),
         "the guard refused the write at the limit"
@@ -701,7 +841,7 @@ pub fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
     let tenant = TenantId::new("tenant-i").expect("valid tenant");
     let stream = StreamId::new(tenant.clone(), "item", "item-1").expect("valid stream");
     assert_eq!(
-        store.stream_version(&stream).expect("readable"),
+        store.stream_version(&stream).await.expect("readable"),
         Some(2),
         "a refused guard wrote nothing at all"
     );
@@ -946,15 +1086,17 @@ pub fn write_vectors(
 ///
 /// # Panics
 /// Panics when the feed cannot be read.
-#[must_use]
-pub fn vectors_from_feed(
+pub async fn vectors_from_feed(
     store: &dyn EventStore,
     tenant: &TenantId,
 ) -> std::collections::BTreeMap<String, EventVector> {
     let mut found = std::collections::BTreeMap::new();
     let mut position = 0;
     loop {
-        let page = store.read_feed(tenant, position, 200).expect("readable");
+        let page = store
+            .read_feed(tenant, position, 200)
+            .await
+            .expect("readable");
         if page.events.is_empty() {
             return found;
         }
@@ -973,12 +1115,13 @@ pub fn vectors_from_feed(
 ///
 /// # Panics
 /// Panics with the failing assertion.
-pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
+pub async fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
     use eventlog_core::Projector;
 
     let tenant = TenantId::new("tenant-page").expect("valid tenant");
     store
         .register_inline(std::sync::Arc::new(Tally) as std::sync::Arc<dyn Projector>)
+        .await
         .expect("registered");
     let body = json!({ "command": "create" });
     for index in 0..5 {
@@ -991,6 +1134,7 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
                 &[event("item.received", index)],
                 &meta(&format!("page-{index}"), &body),
             )
+            .await
             .expect("append");
     }
     // A second kind, so a prefix has something to exclude.
@@ -1002,10 +1146,12 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
             &[event("note.written", 9)],
             &meta("page-note", &body),
         )
+        .await
         .expect("append");
 
     let page = store
         .projection_page(&TALLY, &tenant, Some("item/"), None, 2)
+        .await
         .expect("pageable");
     assert_eq!(page.rows.len(), 2);
     assert_eq!(
@@ -1019,6 +1165,7 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
     while let Some(from) = cursor {
         let next = store
             .projection_page(&TALLY, &tenant, Some("item/"), Some(&from), 2)
+            .await
             .expect("pageable");
         seen.extend(next.rows.iter().map(|(key, _)| key.clone()));
         cursor = next.next_cursor;
@@ -1031,6 +1178,7 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
 
     let exact = store
         .projection_page(&TALLY, &tenant, Some("item/"), None, 5)
+        .await
         .expect("pageable");
     assert_eq!(exact.rows.len(), 5);
     assert!(
@@ -1041,6 +1189,7 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
 
     let everything = store
         .projection_page(&TALLY, &tenant, None, None, 100)
+        .await
         .expect("pageable");
     assert_eq!(
         everything.rows.len(),
@@ -1049,6 +1198,7 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
     );
     let bounded = store
         .projection_page(&TALLY, &tenant, Some("item/"), None, 100)
+        .await
         .expect("pageable");
     assert_eq!(
         bounded.rows.len(),
@@ -1065,7 +1215,7 @@ pub fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
 ///
 /// # Panics
 /// Panics with the failing assertion.
-pub fn run_claims(store: &dyn EventStore) {
+pub async fn run_claims(store: &dyn EventStore) {
     use eventlog_core::Claim;
 
     let tenant = TenantId::new("tenant-claim").expect("valid tenant");
@@ -1076,6 +1226,7 @@ pub fn run_claims(store: &dyn EventStore) {
     assert!(
         store
             .recorded_claim(&tenant, &claim)
+            .await
             .expect("readable")
             .is_none(),
         "an unclaimed key has produced nothing"
@@ -1092,11 +1243,13 @@ pub fn run_claims(store: &dyn EventStore) {
             &[event("item.received", 1)],
             &meta,
         )
+        .await
         .expect("append");
     assert_eq!(written.first_version, 1);
 
     let recorded = store
         .recorded_claim(&tenant, &claim)
+        .await
         .expect("readable")
         .expect("the claim points at what it produced");
     assert_eq!(
@@ -1111,7 +1264,7 @@ pub fn run_claims(store: &dyn EventStore) {
         Claim::new("subject:alice/create", "key-1", "a-different-digest").expect("a claim");
     assert!(
         matches!(
-            store.recorded_claim(&tenant, &changed),
+            store.recorded_claim(&tenant, &changed).await,
             Err(EventLogError::IdempotencyMismatch { .. })
         ),
         "a changed request must not be answered with the earlier result"
@@ -1122,6 +1275,7 @@ pub fn run_claims(store: &dyn EventStore) {
     assert!(
         store
             .recorded_claim(&tenant, &other)
+            .await
             .expect("readable")
             .is_none(),
         "one caller's key is not another's"

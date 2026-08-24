@@ -5,17 +5,24 @@
 //! A file path gives an owner its local store; `:memory:` gives its tests one. They are the same
 //! code, so a property proved in a test is proved for the deployment — which is exactly what a
 //! separate hand-written memory backend cannot say.
+//!
+//! rusqlite is synchronous and has no async driver, so the sync/async bridge lives here rather
+//! than in every caller: each store call runs on tokio's blocking pool and the caller just
+//! `.await`s. Before this bridge was internal, every consuming module wrapped every call in
+//! `spawn_blocking` by hand, and forgetting one wrap panicked a worker at startup.
 
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
+    task::{Context, Poll, Wake, Waker},
 };
 
 use eventlog_core::{
-    AppendResult, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError, EventStore,
-    Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore,
-    Projector, RecordedEvent, Snapshot, StreamId, StreamSlice, TenantId, bounded_limit,
-    indexed_value, new_event_id, redaction_tombstone, validate_append, validate_field,
+    AppendResult, BoxFuture, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError,
+    EventStore, Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec,
+    ProjectionStore, Projector, RecordedEvent, Snapshot, StreamId, StreamSlice, TenantId,
+    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
+    validate_field,
 };
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde_json::Value;
@@ -28,6 +35,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// One owner's event tables in one SQLite database.
 pub struct SqliteEventStore {
+    inner: Arc<Inner>,
+}
+
+/// The synchronous store the blocking pool runs. Shared by `Arc` because a blocking task must
+/// own what it touches: it may outlive a caller that gave up waiting.
+struct Inner {
     connection: Mutex<Connection>,
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
@@ -40,16 +53,53 @@ impl SqliteEventStore {
     /// # Errors
     /// Returns [`EventLogError::Invalid`] for an unusable prefix and [`EventLogError::Backend`]
     /// when the database cannot be opened or its tables cannot be created.
-    pub fn open(path: &str, prefix: &str) -> Result<Self, EventLogError> {
-        let connection = Connection::open(path).map_err(backend)?;
-        Self::from_connection(connection, prefix)
+    pub async fn open(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+        let path = path.to_owned();
+        let prefix = prefix.to_owned();
+        let inner = run_blocking(move || Inner::open(&path, &prefix)).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// An empty store that lives only as long as the process.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the database cannot be created.
-    pub fn in_memory(prefix: &str) -> Result<Self, EventLogError> {
+    pub async fn in_memory(prefix: &str) -> Result<Self, EventLogError> {
+        let prefix = prefix.to_owned();
+        let inner = run_blocking(move || Inner::in_memory(&prefix)).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+}
+
+/// Run one store call where rusqlite is allowed to block.
+///
+/// # Errors
+/// Returns whatever the call returned, or [`EventLogError::Backend`] when the blocking task
+/// panicked — a panic on the pool must surface as an error here, not vanish.
+async fn run_blocking<T, F>(work: F) -> Result<T, EventLogError>
+where
+    F: FnOnce() -> Result<T, EventLogError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(_) => Err(EventLogError::Backend(
+            "the store's blocking worker panicked".to_owned(),
+        )),
+    }
+}
+
+impl Inner {
+    fn open(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+        let connection = Connection::open(path).map_err(backend)?;
+        Self::from_connection(connection, prefix)
+    }
+
+    fn in_memory(prefix: &str) -> Result<Self, EventLogError> {
         let connection = Connection::open_in_memory().map_err(backend)?;
         Self::from_connection(connection, prefix)
     }
@@ -192,16 +242,284 @@ impl SqliteEventStore {
 }
 
 impl EventStore for SqliteEventStore {
-    fn append(
-        &self,
-        stream: &StreamId,
+    fn append<'a>(
+        &'a self,
+        stream: &'a StreamId,
         expected: Expected,
-        events: &[NewEvent],
-        meta: &CommandMeta,
-    ) -> Result<AppendResult, EventLogError> {
-        self.append_guarded(stream, expected, events, meta, &NoGuard)
+        events: &'a [NewEvent],
+        meta: &'a CommandMeta,
+    ) -> BoxFuture<'a, Result<AppendResult, EventLogError>> {
+        self.append_guarded(stream, expected, events, meta, Arc::new(NoGuard))
     }
 
+    fn append_guarded<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        expected: Expected,
+        events: &'a [NewEvent],
+        meta: &'a CommandMeta,
+        guard: Arc<dyn Guard>,
+    ) -> BoxFuture<'a, Result<AppendResult, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        let events = events.to_vec();
+        let meta = meta.clone();
+        Box::pin(run_blocking(move || {
+            inner.append_guarded(&stream, expected, &events, &meta, guard.as_ref())
+        }))
+    }
+
+    fn recorded_claim<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        claim: &'a Claim,
+    ) -> BoxFuture<'a, Result<Option<ClaimedCommand>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let claim = claim.clone();
+        Box::pin(run_blocking(move || inner.recorded_claim(&tenant, &claim)))
+    }
+
+    fn recorded_command<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        idempotency_key: &'a str,
+        request_hash: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AppendResult>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        let idempotency_key = idempotency_key.to_owned();
+        let request_hash = request_hash.to_owned();
+        Box::pin(run_blocking(move || {
+            inner.recorded_command(&stream, &idempotency_key, &request_hash)
+        }))
+    }
+
+    fn read_stream<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        after_version: u64,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<StreamSlice, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        Box::pin(run_blocking(move || {
+            inner.read_stream(&stream, after_version, limit)
+        }))
+    }
+
+    fn stream_version<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<u64>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        Box::pin(run_blocking(move || inner.stream_version(&stream)))
+    }
+
+    fn read_feed<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        after_position: u64,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<FeedPage, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        Box::pin(run_blocking(move || {
+            inner.read_feed(&tenant, after_position, limit)
+        }))
+    }
+
+    fn redact<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        version: u64,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        let reason = reason.to_owned();
+        Box::pin(run_blocking(move || {
+            inner.redact(&stream, version, &reason)
+        }))
+    }
+
+    fn save_snapshot<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        snapshot: &'a Snapshot,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        let snapshot = snapshot.clone();
+        Box::pin(run_blocking(move || {
+            inner.save_snapshot(&stream, &snapshot)
+        }))
+    }
+
+    fn load_snapshot<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<Snapshot>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        Box::pin(run_blocking(move || inner.load_snapshot(&stream)))
+    }
+
+    fn forget_tenant<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        Box::pin(run_blocking(move || inner.forget_tenant(&tenant)))
+    }
+
+    fn create_projections(
+        &self,
+        projector: Arc<dyn Projector>,
+    ) -> BoxFuture<'_, Result<(), EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(run_blocking(move || {
+            inner.create_projections(projector.as_ref())
+        }))
+    }
+
+    fn register_inline(
+        &self,
+        projector: Arc<dyn Projector>,
+    ) -> BoxFuture<'_, Result<(), EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(run_blocking(move || inner.register_inline(projector)))
+    }
+
+    fn is_inline<'a>(&'a self, name: &'a str) -> BoxFuture<'a, bool> {
+        // An in-memory set, not the database: nothing here can block.
+        Box::pin(std::future::ready(self.inner.is_inline(name)))
+    }
+
+    fn run_catch_up<'a>(
+        &'a self,
+        projector: Arc<dyn Projector>,
+        tenant: &'a TenantId,
+        batch: usize,
+    ) -> BoxFuture<'a, Result<CatchUpProgress, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        Box::pin(run_blocking(move || {
+            inner.run_catch_up(projector.as_ref(), &tenant, batch)
+        }))
+    }
+
+    fn rebuild_projection<'a>(
+        &'a self,
+        projector: Arc<dyn Projector>,
+        tenant: &'a TenantId,
+    ) -> BoxFuture<'a, Result<u64, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        Box::pin(run_blocking(move || {
+            inner.rebuild_projection(projector.as_ref(), &tenant)
+        }))
+    }
+
+    fn projection_get<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let projection = *projection;
+        let tenant = tenant.clone();
+        let key = key.to_owned();
+        Box::pin(run_blocking(move || {
+            inner.projection_get(&projection, &tenant, &key)
+        }))
+    }
+
+    fn projection_find<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        field: &'a str,
+        value: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let projection = *projection;
+        let tenant = tenant.clone();
+        let field = field.to_owned();
+        let value = value.to_owned();
+        Box::pin(run_blocking(move || {
+            inner.projection_find(&projection, &tenant, &field, &value, limit)
+        }))
+    }
+
+    fn projection_list<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        after_key: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<(String, Value)>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let projection = *projection;
+        let tenant = tenant.clone();
+        let after_key = after_key.map(str::to_owned);
+        Box::pin(run_blocking(move || {
+            inner.projection_list(&projection, &tenant, after_key.as_deref(), limit)
+        }))
+    }
+
+    fn stream_identity<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+    ) -> BoxFuture<'a, Result<String, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        Box::pin(run_blocking(move || inner.stream_identity(&tenant)))
+    }
+
+    fn put_blob<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        digest: &'a str,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let digest = digest.to_owned();
+        let bytes = bytes.to_vec();
+        Box::pin(run_blocking(move || {
+            inner.put_blob(&tenant, &digest, &bytes)
+        }))
+    }
+
+    fn get_blob<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let digest = digest.to_owned();
+        Box::pin(run_blocking(move || inner.get_blob(&tenant, &digest)))
+    }
+
+    fn delete_blob<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        digest: &'a str,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let digest = digest.to_owned();
+        Box::pin(run_blocking(move || inner.delete_blob(&tenant, &digest)))
+    }
+}
+
+impl Inner {
     fn append_guarded(
         &self,
         stream: &StreamId,
@@ -211,13 +529,31 @@ impl EventStore for SqliteEventStore {
         admission: &dyn Guard,
     ) -> Result<AppendResult, EventLogError> {
         validate_append(events, meta)?;
-        let prefix = self.prefix.clone();
-        let mut guard = self.connection.lock().map_err(poisoned)?;
-        let transaction = guard
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend)?;
+        let mut connection = self.connection.lock().map_err(poisoned)?;
+        let connection = &mut *connection;
+        begin_immediate(connection)?;
+        let result =
+            self.append_in_transaction(connection, stream, expected, events, meta, admission);
+        finish_transaction(connection, result)
+    }
 
-        let recorded: Option<(String, i64, i64)> = transaction
+    /// The append, between `BEGIN IMMEDIATE` and `COMMIT`.
+    ///
+    /// The transaction is managed by hand rather than through rusqlite's `Transaction`: a guard
+    /// or an inline projector writes through a `&mut Connection`, which the borrowing
+    /// `Transaction` type cannot hand out.
+    fn append_in_transaction(
+        &self,
+        connection: &mut Connection,
+        stream: &StreamId,
+        expected: Expected,
+        events: &[NewEvent],
+        meta: &CommandMeta,
+        admission: &dyn Guard,
+    ) -> Result<AppendResult, EventLogError> {
+        let prefix = &self.prefix;
+
+        let recorded: Option<(String, i64, i64)> = connection
             .query_row(
                 &format!(
                     "SELECT request_hash, first_version, last_version FROM {prefix}_commands
@@ -241,8 +577,7 @@ impl EventStore for SqliteEventStore {
                     key: meta.idempotency_key.clone(),
                 });
             }
-            let stored =
-                select_versions(&transaction, &prefix, stream, first_version, last_version)?;
+            let stored = select_versions(connection, prefix, stream, first_version, last_version)?;
             return Ok(AppendResult {
                 first_version: to_u64(first_version)?,
                 last_version: to_u64(last_version)?,
@@ -251,7 +586,7 @@ impl EventStore for SqliteEventStore {
             });
         }
 
-        let head: Option<i64> = transaction
+        let head: Option<i64> = connection
             .query_row(
                 &format!(
                     "SELECT MAX(version) FROM {prefix}_events
@@ -275,11 +610,11 @@ impl EventStore for SqliteEventStore {
 
         {
             let mut projections = SqliteProjections {
-                connection: &transaction,
-                prefix: &prefix,
+                connection: &mut *connection,
+                prefix,
                 inline: &self.inline_names,
             };
-            admission.check(&mut projections)?;
+            drive(admission.check(&mut projections))?;
         }
 
         let now = OffsetDateTime::now_utc();
@@ -289,7 +624,7 @@ impl EventStore for SqliteEventStore {
         for (offset, event) in events.iter().enumerate() {
             let version = head + 1 + offset as u64;
             let event_id = new_event_id();
-            transaction
+            connection
                 .execute(
                     &format!(
                         "INSERT INTO {prefix}_events (
@@ -319,7 +654,7 @@ impl EventStore for SqliteEventStore {
                     ],
                 )
                 .map_err(backend)?;
-            let global_seq = to_u64(transaction.last_insert_rowid())?;
+            let global_seq = to_u64(connection.last_insert_rowid())?;
             written.push(RecordedEvent {
                 global_seq,
                 tenant: stream.tenant().clone(),
@@ -344,7 +679,7 @@ impl EventStore for SqliteEventStore {
 
         let first_version = head + 1;
         let last_version = head + events.len() as u64;
-        transaction
+        connection
             .execute(
                 &format!(
                     "INSERT INTO {prefix}_commands (
@@ -365,22 +700,20 @@ impl EventStore for SqliteEventStore {
             )
             .map_err(backend)?;
 
-        {
-            let inline = self.inline.lock().map_err(poisoned)?;
-            for projector in inline.iter() {
-                let mut projections = SqliteProjections {
-                    connection: &transaction,
-                    prefix: &prefix,
-                    inline: &self.inline_names,
-                };
-                for recorded in &written {
-                    projector.apply(recorded, &mut projections)?;
-                }
+        let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
+        for projector in &projectors {
+            let mut projections = SqliteProjections {
+                connection: &mut *connection,
+                prefix,
+                inline: &self.inline_names,
+            };
+            for recorded in &written {
+                drive(projector.apply(recorded, &mut projections))?;
             }
         }
 
         if let Some(claim) = &meta.claim {
-            transaction
+            connection
                 .execute(
                     &format!(
                         "INSERT INTO {prefix}_claims (
@@ -402,8 +735,6 @@ impl EventStore for SqliteEventStore {
                 )
                 .map_err(backend)?;
         }
-
-        transaction.commit().map_err(backend)?;
 
         Ok(AppendResult {
             first_version,
@@ -963,22 +1294,37 @@ impl EventStore for SqliteEventStore {
                 more_waiting: false,
             });
         }
-        let prefix = self.prefix.clone();
-        let mut guard = self.connection.lock().map_err(poisoned)?;
-        let transaction = guard
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend)?;
+        let mut connection = self.connection.lock().map_err(poisoned)?;
+        let connection = &mut *connection;
+        begin_immediate(connection)?;
+        let result = self.catch_up_in_transaction(connection, projector, tenant, &page);
+        finish_transaction(connection, result)?;
+        Ok(CatchUpProgress {
+            applied: page.events.len() as u64,
+            position: page.next_position,
+            more_waiting: page.has_more,
+        })
+    }
+
+    fn catch_up_in_transaction(
+        &self,
+        connection: &mut Connection,
+        projector: &dyn Projector,
+        tenant: &TenantId,
+        page: &FeedPage,
+    ) -> Result<(), EventLogError> {
+        let prefix = &self.prefix;
         {
             let mut projections = SqliteProjections {
-                connection: &transaction,
-                prefix: &prefix,
+                connection: &mut *connection,
+                prefix,
                 inline: &self.inline_names,
             };
             for recorded in &page.events {
-                projector.apply(recorded, &mut projections)?;
+                drive(projector.apply(recorded, &mut projections))?;
             }
         }
-        transaction
+        connection
             .execute(
                 &format!(
                     "INSERT INTO {prefix}_projection_cursors
@@ -996,12 +1342,7 @@ impl EventStore for SqliteEventStore {
                 ],
             )
             .map_err(backend)?;
-        transaction.commit().map_err(backend)?;
-        Ok(CatchUpProgress {
-            applied: page.events.len() as u64,
-            position: page.next_position,
-            more_waiting: page.has_more,
-        })
+        Ok(())
     }
 
     fn rebuild_projection(
@@ -1103,9 +1444,7 @@ impl EventStore for SqliteEventStore {
         }
         Ok(found)
     }
-}
 
-impl SqliteEventStore {
     fn cursor_position(&self, projection: &str, tenant: &TenantId) -> Result<u64, EventLogError> {
         let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
@@ -1124,15 +1463,126 @@ impl SqliteEventStore {
     }
 }
 
+/// Open a hand-managed transaction. See [`Inner::append_in_transaction`] for why it is not
+/// rusqlite's `Transaction`.
+fn begin_immediate(connection: &Connection) -> Result<(), EventLogError> {
+    connection.execute_batch("BEGIN IMMEDIATE").map_err(backend)
+}
+
+/// Commit on success, roll back on failure — the two ends of [`begin_immediate`].
+fn finish_transaction<T>(
+    connection: &Connection,
+    result: Result<T, EventLogError>,
+) -> Result<T, EventLogError> {
+    match result {
+        Ok(value) => match connection.execute_batch("COMMIT") {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(backend(error))
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// A waker that unparks the thread driving a future, so [`drive`] is a real executor rather
+/// than a spin loop.
+struct ThreadWaker(std::thread::Thread);
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Drive one guard or projector future to completion on the blocking thread.
+///
+/// The futures a [`SqliteProjections`] hands out finish on their first poll — the rusqlite work
+/// happens synchronously — so this normally never parks. It parks rather than panics when a
+/// check awaits something else, so such a guard is slow here, never wrong.
+fn drive<T>(mut future: BoxFuture<'_, T>) -> T {
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// A future that already finished. What a [`SqliteProjections`] hands out: the rusqlite work
+/// happens synchronously when the method is called, and the `.await` just unwraps it.
+fn done<'a, T: Send + 'a>(value: T) -> BoxFuture<'a, T> {
+    Box::pin(std::future::ready(value))
+}
+
 /// A projection's view of the transaction it is running in.
+///
+/// It holds the connection `&mut` — not through rusqlite's `Transaction` — because a guard's
+/// future must be `Send`, and a `Transaction` borrows the connection in a way that is not.
 struct SqliteProjections<'a> {
-    connection: &'a Connection,
+    connection: &'a mut Connection,
     prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
 }
 
 impl ProjectionStore for SqliteProjections<'_> {
-    fn upsert(
+    fn upsert<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+        body: &'a Value,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        done(self.upsert_now(projection, tenant, key, body))
+    }
+
+    fn delete<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        done(self.delete_now(projection, tenant, key))
+    }
+
+    fn get<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
+        done(self.get_now(projection, tenant, key))
+    }
+
+    fn get_for_update<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
+        done(self.get_for_update_now(projection, tenant, key))
+    }
+
+    fn find<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        field: &'a str,
+        value: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>> {
+        done(self.find_now(projection, tenant, field, value, limit))
+    }
+}
+
+impl SqliteProjections<'_> {
+    fn upsert_now(
         &mut self,
         projection: &ProjectionSpec,
         tenant: &TenantId,
@@ -1170,7 +1620,7 @@ impl ProjectionStore for SqliteProjections<'_> {
             .map_err(backend)
     }
 
-    fn delete(
+    fn delete_now(
         &mut self,
         projection: &ProjectionSpec,
         tenant: &TenantId,
@@ -1186,7 +1636,7 @@ impl ProjectionStore for SqliteProjections<'_> {
             .map_err(backend)
     }
 
-    fn get(
+    fn get_now(
         &mut self,
         projection: &ProjectionSpec,
         tenant: &TenantId,
@@ -1210,7 +1660,7 @@ impl ProjectionStore for SqliteProjections<'_> {
         .transpose()
     }
 
-    fn get_for_update(
+    fn get_for_update_now(
         &mut self,
         projection: &ProjectionSpec,
         tenant: &TenantId,
@@ -1227,10 +1677,10 @@ impl ProjectionStore for SqliteProjections<'_> {
             )));
         }
         drop(inline);
-        self.get(projection, tenant, key)
+        self.get_now(projection, tenant, key)
     }
 
-    fn find(
+    fn find_now(
         &mut self,
         projection: &ProjectionSpec,
         tenant: &TenantId,

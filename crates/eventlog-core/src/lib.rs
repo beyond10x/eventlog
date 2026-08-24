@@ -19,13 +19,21 @@ pub use projection::{
     ProjectionStore, Projector, indexed_value, validate_identifier,
 };
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// The future every store method returns.
+///
+/// The store surface is async, but a native `async fn` in the trait would cost `dyn EventStore` —
+/// and the repository, the catch-up runner and every consumer hold exactly that. Boxing the
+/// future keeps the trait usable as an object; callers just `.await`. `Send` is part of the type
+/// because every consumer runs these futures on a multi-threaded executor.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The longest any identity, key or name may be.
 pub const MAX_FIELD_LEN: usize = 512;
@@ -427,6 +435,10 @@ pub enum EventLogError {
 ///
 /// Two backends implement this and one exercise defines what they must agree on. In-memory is
 /// SQLite `:memory:`, so there is no third implementation for the other two to diverge from.
+///
+/// Every method returns a [`BoxFuture`]: the callers are async servers, and the sync/async bridge
+/// lives inside the backends rather than in every caller. Forgetting a caller-side
+/// `spawn_blocking` wrap used to panic a worker at startup; there is no wrap left to forget.
 pub trait EventStore: Send + Sync + 'static {
     /// Record what a command decided.
     ///
@@ -434,13 +446,13 @@ pub trait EventStore: Send + Sync + 'static {
     /// Returns [`EventLogError::Conflict`] when the stream moved under the caller,
     /// [`EventLogError::IdempotencyMismatch`] when the key was used for a different body, and
     /// [`EventLogError::Invalid`] for an unusable command or an empty event list.
-    fn append(
-        &self,
-        stream: &StreamId,
+    fn append<'a>(
+        &'a self,
+        stream: &'a StreamId,
         expected: Expected,
-        events: &[NewEvent],
-        meta: &CommandMeta,
-    ) -> Result<AppendResult, EventLogError>;
+        events: &'a [NewEvent],
+        meta: &'a CommandMeta,
+    ) -> BoxFuture<'a, Result<AppendResult, EventLogError>>;
 
     /// What a caller's earlier claim on this key produced, if anything.
     ///
@@ -448,11 +460,11 @@ pub trait EventStore: Send + Sync + 'static {
     /// Returns [`EventLogError::IdempotencyMismatch`] when the key was claimed for a different
     /// request — the same key with a different body is a different request wearing the first
     /// one's name.
-    fn recorded_claim(
-        &self,
-        tenant: &TenantId,
-        claim: &Claim,
-    ) -> Result<Option<ClaimedCommand>, EventLogError>;
+    fn recorded_claim<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        claim: &'a Claim,
+    ) -> BoxFuture<'a, Result<Option<ClaimedCommand>, EventLogError>>;
 
     /// What a command with this key already produced, if it has run before.
     ///
@@ -462,138 +474,160 @@ pub trait EventStore: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns [`EventLogError::IdempotencyMismatch`] when the key was used for a different body.
-    fn recorded_command(
-        &self,
-        stream: &StreamId,
-        idempotency_key: &str,
-        request_hash: &str,
-    ) -> Result<Option<AppendResult>, EventLogError>;
+    fn recorded_command<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        idempotency_key: &'a str,
+        request_hash: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AppendResult>, EventLogError>>;
 
     /// Read one stream forward, for a fold.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn read_stream(
-        &self,
-        stream: &StreamId,
+    fn read_stream<'a>(
+        &'a self,
+        stream: &'a StreamId,
         after_version: u64,
         limit: usize,
-    ) -> Result<StreamSlice, EventLogError>;
+    ) -> BoxFuture<'a, Result<StreamSlice, EventLogError>>;
 
     /// The stream's head, or `None` when it does not exist.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn stream_version(&self, stream: &StreamId) -> Result<Option<u64>, EventLogError>;
+    fn stream_version<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<u64>, EventLogError>>;
 
     /// Read a tenant's history in commit order, stopping short of anything still in flight.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn read_feed(
-        &self,
-        tenant: &TenantId,
+    fn read_feed<'a>(
+        &'a self,
+        tenant: &'a TenantId,
         after_position: u64,
         limit: usize,
-    ) -> Result<FeedPage, EventLogError>;
+    ) -> BoxFuture<'a, Result<FeedPage, EventLogError>>;
 
     /// Erase one event's body, keeping its id, version and place.
     ///
     /// # Errors
     /// Returns [`EventLogError::NotFound`] when the stream has no such version.
-    fn redact(
-        &self,
-        stream: &StreamId,
+    fn redact<'a>(
+        &'a self,
+        stream: &'a StreamId,
         version: u64,
-        reason: &str,
-    ) -> Result<RecordedEvent, EventLogError>;
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn save_snapshot(&self, stream: &StreamId, snapshot: &Snapshot) -> Result<(), EventLogError>;
+    fn save_snapshot<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        snapshot: &'a Snapshot,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn load_snapshot(&self, stream: &StreamId) -> Result<Option<Snapshot>, EventLogError>;
+    fn load_snapshot<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<Snapshot>, EventLogError>>;
 
     /// Remove everything this kit holds for a tenant, in one transaction.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn forget_tenant(&self, tenant: &TenantId) -> Result<(), EventLogError>;
+    fn forget_tenant<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 
     /// Append with a check that runs inside the same transaction, against inline read models.
     ///
+    /// The guard is shared rather than borrowed because a backend may carry it onto another
+    /// thread to run it beside its connection.
+    ///
     /// # Errors
     /// Returns the guard's refusal, or whatever [`EventStore::append`] would have.
-    fn append_guarded(
-        &self,
-        stream: &StreamId,
+    fn append_guarded<'a>(
+        &'a self,
+        stream: &'a StreamId,
         expected: Expected,
-        events: &[NewEvent],
-        meta: &CommandMeta,
-        guard: &dyn Guard,
-    ) -> Result<AppendResult, EventLogError>;
+        events: &'a [NewEvent],
+        meta: &'a CommandMeta,
+        guard: Arc<dyn Guard>,
+    ) -> BoxFuture<'a, Result<AppendResult, EventLogError>>;
 
     /// Create a projector's tables. Idempotent.
     ///
     /// # Errors
     /// Returns [`EventLogError::Invalid`] for an unusable projection declaration.
-    fn create_projections(&self, projector: &dyn Projector) -> Result<(), EventLogError>;
+    fn create_projections(
+        &self,
+        projector: Arc<dyn Projector>,
+    ) -> BoxFuture<'_, Result<(), EventLogError>>;
 
     /// Drive this projector inside every append transaction from now on.
     ///
     /// # Errors
     /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered.
-    fn register_inline(&self, projector: Arc<dyn Projector>) -> Result<(), EventLogError>;
+    fn register_inline(
+        &self,
+        projector: Arc<dyn Projector>,
+    ) -> BoxFuture<'_, Result<(), EventLogError>>;
 
     /// Whether a projection of this name is driven inline.
-    fn is_inline(&self, name: &str) -> bool;
+    fn is_inline<'a>(&'a self, name: &'a str) -> BoxFuture<'a, bool>;
 
     /// Apply one batch of a catch-up projection under its own lock.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn run_catch_up(
-        &self,
-        projector: &dyn Projector,
-        tenant: &TenantId,
+    fn run_catch_up<'a>(
+        &'a self,
+        projector: Arc<dyn Projector>,
+        tenant: &'a TenantId,
         batch: usize,
-    ) -> Result<CatchUpProgress, EventLogError>;
+    ) -> BoxFuture<'a, Result<CatchUpProgress, EventLogError>>;
 
     /// Drop a projector's tables and replay the whole log into them.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn rebuild_projection(
-        &self,
-        projector: &dyn Projector,
-        tenant: &TenantId,
-    ) -> Result<u64, EventLogError>;
+    fn rebuild_projection<'a>(
+        &'a self,
+        projector: Arc<dyn Projector>,
+        tenant: &'a TenantId,
+    ) -> BoxFuture<'a, Result<u64, EventLogError>>;
 
     /// Read one projection row.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn projection_get(
-        &self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        key: &str,
-    ) -> Result<Option<Value>, EventLogError>;
+    fn projection_get<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>>;
 
     /// Read projection rows by a declared field.
     ///
     /// # Errors
     /// Returns [`EventLogError::Invalid`] when the field was not declared indexed.
-    fn projection_find(
-        &self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        field: &str,
-        value: &str,
+    fn projection_find<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        field: &'a str,
+        value: &'a str,
         limit: usize,
-    ) -> Result<Vec<Value>, EventLogError>;
+    ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>>;
 
     /// Read a page of projection rows in key order.
     ///
@@ -602,13 +636,13 @@ pub trait EventStore: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn projection_list(
-        &self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        after_key: Option<&str>,
+    fn projection_list<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        after_key: Option<&'a str>,
         limit: usize,
-    ) -> Result<Vec<(String, Value)>, EventLogError>;
+    ) -> BoxFuture<'a, Result<Vec<(String, Value)>, EventLogError>>;
 
     /// One page of a projection, with the cursor that continues it.
     ///
@@ -626,34 +660,38 @@ pub trait EventStore: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn projection_page(
-        &self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        prefix: Option<&str>,
-        cursor: Option<&str>,
+    fn projection_page<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        prefix: Option<&'a str>,
+        cursor: Option<&'a str>,
         limit: usize,
-    ) -> Result<ProjectionPage, EventLogError> {
-        let limit = bounded_limit(limit);
-        let prefix = prefix.unwrap_or("");
-        let after = cursor.map_or_else(|| prefix.to_owned(), str::to_owned);
-        let fetched = self.projection_list(projection, tenant, Some(&after), limit + 1)?;
-        let mut rows = Vec::with_capacity(limit);
-        let mut more = false;
-        for (key, body) in fetched {
-            if !key.starts_with(prefix) {
-                break;
+    ) -> BoxFuture<'a, Result<ProjectionPage, EventLogError>> {
+        Box::pin(async move {
+            let limit = bounded_limit(limit);
+            let prefix = prefix.unwrap_or("");
+            let after = cursor.map_or_else(|| prefix.to_owned(), str::to_owned);
+            let fetched = self
+                .projection_list(projection, tenant, Some(&after), limit + 1)
+                .await?;
+            let mut rows = Vec::with_capacity(limit);
+            let mut more = false;
+            for (key, body) in fetched {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if rows.len() == limit {
+                    more = true;
+                    break;
+                }
+                rows.push((key, body));
             }
-            if rows.len() == limit {
-                more = true;
-                break;
-            }
-            rows.push((key, body));
-        }
-        let next_cursor = more
-            .then(|| rows.last().map(|(key, _)| key.clone()))
-            .flatten();
-        Ok(ProjectionPage { rows, next_cursor })
+            let next_cursor = more
+                .then(|| rows.last().map(|(key, _)| key.clone()))
+                .flatten();
+            Ok(ProjectionPage { rows, next_cursor })
+        })
     }
 
     /// A stable identifier for this tenant's stream in this owner.
@@ -664,7 +702,10 @@ pub trait EventStore: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn stream_identity(&self, tenant: &TenantId) -> Result<String, EventLogError>;
+    fn stream_identity<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+    ) -> BoxFuture<'a, Result<String, EventLogError>>;
 
     /// Store bytes under their own digest.
     ///
@@ -674,15 +715,28 @@ pub trait EventStore: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns [`EventLogError::Invalid`] when the digest is unusable.
-    fn put_blob(&self, tenant: &TenantId, digest: &str, bytes: &[u8]) -> Result<(), EventLogError>;
+    fn put_blob<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        digest: &'a str,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn get_blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError>;
+    fn get_blob<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    fn delete_blob(&self, tenant: &TenantId, digest: &str) -> Result<(), EventLogError>;
+    fn delete_blob<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        digest: &'a str,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 }
 
 /// What a caller asked for, clamped to what a page may be.
