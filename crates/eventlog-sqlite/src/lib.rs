@@ -127,7 +127,7 @@ impl Inner {
     /// column inside a wall of DDL — which names neither the file nor the collision.
     ///
     /// This is the same hazard
-    /// [M-022](https://github.com/daemonloom/daemonloom/blob/main/model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md)
+    /// `model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md`
     /// records for `PRIMARY KEY` changes, and no test could have caught it: every test starts with
     /// an empty database. A running deployment found it.
     fn refuse_foreign_tables(&self, connection: &Connection) -> Result<(), EventLogError> {

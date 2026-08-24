@@ -1,50 +1,118 @@
-# Working on eventlog
+# AGENTS.md — eventlog
 
-[github.com/beyond10x/eventlog](https://github.com/beyond10x/eventlog) is the canonical home of
-the eventlog kit, extracted from the daemonloom monorepo at
-[`e01ea676`](https://github.com/daemonloom/daemonloom/tree/e01ea676da18fb855814e7621514e0c98fc57c2c)
-with full history on 2026-08-23. The monorepo keeps a pinned git-submodule checkout at
-`foundation/eventlog`, consumed by the module crates via path dependencies. The gate is
-`bash scripts/gate.sh`.
+The contract for changing **this** repository. Org-wide rules — the naming convention, the
+former-brand rule (atlas ADR 0001) and its four exemption categories, and the rule that renaming
+anything another repo verifies is a coordinated migration with an ADR — live in `atlas/AGENTS.md`
+and are not restated here.
 
-This repository is the shared persistence kit. Its rules originated in the monorepo root
-[`AGENTS.md`](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/AGENTS.md);
-this file carries the component rules. Read `README.md`, then
-[RFC 0020](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md), before changing
-anything here.
+`README.md` orients a reader and shows how to run the backends. This file says what must not break.
 
-## What this component may hold
+## What this repository owns
 
-- No domain type, no product concept, no policy. Every monorepo component may build-depend on
-  these crates, which is only safe while that stays true.
-- No third backend. In-memory is SQLite `:memory:`; a hand-written one is the defect class recorded
-  in [M-022](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/model/modules/docs/stories/M-022-one-replay-rule-behind-one-port.md).
-- No crate named `common`, `shared`, `utils`, `misc`, or `helpers`.
+The shared persistence kit: an append-only log, folds, snapshots, projections, on two backends.
+Every b10x owner may build-depend on these crates. That is the constraint every invariant below
+exists to protect.
 
-## Rules that are not negotiable in review
+## Invariants
 
-- **The conformance exercise is the definition of correct behaviour.** A backend change that needs
-  an exercise change is a design change; say so in the commit rather than editing the assertion.
-- **A new test must fail without the fix.** The watermark test earns its place by failing when
-  `WATERMARK` is replaced with `true`; every regression test here is held to that.
-- **DDL changes are additive only.** A kit release that changes a column is a migration in every
-  owner at once, so a kit major version never forces one.
-- **`redact` is the only `UPDATE` this kit issues against an events table**, and it deletes the
-  snapshots at or after the redacted version in the same transaction.
-- **No payload bytes and no free personal text in the log.** Blobs are content-addressed elsewhere
-  and referenced by digest; identities are opaque ids resolved through the identity directory.
+Each is a claim that can be checked. Breaking one is a design change, not a refactor.
+
+1. **No domain type, no product concept, no policy lives in these crates.** Every owner may
+   build-depend on the kit, which is only safe while that stays true. A type that names a product
+   concept has already broken it.
+2. **There are two backends and no third.** In-memory *is* SQLite `:memory:`, which is why a
+   property proved in a test is proved for the deployment. A hand-written third backend is the
+   defect class recorded in `M-022-one-replay-rule-behind-one-port.md` (predecessor-monorepo path,
+   not in this tree).
+3. **No crate or module named `common`, `shared`, `utils`, `misc` or `helpers`.**
+4. **The conformance exercise is the definition of correct behaviour.** A backend change that needs
+   an exercise change is a design change — say so in the commit rather than editing the assertion.
+5. **A new test fails without the fix.** The watermark test earns its place by failing when
+   `WATERMARK` is replaced with `true`; every regression test here is held to that. Apply the
+   one-line mutation, watch it fail, revert.
+6. **DDL changes are additive only.** A kit release that changes a column is a migration in every
+   owner at once, so a kit major version never forces one.
+7. **`redact` is the only `UPDATE` this kit issues against an events table**, and it deletes the
+   snapshots at or after the redacted version in the same transaction. A second write path against
+   an events table is a second place to forget that.
+8. **No payload bytes and no free personal text enter the log.** Blobs are content-addressed
+   elsewhere and referenced by digest; identities are opaque ids resolved through the identity
+   directory (`crates/eventlog-core/src/lib.rs:769`). This is what lets a person be forgotten in the
+   directory while the log stays append-only.
+
+## Safety envelope
+
+- **The log is append-only and holds other people's durable state.** Erasure and redaction are the
+  only paths that remove anything, and invariant 7 bounds them. Never add a delete, a compaction or
+  a rewrite; a projection is what gets dropped and rebuilt.
+- **Personal data must be unable to arrive**, not merely discouraged — the envelope refuses an
+  address or display name where an opaque id belongs. Never relax that refusal to make a caller's
+  migration easier.
+- **Test credentials never enter the tree.** The PostgreSQL exercise reads
+  `EVENTLOG_TEST_POSTGRES_URL` from the environment; no connection string, password or database file
+  is committed.
 
 ## The watermark couples feed latency across owners
 
-A feed reader stops at `pg_snapshot_xmin(pg_current_snapshot())`, and that snapshot is
-cluster-wide. A long-running transaction belonging to *any* owner in the same PostgreSQL instance
-holds every catch-up projection in that instance still, including ones in unrelated schemas.
-Nothing is skipped and inline projections are unaffected, but do not treat a shared instance as
-isolation for feed latency. Measured on PostgreSQL 17.6 while implementing EL-003; the conformance
-exercise drains with a bounded retry for exactly this reason.
+Measured on PostgreSQL 17.6 while implementing EL-003, and worth knowing before diagnosing a slow
+feed: a feed reader stops at `pg_snapshot_xmin(pg_current_snapshot())`, and that snapshot is
+cluster-wide. A long-running transaction belonging to **any** owner in the same PostgreSQL instance
+holds every catch-up projection in that instance still, including ones in unrelated schemas. Nothing
+is skipped and inline projections are unaffected — but a shared instance is not isolation for feed
+latency. The conformance exercise drains with a bounded retry for exactly this reason.
 
-## Validation
+## Out of scope
 
-Run `bash scripts/gate.sh` from the repo root: locked workspace tests, `cargo fmt --all --check`,
-and clippy with `-D warnings`. The PostgreSQL exercise needs `EVENTLOG_TEST_POSTGRES_URL`; without
-it, it reports itself as not run rather than passing quietly.
+| Belongs elsewhere | Where |
+|---|---|
+| Domain events, aggregates and projections for a product | the owner that has the domain |
+| Identity resolution behind an opaque id | `identity` |
+| Blob storage | content-addressed storage, referenced here by digest |
+| A third backend of any kind | nowhere — see invariant 2 |
+
+## The gate
+
+```console
+bash scripts/gate.sh
+```
+
+In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, `bash scripts/check-brand.sh`.
+Green here is the bar for `main`.
+
+The PostgreSQL exercise runs only when `EVENTLOG_TEST_POSTGRES_URL` is set, and **reports itself as
+not run rather than passing quietly** when it is not. A gate that skipped a backend has not proved
+that backend.
+
+**A green local gate does not guarantee a green CI.** The steps mirror each other; the toolchain
+does not — CI installs whatever `stable` is that day, and a newer clippy can fail a commit that
+passed locally. Run `rustup update` before pushing, and read the gate's own exit status, never a
+pipeline's (`gate.sh 2>&1 | tail` reports `tail`'s status, not the gate's).
+
+`scripts/check-brand.sh` is the brand fence and its exemption list is documented in the script
+itself. Do not add an exemption without the category in the atlas ADR that admits it.
+
+## Releases
+
+Cut `CHANGELOG.md` under a version heading at a fully gated `main` commit, then write an annotated
+tag whose name is the bare version — `0.1.0`, the version and nothing else (atlas § *Naming*). The
+`eventlog-v` prefix was the monorepo's namespace and retired with it.
+
+## Where work is tracked
+
+| What | Where |
+|---|---|
+| Stories, with `id`/`title`/`status`/`depends_on` frontmatter | `docs/stories/`, indexed by `docs/stories/README.md` |
+| What shipped | `CHANGELOG.md` |
+| The decision this kit exists under | `architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md` — predecessor-monorepo path, not in this tree |
+| The normative design, including the physical schema | `architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md` — same |
+
+Read the RFC before changing storage behaviour: its physical schema is normative and this repository
+does not contain it.
+
+## Bot identity
+
+Automated commits and pushes go through the GitHub App via `scripts/as-bot.sh`, never a human
+credential. `scripts/bot-token.sh` mints the token, and **the bot-org default it applies at
+`scripts/bot-token.sh:8` is not the org this repository lives in** — set that variable explicitly to
+`beyond10x` rather than relying on the default.

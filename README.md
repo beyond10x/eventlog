@@ -1,35 +1,44 @@
-# b10x eventlog
+# eventlog
 
-The persistence kit every b10x owner stores durable domain state in.
+The event-sourcing kit every b10x owner stores durable domain state in. A command produces domain
+events, the events are the record, and every read is a fold over them — from a snapshot, from the
+log, or from both.
 
-A command produces domain events, the events are the record, and every read is a fold over them —
-from a snapshot, from the log, or from both. State tables stop being authoritative and become
-projections that can be dropped and rebuilt.
+The problem it removes: state tables that are authoritative, and therefore cannot be dropped,
+rebuilt, audited or explained. Here they are projections. Tenant isolation is not a permission that
+was withheld either — there is no "current tenant" and no `StreamId` constructor that omits one, so
+reading another tenant's history is a call that cannot be written.
 
-Accepted by
-[ADR 0055](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md).
-The design, including the normative physical schema, is
-[RFC 0020](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md).
+## Where it sits
 
-## Crates
+Consumed as a **library**, not run as a service. It depends on nothing in `beyond10x`; its
+consumers are the owner modules that need durable domain state. See
+[atlas](https://github.com/beyond10x/atlas) for where those sit.
 
-| Crate | Owns |
+Two backends and no third. In-memory is SQLite `:memory:`, which is why a property proved in a test
+is proved for the deployment.
+
+## Status
+
+**Unreleased, and the backlog is finished.** Version `0.1.0-dev.1`, `publish = false`, no git tag
+cut. All six stories in [`docs/stories/`](docs/stories/README.md) are `done` — the log, aggregates
+and snapshots, inline and catch-up projections, schema evolution with golden vectors, erasure and
+redaction, and the async store. Everything landed so far is under `## Unreleased` in
+[`CHANGELOG.md`](CHANGELOG.md); versions are component-scoped and release under `eventlog-v*` tags.
+
+## Build, test, run
+
+The gate is **`bash scripts/gate.sh`** — tests, format, clippy and the brand check, in that order.
+Green here is the bar for main.
+
+| step | command |
 |---|---|
-| `eventlog-core` | the envelope, `StreamId`, `Expected`, the error taxonomy, the `EventStore` port |
-| `eventlog-sqlite` | SQLite, file and `:memory:` |
-| `eventlog-postgres` | PostgreSQL 13 or later |
-| `eventlog-conformance` | the one exercise both backends must pass |
+| tests | `cargo test --workspace --locked` |
+| format | `cargo fmt --all --check` |
+| lint | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| brand | `bash scripts/check-brand.sh` |
 
-There are two backends and no third. In-memory is SQLite `:memory:`, which is why a property proved
-in a test is proved for the deployment.
-
-## Gate
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
+Rust 1.91, edition 2024, `unsafe_code = "forbid"`.
 
 The PostgreSQL exercise runs only when it is given a database, and reports itself as skipped
 otherwise:
@@ -42,7 +51,22 @@ EVENTLOG_TEST_POSTGRES_URL=postgresql://postgres:<password>@127.0.0.1:55999/post
 docker rm -f eventlog-test-pg
 ```
 
-## Backlog
+## Layout
 
-[`docs/stories/`](docs/stories/README.md). The module conversions that consume this kit are
-[E-006](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/model/modules/docs/epics/E-006-every-module-persists-as-events.md).
+| crate | owns |
+|---|---|
+| `crates/eventlog-core` | the envelope, `StreamId`, `Expected`, `EventLogError`, the `EventStore` port; `Aggregate`/`Repository`/`SnapshotPolicy`; `Projector`/`ProjectionSpec`/`CatchUpRunner` |
+| `crates/eventlog-sqlite` | `SqliteEventStore` — file and `:memory:`, per-owner table prefixes |
+| `crates/eventlog-postgres` | PostgreSQL 13 or later, with a commit watermark so a feed reader cannot skip an event that committed late |
+| `crates/eventlog-conformance` | the one exercise both backends must pass |
+
+| path | holds |
+|---|---|
+| `docs/stories/` | the backlog, one file per story, with a hand-written index |
+| `scripts/` | `gate.sh`, `check-brand.sh`, and the bot-identity helpers |
+
+## Read more
+
+- [`docs/stories/README.md`](docs/stories/README.md) — the backlog and what each story delivered.
+- [`CHANGELOG.md`](CHANGELOG.md) — every capability the kit has, in the order it arrived.
+- [`AGENTS.md`](AGENTS.md) — working agreements and the invariants this kit holds.

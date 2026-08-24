@@ -5,10 +5,9 @@ One file per story (`EL-NNN-<slug>.md`); frontmatter carries `id`, `title`, `sta
 hand-written.
 
 This component exists because of
-[ADR 0055](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md).
-Read [RFC 0020](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md) before
-changing any of these stories: it is the design they implement, and its physical schema is
-normative.
+`architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md`.
+Read `architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md` before changing any of these
+stories: it is the design they implement, and its physical schema is normative.
 
 | ID | Title | Status |
 |---|---|---|
@@ -20,4 +19,4 @@ normative.
 | [EL-006](EL-006-the-store-goes-async.md) | The store goes async | done |
 
 The module conversions that consume this kit are
-[E-006](https://github.com/daemonloom/daemonloom/blob/e01ea676da18fb855814e7621514e0c98fc57c2c/model/modules/docs/epics/E-006-every-module-persists-as-events.md).
+`model/modules/docs/epics/E-006-every-module-persists-as-events.md`.
