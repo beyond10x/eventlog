@@ -11,6 +11,4 @@ printf 'gate: cargo fmt --all --check\n'
 cargo fmt --all --check
 printf 'gate: cargo clippy --workspace --all-targets --locked -- -D warnings\n'
 cargo clippy --workspace --all-targets --locked -- -D warnings
-printf 'gate: bash scripts/check-brand.sh\n'
-bash scripts/check-brand.sh
 printf 'gate: green\n'

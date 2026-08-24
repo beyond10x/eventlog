@@ -77,7 +77,7 @@ bash scripts/gate.sh
 ```
 
 In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --locked -- -D warnings`, `bash scripts/check-brand.sh`.
+`cargo clippy --workspace --all-targets --locked -- -D warnings`.
 Green here is the bar for `main`.
 
 The PostgreSQL exercise runs only when `EVENTLOG_TEST_POSTGRES_URL` is set, and **reports itself as
@@ -89,7 +89,7 @@ does not — CI installs whatever `stable` is that day, and a newer clippy can f
 passed locally. Run `rustup update` before pushing, and read the gate's own exit status, never a
 pipeline's (`gate.sh 2>&1 | tail` reports `tail`'s status, not the gate's).
 
-`scripts/check-brand.sh` is the brand fence and its exemption list is documented in the script
+The former brand is fenced org-wide by `scripts/check-org-brand.sh` in the **atlas** repo, not here. There is no per-repo fence
 itself. Do not add an exemption without the category in the atlas ADR that admits it.
 
 ## Releases
