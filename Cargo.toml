@@ -21,13 +21,14 @@ eventlog-core = { path = "crates/eventlog-core" }
 eventlog-sqlite = { path = "crates/eventlog-sqlite" }
 eventlog-postgres = { path = "crates/eventlog-postgres" }
 eventlog-conformance = { path = "crates/eventlog-conformance" }
-postgres = { version = "0.19", features = ["with-serde_json-1", "with-time-0_3", "with-uuid-1"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", default-features = false }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-time-0_3", "with-uuid-1"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 uuid = { version = "1", features = ["v7"] }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::{EventLogError, RecordedEvent, TenantId};
+use crate::{BoxFuture, EventLogError, RecordedEvent, TenantId};
 
 /// A read model's table and the fields it can be looked up by.
 ///
@@ -49,34 +49,37 @@ impl ProjectionSpec {
 pub const MAX_INDEXED_FIELDS: usize = 8;
 
 /// Where a projection writes, without knowing which database it is in.
-pub trait ProjectionStore {
+///
+/// `Send` is a supertrait so that a guard's or projector's future — which holds one of these
+/// across its awaits — can itself be `Send`.
+pub trait ProjectionStore: Send {
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the write fails.
-    fn upsert(
-        &mut self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        key: &str,
-        body: &Value,
-    ) -> Result<(), EventLogError>;
+    fn upsert<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+        body: &'a Value,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the delete fails.
-    fn delete(
-        &mut self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        key: &str,
-    ) -> Result<(), EventLogError>;
+    fn delete<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the read fails.
-    fn get(
-        &mut self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        key: &str,
-    ) -> Result<Option<Value>, EventLogError>;
+    fn get<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>>;
 
     /// Read a row and hold it for the rest of this transaction.
     ///
@@ -87,23 +90,23 @@ pub trait ProjectionStore {
     /// # Errors
     /// Returns [`EventLogError::Invalid`] when the projection is not driven inline — a guard over
     /// a lagging read model is a limit that is enforced late, which is not a limit.
-    fn get_for_update(
-        &mut self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        key: &str,
-    ) -> Result<Option<Value>, EventLogError>;
+    fn get_for_update<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>>;
 
     /// # Errors
     /// Returns [`EventLogError::Invalid`] when the field was not declared indexed.
-    fn find(
-        &mut self,
-        projection: &ProjectionSpec,
-        tenant: &TenantId,
-        field: &str,
-        value: &str,
+    fn find<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        field: &'a str,
+        value: &'a str,
         limit: usize,
-    ) -> Result<Vec<Value>, EventLogError>;
+    ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>>;
 }
 
 /// Turns facts into a read model.
@@ -122,34 +125,48 @@ pub trait Projector: Send + Sync {
     /// # Errors
     /// Returns [`EventLogError::Backend`] when a write fails. An inline projector that errors
     /// aborts the append: a broken read model refuses the write rather than diverging quietly.
-    fn apply(
-        &self,
-        event: &RecordedEvent,
-        store: &mut dyn ProjectionStore,
-    ) -> Result<(), EventLogError>;
+    fn apply<'a>(
+        &'a self,
+        event: &'a RecordedEvent,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 }
 
 /// A check run inside the append transaction, against inline read models.
-pub trait Guard {
+///
+/// `Send + Sync` are supertraits because a backend may run the check beside its connection, on
+/// another thread than the caller's.
+pub trait Guard: Send + Sync {
     /// # Errors
     /// Returns the refusal. The append is abandoned and nothing is written.
-    fn check(&self, store: &mut dyn ProjectionStore) -> Result<(), EventLogError>;
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>>;
 }
 
 /// A guard that allows everything, which is what an append without one uses.
 pub struct NoGuard;
 
 impl Guard for NoGuard {
-    fn check(&self, _store: &mut dyn ProjectionStore) -> Result<(), EventLogError> {
-        Ok(())
+    fn check<'a>(
+        &'a self,
+        _store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
 impl<F> Guard for F
 where
-    F: Fn(&mut dyn ProjectionStore) -> Result<(), EventLogError>,
+    F: for<'a> Fn(&'a mut dyn ProjectionStore) -> BoxFuture<'a, Result<(), EventLogError>>
+        + Send
+        + Sync,
 {
-    fn check(&self, store: &mut dyn ProjectionStore) -> Result<(), EventLogError> {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
         self(store)
     }
 }
@@ -177,17 +194,17 @@ impl CatchUpRunner {
     /// # Errors
     /// Returns [`EventLogError::Invalid`] when this projector is registered inline. A projection
     /// is one or the other, never both, or every event lands in it twice.
-    pub fn new(
+    pub async fn new(
         store: Arc<dyn crate::EventStore>,
         projector: Arc<dyn Projector>,
     ) -> Result<Self, EventLogError> {
-        if store.is_inline(projector.name()) {
+        if store.is_inline(projector.name()).await {
             return Err(EventLogError::Invalid(format!(
                 "projection {} is already driven inline",
                 projector.name()
             )));
         }
-        store.create_projections(projector.as_ref())?;
+        store.create_projections(Arc::clone(&projector)).await?;
         Ok(Self {
             store,
             projector,
@@ -206,19 +223,20 @@ impl CatchUpRunner {
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable, or whatever the projector
     /// returned.
-    pub fn run_once(&self, tenant: &TenantId) -> Result<CatchUpProgress, EventLogError> {
+    pub async fn run_once(&self, tenant: &TenantId) -> Result<CatchUpProgress, EventLogError> {
         self.store
-            .run_catch_up(self.projector.as_ref(), tenant, self.batch)
+            .run_catch_up(Arc::clone(&self.projector), tenant, self.batch)
+            .await
     }
 
     /// Apply everything waiting for one tenant, however many passes that takes.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    pub fn drain(&self, tenant: &TenantId) -> Result<u64, EventLogError> {
+    pub async fn drain(&self, tenant: &TenantId) -> Result<u64, EventLogError> {
         let mut applied = 0;
         loop {
-            let progress = self.run_once(tenant)?;
+            let progress = self.run_once(tenant).await?;
             applied += progress.applied;
             if !progress.more_waiting || progress.applied == 0 {
                 return Ok(applied);

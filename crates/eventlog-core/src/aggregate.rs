@@ -161,9 +161,9 @@ impl<A: Aggregate> Repository<A> {
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable, or
     /// [`EventLogError::Invalid`] when a stored body cannot be read as this aggregate's event.
-    pub fn load(&self, tenant: &TenantId, id: &str) -> Result<Loaded<A>, EventLogError> {
+    pub async fn load(&self, tenant: &TenantId, id: &str) -> Result<Loaded<A>, EventLogError> {
         let stream = self.stream(tenant, id)?;
-        let (mut state, mut version) = match self.store.load_snapshot(&stream)? {
+        let (mut state, mut version) = match self.store.load_snapshot(&stream).await? {
             Some(snapshot) if snapshot.state_schema_version == A::STATE_SCHEMA_VERSION => {
                 match serde_json::from_value::<A>(snapshot.state) {
                     Ok(state) => (state, snapshot.version),
@@ -176,7 +176,10 @@ impl<A: Aggregate> Repository<A> {
         };
         let mut seen_any = version > 0;
         loop {
-            let slice = self.store.read_stream(&stream, version, MAX_READ_LIMIT)?;
+            let slice = self
+                .store
+                .read_stream(&stream, version, MAX_READ_LIMIT)
+                .await?;
             if slice.events.is_empty() {
                 break;
             }
@@ -205,14 +208,15 @@ impl<A: Aggregate> Repository<A> {
     ///
     /// # Errors
     /// Returns the domain's refusal from `decide`, or a store error.
-    pub fn handle(
+    pub async fn handle(
         &self,
         tenant: &TenantId,
         id: &str,
         command: &A::Command,
         meta: &CommandMeta,
     ) -> Result<Outcome<A>, A::Error> {
-        self.handle_guarded(tenant, id, command, meta, &crate::NoGuard)
+        self.handle_guarded(tenant, id, command, meta, Arc::new(crate::NoGuard))
+            .await
     }
 
     /// Load, decide, check an invariant that spans streams, and write.
@@ -223,20 +227,21 @@ impl<A: Aggregate> Repository<A> {
     ///
     /// # Errors
     /// Returns the guard's refusal, the domain's refusal from `decide`, or a store error.
-    pub fn handle_guarded(
+    pub async fn handle_guarded(
         &self,
         tenant: &TenantId,
         id: &str,
         command: &A::Command,
         meta: &CommandMeta,
-        guard: &dyn crate::Guard,
+        guard: Arc<dyn crate::Guard>,
     ) -> Result<Outcome<A>, A::Error> {
         let stream = self.stream(tenant, id)?;
-        if let Some(recorded) =
-            self.store
-                .recorded_command(&stream, &meta.idempotency_key, &meta.request_hash)?
+        if let Some(recorded) = self
+            .store
+            .recorded_command(&stream, &meta.idempotency_key, &meta.request_hash)
+            .await?
         {
-            let loaded = self.load(tenant, id)?;
+            let loaded = self.load(tenant, id).await?;
             return Ok(Outcome {
                 state: loaded.state,
                 version: loaded.version,
@@ -246,7 +251,7 @@ impl<A: Aggregate> Repository<A> {
         }
         let mut attempt = 0;
         loop {
-            let loaded = self.load(tenant, id)?;
+            let loaded = self.load(tenant, id).await?;
             let decided = loaded.state.decide(command)?;
             if decided.is_empty() {
                 return Ok(Outcome {
@@ -264,9 +269,10 @@ impl<A: Aggregate> Repository<A> {
             let new_events = to_new_events(&decided)?;
             match self
                 .store
-                .append_guarded(&stream, expected, &new_events, meta, guard)
+                .append_guarded(&stream, expected, &new_events, meta, Arc::clone(&guard))
+                .await
             {
-                Ok(result) => return Ok(self.finish(loaded, result, tenant, id)?),
+                Ok(result) => return Ok(self.finish(loaded, result, tenant, id).await?),
                 Err(EventLogError::Conflict { .. }) if attempt == 0 => {
                     attempt += 1;
                 }
@@ -275,7 +281,7 @@ impl<A: Aggregate> Repository<A> {
         }
     }
 
-    fn finish(
+    async fn finish(
         &self,
         loaded: Loaded<A>,
         result: AppendResult,
@@ -300,7 +306,7 @@ impl<A: Aggregate> Repository<A> {
                 })?,
                 recorded_at: OffsetDateTime::now_utc(),
             };
-            self.store.save_snapshot(&stream, &snapshot)?;
+            self.store.save_snapshot(&stream, &snapshot).await?;
         }
         Ok(Outcome {
             state,
@@ -314,8 +320,8 @@ impl<A: Aggregate> Repository<A> {
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
-    pub fn snapshot_now(&self, tenant: &TenantId, id: &str) -> Result<u64, EventLogError> {
-        let loaded = self.load(tenant, id)?;
+    pub async fn snapshot_now(&self, tenant: &TenantId, id: &str) -> Result<u64, EventLogError> {
+        let loaded = self.load(tenant, id).await?;
         let stream = self.stream(tenant, id)?;
         let snapshot = Snapshot {
             version: loaded.version,
@@ -325,7 +331,7 @@ impl<A: Aggregate> Repository<A> {
             })?,
             recorded_at: OffsetDateTime::now_utc(),
         };
-        self.store.save_snapshot(&stream, &snapshot)?;
+        self.store.save_snapshot(&stream, &snapshot).await?;
         Ok(loaded.version)
     }
 }
