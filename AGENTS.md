@@ -113,6 +113,5 @@ does not contain it.
 ## Bot identity
 
 Automated commits and pushes go through the GitHub App via `scripts/as-bot.sh`, never a human
-credential. `scripts/bot-token.sh` mints the token, and **the bot-org default it applies at
-`scripts/bot-token.sh:8` is not the org this repository lives in** — set that variable explicitly to
-`beyond10x` rather than relying on the default.
+credential. `scripts/bot-token.sh` mints the token; its bot-org default is `beyond10x`, which is
+the org this repository lives in, so `B10X_BOT_ORG` only needs setting to work against another org.

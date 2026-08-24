@@ -24,7 +24,8 @@ is proved for the deployment.
 cut. All six stories in [`docs/stories/`](docs/stories/README.md) are `done` — the log, aggregates
 and snapshots, inline and catch-up projections, schema evolution with golden vectors, erasure and
 redaction, and the async store. Everything landed so far is under `## Unreleased` in
-[`CHANGELOG.md`](CHANGELOG.md); versions are component-scoped and release under `eventlog-v*` tags.
+[`CHANGELOG.md`](CHANGELOG.md); versions are component-scoped and release under a bare-version
+tag — `0.1.0`, the version and nothing else.
 
 ## Build, test, run
 
