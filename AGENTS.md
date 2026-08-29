@@ -7,6 +7,17 @@ and are not restated here.
 
 `README.md` orients a reader and shows how to run the backends. This file says what must not break.
 
+## Serves
+
+The objectives of the collection this repository moves, by id from `atlas/ROADMAP.md` — the only
+cross-repository roadmap, and the page that says what each id means and which evidence closes it:
+
+- **O2 — decisions as data, with evidence.** State as a fold over an append-only log: a decision is an event, and the projection is derived, never edited.
+- **O6 — self-improvement, built into all of it.** The record every other objective is measured from has to be append-only to be believed.
+
+A change here that moves none of these is a question for the operator, not a task.
+`atlas/scripts/check-map.sh` fails a repository whose `AGENTS.md` names no objective.
+
 ## What this repository owns
 
 The shared persistence kit: an append-only log, folds, snapshots, projections, on two backends.
