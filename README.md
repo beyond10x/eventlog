@@ -71,3 +71,9 @@ docker rm -f eventlog-test-pg
 - [`docs/stories/README.md`](docs/stories/README.md) — the backlog and what each story delivered.
 - [`CHANGELOG.md`](CHANGELOG.md) — every capability the kit has, in the order it arrived.
 - [`AGENTS.md`](AGENTS.md) — working agreements and the invariants this kit holds.
+
+<!-- b10x-docs:start -->
+## Documentation
+
+[Eventlog documentation](https://beyond10x.github.io/docs/eventlog/) · [Start](https://beyond10x.github.io/) · [Ecosystem](https://beyond10x.github.io/ecosystem/) · [Impact](https://beyond10x.github.io/changes/) · [Releases](https://beyond10x.github.io/releases/)
+<!-- b10x-docs:end -->
