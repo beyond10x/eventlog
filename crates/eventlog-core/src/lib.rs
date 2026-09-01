@@ -419,6 +419,12 @@ pub struct Snapshot {
 pub enum EventLogError {
     #[error("{0}")]
     Invalid(String),
+    /// A domain guard refused the command without exposing domain policy to this kit.
+    ///
+    /// The code is the owner's stable, machine-readable refusal identifier, not a display message.
+    /// It is returned to the caller but never written to the event log.
+    #[error("guard refused command with code {code}")]
+    GuardRefused { code: String },
     #[error("stream is at version {actual}, not {expected}")]
     Conflict { expected: u64, actual: u64 },
     #[error("idempotency key {key} was already used for a different request")]
@@ -553,7 +559,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// thread to run it beside its connection.
     ///
     /// # Errors
-    /// Returns the guard's refusal, or whatever [`EventStore::append`] would have.
+    /// Returns [`EventLogError::GuardRefused`] when the guard rejects the command, a backend error
+    /// raised while evaluating the guard, or whatever [`EventStore::append`] would have returned.
     fn append_guarded<'a>(
         &'a self,
         stream: &'a StreamId,

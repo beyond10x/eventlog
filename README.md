@@ -56,7 +56,7 @@ docker rm -f eventlog-test-pg
 
 | crate | owns |
 |---|---|
-| `crates/eventlog-core` | the envelope, `StreamId`, `Expected`, `EventLogError`, the `EventStore` port; `Aggregate`/`Repository`/`SnapshotPolicy`; `Projector`/`ProjectionSpec`/`CatchUpRunner` |
+| `crates/eventlog-core` | the envelope, `StreamId`, `Expected`, typed `EventLogError::GuardRefused`, the `EventStore` port; `Aggregate`/`Repository`/`SnapshotPolicy`; `Projector`/`ProjectionSpec`/`CatchUpRunner` |
 | `crates/eventlog-sqlite` | `SqliteEventStore` — file and `:memory:`, per-owner table prefixes |
 | `crates/eventlog-postgres` | PostgreSQL 13 or later, with a commit watermark so a feed reader cannot skip an event that committed late |
 | `crates/eventlog-conformance` | the one exercise both backends must pass |
