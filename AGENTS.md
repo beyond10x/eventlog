@@ -121,8 +121,7 @@ tag whose name is the bare version — `0.1.0`, the version and nothing else (at
 Read the RFC before changing storage behaviour: its physical schema is normative and this repository
 does not contain it.
 
-## Bot identity
+## Public source
 
-Automated commits and pushes go through the GitHub App via `scripts/as-bot.sh`, never a human
-credential. `scripts/bot-token.sh` mints the token; its bot-org default is `beyond10x`, which is
-the org this repository lives in, so `B10X_BOT_ORG` only needs setting to work against another org.
+This repository is public. Organization delivery credentials and bot-authenticated remote
+operations are provided by Atlas-owned tooling outside component source.

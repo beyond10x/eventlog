@@ -64,7 +64,7 @@ docker rm -f eventlog-test-pg
 | path | holds |
 |---|---|
 | `docs/stories/` | the backlog, one file per story, with a hand-written index |
-| `scripts/` | `gate.sh`, `check-brand.sh`, and the bot-identity helpers |
+| `scripts/` | the repository gate and component checks |
 
 ## Read more
 

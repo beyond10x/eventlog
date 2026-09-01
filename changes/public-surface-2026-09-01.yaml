@@ -1,0 +1,14 @@
+schema: b10x-change/v1
+id: eventlog/public-surface-2026-09-01
+repository: eventlog
+publishedAt: 2026-09-01T12:00:00Z
+title: Eventlog joins the public ecosystem surface
+summary: Eventlog now publishes its library boundary, crate layout, adoption path, and downstream role through the shared b10x documentation contract.
+kind: capability
+impact: significant
+source:
+  url: https://github.com/beyond10x/eventlog
+journeys: [build-agents, operate-services]
+affectedSurfaces: [eventlog/docs]
+relations:
+  - {target: surface:workflow/docs, kind: enables, label: Supplies durable workflow state and evidence}
