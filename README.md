@@ -13,7 +13,7 @@ reading another tenant's history is a call that cannot be written.
 
 Consumed as a **library**, not run as a service. It depends on nothing in `beyond10x`; its
 consumers are the owner modules that need durable domain state. See
-[atlas](https://github.com/beyond10x/atlas) for where those sit.
+[the public architecture map](https://beyond10x.github.io/architecture/) for where those sit.
 
 Two backends and no third. In-memory is SQLite `:memory:`, which is why a property proved in a test
 is proved for the deployment.
