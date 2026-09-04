@@ -293,6 +293,137 @@ impl CommandMeta {
     }
 }
 
+/// The lifecycle point represented by one durable effect-evidence record.
+///
+/// Owners write `Attempted` before dispatch. A later record either closes the attempt or marks it
+/// explicitly incomplete so a missing response can never be mistaken for success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum EffectStage {
+    /// Intent was durably accepted before crossing the effect boundary.
+    Attempted,
+    /// The effect completed successfully.
+    Succeeded,
+    /// Dispatch completed with a stable, non-sensitive failure code.
+    Failed { code: String },
+    /// Current authority explicitly denied the effect with a stable refusal code.
+    Refused { code: String },
+    /// No terminal response is yet known and reconciliation is required.
+    Incomplete,
+}
+
+impl EffectStage {
+    /// Whether this stage makes the attempt's current outcome explicit.
+    #[must_use]
+    pub const fn closes_coverage_interval(&self) -> bool {
+        !matches!(self, Self::Attempted)
+    }
+}
+
+/// Product-neutral metadata that an owner embeds in its own durable effect events.
+///
+/// Verified subject, effective actor, request and trace correlation remain on [`CommandMeta`].
+/// This companion names only the effect-specific links, avoiding a second identity vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectEvidence {
+    /// Identity of this individual dispatch attempt; retries get a new value.
+    pub attempt_id: String,
+    /// Stable operation or boundary name.
+    pub operation: String,
+    /// Opaque reference to the authority decision used at dispatch time.
+    pub authority_ref: String,
+    /// Opaque grant used by the attempt, if the authority model has one.
+    pub grant_ref: Option<String>,
+    /// Earlier attempt that caused this retry, if any.
+    pub retry_of: Option<String>,
+    /// Opaque downstream evidence link returned by an effect provider.
+    pub downstream_audit_ref: Option<String>,
+    /// The lifecycle point recorded by this event.
+    pub stage: EffectStage,
+}
+
+impl EffectEvidence {
+    /// Validate bounded identifiers before an append reaches a backend.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] for empty, over-long, or unsafe metadata.
+    pub fn validate(&self) -> Result<(), EventLogError> {
+        validate_field("effect attempt id", &self.attempt_id)?;
+        validate_field("effect operation", &self.operation)?;
+        validate_field("effect authority reference", &self.authority_ref)?;
+        for (name, value) in [
+            ("effect grant reference", self.grant_ref.as_deref()),
+            ("effect retry reference", self.retry_of.as_deref()),
+            (
+                "downstream audit reference",
+                self.downstream_audit_ref.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_field(name, value)?;
+            }
+        }
+        match &self.stage {
+            EffectStage::Failed { code } | EffectStage::Refused { code } => {
+                validate_field("effect outcome code", code)?;
+            }
+            EffectStage::Attempted | EffectStage::Succeeded | EffectStage::Incomplete => {}
+        }
+        Ok(())
+    }
+}
+
+/// One owner's compile-time declaration of evidence emitted at an effect boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectBoundaryCoverage {
+    /// Stable boundary name used in emitted [`EffectEvidence`].
+    pub boundary: &'static str,
+    /// Whether durable attempted evidence precedes dispatch.
+    pub records_attempt: bool,
+    /// Whether success, failure and refusal are durably terminal.
+    pub records_terminal: bool,
+    /// Whether reconciliation can surface a missing terminal as incomplete.
+    pub records_incomplete: bool,
+}
+
+/// Fail a local effect-boundary inventory that could silently omit an attempt or outcome.
+///
+/// # Errors
+/// Returns [`EventLogError::Invalid`] for an empty inventory, duplicate/invalid names, a boundary
+/// without attempted evidence, or a boundary without terminal or explicit incomplete evidence.
+pub fn validate_effect_boundary_inventory(
+    boundaries: &[EffectBoundaryCoverage],
+) -> Result<(), EventLogError> {
+    if boundaries.is_empty() {
+        return Err(EventLogError::Invalid(
+            "effect boundary inventory is empty".to_owned(),
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for boundary in boundaries {
+        validate_field("effect boundary", boundary.boundary)?;
+        if !names.insert(boundary.boundary) {
+            return Err(EventLogError::Invalid(format!(
+                "effect boundary {} is declared more than once",
+                boundary.boundary
+            )));
+        }
+        if !boundary.records_attempt {
+            return Err(EventLogError::Invalid(format!(
+                "effect boundary {} has no attempted evidence",
+                boundary.boundary
+            )));
+        }
+        if !boundary.records_terminal && !boundary.records_incomplete {
+            return Err(EventLogError::Invalid(format!(
+                "effect boundary {} has no terminal or incomplete evidence",
+                boundary.boundary
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A stable digest of a command body, for the idempotency check.
 ///
 /// # Errors
@@ -873,5 +1004,51 @@ mod tests {
         let other = request_hash(&json!({"a": 1, "b": 3})).expect("hashable");
         assert_eq!(first, second);
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn effect_evidence_and_boundary_inventory_are_machine_checked() {
+        let stages = [
+            EffectStage::Attempted,
+            EffectStage::Succeeded,
+            EffectStage::Failed {
+                code: "provider_unavailable".to_owned(),
+            },
+            EffectStage::Refused {
+                code: "grant_revoked".to_owned(),
+            },
+            EffectStage::Incomplete,
+        ];
+        for (index, stage) in stages.into_iter().enumerate() {
+            let evidence = EffectEvidence {
+                attempt_id: format!("attempt-{index}"),
+                operation: "connector.invoke".to_owned(),
+                authority_ref: "authority-1".to_owned(),
+                grant_ref: Some("grant-1".to_owned()),
+                retry_of: None,
+                downstream_audit_ref: None,
+                stage,
+            };
+            assert!(evidence.validate().is_ok());
+        }
+
+        assert!(
+            validate_effect_boundary_inventory(&[EffectBoundaryCoverage {
+                boundary: "connector.invoke",
+                records_attempt: true,
+                records_terminal: true,
+                records_incomplete: true,
+            },])
+            .is_ok()
+        );
+        assert!(
+            validate_effect_boundary_inventory(&[EffectBoundaryCoverage {
+                boundary: "terminal.create",
+                records_attempt: true,
+                records_terminal: false,
+                records_incomplete: false,
+            },])
+            .is_err()
+        );
     }
 }
