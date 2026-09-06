@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# The repository gate: locked workspace tests, formatting, and clippy.
-# Green here is the bar for main. Mirrors what the monorepo gate ran for
-# this component before extraction.
+# Compatibility launcher; the Rust gate owns argument parsing and check selection.
 set -euo pipefail
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-cd "$root"
-printf 'gate: cargo test --workspace --locked\n'
-cargo test --workspace --locked
-printf 'gate: cargo fmt --all --check\n'
-cargo fmt --all --check
-printf 'gate: cargo clippy --workspace --all-targets --locked -- -D warnings\n'
-cargo clippy --workspace --all-targets --locked -- -D warnings
-printf 'gate: green\n'
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+exec cargo run --locked -p eventlog-postgres --example gate -- "$@"

@@ -53,6 +53,23 @@ pub const MAX_INDEXED_FIELDS: usize = 8;
 /// `Send` is a supertrait so that a guard's or projector's future — which holds one of these
 /// across its awaits — can itself be `Send`.
 pub trait ProjectionStore: Send {
+    /// Atomically check and apply host-authorized scope counters inside the current append.
+    /// The return values follow deterministic coordinate order. A refusal changes no counter,
+    /// even when its caller catches the error. Projector contexts and foreign permits refuse.
+    /// # Errors
+    /// Refuses missing authority, unsupported capabilities, invalid scopes and crossed ceilings.
+    fn reserve<'a>(
+        &'a mut self,
+        _permit: &'a crate::AdmissionPermit,
+        _reservations: &'a [crate::Reservation],
+    ) -> BoxFuture<'a, Result<Vec<i64>, EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid(
+                "transaction admission capability is unavailable".into(),
+            ))
+        })
+    }
+
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the write fails.
     fn upsert<'a>(

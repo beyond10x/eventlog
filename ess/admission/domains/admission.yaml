@@ -1,0 +1,29 @@
+domain: eventlog.admission
+entities:
+  - name: eventlog.admission.ScopeCounter
+    identity:
+      name: coordinate
+      type: String
+    fields:
+      - name: held
+        type: Integer
+    lifecycle:
+      initial: Present
+      states: [Present]
+      terminal: [Present]
+    # coordinate is the injective length-prefixed encoding of kind (tenant/deployment),
+    # exact tenant when applicable, and owner-selected scope key, inside one owner schema.
+    # held is nonnegative and changed only with an append receipt in the same transaction.
+    # No business ownership, caller authority, or lifecycle membership is asserted here.
+  - name: eventlog.admission.ProjectionRegistration
+    identity:
+      name: projection_name
+      type: String
+    fields:
+      - name: indexed_fields
+        type: List<String>
+    lifecycle:
+      initial: Present
+      states: [Present]
+      terminal: [Present]
+    # Exact declared projection shape within one owner schema; no wildcard table ownership.

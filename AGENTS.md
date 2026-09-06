@@ -87,13 +87,18 @@ latency. The conformance exercise drains with a bounded retry for exactly this r
 bash scripts/gate.sh
 ```
 
-In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
+The compatibility shell entry point delegates argument parsing and selection to the Rust `gate`
+example. In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 Green here is the bar for `main`.
 
 The PostgreSQL exercise runs only when `EVENTLOG_TEST_POSTGRES_URL` is set, and **reports itself as
 not run rather than passing quietly** when it is not. A gate that skipped a backend has not proved
-that backend.
+that backend. The required `bash scripts/gate.sh --production-proof` mode also requires the
+hosted-role URL and test CA, rejects every selected-zero/ignored/skipped lane, and records exact
+runner output and counts. The Persistence proof CI job runs this mode against PostgreSQL 17.6
+with verified TLS. Comparative capacity and restart receipts remain separate evidence; neither
+a local nor CI conformance run approves a deployment budget.
 
 **A green local gate does not guarantee a green CI.** The steps mirror each other; the toolchain
 does not — CI installs whatever `stable` is that day, and a newer clippy can fail a commit that
@@ -145,3 +150,29 @@ cargo run --manifest-path "$atlas_checkout/Cargo.toml" --locked -q -- \
 
 Keep internal plans, stories, ADRs, decisions, worklogs, security material, and research out of the public allowlist unless a repository authority explicitly declares them public.
 <!-- b10x-docs-operations:end -->
+
+## PostgreSQL admission and callback boundaries
+
+Hosted traffic uses verified TLS, explicit migration/application roles and a declared replica plus
+reserve connection budget. The supported application role is dedicated, has no memberships or
+DDL ownership/creation powers, and has a finite server connection limit within its pool share.
+Schema and projection admission compares actual physical shape and the persisted migration roster.
+Never broaden that profile silently or treat a checksum alone as schema compatibility.
+
+Registration freezes before traffic. A cancelled/unsettled connection stays quarantined until its
+driver stops; an unknown commit is resolved through the original durable command identity.
+Admission counters are generic storage coordinates with an ESS home in `ess/admission/`; no domain
+policy or lifecycle membership belongs there. Tenant/deployment coordinates are structurally
+distinct and encoded without boundary collisions. Trusted guard reservation access never gives a
+domain projector cross-tenant query or write authority. Caught reservation errors and cancellation
+must not commit partial counter changes. Rebuild and catch-up share tenant/projector locks and
+commit the view and cursor atomically.
+
+The committed-XID predicate alone is not a position-contiguity proof: a guard can assign an older
+XID before another append obtains a lower sequence position. The PostgreSQL publication gate
+therefore precedes every other owner lock. Writers share it through commit; feed, catch-up and
+rebuild take it exclusively before a fresh READ COMMITTED query. Preserve the original watermark
+predicate as well, and keep the reversed-XID/position regression plus the original late-commit
+mutation case. Sequence CACHE 1 and deterministic column collations are admission requirements.
+Mixed protocol generations require a fenced cutover; retaining physical old-reader formats does
+not authorize concurrent old writer/feed binaries.

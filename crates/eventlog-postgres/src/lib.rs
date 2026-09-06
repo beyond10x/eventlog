@@ -30,8 +30,12 @@ use eventlog_core::{
 };
 use serde_json::Value;
 use time::OffsetDateTime;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio_postgres::{Client, GenericClient, NoTls, Row, Transaction};
+mod pool;
+mod schema;
+use pool::Pool;
+pub use pool::{PoolOptions, PoolStatus, PostgresConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_postgres::{GenericClient, Row, Transaction};
 
 /// Every envelope column, in the order [`read_event`] expects them.
 const COLUMNS: &str = "global_seq, tenant_id, stream_type, stream_id, version, event_id, \
@@ -43,7 +47,11 @@ const WATERMARK: &str = "committed_xid < pg_snapshot_xmin(pg_current_snapshot())
 
 /// One owner's event tables in one PostgreSQL database.
 pub struct PostgresEventStore {
-    client: AsyncMutex<Client>,
+    pool: Arc<Pool>,
+    allow_schema_writes: bool,
+    registration: tokio::sync::Mutex<()>,
+    frozen: AtomicBool,
+    admission_permit: eventlog_core::AdmissionPermit,
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
@@ -56,148 +64,164 @@ impl PostgresEventStore {
     /// Returns [`EventLogError::Invalid`] for an unusable prefix and [`EventLogError::Backend`]
     /// when the database cannot be reached or the tables cannot be created.
     pub async fn connect(url: &str, prefix: &str) -> Result<Self, EventLogError> {
-        validate_prefix(prefix)?;
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await.map_err(backend)?;
-        // The half that talks to the socket. It runs as its own task and ends by itself when the
-        // client is dropped.
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let store = Self {
-            client: AsyncMutex::new(client),
-            prefix: prefix.to_owned(),
+        Self::connect_local(url, prefix, PoolOptions::default()).await
+    }
+
+    /// Explicit isolated-test constructor; hosted applications use `open` after `migrate`.
+    /// # Errors
+    /// Refuses nonlocal plaintext, unsupported schema and invalid resource bounds.
+    pub async fn connect_local(
+        url: &str,
+        prefix: &str,
+        options: PoolOptions,
+    ) -> Result<Self, EventLogError> {
+        Self::local(PostgresConfig::isolated(url, prefix)?, options).await
+    }
+
+    /// Open an isolated database, including an explicitly selected test-owned schema.
+    /// # Errors
+    /// Refuses hosted configurations or incompatible schemas.
+    pub async fn local(
+        config: PostgresConfig,
+        options: PoolOptions,
+    ) -> Result<Self, EventLogError> {
+        if config.production {
+            return Err(EventLogError::Invalid(
+                "hosted configurations require explicit migration and budget admission".into(),
+            ));
+        }
+        let prefix = config.prefix.clone();
+        let pool = Pool::new(config, options)?;
+        {
+            let mut client = pool.acquire().await?;
+            schema::migrate(&mut client, &prefix, &[]).await?;
+            client.settled();
+        }
+        Ok(Self::from_pool(pool, prefix, true))
+    }
+
+    /// Apply the additive schema with the migration role, including declared projection shapes.
+    /// # Errors
+    /// Refuses unknown/partial schema and serializes concurrent migrators before any DDL.
+    pub async fn migrate(
+        config: PostgresConfig,
+        options: PoolOptions,
+        projections: &[ProjectionSpec],
+    ) -> Result<(), EventLogError> {
+        let prefix = config.prefix.clone();
+        let pool = Pool::new(config, options)?;
+        let result = async {
+            let mut client = pool.acquire().await?;
+            schema::migrate(&mut client, &prefix, projections).await?;
+            client.settled();
+            Ok(())
+        }
+        .await;
+        pool.shutdown().await?;
+        result
+    }
+
+    /// Open a verified hosted database with a DML-only application role.
+    /// `replicas * max_connections + reserved_connections` must fit the observed DB budget.
+    /// # Errors
+    /// Refuses unverified transport, missing/exceeded budgets, DDL-capable roles or schema drift.
+    pub async fn open(
+        config: PostgresConfig,
+        options: PoolOptions,
+        database_connections: usize,
+        replicas: usize,
+        reserved_connections: usize,
+    ) -> Result<Self, EventLogError> {
+        let required = replicas
+            .checked_mul(options.max_connections)
+            .and_then(|value| value.checked_add(reserved_connections));
+        if !config.production
+            || replicas == 0
+            || reserved_connections == 0
+            || required.is_none_or(|value| value > database_connections)
+        {
+            return Err(EventLogError::Invalid(
+                "hosted PostgreSQL transport or deployment connection budget is not admitted"
+                    .into(),
+            ));
+        }
+        let prefix = config.prefix.clone();
+        let pool = Pool::new(config, options)?;
+        {
+            let mut client = pool.acquire().await?;
+            let can_ddl:bool=client.query_one("SELECT COALESCE(has_schema_privilege(current_user,current_schema(),'CREATE'),true) OR EXISTS(SELECT FROM pg_roles WHERE rolname=current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) OR EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user)) OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND c.relkind IN ('r','p','S','v','m','f'))",&[]).await.map_err(backend)?.get(0);
+            if can_ddl {
+                return Err(EventLogError::Invalid(
+                    "hosted application role must not own schema DDL".into(),
+                ));
+            }
+            let role_limit: i32 = client
+                .query_one(
+                    "SELECT rolconnlimit FROM pg_roles WHERE rolname=current_user",
+                    &[],
+                )
+                .await
+                .map_err(backend)?
+                .get(0);
+            if role_limit <= 0
+                || usize::try_from(role_limit)
+                    .ok()
+                    .is_none_or(|limit| limit > replicas * pool.options.max_connections)
+            {
+                return Err(EventLogError::Invalid("hosted application role requires a finite connection limit within its admitted replica pool share".into()));
+            }
+            schema::validate(&mut client, &prefix).await?;
+            schema::permissions(&client, &prefix).await?;
+            client.settled();
+        }
+        Ok(Self::from_pool(pool, prefix, false))
+    }
+    fn from_pool(pool: Arc<Pool>, prefix: String, allow_schema_writes: bool) -> Self {
+        Self {
+            pool,
+            prefix,
+            allow_schema_writes,
+            registration: tokio::sync::Mutex::new(()),
+            frozen: AtomicBool::new(false),
+            admission_permit: eventlog_core::AdmissionPermit::default(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
-        };
-        store.create_tables().await?;
-        Ok(store)
-    }
-
-    /// Refuse a table of ours that somebody else made.
-    ///
-    /// `CREATE TABLE IF NOT EXISTS` **silently does nothing** when a table of that name already
-    /// exists, whatever shape it has. This matters more here than on SQLite: a hosted deployment
-    /// that moves a module onto the log points it at the database the module already had, and the
-    /// old `<prefix>_events` is sitting there.
-    async fn refuse_foreign_tables(&self, client: &Client) -> Result<(), EventLogError> {
-        let prefix = &self.prefix;
-        let events = format!("{prefix}_events");
-        let existing: i64 = client
-            .query_one(
-                "SELECT count(*) FROM information_schema.columns
-                 WHERE table_schema = current_schema() AND table_name = $1",
-                &[&events],
-            )
-            .await
-            .map_err(backend)?
-            .get(0);
-        if existing == 0 {
-            return Ok(());
         }
-        let ours: i64 = client
-            .query_one(
-                "SELECT count(*) FROM information_schema.columns
-                 WHERE table_schema = current_schema() AND table_name = $1
-                   AND column_name = 'global_seq'",
-                &[&events],
-            )
-            .await
-            .map_err(backend)?
-            .get(0);
-        if ours > 0 {
-            return Ok(());
-        }
-        Err(EventLogError::Backend(format!(
-            "this database already has a table called {events} that this kit did not create, so \
-             its own tables cannot be made. It is almost certainly {prefix}'s previous store. \
-             Point this owner at a different schema, or rename the old tables out of the way once \
-             you have decided what to do with what is in them."
-        )))
     }
-
-    async fn create_tables(&self) -> Result<(), EventLogError> {
-        let prefix = &self.prefix;
-        let statements = format!(
-            "CREATE TABLE IF NOT EXISTS {prefix}_events (
-                 global_seq BIGSERIAL PRIMARY KEY,
-                 committed_xid xid8 NOT NULL DEFAULT pg_current_xact_id(),
-                 tenant_id TEXT NOT NULL,
-                 stream_type TEXT NOT NULL,
-                 stream_id TEXT NOT NULL,
-                 version BIGINT NOT NULL,
-                 event_id UUID NOT NULL,
-                 event_name TEXT NOT NULL,
-                 event_schema_version INTEGER NOT NULL,
-                 occurred_at TIMESTAMPTZ NOT NULL,
-                 recorded_at TIMESTAMPTZ NOT NULL,
-                 subject TEXT NOT NULL,
-                 actor TEXT NOT NULL,
-                 request_id TEXT NOT NULL,
-                 trace_id TEXT NOT NULL,
-                 causation_id TEXT,
-                 causation_depth INTEGER NOT NULL DEFAULT 0,
-                 redacted_at TIMESTAMPTZ,
-                 data JSONB NOT NULL,
-                 UNIQUE (tenant_id, stream_type, stream_id, version)
-             );
-             CREATE INDEX IF NOT EXISTS {prefix}_events_feed
-                 ON {prefix}_events (tenant_id, global_seq);
-             CREATE TABLE IF NOT EXISTS {prefix}_commands (
-                 tenant_id TEXT NOT NULL,
-                 stream_type TEXT NOT NULL,
-                 stream_id TEXT NOT NULL,
-                 idempotency_key TEXT NOT NULL,
-                 request_hash TEXT NOT NULL,
-                 first_version BIGINT NOT NULL,
-                 last_version BIGINT NOT NULL,
-                 recorded_at TIMESTAMPTZ NOT NULL,
-                 PRIMARY KEY (tenant_id, stream_type, stream_id, idempotency_key)
-             );
-             CREATE TABLE IF NOT EXISTS {prefix}_claims (
-                 tenant_id TEXT NOT NULL,
-                 scope TEXT NOT NULL,
-                 claim_key TEXT NOT NULL,
-                 request_digest TEXT NOT NULL,
-                 stream_type TEXT NOT NULL,
-                 stream_id TEXT NOT NULL,
-                 first_version BIGINT NOT NULL,
-                 last_version BIGINT NOT NULL,
-                 recorded_at TIMESTAMPTZ NOT NULL,
-                 PRIMARY KEY (tenant_id, scope, claim_key)
-             );
-             CREATE TABLE IF NOT EXISTS {prefix}_identity (
-                 tenant_id TEXT NOT NULL PRIMARY KEY,
-                 stream_identity TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS {prefix}_blobs (
-                 tenant_id TEXT NOT NULL,
-                 digest TEXT NOT NULL,
-                 bytes BYTEA NOT NULL,
-                 byte_count BIGINT NOT NULL,
-                 recorded_at TIMESTAMPTZ NOT NULL,
-                 PRIMARY KEY (tenant_id, digest)
-             );
-             CREATE TABLE IF NOT EXISTS {prefix}_projection_cursors (
-                 projection TEXT NOT NULL,
-                 tenant_id TEXT NOT NULL,
-                 global_seq BIGINT NOT NULL,
-                 updated_at TIMESTAMPTZ NOT NULL,
-                 PRIMARY KEY (projection, tenant_id)
-             );
-             CREATE TABLE IF NOT EXISTS {prefix}_snapshots (
-                 tenant_id TEXT NOT NULL,
-                 stream_type TEXT NOT NULL,
-                 stream_id TEXT NOT NULL,
-                 version BIGINT NOT NULL,
-                 state_schema_version INTEGER NOT NULL,
-                 state JSONB NOT NULL,
-                 recorded_at TIMESTAMPTZ NOT NULL,
-                 PRIMARY KEY (tenant_id, stream_type, stream_id)
-             );"
-        );
-        let client = self.client.lock().await;
-        self.refuse_foreign_tables(&client).await?;
-        client.batch_execute(&statements).await.map_err(backend)
+    /// Issue the owner host's transaction-admission grant before handing the store to domains.
+    /// Keep this permit in trusted control guards, never in caller input or domain projectors.
+    pub fn admission_permit(&self) -> eventlog_core::AdmissionPermit {
+        self.admission_permit.clone()
+    }
+    /// Observe configured and currently held pool bounds.
+    pub fn pool_status(&self) -> PoolStatus {
+        self.pool.status()
+    }
+    /// Stop new acquisitions and wait a bounded interval for active leases to finish.
+    /// # Errors
+    /// A deadline refuses while outstanding work remains; new traffic stays closed.
+    pub async fn shutdown(&self) -> Result<(), EventLogError> {
+        self.pool.shutdown().await
+    }
+    /// Seal startup registration before exposing any service traffic.
+    pub async fn seal(&self) {
+        self.freeze().await;
+    }
+    async fn freeze(&self) {
+        let _registration = self.registration.lock().await;
+        self.frozen.store(true, Ordering::Release);
+    }
+    fn bounded<'a, T: Send + 'a>(
+        &'a self,
+        future: impl std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
+    ) -> BoxFuture<'a, Result<T, EventLogError>> {
+        Box::pin(async move {
+            tokio::time::timeout(self.pool.options.transaction_timeout, future)
+                .await
+                .map_err(|_| EventLogError::Deadline {
+                    operation: "store operation",
+                })?
+        })
     }
 
     /// Drop this owner's tables, cursors included. For test setup only.
@@ -210,9 +234,9 @@ impl PostgresEventStore {
     /// Returns [`EventLogError::Backend`] when the database cannot be reached.
     pub async fn drop_tables(&self) -> Result<(), EventLogError> {
         let prefix = &self.prefix;
-        self.client
-            .lock()
-            .await
+        self.pool
+            .acquire()
+            .await?
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {prefix}_events;
                  DROP TABLE IF EXISTS {prefix}_commands;
@@ -220,7 +244,10 @@ impl PostgresEventStore {
                  DROP TABLE IF EXISTS {prefix}_snapshots;
                  DROP TABLE IF EXISTS {prefix}_projection_cursors;
                  DROP TABLE IF EXISTS {prefix}_blobs;
-                 DROP TABLE IF EXISTS {prefix}_identity;"
+                 DROP TABLE IF EXISTS {prefix}_identity;
+                 DROP TABLE IF EXISTS {prefix}_scope_counters;
+                 DROP TABLE IF EXISTS {prefix}_schema_version;
+                 DROP TABLE IF EXISTS {prefix}_projection_registry;"
             ))
             .await
             .map_err(backend)
@@ -247,10 +274,28 @@ impl EventStore for PostgresEventStore {
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendResult, EventLogError>> {
         Box::pin(async move {
+            tokio::time::timeout(self.pool.options.transaction_timeout, async move {
             validate_append(events, meta)?;
+            self.freeze().await;
             let prefix = self.prefix.clone();
-            let mut client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
+            client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction,&self.prefix,false).await?;
+
+            if let Some(claim) = &meta.claim {
+                lock_identity(&transaction,&prefix,"claim",&[stream.tenant().as_str(),&claim.scope,&claim.key]).await?;
+                let prior=transaction.query_opt(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=$1 AND scope=$2 AND claim_key=$3"), &[&stream.tenant().as_str(),&claim.scope,&claim.key]).await.map_err(backend)?;
+                if let Some(row)=prior {
+                    if row.get::<_,String>(0)!=claim.digest { return Err(EventLogError::IdempotencyMismatch {key:claim.key.clone()}); }
+                    let original=StreamId::new(stream.tenant().clone(),row.get::<_,String>(1),row.get::<_,String>(2))?;
+                    let first:i64=row.get(3); let last:i64=row.get(4);
+                    let events=select_versions(&transaction,&prefix,&original,first,last).await?;
+                    transaction.rollback().await.map_err(backend)?; client.settled();
+                    return Ok(AppendResult {first_version:to_u64(first)?,last_version:to_u64(last)?,events,deduplicated:true});
+                }
+            }
+            lock_identity(&transaction,&prefix,"stream",&[stream.tenant().as_str(),stream.stream_type(),stream.stream_id()]).await?;
 
             let recorded = transaction
                 .query_opt(
@@ -281,6 +326,8 @@ impl EventStore for PostgresEventStore {
                 let stored =
                     select_versions(&transaction, &prefix, stream, first_version, last_version)
                         .await?;
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
                 return Ok(AppendResult {
                     first_version: to_u64(first_version)?,
                     last_version: to_u64(last_version)?,
@@ -315,8 +362,12 @@ impl EventStore for PostgresEventStore {
                     client: &transaction,
                     prefix: &prefix,
                     inline: &self.inline_names,
+                    tenant: stream.tenant(),
+                    admission: Some((&self.admission_permit, stream.tenant())),
+                    reservation_pending: false,
                 };
                 admission.check(&mut projections).await?;
+                if projections.reservation_pending { return Err(EventLogError::Invalid("unfinished reservation poisons this append".into())); }
             }
 
             let now = OffsetDateTime::now_utc();
@@ -334,7 +385,7 @@ impl EventStore for PostgresEventStore {
                                  request_id, trace_id, causation_id, causation_depth, data)
                              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                                      $15, $16)
-                             RETURNING global_seq"
+                             RETURNING {COLUMNS}"
                         ),
                         &[
                             &stream.tenant().as_str(),
@@ -357,27 +408,7 @@ impl EventStore for PostgresEventStore {
                     )
                     .await
                     .map_err(backend)?;
-                let global_seq: i64 = row.get(0);
-                written.push(RecordedEvent {
-                    global_seq: to_u64(global_seq)?,
-                    tenant: stream.tenant().clone(),
-                    stream_type: stream.stream_type().to_owned(),
-                    stream_id: stream.stream_id().to_owned(),
-                    version,
-                    event_id,
-                    name: event.name.clone(),
-                    schema_version: event.schema_version,
-                    occurred_at: meta.occurred_at,
-                    recorded_at: now,
-                    subject: meta.subject.clone(),
-                    actor: meta.actor.clone(),
-                    request_id: meta.request_id.clone(),
-                    trace_id: meta.trace_id.clone(),
-                    causation_id: meta.causation_id.clone(),
-                    causation_depth: meta.causation_depth,
-                    redacted_at: None,
-                    data: event.data.clone(),
-                });
+                written.push(read_event(&row)?);
             }
 
             let first_version = head + 1;
@@ -410,6 +441,9 @@ impl EventStore for PostgresEventStore {
                     client: &transaction,
                     prefix: &prefix,
                     inline: &self.inline_names,
+                    tenant: stream.tenant(),
+                    admission: None,
+                    reservation_pending: false,
                 };
                 for recorded in &written {
                     projector.apply(recorded, &mut projections).await?;
@@ -441,7 +475,8 @@ impl EventStore for PostgresEventStore {
                     .map_err(backend)?;
             }
 
-            transaction.commit().await.map_err(backend)?;
+            transaction.commit().await.map_err(|_| EventLogError::UnknownCommit)?;
+            client.settled();
 
             Ok(AppendResult {
                 first_version,
@@ -449,6 +484,7 @@ impl EventStore for PostgresEventStore {
                 events: written,
                 deduplicated: false,
             })
+        }).await.map_err(|_|EventLogError::UnknownCommit)?
         })
     }
 
@@ -457,9 +493,9 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         claim: &'a Claim,
     ) -> BoxFuture<'a, Result<Option<ClaimedCommand>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let row = client
                 .query_opt(
                     &format!(
@@ -471,6 +507,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             let Some(row) = row else {
                 return Ok(None);
             };
@@ -498,9 +535,10 @@ impl EventStore for PostgresEventStore {
         idempotency_key: &'a str,
         request_hash: &'a str,
     ) -> BoxFuture<'a, Result<Option<AppendResult>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = self.prefix.clone();
-            let mut client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
+            client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
             let recorded = transaction
                 .query_opt(
@@ -519,6 +557,8 @@ impl EventStore for PostgresEventStore {
                 .await
                 .map_err(backend)?;
             let Some(row) = recorded else {
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
                 return Ok(None);
             };
             let stored_hash: String = row.get(0);
@@ -531,6 +571,8 @@ impl EventStore for PostgresEventStore {
             }
             let events =
                 select_versions(&transaction, &prefix, stream, first_version, last_version).await?;
+            transaction.rollback().await.map_err(backend)?;
+            client.settled();
             Ok(Some(AppendResult {
                 first_version: to_u64(first_version)?,
                 last_version: to_u64(last_version)?,
@@ -546,10 +588,10 @@ impl EventStore for PostgresEventStore {
         after_version: u64,
         limit: usize,
     ) -> BoxFuture<'a, Result<StreamSlice, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let limit = bounded_limit(limit);
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let rows = client
                 .query(
                     &format!(
@@ -568,6 +610,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             let mut events = rows
                 .iter()
                 .map(read_event)
@@ -587,9 +630,9 @@ impl EventStore for PostgresEventStore {
         &'a self,
         stream: &'a StreamId,
     ) -> BoxFuture<'a, Result<Option<u64>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let head: Option<i64> = client
                 .query_one(
                     &format!(
@@ -605,6 +648,7 @@ impl EventStore for PostgresEventStore {
                 .await
                 .map_err(backend)?
                 .get(0);
+            client.settled();
             head.map(to_u64).transpose()
         })
     }
@@ -615,11 +659,13 @@ impl EventStore for PostgresEventStore {
         after_position: u64,
         limit: usize,
     ) -> BoxFuture<'a, Result<FeedPage, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let limit = bounded_limit(limit);
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
-            let rows = client
+            let mut client = self.pool.acquire().await?;
+            let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction, &self.prefix, true).await?;
+            let rows = transaction
                 .query(
                     &format!(
                         "SELECT {COLUMNS} FROM {prefix}_events
@@ -634,6 +680,8 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            transaction.commit().await.map_err(backend)?;
+            client.settled();
             let mut events = rows
                 .iter()
                 .map(read_event)
@@ -657,11 +705,13 @@ impl EventStore for PostgresEventStore {
         version: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             validate_field("redaction reason", reason)?;
             let prefix = self.prefix.clone();
-            let mut client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
+            client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction, &self.prefix, false).await?;
             let now = OffsetDateTime::now_utc();
             let changed = transaction
                 .execute(
@@ -708,7 +758,11 @@ impl EventStore for PostgresEventStore {
                 to_i64(version)?,
             )
             .await?;
-            transaction.commit().await.map_err(backend)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| EventLogError::UnknownCommit)?;
+            client.settled();
             events.pop().ok_or(EventLogError::NotFound)
         })
     }
@@ -718,9 +772,9 @@ impl EventStore for PostgresEventStore {
         stream: &'a StreamId,
         snapshot: &'a Snapshot,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             client
                 .execute(
                     &format!(
@@ -745,8 +799,9 @@ impl EventStore for PostgresEventStore {
                     ],
                 )
                 .await
-                .map(|_| ())
-                .map_err(backend)
+                .map_err(backend)?;
+            client.settled();
+            Ok(())
         })
     }
 
@@ -754,9 +809,9 @@ impl EventStore for PostgresEventStore {
         &'a self,
         stream: &'a StreamId,
     ) -> BoxFuture<'a, Result<Option<Snapshot>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let row = client
                 .query_opt(
                     &format!(
@@ -772,6 +827,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             let Some(row) = row else {
                 return Ok(None);
             };
@@ -792,14 +848,17 @@ impl EventStore for PostgresEventStore {
         &'a self,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = self.prefix.clone();
-            let mut client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
+            client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction, &self.prefix, false).await?;
             for table in [
                 "events",
                 "commands",
                 "claims",
+                "identity",
                 "snapshots",
                 "projection_cursors",
                 "blobs",
@@ -815,28 +874,41 @@ impl EventStore for PostgresEventStore {
             // Every read model this owner has ever created, not only the ones registered in this
             // process. A projection table left behind after an erasure is the erased tenant, still
             // readable, in a table nobody thought to name.
-            let pattern = format!("{prefix}_p_%");
-            let tables: Vec<String> = transaction
+            let rows = transaction
                 .query(
-                    "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()
-                     AND tablename LIKE $1",
-                    &[&pattern],
+                    &format!("SELECT projection_name FROM {prefix}_projection_registry"),
+                    &[],
                 )
                 .await
-                .map_err(backend)?
-                .iter()
-                .map(|row| row.get(0))
-                .collect();
-            for table in tables {
+                .map_err(backend)?;
+            for row in rows {
+                let name: String = row.get(0);
+                eventlog_core::validate_identifier("registered projection", &name)?;
+                let table = projection_table(&prefix, &name);
                 transaction
                     .execute(
-                        &format!("DELETE FROM {table} WHERE tenant_id = $1"),
+                        &format!("DELETE FROM {table} WHERE tenant_id=$1"),
                         &[&tenant.as_str()],
                     )
                     .await
                     .map_err(backend)?;
             }
-            transaction.commit().await.map_err(backend)
+            let coordinate_prefix = format!("t{}:{}", tenant.as_str().len(), tenant.as_str());
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {prefix}_scope_counters WHERE left(coordinate,length($1))=$1"
+                    ),
+                    &[&coordinate_prefix],
+                )
+                .await
+                .map_err(backend)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| EventLogError::UnknownCommit)?;
+            client.settled();
+            Ok(())
         })
     }
 
@@ -847,10 +919,11 @@ impl EventStore for PostgresEventStore {
         after_key: Option<&'a str>,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<(String, Value)>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let limit = bounded_limit(limit);
+            projection.validate()?;
             let table = projection_table(&self.prefix, projection.name);
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let rows = client
                 .query(
                     &format!(
@@ -866,6 +939,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
         })
     }
@@ -874,10 +948,10 @@ impl EventStore for PostgresEventStore {
         &'a self,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<String, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
             let identity = new_event_id();
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let row = client
                 .query_one(
                     &format!(
@@ -890,6 +964,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             Ok(row.get(0))
         })
     }
@@ -900,10 +975,10 @@ impl EventStore for PostgresEventStore {
         digest: &'a str,
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             validate_field("digest", digest)?;
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             client
                 .execute(
                     &format!(
@@ -921,8 +996,9 @@ impl EventStore for PostgresEventStore {
                     ],
                 )
                 .await
-                .map(|_| ())
-                .map_err(backend)
+                .map_err(backend)?;
+            client.settled();
+            Ok(())
         })
     }
 
@@ -931,9 +1007,9 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let row = client
                 .query_opt(
                     &format!(
@@ -943,6 +1019,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             Ok(row.map(|row| row.get(0)))
         })
     }
@@ -952,17 +1029,18 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         digest: &'a str,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let prefix = &self.prefix;
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             client
                 .execute(
                     &format!("DELETE FROM {prefix}_blobs WHERE tenant_id = $1 AND digest = $2"),
                     &[&tenant.as_str(), &digest],
                 )
                 .await
-                .map(|_| ())
-                .map_err(backend)
+                .map_err(backend)?;
+            client.settled();
+            Ok(())
         })
     }
 
@@ -970,34 +1048,15 @@ impl EventStore for PostgresEventStore {
         &self,
         projector: Arc<dyn Projector>,
     ) -> BoxFuture<'_, Result<(), EventLogError>> {
-        Box::pin(async move {
-            let prefix = &self.prefix;
-            let client = self.client.lock().await;
-            for spec in projector.projections() {
-                spec.validate()?;
-                let table = projection_table(prefix, spec.name);
-                let columns: String = joined(spec.indexed.len(), |position| {
-                    format!(", idx_{position} TEXT")
-                });
-                let indexes: String = joined(spec.indexed.len(), |position| {
-                    format!(
-                        "CREATE INDEX IF NOT EXISTS {table}_idx_{position}
-                             ON {table} (tenant_id, idx_{position});"
-                    )
-                });
-                client
-                    .batch_execute(&format!(
-                        "CREATE TABLE IF NOT EXISTS {table} (
-                             tenant_id TEXT NOT NULL,
-                             row_key TEXT NOT NULL,
-                             body JSONB NOT NULL{columns},
-                             PRIMARY KEY (tenant_id, row_key)
-                         );
-                         {indexes}"
-                    ))
-                    .await
-                    .map_err(backend)?;
+        self.bounded(async move {
+            let mut client = self.pool.acquire().await?;
+            if self.allow_schema_writes {
+                schema::migrate(&mut client, &self.prefix, projector.projections()).await?;
             }
+            for spec in projector.projections() {
+                schema::validate_projection(&mut client, &self.prefix, spec).await?;
+            }
+            client.settled();
             Ok(())
         })
     }
@@ -1006,7 +1065,43 @@ impl EventStore for PostgresEventStore {
         &self,
         projector: Arc<dyn Projector>,
     ) -> BoxFuture<'_, Result<(), EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
+            let _registration = self.registration.lock().await;
+            {
+                let projectors = self.inline.lock().map_err(poisoned)?;
+                if projectors
+                    .iter()
+                    .any(|existing| existing.name() == projector.name())
+                {
+                    return Err(EventLogError::Invalid("duplicate inline projector".into()));
+                }
+            }
+            if self.frozen.load(Ordering::Acquire) {
+                return Err(EventLogError::Invalid(
+                    "inline registration is frozen after serving begins".into(),
+                ));
+            }
+            {
+                let names = self.inline_names.lock().map_err(poisoned)?;
+                if projector
+                    .projections()
+                    .iter()
+                    .any(|spec| names.contains(spec.name))
+                {
+                    return Err(EventLogError::Invalid(
+                        "duplicate inline projection registration".into(),
+                    ));
+                }
+            }
+            let mut declared = BTreeSet::new();
+            for spec in projector.projections() {
+                spec.validate()?;
+                if !declared.insert(spec.name) {
+                    return Err(EventLogError::Invalid(
+                        "duplicate projection in one registration".into(),
+                    ));
+                }
+            }
             self.create_projections(Arc::clone(&projector)).await?;
             let mut names = self.inline_names.lock().map_err(poisoned)?;
             for spec in projector.projections() {
@@ -1024,12 +1119,9 @@ impl EventStore for PostgresEventStore {
     }
 
     fn is_inline<'a>(&'a self, name: &'a str) -> BoxFuture<'a, bool> {
-        // An in-memory set, not the database: nothing here can block.
-        Box::pin(std::future::ready(
-            self.inline_names
-                .lock()
-                .is_ok_and(|names| names.contains(name)),
-        ))
+        Box::pin(std::future::ready(self.inline.lock().is_ok_and(
+            |projectors| projectors.iter().any(|projector| projector.name() == name),
+        )))
     }
 
     fn run_catch_up<'a>(
@@ -1038,17 +1130,19 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         batch: usize,
     ) -> BoxFuture<'a, Result<CatchUpProgress, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let batch = bounded_limit(batch);
             let prefix = self.prefix.clone();
-            let mut client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
+            client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction,&self.prefix,true).await?;
 
             // One runner per projection, whatever the replica count says.
             let locked: bool = transaction
                 .query_one(
-                    "SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)",
-                    &[&projector.name()],
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))",
+                    &[&serde_json::to_string(&[self.prefix.as_str(),"projector",projector.name(),tenant.as_str()]).map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))?],
                 )
                 .await
                 .map_err(backend)?
@@ -1105,6 +1199,9 @@ impl EventStore for PostgresEventStore {
                     client: &transaction,
                     prefix: &prefix,
                     inline: &self.inline_names,
+                    tenant,
+                    admission: None,
+                    reservation_pending: false,
                 };
                 for recorded in &events {
                     projector.apply(recorded, &mut projections).await?;
@@ -1130,7 +1227,8 @@ impl EventStore for PostgresEventStore {
                 .await
                 .map_err(backend)?;
             let applied = events.len() as u64;
-            transaction.commit().await.map_err(backend)?;
+            transaction.commit().await.map_err(|_| EventLogError::UnknownCommit)?;
+            client.settled();
             Ok(CatchUpProgress {
                 applied,
                 position: to_u64(next_position)?,
@@ -1144,39 +1242,37 @@ impl EventStore for PostgresEventStore {
         projector: Arc<dyn Projector>,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<u64, EventLogError>> {
-        Box::pin(async move {
-            let prefix = self.prefix.clone();
-            {
-                let client = self.client.lock().await;
-                for spec in projector.projections() {
-                    let table = projection_table(&prefix, spec.name);
-                    client
-                        .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
-                        .await
-                        .map_err(backend)?;
-                }
-                client
-                    .execute(
-                        &format!(
-                            "DELETE FROM {prefix}_projection_cursors
-                             WHERE projection = $1 AND tenant_id = $2"
-                        ),
-                        &[&projector.name(), &tenant.as_str()],
-                    )
-                    .await
-                    .map_err(backend)?;
+        self.bounded(async move {
+            if self.is_inline(projector.name()).await { return Err(EventLogError::Invalid("rebuild requires a catch-up projection".into())); }
+            let mut client=self.pool.acquire().await?; client.quarantine();
+            let transaction=client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction,&self.prefix,true).await?;
+            // Exactly the same owner/tenant/projector lock as ordinary catch-up workers.
+            let identity=serde_json::to_string(&[self.prefix.as_str(),"projector",projector.name(),tenant.as_str()]).map_err(|_|EventLogError::Invalid("invalid lock coordinates".into()))?;
+            transaction.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&identity]).await.map_err(backend)?;
+            for spec in projector.projections() {
+                spec.validate()?;
+                let active=projection_table(&self.prefix,spec.name); let shadow=projection_table("eventlog_rebuild",spec.name);
+                transaction.batch_execute(&format!("CREATE TEMP TABLE {shadow} (LIKE {active} INCLUDING ALL) ON COMMIT DROP")).await.map_err(backend)?;
             }
-            self.create_projections(Arc::clone(&projector)).await?;
-            let mut applied = 0;
+            // Only the committed watermark is eligible; a late earlier transaction remains for catch-up.
+            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {}_events WHERE tenant_id=$1 AND {WATERMARK}",self.prefix), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
+            let mut position=0_i64; let mut applied=0_u64;
             loop {
-                let progress = self
-                    .run_catch_up(Arc::clone(&projector), tenant, MAX_READ_LIMIT)
-                    .await?;
-                applied += progress.applied;
-                if progress.applied == 0 || !progress.more_waiting {
-                    return Ok(applied);
-                }
+                let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
+                if rows.is_empty() {break;}
+                let mut projections=PostgresProjections {client:&transaction,prefix:"eventlog_rebuild",inline:&self.inline_names,tenant,admission:None,reservation_pending:false};
+                for row in &rows {let event=read_event(row)?; projector.apply(&event,&mut projections).await?; position=to_i64(event.global_seq)?; applied+=1;}
             }
+            // MVCC keeps the original visible until this replacement and cursor commit together.
+            for spec in projector.projections() {
+                spec.validate()?;
+                let active=projection_table(&self.prefix,spec.name); let shadow=projection_table("eventlog_rebuild",spec.name);
+                transaction.execute(&format!("DELETE FROM {active} WHERE tenant_id=$1"), &[&tenant.as_str()]).await.map_err(backend)?;
+                transaction.execute(&format!("INSERT INTO {active} SELECT * FROM {shadow} WHERE tenant_id=$1"), &[&tenant.as_str()]).await.map_err(backend)?;
+            }
+            transaction.execute(&format!("INSERT INTO {}_projection_cursors(projection,tenant_id,global_seq,updated_at) VALUES($1,$2,$3,$4) ON CONFLICT(projection,tenant_id) DO UPDATE SET global_seq=EXCLUDED.global_seq,updated_at=EXCLUDED.updated_at",self.prefix), &[&projector.name(),&tenant.as_str(),&position,&OffsetDateTime::now_utc()]).await.map_err(backend)?;
+            transaction.commit().await.map_err(|_|EventLogError::UnknownCommit)?; client.settled(); Ok(applied)
         })
     }
 
@@ -1186,9 +1282,10 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
+            projection.validate()?;
             let table = projection_table(&self.prefix, projection.name);
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let row = client
                 .query_opt(
                     &format!("SELECT body FROM {table} WHERE tenant_id = $1 AND row_key = $2"),
@@ -1196,6 +1293,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             Ok(row.map(|row| row.get(0)))
         })
     }
@@ -1208,16 +1306,17 @@ impl EventStore for PostgresEventStore {
         value: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>> {
-        Box::pin(async move {
+        self.bounded(async move {
             let position = projection.field_position(field).ok_or_else(|| {
                 EventLogError::Invalid(format!(
                     "{field} is not a declared indexed field of {}",
                     projection.name
                 ))
             })?;
+            projection.validate()?;
             let table = projection_table(&self.prefix, projection.name);
             let limit = bounded_limit(limit);
-            let client = self.client.lock().await;
+            let mut client = self.pool.acquire().await?;
             let rows = client
                 .query(
                     &format!(
@@ -1229,6 +1328,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            client.settled();
             Ok(rows.iter().map(|row| row.get(0)).collect())
         })
     }
@@ -1239,9 +1339,65 @@ struct PostgresProjections<'a, 'b> {
     client: &'a Transaction<'b>,
     prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
+    tenant: &'a TenantId,
+    admission: Option<(&'a eventlog_core::AdmissionPermit, &'a TenantId)>,
+    reservation_pending: bool,
 }
 
 impl ProjectionStore for PostgresProjections<'_, '_> {
+    fn reserve<'a>(
+        &'a mut self,
+        permit: &'a eventlog_core::AdmissionPermit,
+        reservations: &'a [eventlog_core::Reservation],
+    ) -> BoxFuture<'a, Result<Vec<i64>, EventLogError>> {
+        Box::pin(async move {
+            let Some((authority, tenant)) = self.admission else {
+                return Err(EventLogError::Invalid(
+                    "admission is confined to a trusted append guard".into(),
+                ));
+            };
+            if !authority.same_authority(permit) {
+                return Err(EventLogError::Invalid("foreign admission permit".into()));
+            }
+            let ordered = eventlog_core::ordered_reservations(reservations, tenant)?;
+            if self.reservation_pending {
+                return Err(EventLogError::Invalid(
+                    "unfinished reservation poisons this append".into(),
+                ));
+            }
+            self.reservation_pending = true;
+            self.client
+                .batch_execute("SAVEPOINT eventlog_reservation")
+                .await
+                .map_err(backend)?;
+            let result=async {
+                for (coordinate,_) in &ordered {lock_identity(self.client,self.prefix,"admission",&[coordinate]).await?;}
+                let table=format!("{}_scope_counters",self.prefix);
+                let mut next=Vec::with_capacity(ordered.len());
+                // Validate every scope before any writes, including absent zero counters.
+                for (coordinate,reservation) in &ordered {
+                    let held=self.client.query_opt(&format!("SELECT held FROM {table} WHERE coordinate=$1 FOR UPDATE"), &[coordinate]).await.map_err(backend)?.map_or(0,|row|row.get::<_,i64>(0));
+                    let updated=held.checked_add(reservation.delta).filter(|value|*value>=0 && *value<=reservation.ceiling).ok_or_else(||EventLogError::Invalid("admission ceiling or release bound refused".into()))?;
+                    next.push(updated);
+                }
+                for ((coordinate,_),held) in ordered.iter().zip(&next) {self.client.execute(&format!("INSERT INTO {table}(coordinate,held) VALUES($1,$2) ON CONFLICT(coordinate) DO UPDATE SET held=EXCLUDED.held"), &[coordinate,held]).await.map_err(backend)?;}
+                Ok(next)
+            }.await;
+            if result.is_err() {
+                self.client
+                    .batch_execute("ROLLBACK TO SAVEPOINT eventlog_reservation")
+                    .await
+                    .map_err(backend)?;
+            }
+            self.client
+                .batch_execute("RELEASE SAVEPOINT eventlog_reservation")
+                .await
+                .map_err(backend)?;
+            self.reservation_pending = false;
+            result
+        })
+    }
+
     fn upsert<'a>(
         &'a mut self,
         projection: &'a ProjectionSpec,
@@ -1250,6 +1406,12 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         body: &'a Value,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
+            if tenant != self.tenant {
+                return Err(EventLogError::Invalid(
+                    "projection context cannot cross tenant".into(),
+                ));
+            }
+            projection.validate()?;
             let table = projection_table(self.prefix, projection.name);
             let columns: String = joined(projection.indexed.len(), |position| {
                 format!(", idx_{position}")
@@ -1292,6 +1454,12 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         key: &'a str,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
+            if tenant != self.tenant {
+                return Err(EventLogError::Invalid(
+                    "projection context cannot cross tenant".into(),
+                ));
+            }
+            projection.validate()?;
             let table = projection_table(self.prefix, projection.name);
             self.client
                 .execute(
@@ -1311,6 +1479,12 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
         Box::pin(async move {
+            if tenant != self.tenant {
+                return Err(EventLogError::Invalid(
+                    "projection context cannot cross tenant".into(),
+                ));
+            }
+            projection.validate()?;
             let table = projection_table(self.prefix, projection.name);
             let row = self
                 .client
@@ -1331,6 +1505,11 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
         Box::pin(async move {
+            if tenant != self.tenant {
+                return Err(EventLogError::Invalid(
+                    "projection context cannot cross tenant".into(),
+                ));
+            }
             {
                 let inline = self.inline.lock().map_err(poisoned)?;
                 if !inline.contains(projection.name) {
@@ -1341,6 +1520,14 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                     )));
                 }
             }
+            lock_identity(
+                self.client,
+                self.prefix,
+                "projection-row",
+                &[projection.name, tenant.as_str(), key],
+            )
+            .await?;
+            projection.validate()?;
             let table = projection_table(self.prefix, projection.name);
             let row = self
                 .client
@@ -1365,12 +1552,18 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>> {
         Box::pin(async move {
+            if tenant != self.tenant {
+                return Err(EventLogError::Invalid(
+                    "projection context cannot cross tenant".into(),
+                ));
+            }
             let position = projection.field_position(field).ok_or_else(|| {
                 EventLogError::Invalid(format!(
                     "{field} is not a declared indexed field of {}",
                     projection.name
                 ))
             })?;
+            projection.validate()?;
             let table = projection_table(self.prefix, projection.name);
             let limit = bounded_limit(limit);
             let rows = self
@@ -1483,6 +1676,8 @@ fn check_expected(expected: Expected, head: u64) -> Result<(), EventLogError> {
 
 fn validate_prefix(prefix: &str) -> Result<(), EventLogError> {
     if prefix.is_empty()
+        || prefix == "eventlog_expected"
+        || prefix == "eventlog_rebuild"
         || prefix.len() > 32
         || !prefix
             .bytes()
@@ -1517,8 +1712,20 @@ fn to_u32(value: i32) -> Result<u32, EventLogError> {
         .map_err(|_| EventLogError::Backend("stored value is out of range".to_owned()))
 }
 
-fn backend(error: impl std::fmt::Display) -> EventLogError {
-    EventLogError::Backend(error.to_string())
+fn backend(error: tokio_postgres::Error) -> EventLogError {
+    let result = match error.code().map(tokio_postgres::error::SqlState::code) {
+        Some("53300") => EventLogError::Overloaded,
+        Some("57014" | "55P03") => EventLogError::Deadline {
+            operation: "database statement or lock",
+        },
+        Some(code) => EventLogError::Backend(format!(
+            "PostgreSQL SQLSTATE {code}, position {:?}",
+            error.as_db_error().and_then(|error| error.position())
+        )),
+        None => EventLogError::Backend("PostgreSQL connection unavailable".into()),
+    };
+    drop(error);
+    result
 }
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
@@ -1527,4 +1734,36 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
 
 mod uuid_shim {
     pub use uuid::Uuid;
+}
+
+// JSON arrays encode string components injectively; hash collisions serialize unrelated work only.
+async fn lock_identity(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    kind: &str,
+    fields: &[&str],
+) -> Result<(), EventLogError> {
+    let identity = serde_json::to_string(&(prefix, kind, fields))
+        .map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))?;
+    transaction.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&identity]).await.map_err(backend)?;
+    Ok(())
+}
+
+// Transaction publication gate: XID order can differ from global sequence allocation order.
+// Take this before every other owner lock. Feed/fold readers query a fresh READ COMMITTED
+// snapshot only after all in-flight publishers settle; writers remain mutually concurrent.
+async fn publication_gate(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    exclusive: bool,
+) -> Result<(), EventLogError> {
+    let identity = serde_json::to_string(&[prefix, "publication"])
+        .map_err(|_| EventLogError::Invalid("publication coordinates".into()))?;
+    let function = if exclusive {
+        "pg_advisory_xact_lock"
+    } else {
+        "pg_advisory_xact_lock_shared"
+    };
+    transaction.query_one(&format!("SELECT {function}(hashtextextended(current_database() || ':' || current_schema() || $1,0))"),&[&identity]).await.map_err(backend)?;
+    Ok(())
 }

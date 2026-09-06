@@ -10,7 +10,9 @@
 //! There is no "current tenant" here and no constructor that omits one, so reading another
 //! tenant's history is not a permission that was withheld — it is a call that cannot be written.
 
+mod admission;
 mod aggregate;
+pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod projection;
 
 pub use aggregate::{Aggregate, Applied, DomainEvent, Loaded, Outcome, Repository, SnapshotPolicy};
@@ -419,6 +421,15 @@ pub struct Snapshot {
 pub enum EventLogError {
     #[error("{0}")]
     Invalid(String),
+    #[error("event store resource budget exhausted")]
+    Overloaded,
+    #[error("event store is closed")]
+    Closed,
+    #[error("event store deadline exceeded during {operation}")]
+    Deadline { operation: &'static str },
+    #[error("commit outcome unknown; reconnect and resolve the same command identity")]
+    UnknownCommit,
+
     #[error("stream is at version {actual}, not {expected}")]
     Conflict { expected: u64, actual: u64 },
     #[error("idempotency key {key} was already used for a different request")]
