@@ -164,6 +164,12 @@ pub struct PoolStatus {
     pub closed: bool,
 }
 
+#[cfg(test)]
+struct RecyclePause {
+    reached: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
 pub(crate) struct Pool {
     config: PostgresConfig,
     pub(crate) options: PoolOptions,
@@ -173,6 +179,8 @@ pub(crate) struct Pool {
     active: AtomicUsize,
     closed: AtomicBool,
     returned: Notify,
+    #[cfg(test)]
+    recycle_pause: Mutex<Option<RecyclePause>>,
 }
 impl Pool {
     pub(crate) fn new(
@@ -191,6 +199,8 @@ impl Pool {
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             returned: Notify::new(),
+            #[cfg(test)]
+            recycle_pause: Mutex::new(None),
         }))
     }
     pub(crate) async fn acquire(self: &Arc<Self>) -> Result<Lease, EventLogError> {
@@ -345,8 +355,14 @@ impl Drop for Lease {
             && !self.pool.closed.load(Ordering::Acquire)
             && let Some(connection) = self.client.take()
         {
+            #[cfg(test)]
+            if let Some(pause) = self.pool.recycle_pause.lock().unwrap().take() {
+                pause.reached.wait();
+                pause.resume.wait();
+            }
             if !connection.client.is_closed()
                 && let Ok(mut idle) = self.pool.idle.lock()
+                && !self.pool.closed.load(Ordering::Acquire)
             {
                 idle.push(connection);
                 self.pool.active.fetch_sub(1, Ordering::AcqRel);
@@ -389,5 +405,64 @@ impl Drop for Connection {
         if let Some(driver) = &self.driver {
             driver.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_does_not_recycle_a_returning_connection_after_close() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        assert!(
+            url.is_some() || std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none(),
+            "required PostgreSQL proof cannot skip an absent database URL"
+        );
+        let Some(url) = url else {
+            eprintln!("skipped: PostgreSQL shutdown race needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let pool = Pool::new(
+            PostgresConfig::isolated(&url, "shutdown_race").unwrap(),
+            PoolOptions::default(),
+        )
+        .unwrap();
+        let mut lease = pool.acquire().await.unwrap();
+        lease.settled();
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *pool.recycle_pause.lock().unwrap() = Some(RecyclePause {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let returning = tokio::task::spawn_blocking(move || drop(lease));
+        reached.wait();
+        let closing_pool = pool.clone();
+        let closing = tokio::spawn(async move { closing_pool.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.status().closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The original return decision predates closure, while the idle insertion follows it.
+        resume.wait();
+        returning.await.unwrap();
+        closing.await.unwrap().unwrap();
+        let status = pool.status();
+        eprintln!(
+            "shutdown completed: closed={}, checked_out={}, idle={}",
+            status.closed, status.checked_out, status.idle
+        );
+        assert!(status.closed);
+        assert_eq!(status.checked_out, 0);
+        assert_eq!(
+            status.idle, 0,
+            "shutdown must close a lease returned during closure"
+        );
     }
 }

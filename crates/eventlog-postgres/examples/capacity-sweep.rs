@@ -47,6 +47,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let profile: Value = serde_json::from_str(include_str!("observation/laboratory-profile.json"))?;
+    let profile_name = profile["profile"]
+        .as_str()
+        .ok_or("missing laboratory profile name")?;
     let output = args.output.as_path();
     fs::create_dir(output)?;
     let cgroup = args.cgroup.as_path();
@@ -223,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         output.join("comparison.json"),
         serde_json::to_vec_pretty(
-            &json!({"profile":"eventlog-comparative-lab-v4","configurations":configurations,"steady_envelope_valid":valid,"production_capacity_admitted":false,"recovery_requirement":"separate restart/replay receipt required"}),
+            &json!({"profile":profile_name,"configurations":configurations,"steady_envelope_valid":valid,"production_capacity_admitted":false,"recovery_requirement":"separate restart/replay receipt required"}),
         )?,
     )?;
     if !valid {

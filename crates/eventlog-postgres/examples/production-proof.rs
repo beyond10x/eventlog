@@ -86,6 +86,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "ambiguous_legacy_namespace_refuses_and_rolls_back_all_erasure",
         "absent_deployment_scope_races_across_tenants_and_clients",
         "registration_freezes_and_pool_refuses_bounded_overload",
+        "pool::tests::shutdown_does_not_recycle_a_returning_connection_after_close",
         "verified_tls_requires_matching_server_and_separate_application_role",
         "legacy_populated_schema_migrates_atomically_and_unknown_checksums_refuse",
         "schema_admission_refuses_triggers_policies_generation_and_foreign_sequences",
