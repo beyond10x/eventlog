@@ -147,6 +147,19 @@ async fn shape<C: GenericClient>(
             "unadmitted trigger, policy or generated column: {table}"
         )));
     }
+    let inherited: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=to_regclass($1) OR inhparent=to_regclass($1))",
+            &[&table],
+        )
+        .await
+        .map_err(backend)?
+        .get(0);
+    if inherited {
+        return Err(EventLogError::Invalid(format!(
+            "unsupported inherited relation: {table}"
+        )));
+    }
     let mut shape = Vec::new();
     for row in client.query("SELECT a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, COALESCE(pg_get_expr(d.adbin,d.adrelid),''),a.attcollation::text FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE a.attrelid=to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum", &[&table]).await.map_err(backend)? {
         let default: String = row.get(3);

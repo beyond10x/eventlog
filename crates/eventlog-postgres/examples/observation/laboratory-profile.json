@@ -1,6 +1,6 @@
 {
-  "profile": "eventlog-comparative-lab-v4",
-  "declared_before_measurement": "2026-09-06T22:10:36.607471+00:00",
+  "profile": "eventlog-comparative-lab-v5",
+  "declared_before_measurement": "2026-09-07T00:10:14.638667+00:00",
   "scope": "Disposable single-host laboratory only; no production capacity admission",
   "seed": 73491,
   "database_image": "postgres:17.6-alpine3.22",
@@ -47,7 +47,7 @@
   "failure_interval": "separate declared connection-loss/restart test after each adapter sweep; resume and compare retained event/receipt/view state",
   "acceptance": "zero correctness violations and bounds breaches; report each unmeasured metric explicitly instead of approving capacity",
   "comparison": "identical hardware, source fixture, offered concurrency, data sizes and DB budget; adapter-internal baseline serialization versus candidate pool size is the measured implementation difference",
-  "supersedes_before_measurement": "eventlog-comparative-lab-v3; previous v3b and intermediate receipts remain distinct pre-publication-fix evidence",
+  "supersedes_before_measurement": "eventlog-comparative-lab-v4; preserve original v4 receipts as evidence preceding the unrelated-xmin, inherited-table and SQLite legacy-erasure corrections",
   "aggregate_concurrency": [
     1,
     8,
@@ -58,6 +58,6 @@
   "warmup_interval": "same live process/pool before the measured steady phase; excluded from worker steady throughput and latency histograms",
   "compiler_policy": "Both adapters use the identical compiler recorded before their builds in identity.json; each compiler change creates a distinct receipt.",
   "canonical_local_compiler": "rustc 1.98.1 (48a229cea 2026-09-01)",
-  "candidate_publication_protocol": "Owner shared writer / exclusive feed-and-rebuild transaction advisory gate with forced READ COMMITTED snapshots; original committed-XID predicate retained.",
-  "revision_reason": "Corrected publication ordering protocol, complete source provenance, and current stable compiler; workloads, samples, resources and acceptance budgets unchanged."
+  "candidate_publication_protocol": "Owner shared writer / exclusive feed-and-rebuild transaction advisory gate with forced READ COMMITTED snapshots; original committed-XID predicate retained and readers stop before the first withheld global position in the same statement snapshot.",
+  "revision_reason": "Re-measure the corrected contiguous publication prefix; inherited PostgreSQL table admission and legacy SQLite erasure corrections included in the frozen candidate. Workloads, samples, resources and acceptance budgets unchanged from v4."
 }

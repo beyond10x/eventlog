@@ -62,9 +62,11 @@ Run `PostgresEventStore::migrate(config, options, projections)` with the migrati
 opening traffic. It serializes additive migrations, checks the complete old physical shape and
 records schema version/checksum plus the exact projection roster. Supply every legacy projection's
 name and indexed paths explicitly. Unknown, partial, altered, unlogged, RLS/policy/trigger or
-foreign-sequence shapes refuse admission. Event sequence CACHE 1, positive unit increment and
+foreign-sequence or inherited-table shapes refuse admission. Event sequence CACHE 1, positive unit increment and
 non-cycling BIGSERIAL range are part of admission; column collations must match and be deterministic. Existing event envelopes and the committed-transaction
-feed watermark predicate stays unchanged. A separate transaction publication gate prevents a
+feed watermark predicate stays unchanged. Readers also stop before the first position withheld
+by that predicate: an unrelated transaction can hold xmin between already committed append XIDs,
+so filtering individual rows alone could skip a lower position. A separate transaction publication gate prevents a
 reader from advancing past an in-flight lower position when transaction-id and position order
 differ: append/redaction/erasure hold a shared owner gate; feed/catch-up/rebuild take it exclusively
 before a fresh READ COMMITTED query. Connections force that isolation even if inherited URL/role
@@ -94,6 +96,12 @@ receipt and persisted envelopes are returned on retry. Register projections befo
 first append; registration after that point refuses. Catch-up workers serialize by exact owner,
 projection and tenant. Rebuild folds into temporary shadow tables and commits only the selected
 tenant's replacement and cursor together; readers retain the prior view on failure.
+
+SQLite tenant erasure also discovers projection tables retained by older files without a
+projection registry. It matches the literal owner namespace and verifies the legacy table shape.
+Ambiguous overlapping namespaces or unsupported matching tables refuse the entire erasure and
+roll back its event, receipt and projection deletions; the caller must resolve that ownership
+ambiguity before retrying.
 
 ## Atomic storage admission
 

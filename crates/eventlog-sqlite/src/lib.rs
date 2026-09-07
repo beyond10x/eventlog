@@ -1115,7 +1115,7 @@ impl Inner {
         // Every read model this owner has ever created, not only the ones registered in this
         // process. A projection table left behind after an erasure is the erased tenant, still
         // readable, in a table nobody thought to name.
-        let tables: Vec<String> = {
+        let mut tables: BTreeSet<String> = {
             let mut statement = transaction
                 .prepare(&format!(
                     "SELECT projection_name FROM {prefix}_projection_registry"
@@ -1124,15 +1124,70 @@ impl Inner {
             let rows = statement
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(backend)?;
-            let mut names = Vec::new();
+            let mut names = BTreeSet::new();
             for row in rows {
-                names.push(row.map_err(backend)?);
+                let name = row.map_err(backend)?;
+                eventlog_core::validate_identifier("registered projection", &name)?;
+                names.insert(projection_table(&prefix, &name));
             }
             names
         };
-        for name in tables {
-            eventlog_core::validate_identifier("registered projection", &name)?;
-            let table = projection_table(&prefix, &name);
+        // Old files have projection tables but no persisted registry. Match a literal namespace
+        // prefix (LIKE would treat its underscores as wildcards), and prove the legacy table
+        // shape before erasing. A nested/ambiguous owner namespace refuses the whole transaction.
+        let projection_prefix = format!("{prefix}_p_");
+        {
+            let mut statement = transaction
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND substr(name,1,length(?1))=?1")
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(params![projection_prefix], |row| row.get::<_, String>(0))
+                .map_err(backend)?;
+            for row in rows {
+                tables.insert(row.map_err(backend)?);
+            }
+        }
+        for table in tables {
+            let name = table.strip_prefix(&projection_prefix).ok_or_else(|| {
+                EventLogError::Invalid("projection outside owner namespace".into())
+            })?;
+            eventlog_core::validate_identifier("stored projection", name)?;
+            let mut statement = transaction
+                .prepare(&format!("PRAGMA table_xinfo({table})"))
+                .map_err(backend)?;
+            let columns = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(backend)?;
+            let valid = columns.len() >= 3
+                && columns.iter().enumerate().all(|(i, column)| {
+                    let (expected_name, not_null, primary_key) = match i {
+                        0 => ("tenant_id".to_owned(), 1, 1),
+                        1 => ("row_key".to_owned(), 1, 2),
+                        2 => ("body".to_owned(), 1, 0),
+                        _ => (format!("idx_{}", i - 3), 0, 0),
+                    };
+                    column.0 == expected_name
+                        && column.1.eq_ignore_ascii_case("TEXT")
+                        && column.2 == not_null
+                        && column.3 == primary_key
+                        && column.4 == 0
+                });
+            if !valid {
+                return Err(EventLogError::Invalid(format!(
+                    "unsupported or ambiguous legacy projection: {table}"
+                )));
+            }
+            drop(statement);
             transaction
                 .execute(
                     &format!("DELETE FROM {table} WHERE tenant_id=?1"),

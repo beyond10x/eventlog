@@ -668,9 +668,11 @@ impl EventStore for PostgresEventStore {
             let rows = transaction
                 .query(
                     &format!(
-                        "SELECT {COLUMNS} FROM {prefix}_events
+                        "SELECT {COLUMNS} FROM {}
                          WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK}
-                         ORDER BY global_seq LIMIT $3"
+                           AND (first_unsettled IS NULL OR global_seq < first_unsettled)
+                         ORDER BY global_seq LIMIT $3",
+                        watermarked_source(prefix)
                     ),
                     &[
                         &tenant.as_str(),
@@ -1170,9 +1172,11 @@ impl EventStore for PostgresEventStore {
             let rows = transaction
                 .query(
                     &format!(
-                        "SELECT {COLUMNS} FROM {prefix}_events
+                        "SELECT {COLUMNS} FROM {}
                          WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK}
-                         ORDER BY global_seq LIMIT $3"
+                           AND (first_unsettled IS NULL OR global_seq < first_unsettled)
+                         ORDER BY global_seq LIMIT $3",
+                        watermarked_source(&prefix)
                     ),
                     &[&tenant.as_str(), &position, &to_i64(batch as u64 + 1)?],
                 )
@@ -1255,8 +1259,9 @@ impl EventStore for PostgresEventStore {
                 let active=projection_table(&self.prefix,spec.name); let shadow=projection_table("eventlog_rebuild",spec.name);
                 transaction.batch_execute(&format!("CREATE TEMP TABLE {shadow} (LIKE {active} INCLUDING ALL) ON COMMIT DROP")).await.map_err(backend)?;
             }
-            // Only the committed watermark is eligible; a late earlier transaction remains for catch-up.
-            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {}_events WHERE tenant_id=$1 AND {WATERMARK}",self.prefix), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
+            // Rebuild the same contiguous eligible prefix used by feed and catch-up. An unrelated
+            // transaction can hold xmin between two already-committed append XIDs.
+            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND {WATERMARK} AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
             let mut position=0_i64; let mut applied=0_u64;
             loop {
                 let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
@@ -1747,6 +1752,17 @@ async fn lock_identity(
         .map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))?;
     transaction.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&identity]).await.map_err(backend)?;
     Ok(())
+}
+
+// Evaluate both the row watermark and the first withheld position in one statement snapshot.
+// The publication gate settles owner writers, but unrelated transactions can still hold xmin
+// between committed XIDs. Never publish a higher position past such a withheld lower position.
+fn watermarked_source(prefix: &str) -> String {
+    format!(
+        "{prefix}_events CROSS JOIN \
+         (SELECT MIN(global_seq) AS first_unsettled FROM {prefix}_events \
+          WHERE NOT ({WATERMARK})) AS publication_prefix"
+    )
 }
 
 // Transaction publication gate: XID order can differ from global sequence allocation order.
