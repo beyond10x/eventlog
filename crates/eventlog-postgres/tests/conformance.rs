@@ -12,6 +12,171 @@ use tokio_postgres::NoTls;
 /// asserts on its feed is a race by design. One at a time, deterministically.
 static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pool_observation_preserves_two_connections_and_four_waiters() {
+    use eventlog_core::{BoxFuture, EventLogError, Guard, ProjectionStore};
+    use std::{
+        future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
+    struct Hold {
+        entered: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl Guard for Hold {
+        fn check<'a>(
+            &'a self,
+            _: &'a mut dyn ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                let release = self.release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                self.entered.send(()).await.unwrap();
+                release.await;
+                Ok(())
+            })
+        }
+    }
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: pool observation requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    store("pool_observation_public")
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let store = Arc::new(
+        PostgresEventStore::connect_local(
+            &url,
+            "pool_observation_public",
+            eventlog_postgres::PoolOptions {
+                max_connections: 2,
+                max_waiters: 4,
+                acquisition_timeout: Duration::from_secs(2),
+                ..eventlog_postgres::PoolOptions::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let (entered, mut receiving) = tokio::sync::mpsc::channel(2);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut holders = Vec::new();
+    let tenant = TenantId::new("pool-observation").unwrap();
+    for id in ["cancelled", "committed"] {
+        let store = store.clone();
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let guard = Arc::new(Hold {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        holders.push(tokio::spawn(async move {
+            store
+                .append_guarded(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    guard,
+                )
+                .await
+        }));
+    }
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(2), receiving.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let stream = StreamId::new(tenant.clone(), "item", "committed").unwrap();
+    let mut queued = (0..4)
+        .map(|_| Box::pin(store.stream_version(&stream)))
+        .collect::<Vec<_>>();
+    for query in &mut queued {
+        assert!(matches!(
+            query.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+    }
+    let saturated = store.pool_status();
+    assert_eq!(
+        (saturated.checked_out, saturated.waiting, saturated.idle),
+        (2, 4, 0)
+    );
+    assert_eq!(
+        store.stream_version(&stream).await,
+        Err(EventLogError::Overloaded)
+    );
+    let done = Arc::new(AtomicBool::new(false));
+    let sampling = store.clone();
+    let stopping = done.clone();
+    let monitor = tokio::spawn(async move {
+        let mut samples = 0;
+        while !stopping.load(Ordering::Acquire) {
+            let status = sampling.pool_status();
+            assert!(
+                status.checked_out <= 2
+                    && status.waiting <= 4
+                    && status.checked_out + status.idle <= 2,
+                "{status:?}"
+            );
+            samples += 1;
+            tokio::task::yield_now().await;
+        }
+        samples
+    });
+    holders[0].abort();
+    release.notify_waiters();
+    let committed = holders.pop().unwrap().await.unwrap().unwrap();
+    assert_eq!(committed.last_version, 1);
+    assert!(holders.pop().unwrap().await.unwrap_err().is_cancelled());
+    for query in queued {
+        assert_eq!(query.await.unwrap(), Some(1));
+    }
+    let cancelled = StreamId::new(tenant, "item", "cancelled").unwrap();
+    assert_eq!(store.stream_version(&cancelled).await.unwrap(), None);
+    let mut queries = Vec::new();
+    for _ in 0..64 {
+        let store = store.clone();
+        let stream = stream.clone();
+        queries.push(tokio::spawn(
+            async move { store.stream_version(&stream).await },
+        ));
+    }
+    let mut completed = 0;
+    let mut overloaded = 0;
+    for query in queries {
+        match query.await.unwrap() {
+            Ok(Some(1)) => completed += 1,
+            Err(EventLogError::Overloaded) => overloaded += 1,
+            result => panic!("unexpected bounded query result: {result:?}"),
+        }
+    }
+    done.store(true, Ordering::Release);
+    let samples = monitor.await.unwrap();
+    assert!(samples > 0 && completed > 0);
+    assert_eq!(completed + overloaded, 64);
+    store.shutdown().await.unwrap();
+    let drained = store.pool_status();
+    assert_eq!(
+        (drained.checked_out, drained.waiting, drained.idle),
+        (0, 0, 0)
+    );
+    assert!(drained.closed);
+    eprintln!(
+        "public pool profile2/4: queued4, committed1, cancelled1, query_success={completed}, overload={overloaded}, samples={samples}"
+    );
+}
+
 #[test]
 fn isolated_transport_cannot_hide_a_remote_address_behind_localhost() {
     use eventlog_postgres::PostgresConfig;
