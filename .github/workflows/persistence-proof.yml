@@ -30,9 +30,6 @@ jobs:
     env:
       EVENTLOG_TEST_POSTGRES_URL: postgresql://postgres@127.0.0.1:5432/postgres
       EVENTLOG_TEST_HOSTED_POSTGRES_URL: postgresql://eventlog_test_application@127.0.0.1:5432/postgres
-      EVENTLOG_TEST_POSTGRES_CA: ${{ runner.temp }}/eventlog-proof-tls/ca.crt
-      EVENTLOG_PROOF_REPORT: ${{ runner.temp }}/eventlog-proof.json
-      EVENTLOG_PROOF_RAW: ${{ runner.temp }}/eventlog-proof-raw.log
       CARGO_BUILD_JOBS: 2
       RUST_TEST_THREADS: 1
     steps:
@@ -53,6 +50,10 @@ jobs:
       - name: Configure disposable verified TLS fixture
         run: cargo run --locked -p eventlog-postgres --example production-fixture -- --container '${{ job.services.postgres.id }}' --directory '${{ runner.temp }}/eventlog-proof-tls'
       - name: Required PostgreSQL and SQLite conformance, formatter and linter
+        env:
+          EVENTLOG_TEST_POSTGRES_CA: ${{ runner.temp }}/eventlog-proof-tls/ca.crt
+          EVENTLOG_PROOF_REPORT: ${{ runner.temp }}/eventlog-proof.json
+          EVENTLOG_PROOF_RAW: ${{ runner.temp }}/eventlog-proof-raw.log
         run: bash scripts/gate.sh --production-proof
       - name: Required comparative envelope and restart replay
         run: cargo run --locked -p eventlog-postgres --example comparative-proof -- --baseline ../baseline --container '${{ job.services.postgres.id }}' --output '${{ runner.temp }}/eventlog-comparison'
