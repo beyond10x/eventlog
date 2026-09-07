@@ -10,13 +10,18 @@ publish.workspace = true
 
 [dependencies]
 eventlog-core.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+sha2.workspace = true
+serde.workspace = true
+rustls.workspace = true
+tokio-postgres-rustls.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-postgres.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+clap.workspace = true
 eventlog-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-postgres.workspace = true

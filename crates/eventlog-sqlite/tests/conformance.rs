@@ -119,3 +119,41 @@ async fn a_table_of_ours_that_somebody_else_made_is_refused_by_name() {
         .await
         .expect("reopening one of ours is not a collision");
 }
+
+#[tokio::test]
+async fn rebuild_preserves_other_tenants_and_previous_view_on_failure() {
+    let store: std::sync::Arc<dyn eventlog_core::EventStore> = std::sync::Arc::new(
+        SqliteEventStore::in_memory("rebuild_isolation")
+            .await
+            .expect("store"),
+    );
+    eventlog_conformance::run_rebuild_isolation(&store).await;
+}
+
+#[tokio::test]
+async fn scope_reservations_are_atomic_and_confined_in_memory_and_file() {
+    let memory = SqliteEventStore::in_memory("scope_atomic")
+        .await
+        .expect("memory");
+    eventlog_conformance::run_scope_atomicity(&memory, &memory.admission_permit()).await;
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("scopes.sqlite");
+    let file = SqliteEventStore::open(path.to_str().expect("path"), "scope_atomic")
+        .await
+        .expect("file");
+    eventlog_conformance::run_scope_atomicity(&file, &file.admission_permit()).await;
+}
+
+#[tokio::test]
+async fn inline_failure_preserves_all_atomic_state_and_callback_authority() {
+    let memory = SqliteEventStore::in_memory("inline_atomic")
+        .await
+        .expect("memory");
+    eventlog_conformance::run_inline_failure_atomicity(&memory, &memory.admission_permit()).await;
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("atomic.sqlite");
+    let file = SqliteEventStore::open(path.to_str().expect("path"), "inline_atomic")
+        .await
+        .expect("file");
+    eventlog_conformance::run_inline_failure_atomicity(&file, &file.admission_permit()).await;
+}

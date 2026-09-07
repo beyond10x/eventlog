@@ -1281,3 +1281,498 @@ pub async fn run_claims(store: &dyn EventStore) {
         "one caller's key is not another's"
     );
 }
+
+/// A rebuild is a tenant-local replacement; a failed fold keeps the previous generation.
+///
+/// # Panics
+/// Panics when a backend loses another tenant or exposes a failed replacement.
+pub async fn run_rebuild_isolation(store: &std::sync::Arc<dyn EventStore>) {
+    use eventlog_core::{CatchUpRunner, Projector};
+    struct Fails;
+    impl Projector for Fails {
+        fn name(&self) -> &'static str {
+            "tally"
+        }
+        fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+            std::slice::from_ref(&TALLY)
+        }
+        fn apply<'a>(
+            &'a self,
+            _: &'a eventlog_core::RecordedEvent,
+            _: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async {
+                Err(EventLogError::Invalid(
+                    "injected unsupported event version".to_owned(),
+                ))
+            })
+        }
+    }
+    let projector: std::sync::Arc<dyn Projector> = std::sync::Arc::new(Tally);
+    let runner = CatchUpRunner::new(
+        std::sync::Arc::clone(store),
+        std::sync::Arc::clone(&projector),
+    )
+    .await
+    .expect("runner");
+    let first = TenantId::new("rebuild-first").expect("tenant");
+    let other = TenantId::new("rebuild-other").expect("tenant");
+    for tenant in [&first, &other] {
+        let stream = StreamId::new(tenant.clone(), "item", "same").expect("stream");
+        store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[event("item.received", 1)],
+                &meta("same", &json!({"value":1})),
+            )
+            .await
+            .expect("append");
+        drain_at_least(&runner, tenant, 1).await;
+    }
+    let before = store
+        .projection_get(&TALLY, &other, "item/same")
+        .await
+        .expect("read");
+    store
+        .rebuild_projection(std::sync::Arc::clone(&projector), &first)
+        .await
+        .expect("rebuild");
+    assert_eq!(
+        store
+            .projection_get(&TALLY, &other, "item/same")
+            .await
+            .expect("read"),
+        before,
+        "rebuilding one tenant must preserve every other tenant"
+    );
+    let first_before = store
+        .projection_get(&TALLY, &first, "item/same")
+        .await
+        .expect("read");
+    assert!(
+        store
+            .rebuild_projection(std::sync::Arc::new(Fails), &first)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .projection_get(&TALLY, &first, "item/same")
+            .await
+            .expect("read"),
+        first_before,
+        "a failed fold must retain the active view"
+    );
+}
+
+/// A fixture-only guard: real policy and lifecycle membership remain with the owning service.
+pub struct ReserveScopes {
+    pub permit: eventlog_core::AdmissionPermit,
+    pub reservations: Vec<eventlog_core::Reservation>,
+}
+
+/// Fail after a view write, probe callback authority, then resolve the same command successfully.
+/// # Panics
+/// Panics on partial events, receipts, claims, views, counters or callback tenant authority.
+pub async fn run_inline_failure_atomicity(
+    store: &dyn EventStore,
+    permit: &eventlog_core::AdmissionPermit,
+) {
+    use eventlog_core::{AdmissionScope, Projector, Reservation};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    };
+    const REGISTRATION: eventlog_core::ProjectionSpec = eventlog_core::ProjectionSpec {
+        name: "registration_atomic",
+        indexed: &[],
+    };
+    struct Registration(bool);
+    impl Projector for Registration {
+        fn name(&self) -> &'static str {
+            if self.0 { "duplicate" } else { "repaired" }
+        }
+        fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+            if self.0 {
+                &[REGISTRATION, REGISTRATION]
+            } else {
+                std::slice::from_ref(&REGISTRATION)
+            }
+        }
+        fn apply<'a>(
+            &'a self,
+            _event: &'a eventlog_core::RecordedEvent,
+            _store: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    struct Probe {
+        mode: Arc<AtomicU8>,
+        permit: eventlog_core::AdmissionPermit,
+    }
+    impl Projector for Probe {
+        fn name(&self) -> &'static str {
+            "inline_failure"
+        }
+        fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+            std::slice::from_ref(&TALLY)
+        }
+        fn apply<'a>(
+            &'a self,
+            event: &'a eventlog_core::RecordedEvent,
+            store: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                Tally.apply(event, store).await?;
+                match self.mode.load(Ordering::Acquire) {
+                    1 => return Err(EventLogError::Invalid("injected after view write".into())),
+                    2 => {
+                        store
+                            .get(
+                                &TALLY,
+                                &TenantId::new("foreign-tenant").expect("tenant"),
+                                "item/one",
+                            )
+                            .await?;
+                    }
+                    3 => {
+                        store
+                            .reserve(
+                                &self.permit,
+                                &[Reservation {
+                                    scope: AdmissionScope::Deployment {
+                                        key: "untrusted".into(),
+                                    },
+                                    delta: 1,
+                                    ceiling: 1,
+                                }],
+                            )
+                            .await?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+        }
+    }
+    assert!(
+        store
+            .register_inline(Arc::new(Registration(true)))
+            .await
+            .is_err(),
+        "duplicate setup refuses"
+    );
+    store
+        .register_inline(Arc::new(Registration(false)))
+        .await
+        .expect("failed setup must not poison a later valid registration");
+    let mode = Arc::new(AtomicU8::new(1));
+    store
+        .register_inline(Arc::new(Probe {
+            mode: mode.clone(),
+            permit: permit.clone(),
+        }))
+        .await
+        .expect("registered probe");
+    let tenant = TenantId::new("atomic-inline").expect("tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "one").expect("stream");
+    let events = [event("item.received", 1)];
+    let mut command = meta("exact-command", &json!({"value":1}));
+    let claim =
+        eventlog_core::Claim::new("creation", "same", command.request_hash.clone()).expect("claim");
+    command.claim = Some(claim.clone());
+    let guard = Arc::new(ReserveScopes {
+        permit: permit.clone(),
+        reservations: vec![Reservation {
+            scope: AdmissionScope::Tenant {
+                tenant: tenant.clone(),
+                key: "quota".into(),
+            },
+            delta: 1,
+            ceiling: 1,
+        }],
+    });
+    for injected in 1..=3 {
+        mode.store(injected, Ordering::Release);
+        assert!(
+            matches!(
+                store
+                    .append_guarded(
+                        &stream,
+                        Expected::NoStream,
+                        &events,
+                        &command,
+                        guard.clone()
+                    )
+                    .await,
+                Err(EventLogError::Invalid(_))
+            ),
+            "failed or unauthorized projector must refuse"
+        );
+        assert!(
+            store
+                .read_stream(&stream, 0, 10)
+                .await
+                .expect("events")
+                .events
+                .is_empty()
+        );
+        assert!(
+            store
+                .recorded_claim(&tenant, &claim)
+                .await
+                .expect("claim")
+                .is_none()
+        );
+        assert!(
+            store
+                .projection_get(&TALLY, &tenant, "item/one")
+                .await
+                .expect("view")
+                .is_none()
+        );
+    }
+    mode.store(0, Ordering::Release);
+    let accepted = store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &events,
+            &command,
+            guard.clone(),
+        )
+        .await
+        .expect("all refused counters and receipts rolled back");
+    assert!(!accepted.deduplicated);
+    let replay = store
+        .append_guarded(&stream, Expected::NoStream, &events, &command, guard)
+        .await
+        .expect("exact retry");
+    assert!(replay.deduplicated);
+    assert_eq!(accepted.events, replay.events);
+    assert_eq!(
+        store
+            .projection_get(&TALLY, &tenant, "item/one")
+            .await
+            .expect("view")
+            .expect("row")["count"],
+        1
+    );
+}
+impl eventlog_core::Guard for ReserveScopes {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            store
+                .reserve(&self.permit, &self.reservations)
+                .await
+                .map(|_| ())
+        })
+    }
+}
+/// Validate atomic, tenant-confined reservations and idempotent release on either real backend.
+/// # Panics
+/// Panics if a counter changes on refusal/retry or a caller can forge authority.
+pub async fn run_scope_atomicity(store: &dyn EventStore, permit: &eventlog_core::AdmissionPermit) {
+    use eventlog_core::{AdmissionScope, Reservation};
+    struct Catches {
+        permit: eventlog_core::AdmissionPermit,
+        tenant: TenantId,
+    }
+    impl eventlog_core::Guard for Catches {
+        fn check<'a>(
+            &'a self,
+            store: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                let refused = [
+                    Reservation {
+                        scope: AdmissionScope::Tenant {
+                            tenant: self.tenant.clone(),
+                            key: "aaa/new".into(),
+                        },
+                        delta: 1,
+                        ceiling: 1,
+                    },
+                    Reservation {
+                        scope: AdmissionScope::Deployment {
+                            key: "owner/shared".into(),
+                        },
+                        delta: 1,
+                        ceiling: 1,
+                    },
+                ];
+                assert!(store.reserve(&self.permit, &refused).await.is_err());
+                let check = [Reservation {
+                    scope: AdmissionScope::Tenant {
+                        tenant: self.tenant.clone(),
+                        key: "aaa/new".into(),
+                    },
+                    delta: 1,
+                    ceiling: 1,
+                }];
+                store.reserve(&self.permit, &check).await?;
+                Ok(())
+            })
+        }
+    }
+    let tenant = TenantId::new("scope-a").expect("tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "a").expect("stream");
+    let scopes = |delta| {
+        vec![
+            Reservation {
+                scope: AdmissionScope::Tenant {
+                    tenant: tenant.clone(),
+                    key: "service-a/quota".into(),
+                },
+                delta,
+                ceiling: 1,
+            },
+            Reservation {
+                scope: AdmissionScope::Deployment {
+                    key: "owner/shared".into(),
+                },
+                delta,
+                ceiling: 1,
+            },
+        ]
+    };
+    let guard = |permit: eventlog_core::AdmissionPermit, reservations| {
+        std::sync::Arc::new(ReserveScopes {
+            permit,
+            reservations,
+        }) as std::sync::Arc<dyn eventlog_core::Guard>
+    };
+    let events = [event("item.received", 1)];
+    let first = meta("hold", &json!({"delta":1}));
+    let result = store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &events,
+            &first,
+            guard(permit.clone(), scopes(1)),
+        )
+        .await
+        .expect("first reservation");
+    let retry = store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &events,
+            &first,
+            guard(permit.clone(), scopes(1)),
+        )
+        .await
+        .expect("same receipt");
+    assert_eq!(result.events, retry.events);
+    assert!(retry.deduplicated);
+    let denied = meta("denied", &json!({"delta":1}));
+    assert!(
+        store
+            .append_guarded(
+                &stream,
+                Expected::Exact(1),
+                &events,
+                &denied,
+                guard(permit.clone(), scopes(1))
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .recorded_command(&stream, &denied.idempotency_key, &denied.request_hash)
+            .await
+            .expect("receipt read")
+            .is_none()
+    );
+    assert_eq!(
+        store.stream_version(&stream).await.expect("version"),
+        Some(1)
+    );
+    // Releasing is atomic with its receipt; repeating the receipt cannot release twice.
+    let release = meta("release", &json!({"delta":-1}));
+    store
+        .append_guarded(
+            &stream,
+            Expected::Exact(1),
+            &events,
+            &release,
+            guard(permit.clone(), scopes(-1)),
+        )
+        .await
+        .expect("release");
+    store
+        .append_guarded(
+            &stream,
+            Expected::Exact(1),
+            &events,
+            &release,
+            guard(permit.clone(), scopes(-1)),
+        )
+        .await
+        .expect("release retry");
+    let reuse = meta("reuse", &json!({"delta":1}));
+    store
+        .append_guarded(
+            &stream,
+            Expected::Exact(2),
+            &events,
+            &reuse,
+            guard(permit.clone(), scopes(1)),
+        )
+        .await
+        .expect("exactly one released slot");
+    let fake = eventlog_core::AdmissionPermit::default();
+    assert!(
+        store
+            .append_guarded(
+                &stream,
+                Expected::Exact(3),
+                &events,
+                &meta("forged", &json!({})),
+                guard(fake, scopes(0))
+            )
+            .await
+            .is_err()
+    );
+    let foreign = vec![Reservation {
+        scope: AdmissionScope::Tenant {
+            tenant: TenantId::new("scope-other").expect("tenant"),
+            key: "service-a/quota".into(),
+        },
+        delta: 0,
+        ceiling: 1,
+    }];
+    assert!(
+        store
+            .append_guarded(
+                &stream,
+                Expected::Exact(3),
+                &events,
+                &meta("foreign", &json!({})),
+                guard(permit.clone(), foreign)
+            )
+            .await
+            .is_err()
+    );
+    // Catching a multi-scope refusal must not commit an earlier partial delta.
+    store
+        .append_guarded(
+            &stream,
+            Expected::Exact(3),
+            &events,
+            &meta("caught", &json!({})),
+            std::sync::Arc::new(Catches {
+                permit: permit.clone(),
+                tenant,
+            }),
+        )
+        .await
+        .expect("caught refusal left no partial counter");
+}

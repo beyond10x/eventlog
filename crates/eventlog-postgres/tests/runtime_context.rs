@@ -19,9 +19,14 @@ use tokio_postgres::NoTls;
 static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn url() -> Option<String> {
-    std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+    let value = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.trim().is_empty());
+    assert!(
+        value.is_some() || std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none(),
+        "required PostgreSQL proof cannot skip an absent database URL"
+    );
+    value
 }
 
 /// A store on its own prefix with a clean slate, tally table included.

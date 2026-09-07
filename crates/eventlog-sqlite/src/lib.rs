@@ -45,9 +45,16 @@ struct Inner {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    admission_permit: eventlog_core::AdmissionPermit,
+    registration: Mutex<bool>,
 }
 
 impl SqliteEventStore {
+    /// Give only the trusted host this grant; the domain's `EventStore` port cannot issue it.
+    pub fn admission_permit(&self) -> eventlog_core::AdmissionPermit {
+        self.inner.admission_permit.clone()
+    }
+
     /// Open or create the store for one owner, identified by its table prefix.
     ///
     /// # Errors
@@ -114,8 +121,11 @@ impl Inner {
             prefix: prefix.to_owned(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            admission_permit: eventlog_core::AdmissionPermit::default(),
+            registration: Mutex::new(false),
         };
         store.create_tables()?;
+        store.connection.lock().map_err(poisoned)?.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {prefix}_scope_counters (coordinate TEXT PRIMARY KEY, held INTEGER NOT NULL CHECK(held>=0)); CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(projection_name TEXT PRIMARY KEY,indexed_fields TEXT NOT NULL)")).map_err(backend)?;
         Ok(store)
     }
 
@@ -529,6 +539,7 @@ impl Inner {
         admission: &dyn Guard,
     ) -> Result<AppendResult, EventLogError> {
         validate_append(events, meta)?;
+        *self.registration.lock().map_err(poisoned)? = true;
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
@@ -552,6 +563,25 @@ impl Inner {
         admission: &dyn Guard,
     ) -> Result<AppendResult, EventLogError> {
         let prefix = &self.prefix;
+
+        if let Some(claim) = &meta.claim {
+            let prior:Option<(String,String,String,i64,i64)>=connection.query_row(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=?1 AND scope=?2 AND claim_key=?3"),params![stream.tenant().as_str(),claim.scope,claim.key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(backend)?;
+            if let Some((digest, kind, id, first, last)) = prior {
+                if digest != claim.digest {
+                    return Err(EventLogError::IdempotencyMismatch {
+                        key: claim.key.clone(),
+                    });
+                }
+                let original = StreamId::new(stream.tenant().clone(), kind, id)?;
+                let events = select_versions(connection, prefix, &original, first, last)?;
+                return Ok(AppendResult {
+                    first_version: to_u64(first)?,
+                    last_version: to_u64(last)?,
+                    events,
+                    deduplicated: true,
+                });
+            }
+        }
 
         let recorded: Option<(String, i64, i64)> = connection
             .query_row(
@@ -613,6 +643,8 @@ impl Inner {
                 connection: &mut *connection,
                 prefix,
                 inline: &self.inline_names,
+                tenant: stream.tenant(),
+                admission: Some((&self.admission_permit, stream.tenant())),
             };
             drive(admission.check(&mut projections))?;
         }
@@ -706,6 +738,8 @@ impl Inner {
                 connection: &mut *connection,
                 prefix,
                 inline: &self.inline_names,
+                tenant: stream.tenant(),
+                admission: None,
             };
             for recorded in &written {
                 drive(projector.apply(recorded, &mut projections))?;
@@ -1065,6 +1099,8 @@ impl Inner {
         for table in [
             "events",
             "commands",
+            "claims",
+            "identity",
             "snapshots",
             "projection_cursors",
             "blobs",
@@ -1079,30 +1115,95 @@ impl Inner {
         // Every read model this owner has ever created, not only the ones registered in this
         // process. A projection table left behind after an erasure is the erased tenant, still
         // readable, in a table nobody thought to name.
-        let tables: Vec<String> = {
+        let mut tables: BTreeSet<String> = {
             let mut statement = transaction
                 .prepare(&format!(
-                    "SELECT name FROM sqlite_master
-                     WHERE type = 'table' AND name LIKE '{prefix}_p_%'"
+                    "SELECT projection_name FROM {prefix}_projection_registry"
                 ))
                 .map_err(backend)?;
             let rows = statement
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(backend)?;
-            let mut names = Vec::new();
+            let mut names = BTreeSet::new();
             for row in rows {
-                names.push(row.map_err(backend)?);
+                let name = row.map_err(backend)?;
+                eventlog_core::validate_identifier("registered projection", &name)?;
+                names.insert(projection_table(&prefix, &name));
             }
             names
         };
+        // Old files have projection tables but no persisted registry. Match a literal namespace
+        // prefix (LIKE would treat its underscores as wildcards), and prove the legacy table
+        // shape before erasing. A nested/ambiguous owner namespace refuses the whole transaction.
+        let projection_prefix = format!("{prefix}_p_");
+        {
+            let mut statement = transaction
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND substr(name,1,length(?1))=?1")
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(params![projection_prefix], |row| row.get::<_, String>(0))
+                .map_err(backend)?;
+            for row in rows {
+                tables.insert(row.map_err(backend)?);
+            }
+        }
         for table in tables {
+            let name = table.strip_prefix(&projection_prefix).ok_or_else(|| {
+                EventLogError::Invalid("projection outside owner namespace".into())
+            })?;
+            eventlog_core::validate_identifier("stored projection", name)?;
+            let mut statement = transaction
+                .prepare(&format!("PRAGMA table_xinfo({table})"))
+                .map_err(backend)?;
+            let columns = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(backend)?;
+            let valid = columns.len() >= 3
+                && columns.iter().enumerate().all(|(i, column)| {
+                    let (expected_name, not_null, primary_key) = match i {
+                        0 => ("tenant_id".to_owned(), 1, 1),
+                        1 => ("row_key".to_owned(), 1, 2),
+                        2 => ("body".to_owned(), 1, 0),
+                        _ => (format!("idx_{}", i - 3), 0, 0),
+                    };
+                    column.0 == expected_name
+                        && column.1.eq_ignore_ascii_case("TEXT")
+                        && column.2 == not_null
+                        && column.3 == primary_key
+                        && column.4 == 0
+                });
+            if !valid {
+                return Err(EventLogError::Invalid(format!(
+                    "unsupported or ambiguous legacy projection: {table}"
+                )));
+            }
+            drop(statement);
             transaction
                 .execute(
-                    &format!("DELETE FROM {table} WHERE tenant_id = ?1"),
+                    &format!("DELETE FROM {table} WHERE tenant_id=?1"),
                     params![tenant.as_str()],
                 )
                 .map_err(backend)?;
         }
+        let coordinate_prefix = format!("t{}:{}", tenant.as_str().len(), tenant.as_str());
+        transaction
+            .execute(
+                &format!(
+                    "DELETE FROM {prefix}_scope_counters WHERE substr(coordinate,1,length(?1))=?1"
+                ),
+                params![coordinate_prefix],
+            )
+            .map_err(backend)?;
         transaction.commit().map_err(backend)
     }
 
@@ -1114,6 +1215,7 @@ impl Inner {
         limit: usize,
     ) -> Result<Vec<(String, Value)>, EventLogError> {
         let limit = bounded_limit(limit);
+        projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
         let mut statement = guard
@@ -1254,10 +1356,55 @@ impl Inner {
                 ))
                 .map_err(backend)?;
         }
+        for spec in projector.projections() {
+            let indexed = serde_json::to_string(spec.indexed)
+                .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+            guard.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES(?1,?2) ON CONFLICT(projection_name) DO NOTHING"),params![spec.name,&indexed]).map_err(backend)?;
+            let recorded:String=guard.query_row(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"),params![spec.name],|row|row.get(0)).map_err(backend)?;
+            if recorded != indexed {
+                return Err(EventLogError::Invalid(
+                    "projection registration shape changed".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
     fn register_inline(&self, projector: Arc<dyn Projector>) -> Result<(), EventLogError> {
+        let registration = self.registration.lock().map_err(poisoned)?;
+        if *registration {
+            return Err(EventLogError::Invalid(
+                "inline registration is frozen after serving begins".into(),
+            ));
+        }
+        {
+            let projectors = self.inline.lock().map_err(poisoned)?;
+            if projectors
+                .iter()
+                .any(|existing| existing.name() == projector.name())
+            {
+                return Err(EventLogError::Invalid("duplicate inline projector".into()));
+            }
+        }
+        {
+            let names = self.inline_names.lock().map_err(poisoned)?;
+            if projector
+                .projections()
+                .iter()
+                .any(|spec| names.contains(spec.name))
+            {
+                return Err(EventLogError::Invalid("duplicate inline projection".into()));
+            }
+        }
+        let mut declared = BTreeSet::new();
+        for spec in projector.projections() {
+            spec.validate()?;
+            if !declared.insert(spec.name) {
+                return Err(EventLogError::Invalid(
+                    "duplicate projection in one registration".into(),
+                ));
+            }
+        }
         self.create_projections(projector.as_ref())?;
         let mut names = self.inline_names.lock().map_err(poisoned)?;
         for spec in projector.projections() {
@@ -1273,9 +1420,9 @@ impl Inner {
     }
 
     fn is_inline(&self, name: &str) -> bool {
-        self.inline_names
+        self.inline
             .lock()
-            .is_ok_and(|names| names.contains(name))
+            .is_ok_and(|projectors| projectors.iter().any(|projector| projector.name() == name))
     }
 
     fn run_catch_up(
@@ -1285,25 +1432,43 @@ impl Inner {
         batch: usize,
     ) -> Result<CatchUpProgress, EventLogError> {
         let batch = bounded_limit(batch);
-        let position = self.cursor_position(projector.name(), tenant)?;
-        let page = self.read_feed(tenant, position, batch)?;
-        if page.events.is_empty() {
-            return Ok(CatchUpProgress {
-                applied: 0,
-                position,
-                more_waiting: false,
-            });
-        }
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
-        let result = self.catch_up_in_transaction(connection, projector, tenant, &page);
-        finish_transaction(connection, result)?;
-        Ok(CatchUpProgress {
-            applied: page.events.len() as u64,
-            position: page.next_position,
-            more_waiting: page.has_more,
-        })
+        let result = (|| {
+            let position:i64=connection.query_row(&format!("SELECT global_seq FROM {}_projection_cursors WHERE projection=?1 AND tenant_id=?2",self.prefix),params![projector.name(),tenant.as_str()],|row|row.get(0)).optional().map_err(backend)?.unwrap_or(0);
+            let mut events = {
+                let mut statement=connection.prepare(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=?1 AND global_seq>?2 ORDER BY global_seq LIMIT ?3",self.prefix)).map_err(backend)?;
+                let rows = statement
+                    .query_map(
+                        params![tenant.as_str(), position, to_i64(batch as u64 + 1)?],
+                        read_event,
+                    )
+                    .map_err(backend)?;
+                let mut events = Vec::new();
+                for row in rows {
+                    events.push(row.map_err(backend)??);
+                }
+                events
+            };
+            let has_more = events.len() > batch;
+            events.truncate(batch);
+            let next_position = events
+                .last()
+                .map_or(to_u64(position)?, |event| event.global_seq);
+            let page = FeedPage {
+                events,
+                next_position,
+                has_more,
+            };
+            self.catch_up_in_transaction(connection, projector, tenant, &page)?;
+            Ok(CatchUpProgress {
+                applied: page.events.len() as u64,
+                position: next_position,
+                more_waiting: has_more,
+            })
+        })();
+        finish_transaction(connection, result)
     }
 
     fn catch_up_in_transaction(
@@ -1319,6 +1484,8 @@ impl Inner {
                 connection: &mut *connection,
                 prefix,
                 inline: &self.inline_names,
+                tenant,
+                admission: None,
             };
             for recorded in &page.events {
                 drive(projector.apply(recorded, &mut projections))?;
@@ -1350,34 +1517,78 @@ impl Inner {
         projector: &dyn Projector,
         tenant: &TenantId,
     ) -> Result<u64, EventLogError> {
-        let prefix = self.prefix.clone();
-        {
-            let guard = self.connection.lock().map_err(poisoned)?;
+        if self.is_inline(projector.name()) {
+            return Err(EventLogError::Invalid(
+                "rebuild requires a catch-up projection".into(),
+            ));
+        }
+        let mut connection = self.connection.lock().map_err(poisoned)?;
+        let connection = &mut *connection;
+        begin_immediate(connection)?;
+        let result = (|| {
             for spec in projector.projections() {
-                let table = projection_table(&prefix, spec.name);
-                guard
-                    .execute(&format!("DROP TABLE IF EXISTS {table}"), [])
+                let shadow = projection_table("eventlog_rebuild", spec.name);
+                let columns = joined(spec.indexed.len(), |position| {
+                    format!(",idx_{position} TEXT")
+                });
+                connection.execute_batch(&format!("CREATE TEMP TABLE {shadow}(tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body TEXT NOT NULL{columns},PRIMARY KEY(tenant_id,row_key))")).map_err(backend)?;
+            }
+            let mut position = 0_i64;
+            let mut applied = 0_u64;
+            loop {
+                let events = {
+                    let mut statement=connection.prepare(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=?1 AND global_seq>?2 ORDER BY global_seq LIMIT ?3",self.prefix)).map_err(backend)?;
+                    let rows = statement
+                        .query_map(
+                            params![tenant.as_str(), position, to_i64(MAX_READ_LIMIT as u64)?],
+                            read_event,
+                        )
+                        .map_err(backend)?;
+                    let mut events = Vec::new();
+                    for row in rows {
+                        events.push(row.map_err(backend)??);
+                    }
+                    events
+                };
+                if events.is_empty() {
+                    break;
+                }
+                let mut projections = SqliteProjections {
+                    connection: &mut *connection,
+                    prefix: "eventlog_rebuild",
+                    inline: &self.inline_names,
+                    tenant,
+                    admission: None,
+                };
+                for event in &events {
+                    drive(projector.apply(event, &mut projections))?;
+                    position = to_i64(event.global_seq)?;
+                    applied += 1;
+                }
+            }
+            for spec in projector.projections() {
+                let active = projection_table(&self.prefix, spec.name);
+                let shadow = projection_table("eventlog_rebuild", spec.name);
+                connection
+                    .execute(
+                        &format!("DELETE FROM {active} WHERE tenant_id=?1"),
+                        params![tenant.as_str()],
+                    )
+                    .map_err(backend)?;
+                connection
+                    .execute(
+                        &format!("INSERT INTO {active} SELECT * FROM {shadow} WHERE tenant_id=?1"),
+                        params![tenant.as_str()],
+                    )
+                    .map_err(backend)?;
+                connection
+                    .execute_batch(&format!("DROP TABLE {shadow}"))
                     .map_err(backend)?;
             }
-            guard
-                .execute(
-                    &format!(
-                        "DELETE FROM {prefix}_projection_cursors
-                         WHERE projection = ?1 AND tenant_id = ?2"
-                    ),
-                    params![projector.name(), tenant.as_str()],
-                )
-                .map_err(backend)?;
-        }
-        self.create_projections(projector)?;
-        let mut applied = 0;
-        loop {
-            let progress = self.run_catch_up(projector, tenant, MAX_READ_LIMIT)?;
-            applied += progress.applied;
-            if progress.applied == 0 || !progress.more_waiting {
-                return Ok(applied);
-            }
-        }
+            connection.execute(&format!("INSERT INTO {}_projection_cursors(projection,tenant_id,global_seq,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(projection,tenant_id) DO UPDATE SET global_seq=excluded.global_seq,updated_at=excluded.updated_at",self.prefix),params![projector.name(),tenant.as_str(),position,format_time(OffsetDateTime::now_utc())?]).map_err(backend)?;
+            Ok(applied)
+        })();
+        finish_transaction(connection, result)
     }
 
     fn projection_get(
@@ -1387,6 +1598,7 @@ impl Inner {
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
         let prefix = &self.prefix;
+        projection.validate()?;
         let table = projection_table(prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
         let body: Option<String> = guard
@@ -1420,6 +1632,7 @@ impl Inner {
             ))
         })?;
         let limit = bounded_limit(limit);
+        projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
         let mut statement = guard
@@ -1443,23 +1656,6 @@ impl Inner {
             })?);
         }
         Ok(found)
-    }
-
-    fn cursor_position(&self, projection: &str, tenant: &TenantId) -> Result<u64, EventLogError> {
-        let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
-        let position: Option<i64> = guard
-            .query_row(
-                &format!(
-                    "SELECT global_seq FROM {prefix}_projection_cursors
-                     WHERE projection = ?1 AND tenant_id = ?2"
-                ),
-                params![projection, tenant.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        position.map_or(Ok(0), to_u64)
     }
 }
 
@@ -1529,9 +1725,19 @@ struct SqliteProjections<'a> {
     connection: &'a mut Connection,
     prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
+    tenant: &'a TenantId,
+    admission: Option<(&'a eventlog_core::AdmissionPermit, &'a TenantId)>,
 }
 
 impl ProjectionStore for SqliteProjections<'_> {
+    fn reserve<'a>(
+        &'a mut self,
+        permit: &'a eventlog_core::AdmissionPermit,
+        reservations: &'a [eventlog_core::Reservation],
+    ) -> BoxFuture<'a, Result<Vec<i64>, EventLogError>> {
+        done(self.reserve_now(permit, reservations))
+    }
+
     fn upsert<'a>(
         &'a mut self,
         projection: &'a ProjectionSpec,
@@ -1582,6 +1788,64 @@ impl ProjectionStore for SqliteProjections<'_> {
 }
 
 impl SqliteProjections<'_> {
+    fn reserve_now(
+        &mut self,
+        permit: &eventlog_core::AdmissionPermit,
+        reservations: &[eventlog_core::Reservation],
+    ) -> Result<Vec<i64>, EventLogError> {
+        let Some((authority, tenant)) = self.admission else {
+            return Err(EventLogError::Invalid(
+                "admission is confined to a trusted append guard".into(),
+            ));
+        };
+        if !authority.same_authority(permit) {
+            return Err(EventLogError::Invalid("foreign admission permit".into()));
+        }
+        let ordered = eventlog_core::ordered_reservations(reservations, tenant)?;
+        self.connection
+            .execute_batch("SAVEPOINT eventlog_reservation")
+            .map_err(backend)?;
+        let result = (|| {
+            let table = format!("{}_scope_counters", self.prefix);
+            let mut next = Vec::with_capacity(ordered.len());
+            // BEGIN IMMEDIATE already serializes independent connections, including absent keys.
+            for (coordinate, reservation) in &ordered {
+                let held = self
+                    .connection
+                    .query_row(
+                        &format!("SELECT held FROM {table} WHERE coordinate=?1"),
+                        params![coordinate],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(backend)?
+                    .unwrap_or(0);
+                next.push(
+                    held.checked_add(reservation.delta)
+                        .filter(|value| *value >= 0 && *value <= reservation.ceiling)
+                        .ok_or_else(|| {
+                            EventLogError::Invalid(
+                                "admission ceiling or release bound refused".into(),
+                            )
+                        })?,
+                );
+            }
+            for ((coordinate, _), held) in ordered.iter().zip(&next) {
+                self.connection.execute(&format!("INSERT INTO {table}(coordinate,held) VALUES(?1,?2) ON CONFLICT(coordinate) DO UPDATE SET held=excluded.held"),params![coordinate,held]).map_err(backend)?;
+            }
+            Ok(next)
+        })();
+        if result.is_err() {
+            self.connection
+                .execute_batch("ROLLBACK TO SAVEPOINT eventlog_reservation")
+                .map_err(backend)?;
+        }
+        self.connection
+            .execute_batch("RELEASE SAVEPOINT eventlog_reservation")
+            .map_err(backend)?;
+        result
+    }
+
     fn upsert_now(
         &mut self,
         projection: &ProjectionSpec,
@@ -1589,6 +1853,12 @@ impl SqliteProjections<'_> {
         key: &str,
         body: &Value,
     ) -> Result<(), EventLogError> {
+        if tenant != self.tenant {
+            return Err(EventLogError::Invalid(
+                "projection context cannot cross tenant".into(),
+            ));
+        }
+        projection.validate()?;
         let table = projection_table(self.prefix, projection.name);
         let columns: String = joined(projection.indexed.len(), |position| {
             format!(", idx_{position}")
@@ -1626,6 +1896,12 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<(), EventLogError> {
+        if tenant != self.tenant {
+            return Err(EventLogError::Invalid(
+                "projection context cannot cross tenant".into(),
+            ));
+        }
+        projection.validate()?;
         let table = projection_table(self.prefix, projection.name);
         self.connection
             .execute(
@@ -1642,6 +1918,12 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
+        if tenant != self.tenant {
+            return Err(EventLogError::Invalid(
+                "projection context cannot cross tenant".into(),
+            ));
+        }
+        projection.validate()?;
         let table = projection_table(self.prefix, projection.name);
         let body: Option<String> = self
             .connection
@@ -1666,6 +1948,11 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
+        if tenant != self.tenant {
+            return Err(EventLogError::Invalid(
+                "projection context cannot cross tenant".into(),
+            ));
+        }
         // SQLite has one writer and this transaction is already IMMEDIATE, so the row is held.
         // The check that matters is the same one PostgreSQL makes: a guard may only read a read
         // model that is written in this transaction.
@@ -1688,12 +1975,18 @@ impl SqliteProjections<'_> {
         value: &str,
         limit: usize,
     ) -> Result<Vec<Value>, EventLogError> {
+        if tenant != self.tenant {
+            return Err(EventLogError::Invalid(
+                "projection context cannot cross tenant".into(),
+            ));
+        }
         let position = projection.field_position(field).ok_or_else(|| {
             EventLogError::Invalid(format!(
                 "{field} is not a declared indexed field of {}",
                 projection.name
             ))
         })?;
+        projection.validate()?;
         let table = projection_table(self.prefix, projection.name);
         let limit = bounded_limit(limit);
         let mut statement = self
