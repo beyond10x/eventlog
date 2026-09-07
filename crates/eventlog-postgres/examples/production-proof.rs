@@ -87,6 +87,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "absent_deployment_scope_races_across_tenants_and_clients",
         "registration_freezes_and_pool_refuses_bounded_overload",
         "pool_observation_preserves_two_connections_and_four_waiters",
+        "shutdown_cancellation_preserves_public_pool_lifetimes",
+        "public_queue_cancellation_and_broken_idle_reclaim_exact_capacity",
         "pool::tests::reusable_retirement_preserves_two_connection_four_waiter_snapshot",
         "pool::tests::quarantine_retirement_cannot_count_a_replacement_twice",
         "pool::tests::idle_checkout_has_one_coherent_owner",

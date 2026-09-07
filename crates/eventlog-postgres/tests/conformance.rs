@@ -1796,3 +1796,299 @@ async fn schema_admission_refuses_triggers_policies_generation_and_foreign_seque
         }
     }
 }
+
+struct ReviewPoolHold {
+    entered: tokio::sync::mpsc::Sender<()>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl eventlog_core::Guard for ReviewPoolHold {
+    fn check<'a>(
+        &'a self,
+        _: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), eventlog_core::EventLogError>> {
+        Box::pin(async move {
+            let release = self.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            self.entered.send(()).await.expect("review receiver");
+            release.await;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn shutdown_cancellation_preserves_public_pool_lifetimes() {
+    use eventlog_core::EventLogError;
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::{Duration, Instant},
+    };
+    let _exclusive = EXCLUSIVE.lock().await;
+    let url = url().expect("required real PostgreSQL review fixture");
+    let prefix = "review_pool_shutdown";
+    store(prefix).await.unwrap().shutdown().await.unwrap();
+    let options = eventlog_postgres::PoolOptions {
+        max_connections: 1,
+        max_waiters: 1,
+        acquisition_timeout: Duration::from_millis(100),
+        shutdown_timeout: Duration::from_millis(100),
+        ..eventlog_postgres::PoolOptions::default()
+    };
+    let adapter = Arc::new(
+        PostgresEventStore::connect_local(&url, prefix, options.clone())
+            .await
+            .unwrap(),
+    );
+    let tenant = TenantId::new("review-tenant").unwrap();
+    let stream = StreamId::new(tenant, "item", "held").unwrap();
+    let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let guard = Arc::new(ReviewPoolHold {
+        entered,
+        release: release.clone(),
+    });
+    let writing = adapter.clone();
+    let written_stream = stream.clone();
+    let writer = tokio::spawn(async move {
+        writing
+            .append_guarded(
+                &written_stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta("review-shutdown", &serde_json::json!({})),
+                guard,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut queued = Box::pin(adapter.stream_version(&stream));
+    assert!(matches!(
+        queued
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    assert_eq!(adapter.pool_status().waiting, 1);
+    let mut cancelled_shutdown = Box::pin(adapter.shutdown());
+    assert!(matches!(
+        cancelled_shutdown
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    assert!(adapter.pool_status().closed);
+    drop(cancelled_shutdown);
+    assert_eq!(queued.await, Err(EventLogError::Closed));
+    assert_eq!(adapter.pool_status().waiting, 0);
+    assert_eq!(adapter.pool_status().checked_out, 1);
+    assert_eq!(
+        adapter.stream_version(&stream).await,
+        Err(EventLogError::Closed)
+    );
+    let started = Instant::now();
+    let (first, second) = tokio::join!(adapter.shutdown(), adapter.shutdown());
+    for result in [first, second] {
+        assert_eq!(
+            result,
+            Err(EventLogError::Deadline {
+                operation: "shutdown"
+            })
+        );
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(adapter.pool_status().checked_out, 1);
+    release.notify_waiters();
+    let committed = writer.await.unwrap().unwrap();
+    assert_eq!(committed.last_version, 1);
+    let (first, second) = tokio::join!(adapter.shutdown(), adapter.shutdown());
+    first.unwrap();
+    second.unwrap();
+    let status = adapter.pool_status();
+    assert!(status.closed);
+    assert_eq!((status.checked_out, status.waiting, status.idle), (0, 0, 0));
+    assert_eq!(
+        adapter.read_feed(stream.tenant(), 0, 1).await,
+        Err(EventLogError::Closed)
+    );
+    let reopened = PostgresEventStore::connect_local(&url, prefix, options)
+        .await
+        .unwrap();
+    let replay = reopened
+        .recorded_command(
+            &stream,
+            "review-shutdown",
+            &eventlog_conformance::meta("review-shutdown", &serde_json::json!({})).request_hash,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.events, committed.events);
+    reopened.shutdown().await.unwrap();
+    eprintln!(
+        "public shutdown cancellation: queued Closed; two bounded shutdown deadlines; accepted command retained; repeated shutdown drained 0/0/0"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn public_queue_cancellation_and_broken_idle_reclaim_exact_capacity() {
+    use eventlog_core::EventLogError;
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::{Duration, Instant},
+    };
+    let _exclusive = EXCLUSIVE.lock().await;
+    let url = url().expect("required real PostgreSQL review fixture");
+    let prefix = "review_pool_queue";
+    store(prefix).await.unwrap().shutdown().await.unwrap();
+    let options = eventlog_postgres::PoolOptions {
+        max_connections: 1,
+        max_waiters: 1,
+        acquisition_timeout: Duration::from_millis(75),
+        ..eventlog_postgres::PoolOptions::default()
+    };
+    let tagged_url = format!(
+        "{url}{}application_name=eventlog_pool_review_queue",
+        if url.contains('?') { '&' } else { '?' }
+    );
+    let adapter = Arc::new(
+        PostgresEventStore::connect_local(&tagged_url, prefix, options)
+            .await
+            .unwrap(),
+    );
+    let stream = StreamId::new(TenantId::new("review-tenant").unwrap(), "item", "queued").unwrap();
+    let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let writing = adapter.clone();
+    let written_stream = stream.clone();
+    let guard = Arc::new(ReviewPoolHold {
+        entered,
+        release: release.clone(),
+    });
+    let writer = tokio::spawn(async move {
+        writing
+            .append_guarded(
+                &written_stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta("review-queue", &serde_json::json!({})),
+                guard,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..4 {
+        let mut cancelled = Box::pin(adapter.stream_version(&stream));
+        assert!(matches!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        let state = adapter.pool_status();
+        assert_eq!((state.checked_out, state.waiting, state.idle), (1, 1, 0));
+        assert_eq!(
+            adapter.stream_version(&stream).await,
+            Err(EventLogError::Overloaded)
+        );
+        drop(cancelled);
+        assert_eq!(adapter.pool_status().waiting, 0);
+        let started = Instant::now();
+        assert_eq!(
+            adapter.stream_version(&stream).await,
+            Err(EventLogError::Deadline {
+                operation: "pool acquisition"
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let state = adapter.pool_status();
+        assert_eq!((state.checked_out, state.waiting, state.idle), (1, 0, 0));
+    }
+    let mut granted = Box::pin(adapter.stream_version(&stream));
+    assert!(matches!(
+        granted
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    release.notify_waiters();
+    let committed = writer.await.unwrap().unwrap();
+    let state = adapter.pool_status();
+    assert_eq!((state.checked_out, state.waiting, state.idle), (0, 1, 1));
+    drop(granted);
+    let state = adapter.pool_status();
+    assert_eq!((state.checked_out, state.waiting, state.idle), (0, 0, 1));
+    assert_eq!(adapter.stream_version(&stream).await.unwrap(), Some(1));
+    let observer = client(&url).await;
+    let rows = observer.query("SELECT pid FROM pg_stat_activity WHERE application_name = 'eventlog_pool_review_queue'", &[]).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one idle server connection belongs to this exact test adapter"
+    );
+    let pid: i32 = rows[0].get(0);
+    assert!(
+        observer
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let started = Instant::now();
+    while observer
+        .query_opt("SELECT pid FROM pg_stat_activity WHERE pid = $1", &[&pid])
+        .await
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the fixture's terminated backend never exited"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut transport_refusals = 0;
+    loop {
+        match adapter.stream_version(&stream).await {
+            Ok(Some(1)) => break,
+            Err(EventLogError::Backend(_)) => transport_refusals += 1,
+            result => panic!("broken-idle recovery changed its typed outcome: {result:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let state = adapter.pool_status();
+        assert!(
+            state.checked_out + state.idle <= 1 && state.waiting <= 1,
+            "{state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let replay = adapter
+        .recorded_command(
+            &stream,
+            "review-queue",
+            &eventlog_conformance::meta("review-queue", &serde_json::json!({})).request_hash,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.events, committed.events);
+    adapter.shutdown().await.unwrap();
+    let state = adapter.pool_status();
+    assert_eq!((state.checked_out, state.waiting, state.idle), (0, 0, 0));
+    eprintln!(
+        "public queue: four cancellations, four acquisition deadlines, four overloads, one granted-unpolled cancellation, own idle backend {pid} terminated; reconnect transport_refusals={transport_refusals}"
+    );
+}
