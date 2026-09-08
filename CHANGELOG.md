@@ -1,9 +1,10 @@
 # Changelog
 
-All notable changes to this component are recorded here. Versions are component-scoped and released
-under `eventlog-v*` tags.
+All notable changes to this component are recorded here. Releases use bare semantic-version tags.
 
 ## Unreleased
+
+## 0.1.0 - 2026-09-01
 
 ### Added
 
@@ -24,3 +25,7 @@ under `eventlog-v*` tags.
   catch-up one is refused.
 - Both backends: projection tables, durable cursors, projection rebuild from the log, and
   `pg_try_advisory_xact_lock` around a PostgreSQL catch-up pass.
+- `eventlog-core`: `EventLogError::GuardRefused { code }`, a domain-neutral, machine-readable
+  refusal result for guards. The shared backend exercise proves a refusal rolls back both the
+  append and any projection write made while evaluating the guard.
+- Source distribution under Apache License 2.0.

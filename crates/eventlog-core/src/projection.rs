@@ -138,7 +138,9 @@ pub trait Projector: Send + Sync {
 /// another thread than the caller's.
 pub trait Guard: Send + Sync {
     /// # Errors
-    /// Returns the refusal. The append is abandoned and nothing is written.
+    /// Returns [`EventLogError::GuardRefused`] with the domain owner's stable refusal code when
+    /// the command is rejected, or the relevant store error when the check cannot be completed.
+    /// Either result abandons the append and rolls back every projection write the guard made.
     fn check<'a>(
         &'a self,
         store: &'a mut dyn ProjectionStore,

@@ -29,4 +29,4 @@ exercise that defines what they must agree on. No aggregates, no projections, no
   PostgreSQL. It follows `model/modules/modules/corpus/crates/corpus-store/src/contract.rs`, which
   is the only shared exercise in the repository and the reason M-022 was found.
 - The component has its own workspace, gate, `CHANGELOG.md` and `AGENTS.md`, and releases under
-  `eventlog-v*` tags.
+  bare semantic-version tags.

@@ -20,12 +20,11 @@ is proved for the deployment.
 
 ## Status
 
-**Unreleased, and the backlog is finished.** Version `0.1.0-dev.1`, `publish = false`, no git tag
-cut. All six stories in [`docs/stories/`](docs/stories/README.md) are `done` — the log, aggregates
-and snapshots, inline and catch-up projections, schema evolution with golden vectors, erasure and
-redaction, and the async store. Everything landed so far is under `## Unreleased` in
-[`CHANGELOG.md`](CHANGELOG.md); versions are component-scoped and release under a bare-version
-tag — `0.1.0`, the version and nothing else.
+**Release-ready at 0.1.0.** The crates are source-distributed from this repository under Apache
+License 2.0 and remain excluded from crates.io with `publish = false`. All stories in
+[`docs/stories/`](docs/stories/README.md) are `done` — the log, aggregates and snapshots, inline and
+catch-up projections, schema evolution with golden vectors, erasure and redaction, the async store,
+and typed guard refusals. Releases use a bare-version tag — `0.1.0`, the version and nothing else.
 
 ## Build, test, run
 
@@ -56,7 +55,7 @@ docker rm -f eventlog-test-pg
 
 | crate | owns |
 |---|---|
-| `crates/eventlog-core` | the envelope, `StreamId`, `Expected`, `EventLogError`, the `EventStore` port; `Aggregate`/`Repository`/`SnapshotPolicy`; `Projector`/`ProjectionSpec`/`CatchUpRunner` |
+| `crates/eventlog-core` | the envelope, `StreamId`, `Expected`, typed `EventLogError::GuardRefused`, the `EventStore` port; `Aggregate`/`Repository`/`SnapshotPolicy`; `Projector`/`ProjectionSpec`/`CatchUpRunner` |
 | `crates/eventlog-sqlite` | `SqliteEventStore` — file and `:memory:`, per-owner table prefixes |
 | `crates/eventlog-postgres` | PostgreSQL 13 or later, with a commit watermark so a feed reader cannot skip an event that committed late |
 | `crates/eventlog-conformance` | the one exercise both backends must pass |

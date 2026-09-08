@@ -26,5 +26,8 @@ decision explicit rather than accidental.
 - A guard — an invariant spanning streams — reads an inline projection `FOR UPDATE` inside the
   append transaction. The kit refuses to start when a guard names a projection registered as
   catch-up.
+- A domain refusal is returned as `EventLogError::GuardRefused { code }`. The code is stable and
+  machine-readable; the backend rolls back the append and every projection write made by the
+  guard before refusing.
 - Any projection can be dropped and rebuilt from the log, and a test does exactly that and compares
   the result byte for byte.

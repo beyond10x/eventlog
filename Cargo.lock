@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-conformance"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "eventlog-core",
  "serde",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-core"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-postgres"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "eventlog-conformance",
  "eventlog-core",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-sqlite"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "eventlog-conformance",
  "eventlog-core",
