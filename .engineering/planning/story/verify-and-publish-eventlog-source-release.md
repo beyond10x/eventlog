@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:verify-and-publish-eventlog-source-release
 kind: story
-status: draft
+status: active
 title: Verify integrated Eventlog and complete authorized source publication
 tags:
 - release
@@ -23,8 +23,10 @@ scope:
 - confidence: cited
   path: README.md
 - confidence: cited
+  path: crates/eventlog-postgres/examples/observation/laboratory-profile.json
+- confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
-revision: 7
+revision: 11
 ---
 ## Intent and authorization boundary
 
@@ -39,3 +41,7 @@ The combined branch has no open confirmed actionable finding; complete real-back
 Required scripts and examples are described in AGENTS.md Releases and README Required proof and comparative laboratory. Baseline20e00c1eeab5d67bd5f749bbbd871b1fbfe7f796 is isolated in managed wt-d3a4aefef9fc; copied harness/dependency changes are intentional and retained as proof, with original runtime bytes verified. Candidate source must remain frozen through the comparative run. Fixture resource limit is two CPUs,1GiB,256 pids.
 
 Coordinator owns Cargo.toml/Cargo.lock, LICENSE, CHANGELOG.md, README.md, required test roster, planning records and publication. No consumer promotion, deployment, Atlas/Website source change, documentation shell release or private key upload is included. Ordinary source completion follows this repository's current authority.
+
+## Comparative fixture correction
+
+Before this session's comparative measurement, Docker inspection returned `volume /var/lib/postgresql/data` for the assigned integration fixture. laboratory-profile.json:10 incorrectly described a container writable layer. Update the declaration to v7 with an explicit Docker data volume; preserve existing workloads, compiler policy, CPU/memory/pid limits and every acceptance budget. This corrects measured fixture provenance before measurement, not a threshold changed to pass a result. Earlier v6 receipts remain historical evidence. Root observed this directly on 2026-09-09 at00:59UTC.

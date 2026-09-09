@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:validate-public-append-inputs
 kind: story
-status: active
+status: implemented
 title: Enforce constructor invariants at public input boundaries
 tags:
 - code-review
@@ -15,11 +15,11 @@ scope:
   path: crates/eventlog-conformance/src/lib.rs
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-postgres/tests/input_validation.rs
 - confidence: cited
   path: crates/eventlog-sqlite/tests/input_validation_review.rs
-revision: 7
+revision: 10
 ---
 ## Problem and reachability
 
@@ -36,3 +36,7 @@ Reuse constructor validation in TenantId/StreamId deserialization and NewEvent/C
 ## Scope
 
 Cited core/src/lib.rs defines the input types and shared validator; shared conformance/src/lib.rs carries backend-neutral assertions. Cited SQLite input_validation_review.rs holds the three retained adversarial cases. Inferred separate PostgreSQL tests/input_validation.rs invokes the same cases with real PostgreSQL. Coordinator owns required-case roster and shared docs. Serialize after snapshot's overlapping core and shared-conformance edits, then run concurrently with isolated PostgreSQL rewrite-rule admission repair.
+
+## Scope and result confirmation
+
+Commit eae613186532260679fb16f82e0a56e7c3faf44c touches exactly the four scoped paths. The inferred PostgreSQL wrapper was confirmed. Shared real-backend coverage checks fifty invalid batch scenarios, preserves the three original adversarial cases, and proves valid wire forms and exact field limits. Final integration source09c71ec3165e187f7baf6277ffa40079d863f3cd ran98 cases with no failures/skips and all required cases selected. Independent review found no additional defect. No backend implementation, release metadata or AEP file was changed by this worker.

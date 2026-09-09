@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:reject-postgres-rewrite-rules
 kind: story
-status: active
+status: implemented
 title: Reject rewrite rules during PostgreSQL admission
 tags:
 - code-review
@@ -15,7 +15,7 @@ scope:
   path: crates/eventlog-postgres/src/schema.rs
 - confidence: cited
   path: crates/eventlog-postgres/tests/conformance.rs
-revision: 5
+revision: 7
 ---
 ## Problem and reachability
 
@@ -32,3 +32,7 @@ Reject pg_rewrite entries through the common physical-shape validator, not a spe
 ## Scope
 
 Cited crates/eventlog-postgres/src/schema.rs and tests/conformance.rs. Coordinator owns production-proof required-case roster and docs. Wait for snapshot schema/test edits to integrate, then implement in parallel with the disjoint common-input-validation unit.
+
+## Scope and result confirmation
+
+Commit6bbb06d5a21412a8c51ae69e5462b4eb28d36460 touches exactly schema.rs and tests/conformance.rs. Review discovered that explicit projection migration skipped the shared physical-shape validator, so the fix invokes that check inside the existing migration transaction as well as rejecting pg_rewrite in the common validator. Four focused cases cover all eleven actual durable tables, local and hosted admission, projection migration/create/register, and retained valid receipts. The disabled-guard mutant fails all four cases. Independent review found no additional issue. Final integration09c71ec3165e187f7baf6277ffa40079d863f3cd ran98 cases with no failures/skips. Coordinator added all four cases to the mandatory production roster.

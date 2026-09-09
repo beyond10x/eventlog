@@ -1,13 +1,13 @@
 {
-  "profile": "eventlog-comparative-lab-v6",
-  "declared_before_measurement": "2026-09-07T01:21:54+00:00",
+  "profile": "eventlog-comparative-lab-v7",
+  "declared_before_measurement": "2026-09-09T00:59:32+00:00",
   "scope": "Disposable single-host laboratory only; no production capacity admission",
   "seed": 73491,
   "database_image": "postgres:17.6-alpine3.22",
   "database_cpu_limit": 2,
   "database_memory_bytes": 1073741824,
   "database_pids_limit": 256,
-  "database_storage": "disposable container writable layer; actual filesystem capacity/IO observations retained separately",
+  "database_storage": "disposable Docker volume mounted at /var/lib/postgresql/data, shared by both adapter measurements; actual filesystem capacity/IO observations retained separately",
   "processes": 2,
   "concurrency_per_process": {
     "1": "worker0 and worker1 run sequentially, one lane each",
@@ -47,7 +47,7 @@
   "failure_interval": "separate declared connection-loss/restart test after each adapter sweep; resume and compare retained event/receipt/view state",
   "acceptance": "zero correctness violations and bounds breaches; report each unmeasured metric explicitly instead of approving capacity",
   "comparison": "identical hardware, source fixture, offered concurrency, data sizes and DB budget; adapter-internal baseline serialization versus candidate pool size is the measured implementation difference",
-  "supersedes_before_measurement": "eventlog-comparative-lab-v5; preserve original v5 receipts as evidence preceding the pool shutdown/return race correction",
+  "supersedes_before_measurement": "eventlog-comparative-lab-v6; correct the fixture storage description before measurement and preserve earlier receipts; workload and acceptance budgets remain unchanged",
   "aggregate_concurrency": [
     1,
     8,

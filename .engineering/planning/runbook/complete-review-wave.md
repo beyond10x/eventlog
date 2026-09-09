@@ -4,7 +4,7 @@ id: runbook:complete-review-wave
 kind: runbook
 status: draft
 title: Complete Eventlog review and integration
-revision: 4
+revision: 5
 ---
 ## Authorization and ownership
 
@@ -49,3 +49,13 @@ The typed next-wave result places story:reject-postgres-rewrite-rules and story:
 An independent read-only review of the selected snapshot design found no reachable gap across redaction, erase/recreate ABA, pre-fold capture and publication locking. It did not claim tests on unfinished implementation.
 
 Comparative baseline managed recordwt-d3a4aefef9fc, exact20e00c1eeab5d67bd5f749bbbd871b1fbfe7f796, coordinator lease. Disposable eventlog-complete-20260909 has the required2CPU/1GiB/256pids envelope; memory-swap was set explicitly to2GiB because Docker refused changing memory alone. Source proof awaits the final frozen candidate. Final publication is tracked by story:verify-and-publish-eventlog-source-release rather than conflated with the preserved historical implemented preparation record.
+
+## Implementation closure and final proof
+
+All four confirmed review defect classes are fixed: stale snapshots, catch-up connection reuse, public input validation and PostgreSQL rewrite-rule admission. Guard/effect feature contracts are integrated. Each unit received a bounded adversary pass; all post-fix passes found no additional issue. Broader review findings each have a fixed outcome recorded against their original review. Per-agent token/tool metrics remain unavailable from this harness.
+
+Final code integration09c71ec3165e187f7baf6277ffa40079d863f3cd is clean and passed the full required production gate:98 passed,0failed,0skipped,missing_required_cases=[]. Formatting and clippy passed. All three ESS roots validate. Source and manifest metadata after this gate change only planning receipts and the laboratory storage declaration, which is corrected to a v7 Docker-volume profile before measurement without changing workloads or budgets.
+
+Exact frozen-source final receipts will be retained under $HOME/.cache/eventlog-complete-20260909/evidence and the comparative run under $HOME/.cache/eventlog-complete-20260909/comparative-final. Read their source identities and verdicts directly; this prospective location record is not evidence of a future successful run. No source edits may occur during that comparative run. Source publication remains a separate human gate after integration and final proof, owned by story:verify-and-publish-eventlog-source-release.
+
+Snapshot treewt-f0ba183ee985 was published, reports retained, leases ended, Cargo cleaned1.4GiB, then worktree finish and exact-id reviewed GC removed it; its disposable PostgreSQL fixture was stopped and removed. A coordinator heartbeat accidentally named a separate snapshot-review session; that coordinator-owned record was ended, and the actual reviewer's separate lease was left to its owner. Other unit and integration cleanup follows published recovery proof, retained evidence and process/lease checks.
