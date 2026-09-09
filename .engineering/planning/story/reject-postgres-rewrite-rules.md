@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:reject-postgres-rewrite-rules
 kind: story
-status: draft
+status: active
 title: Reject rewrite rules during PostgreSQL admission
 tags:
 - code-review
@@ -15,7 +15,7 @@ scope:
   path: crates/eventlog-postgres/src/schema.rs
 - confidence: cited
   path: crates/eventlog-postgres/tests/conformance.rs
-revision: 3
+revision: 5
 ---
 ## Problem and reachability
 

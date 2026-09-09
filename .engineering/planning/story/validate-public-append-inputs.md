@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:validate-public-append-inputs
 kind: story
-status: draft
+status: active
 title: Enforce constructor invariants at public input boundaries
 tags:
 - code-review
@@ -19,7 +19,7 @@ scope:
   path: crates/eventlog-postgres/tests/input_validation.rs
 - confidence: cited
   path: crates/eventlog-sqlite/tests/input_validation_review.rs
-revision: 5
+revision: 7
 ---
 ## Problem and reachability
 

@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:prevent-stale-snapshots-after-redaction
 kind: story
-status: active
+status: implemented
 title: Prevent stale snapshots from restoring redacted state
 tags:
 - code-review
@@ -34,7 +34,7 @@ scope:
   path: ess/snapshots/domains/snapshots.yaml
 - confidence: cited
   path: ess/snapshots/system.yaml
-revision: 17
+revision: 18
 ---
 ## Problem
 
