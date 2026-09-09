@@ -24,8 +24,8 @@ use std::{
 use eventlog_core::{
     AppendResult, BoxFuture, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError,
     EventStore, Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec,
-    ProjectionStore, Projector, RecordedEvent, Snapshot, StreamId, StreamSlice, TenantId,
-    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
+    ProjectionStore, Projector, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice,
+    TenantId, bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
     validate_field,
 };
 use serde_json::Value;
@@ -242,6 +242,7 @@ impl PostgresEventStore {
                  DROP TABLE IF EXISTS {prefix}_commands;
                  DROP TABLE IF EXISTS {prefix}_claims;
                  DROP TABLE IF EXISTS {prefix}_snapshots;
+                 DROP TABLE IF EXISTS {prefix}_snapshot_generations;
                  DROP TABLE IF EXISTS {prefix}_projection_cursors;
                  DROP TABLE IF EXISTS {prefix}_blobs;
                  DROP TABLE IF EXISTS {prefix}_identity;
@@ -715,6 +716,7 @@ impl EventStore for PostgresEventStore {
             let transaction = client.transaction().await.map_err(backend)?;
             publication_gate(&transaction, &self.prefix, false).await?;
             let now = OffsetDateTime::now_utc();
+            transaction.execute(&format!("INSERT INTO {prefix}_snapshot_generations (tenant_id,stream_type,stream_id,generation) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant_id,stream_type,stream_id) DO UPDATE SET generation=EXCLUDED.generation"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), &uuid::Uuid::now_v7()]).await.map_err(backend)?;
             let changed = transaction
                 .execute(
                     &format!(
@@ -771,13 +773,51 @@ impl EventStore for PostgresEventStore {
 
     fn save_snapshot<'a>(
         &'a self,
-        stream: &'a StreamId,
-        snapshot: &'a Snapshot,
+        _stream: &'a StreamId,
+        _snapshot: &'a Snapshot,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid("snapshot provenance is required; capture snapshot_generation before folding and use save_snapshot_checked".into()))
+        })
+    }
+
+    fn snapshot_generation<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<SnapshotGeneration>, EventLogError>> {
         self.bounded(async move {
             let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
-            client
+            client.quarantine();
+            let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction, prefix, false).await?;
+            transaction.execute(&format!("INSERT INTO {prefix}_snapshot_generations (tenant_id,stream_type,stream_id,generation) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant_id,stream_type,stream_id) DO NOTHING"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), &uuid::Uuid::now_v7()]).await.map_err(backend)?;
+            let generation: uuid::Uuid = transaction.query_one(&format!("SELECT generation FROM {prefix}_snapshot_generations WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id()]).await.map_err(backend)?.get(0);
+            transaction.commit().await.map_err(|_| EventLogError::UnknownCommit)?;
+            client.settled();
+            Ok(Some(SnapshotGeneration::from_uuid(generation)))
+        })
+    }
+
+    fn save_snapshot_checked<'a>(
+        &'a self,
+        stream: &'a StreamId,
+        snapshot: &'a Snapshot,
+        generation: &'a SnapshotGeneration,
+    ) -> BoxFuture<'a, Result<bool, EventLogError>> {
+        self.bounded(async move {
+            let prefix = &self.prefix;
+            let mut client = self.pool.acquire().await?;
+            client.quarantine();
+            let transaction = client.transaction().await.map_err(backend)?;
+            publication_gate(&transaction, prefix, false).await?;
+            let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)?;
+            if accepted == 0 {
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
+                return Ok(false);
+            }
+            transaction
                 .execute(
                     &format!(
                         "INSERT INTO {prefix}_snapshots (
@@ -802,8 +842,9 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            transaction.commit().await.map_err(|_| EventLogError::UnknownCommit)?;
             client.settled();
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -818,8 +859,10 @@ impl EventStore for PostgresEventStore {
                 .query_opt(
                     &format!(
                         "SELECT version, state_schema_version, state, recorded_at
-                         FROM {prefix}_snapshots
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3"
+                         FROM {prefix}_snapshots JOIN {prefix}_snapshot_generations
+                         USING (tenant_id, stream_type, stream_id)
+                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
+                         AND cached_generation = generation"
                     ),
                     &[
                         &stream.tenant().as_str(),
@@ -855,13 +898,14 @@ impl EventStore for PostgresEventStore {
             let mut client = self.pool.acquire().await?;
             client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
-            publication_gate(&transaction, &self.prefix, false).await?;
+            publication_gate(&transaction, &self.prefix, true).await?;
             for table in [
                 "events",
                 "commands",
                 "claims",
                 "identity",
                 "snapshots",
+                "snapshot_generations",
                 "projection_cursors",
                 "blobs",
             ] {

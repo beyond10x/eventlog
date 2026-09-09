@@ -499,6 +499,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
         "claims",
         "identity",
         "snapshots",
+        "snapshot_generations",
         "projection_cursors",
         "blobs",
         "scope_counters",
@@ -1065,6 +1066,22 @@ async fn verified_tls_requires_matching_server_and_separate_application_role() {
     sql.batch_execute("GRANT USAGE ON SCHEMA hosted_owner TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_owner TO eventlog_test_application; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_owner TO eventlog_test_application").await.expect("DML-only role grants");
     let config = PostgresConfig::verified(&app_url, "hosted_owner", "kit", roots.clone())
         .expect("verified application config");
+    sql.batch_execute(
+        "REVOKE UPDATE ON hosted_owner.kit_snapshot_generations FROM eventlog_test_application",
+    )
+    .await
+    .unwrap();
+    assert!(
+        PostgresEventStore::open(config.clone(), PoolOptions::default(), 16, 2, 8)
+            .await
+            .is_err(),
+        "snapshot metadata permissions are required before serving"
+    );
+    sql.batch_execute(
+        "GRANT UPDATE ON hosted_owner.kit_snapshot_generations TO eventlog_test_application",
+    )
+    .await
+    .unwrap();
     sql.batch_execute(
         "REVOKE INSERT ON hosted_owner.kit_scope_counters FROM eventlog_test_application",
     )
@@ -1949,7 +1966,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
         .expect("old data");
     original.shutdown().await.expect("old writer stopped");
     let sql = client(&url).await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry").await.expect("exact original populated schema");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations").await.expect("exact original populated schema");
     let config = PostgresConfig::isolated(&url, "schema_upgrade").expect("config");
     let (a, b) = tokio::join!(
         PostgresEventStore::migrate(config.clone(), PoolOptions::default(), &[]),
@@ -1978,7 +1995,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
             .is_err(),
         "unknown version/checksum refuses before serving"
     );
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry").await.expect("restore old fixture");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations").await.expect("restore old fixture");
     PostgresEventStore::migrate(
         PostgresConfig::isolated(&url, "schema_upgrade").expect("config"),
         PoolOptions::default(),
@@ -2355,5 +2372,194 @@ async fn public_queue_cancellation_and_broken_idle_reclaim_exact_capacity() {
     assert_eq!((state.checked_out, state.waiting, state.idle), (0, 0, 0));
     eprintln!(
         "public queue: four cancellations, four acquisition deadlines, four overloads, one granted-unpolled cancellation, own idle backend {pid} terminated; reconnect transport_refusals={transport_refusals}"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_history_and_repository_privacy_interleavings() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("snapshot_races").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let store: std::sync::Arc<dyn EventStore> = std::sync::Arc::new(adapter);
+    eventlog_conformance::run_snapshot_generations(store.clone()).await;
+    let tenant = eventlog_core::TenantId::new("snapshot-races").unwrap();
+    for automatic in [true, false] {
+        let id = if automatic {
+            "automatic-postgres"
+        } else {
+            "explicit-postgres"
+        };
+        let repository =
+            eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone())
+                .with_policy(eventlog_core::SnapshotPolicy {
+                    every: u64::from(automatic),
+                });
+        if !automatic {
+            repository
+                .handle(
+                    &tenant,
+                    id,
+                    &(),
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        let stream = repository.stream(&tenant, id).unwrap();
+        let (observed, resume) = eventlog_conformance::pause_snapshot_serialization(id);
+        let owner = tenant.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                if automatic {
+                    repository
+                        .handle(
+                            &owner,
+                            id,
+                            &(),
+                            &eventlog_conformance::meta(id, &serde_json::json!({})),
+                        )
+                        .await
+                        .map(|outcome| outcome.version)
+                } else {
+                    repository.snapshot_now(&owner, id).await
+                }
+            })
+        });
+        tokio::task::spawn_blocking(move || {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        store.redact(&stream, 1, "privacy").await.unwrap();
+        resume.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 1);
+        let loaded =
+            eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone())
+                .load(&tenant, id)
+                .await
+                .unwrap();
+        assert_eq!(
+            loaded.state.total, 0,
+            "delayed repository cache must agree with redacted fold"
+        );
+        if automatic {
+            assert!(store.load_snapshot(&stream).await.unwrap().is_none());
+        } else {
+            assert_eq!(
+                store.load_snapshot(&stream).await.unwrap().unwrap().state["total"],
+                serde_json::json!(0)
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn committed_commands_survive_snapshot_storage_failure() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("cache_failure").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let store = std::sync::Arc::new(adapter);
+    let sql = client(&url().unwrap()).await;
+    sql.batch_execute("CREATE OR REPLACE FUNCTION cache_failure_injected() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected cache failure'; END; $$; CREATE TRIGGER cache_failure_injected BEFORE INSERT ON cache_failure_snapshots FOR EACH ROW EXECUTE FUNCTION cache_failure_injected();").await.unwrap();
+    let repository =
+        eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone())
+            .with_policy(eventlog_core::SnapshotPolicy { every: 1 });
+    let tenant = TenantId::new("tenant").unwrap();
+    assert_eq!(
+        repository
+            .handle(
+                &tenant,
+                "failure",
+                &(),
+                &eventlog_conformance::meta("failure", &serde_json::json!({}))
+            )
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    assert!(repository.snapshot_now(&tenant, "failure").await.is_err());
+    assert_eq!(
+        repository
+            .load(&tenant, "failure")
+            .await
+            .unwrap()
+            .state
+            .total,
+        1
+    );
+    assert_eq!(sql.query_one("SELECT count(*) FROM cache_failure_snapshot_generations WHERE cached_generation IS NOT NULL", &[]).await.unwrap().get::<_, i64>(0), 0, "failed cache write rolls back its proof");
+    sql.batch_execute("DROP TRIGGER cache_failure_injected ON cache_failure_snapshots; DROP FUNCTION cache_failure_injected()").await.unwrap();
+}
+#[tokio::test]
+async fn snapshot_capture_waits_for_complete_tenant_erasure() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("snapshot_erasure").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let store = std::sync::Arc::new(adapter);
+    let tenant = TenantId::new("tenant").unwrap();
+    let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("one", &serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+    let mut sql = client(&url().unwrap()).await;
+    let transaction = sql.transaction().await.unwrap();
+    transaction
+        .query("SELECT * FROM snapshot_erasure_events FOR UPDATE", &[])
+        .await
+        .unwrap();
+    let eraser = store.clone();
+    let owner = tenant.clone();
+    let erasure = tokio::spawn(async move { eraser.forget_tenant(&owner).await });
+    let observer = client(&url().unwrap()).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting: bool = observer.query_one("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE query LIKE 'DELETE FROM snapshot_erasure_events%' AND wait_event_type='Lock')", &[]).await.unwrap().get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "erasure must reach its blocked DELETE"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let capturer = store.clone();
+    let empty = StreamId::new(tenant.clone(), "item", "empty").unwrap();
+    let observed_stream = empty.clone();
+    let mut capture =
+        tokio::spawn(async move { capturer.snapshot_generation(&observed_stream).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut capture)
+            .await
+            .is_err(),
+        "capture cannot create a token in the middle of erasure"
+    );
+    transaction.commit().await.unwrap();
+    erasure.await.unwrap().unwrap();
+    let generation = capture.await.unwrap().unwrap().unwrap();
+    assert_eq!(
+        store.snapshot_generation(&empty).await.unwrap().unwrap(),
+        generation
+    );
+    assert!(
+        store
+            .read_stream(&stream, 0, 100)
+            .await
+            .unwrap()
+            .events
+            .is_empty()
     );
 }

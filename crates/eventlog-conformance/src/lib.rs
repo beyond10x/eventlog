@@ -357,6 +357,11 @@ async fn bytes_live_outside_the_log_and_can_be_erased_alone(
 }
 
 async fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
+    let generation = store
+        .snapshot_generation(stream)
+        .await
+        .expect("observable")
+        .expect("verified snapshots");
     assert!(
         store
             .load_snapshot(stream)
@@ -371,7 +376,7 @@ async fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
         recorded_at: OffsetDateTime::UNIX_EPOCH,
     };
     store
-        .save_snapshot(stream, &snapshot)
+        .save_snapshot_checked(stream, &snapshot, &generation)
         .await
         .expect("writable");
     let loaded = store
@@ -388,7 +393,12 @@ async fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
         state: json!({ "state": "newer" }),
         recorded_at: OffsetDateTime::UNIX_EPOCH,
     };
-    store.save_snapshot(stream, &newer).await.expect("writable");
+    assert!(
+        store
+            .save_snapshot_checked(stream, &newer, &generation)
+            .await
+            .expect("writable")
+    );
     let loaded = store
         .load_snapshot(stream)
         .await
@@ -397,6 +407,239 @@ async fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {
     assert_eq!(
         loaded.state_schema_version, 2,
         "a stream keeps its latest fold, not a pile of them"
+    );
+}
+
+/// An aggregate used by both adapters to prove that cached privacy history matches a full fold.
+#[derive(Debug, serde::Deserialize)]
+pub struct SnapshotCounter {
+    pub id: String,
+    pub total: u64,
+}
+
+type SnapshotPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+static SNAPSHOT_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, SnapshotPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+/// Pause one serialization after the repository has folded state, without a fake `EventStore`.
+/// The caller completes a real privacy operation before resuming serialization.
+///
+/// # Panics
+/// Panics if that id already has a pending pause or the test registry is poisoned.
+pub fn pause_snapshot_serialization(
+    id: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (arrived, observed) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    assert!(
+        SNAPSHOT_PAUSES
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), (arrived, resumed))
+            .is_none()
+    );
+    (observed, resume)
+}
+
+impl serde::Serialize for SnapshotCounter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let pause = SNAPSHOT_PAUSES.lock().unwrap().remove(&self.id);
+        if let Some((arrived, resumed)) = pause {
+            arrived.send(()).map_err(serde::ser::Error::custom)?;
+            resumed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(serde::ser::Error::custom)?;
+        }
+        let mut state = serializer.serialize_struct("SnapshotCounter", 2)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("total", &self.total)?;
+        state.end()
+    }
+}
+
+pub struct SnapshotIncrement;
+impl eventlog_core::DomainEvent for SnapshotIncrement {
+    fn name(&self) -> &'static str {
+        "snapshot.incremented"
+    }
+    fn schema_version(&self) -> u32 {
+        1
+    }
+    fn to_data(&self) -> Result<serde_json::Value, EventLogError> {
+        Ok(json!({}))
+    }
+    fn from_data(_: &str, _: u32, _: &serde_json::Value) -> Result<Self, EventLogError> {
+        Ok(Self)
+    }
+}
+
+impl eventlog_core::Aggregate for SnapshotCounter {
+    type Command = ();
+    type Event = SnapshotIncrement;
+    type Error = EventLogError;
+    const TYPE: &'static str = "snapshot_counter";
+    const STATE_SCHEMA_VERSION: u32 = 1;
+    fn empty(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            total: 0,
+        }
+    }
+    fn apply(&mut self, applied: &eventlog_core::Applied<'_, Self::Event>) {
+        if matches!(applied, eventlog_core::Applied::Happened { .. }) {
+            self.total += 1;
+        }
+    }
+    fn decide(&self, (): &()) -> Result<Vec<Self::Event>, EventLogError> {
+        Ok(vec![SnapshotIncrement])
+    }
+}
+
+/// Exercise delayed saves, current-history caching, repeated redaction, tenant isolation and ABA.
+///
+/// # Panics
+/// Panics when a backend violates the verified snapshot contract.
+pub async fn run_snapshot_generations(store: std::sync::Arc<dyn EventStore>) {
+    use eventlog_core::{Repository, SnapshotPolicy};
+    let repository =
+        Repository::<SnapshotCounter>::new(store.clone()).with_policy(SnapshotPolicy { every: 0 });
+    let tenant = TenantId::new("snapshot-history").unwrap();
+    let twin = TenantId::new("snapshot-twin").unwrap();
+    for (owner, id) in [
+        (&tenant, "subject"),
+        (&tenant, "unaffected"),
+        (&twin, "subject"),
+    ] {
+        repository
+            .handle(owner, id, &(), &meta(id, &json!({})))
+            .await
+            .unwrap();
+        repository.snapshot_now(owner, id).await.unwrap();
+    }
+    let stream = repository.stream(&tenant, "subject").unwrap();
+    let observed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    let loaded = repository.load(&tenant, "subject").await.unwrap();
+    let stale = Snapshot {
+        version: loaded.version,
+        state_schema_version: 1,
+        state: serde_json::to_value(loaded.state).unwrap(),
+        recorded_at: OffsetDateTime::now_utc(),
+    };
+    store.redact(&stream, 1, "privacy").await.unwrap();
+    assert!(matches!(
+        store.save_snapshot(&stream, &stale).await,
+        Err(EventLogError::Invalid(_))
+    ));
+    assert!(
+        !store
+            .save_snapshot_checked(&stream, &stale, &observed)
+            .await
+            .unwrap()
+    );
+    assert!(store.load_snapshot(&stream).await.unwrap().is_none());
+    assert_eq!(
+        repository
+            .load(&tenant, "subject")
+            .await
+            .unwrap()
+            .state
+            .total,
+        0
+    );
+    repository.snapshot_now(&tenant, "subject").await.unwrap();
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().state["total"],
+        json!(0)
+    );
+    let current = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    let valid = store.load_snapshot(&stream).await.unwrap().unwrap();
+    store.redact(&stream, 1, "changed-reason").await.unwrap();
+    assert!(
+        !store
+            .save_snapshot_checked(&stream, &valid, &current)
+            .await
+            .unwrap()
+    );
+    for (owner, id) in [(&tenant, "unaffected"), (&twin, "subject")] {
+        let other = repository.stream(owner, id).unwrap();
+        assert!(store.load_snapshot(&other).await.unwrap().is_some());
+        assert_eq!(repository.load(owner, id).await.unwrap().state.total, 1);
+    }
+    let empty = repository.stream(&tenant, "empty").unwrap();
+    let empty_generation = store.snapshot_generation(&empty).await.unwrap().unwrap();
+    store.forget_tenant(&tenant).await.unwrap();
+    assert!(
+        !store
+            .save_snapshot_checked(&stream, &stale, &observed)
+            .await
+            .unwrap()
+    );
+    repository
+        .handle(&tenant, "subject", &(), &meta("recreated", &json!({})))
+        .await
+        .unwrap();
+    repository
+        .handle(&tenant, "empty", &(), &meta("recreated-empty", &json!({})))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .save_snapshot_checked(&stream, &stale, &observed)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .save_snapshot_checked(&empty, &stale, &empty_generation)
+            .await
+            .unwrap()
+    );
+    assert_ne!(
+        store.snapshot_generation(&stream).await.unwrap().unwrap(),
+        observed
+    );
+    repository.snapshot_now(&tenant, "subject").await.unwrap();
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().state["total"],
+        json!(1)
+    );
+    let failures =
+        Repository::<SnapshotCounter>::new(store.clone()).with_policy(SnapshotPolicy { every: 1 });
+    let (observed, resume) = pause_snapshot_serialization("serialization-failure");
+    drop((observed, resume));
+    assert_eq!(
+        failures
+            .handle(
+                &tenant,
+                "serialization-failure",
+                &(),
+                &meta("serialization", &json!({}))
+            )
+            .await
+            .unwrap()
+            .version,
+        1,
+        "a committed command survives cache serialization failure"
+    );
+    let (observed, resume) = pause_snapshot_serialization("serialization-failure");
+    drop((observed, resume));
+    assert!(
+        failures
+            .snapshot_now(&tenant, "serialization-failure")
+            .await
+            .is_err(),
+        "explicit snapshot surfaces serialization failure"
+    );
+    assert_eq!(
+        failures
+            .load(&tenant, "serialization-failure")
+            .await
+            .unwrap()
+            .state
+            .total,
+        1
     );
 }
 
@@ -446,8 +689,13 @@ async fn forgetting_a_tenant_leaves_nothing(
     other: &TenantId,
     twin: &StreamId,
 ) {
+    let generation = store
+        .snapshot_generation(twin)
+        .await
+        .expect("observable")
+        .expect("verified snapshots");
     store
-        .save_snapshot(
+        .save_snapshot_checked(
             twin,
             &Snapshot {
                 version: 1,
@@ -455,6 +703,7 @@ async fn forgetting_a_tenant_leaves_nothing(
                 state: json!({ "state": "received" }),
                 recorded_at: OffsetDateTime::UNIX_EPOCH,
             },
+            &generation,
         )
         .await
         .expect("writable");

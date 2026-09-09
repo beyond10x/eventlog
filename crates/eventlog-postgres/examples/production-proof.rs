@@ -70,6 +70,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let required = [
+        "snapshot_history_and_repository_privacy_interleavings",
+        "schema::snapshot_tests::snapshot_schema_upgrade_retains_history_and_refuses_partial_metadata",
+        "committed_commands_survive_snapshot_storage_failure",
+        "snapshot_capture_waits_for_complete_tenant_erasure",
         "independent_first_appends_return_contract_outcomes",
         "isolated_transport_cannot_hide_a_remote_address_behind_localhost",
         "lost_commit_response_reconnects_to_exact_durable_receipt",

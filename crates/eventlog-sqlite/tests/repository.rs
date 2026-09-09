@@ -128,6 +128,35 @@ async fn fixture() -> (Arc<SqliteEventStore>, TenantId) {
 }
 
 #[tokio::test]
+async fn a_delayed_unproven_snapshot_cannot_restore_redacted_state() {
+    let (store, tenant) = fixture().await;
+    let repository = Repository::<Counter>::new(store.clone());
+    repository
+        .handle(&tenant, "delayed", &Command::Add(1), &meta("delayed"))
+        .await
+        .unwrap();
+    let loaded = repository.load(&tenant, "delayed").await.unwrap();
+    let stream = repository.stream(&tenant, "delayed").unwrap();
+    let snapshot = eventlog_core::Snapshot {
+        version: loaded.version,
+        state_schema_version: Counter::STATE_SCHEMA_VERSION,
+        state: serde_json::to_value(loaded.state).unwrap(),
+        recorded_at: OffsetDateTime::now_utc(),
+    };
+    store.redact(&stream, 1, "privacy").await.unwrap();
+    let _ = store.save_snapshot(&stream, &snapshot).await;
+    assert_eq!(
+        repository
+            .load(&tenant, "delayed")
+            .await
+            .unwrap()
+            .state
+            .total,
+        0
+    );
+}
+
+#[tokio::test]
 async fn a_command_folds_into_the_state_it_produced() {
     let (store, tenant) = fixture().await;
     let repository = Repository::<Counter>::new(store);
@@ -320,8 +349,9 @@ async fn a_stale_snapshot_schema_is_discarded_rather_than_trusted() {
         .await
         .expect("handled");
     let stream = StreamId::new(tenant.clone(), "counter", "c-1").expect("valid stream");
+    let generation = store.snapshot_generation(&stream).await.unwrap().unwrap();
     store
-        .save_snapshot(
+        .save_snapshot_checked(
             &stream,
             &eventlog_core::Snapshot {
                 version: 1,
@@ -329,6 +359,7 @@ async fn a_stale_snapshot_schema_is_discarded_rather_than_trusted() {
                 state: json!({ "nonsense": true }),
                 recorded_at: OffsetDateTime::UNIX_EPOCH,
             },
+            &generation,
         )
         .await
         .expect("writable");
@@ -390,4 +421,115 @@ async fn a_second_event_type_folds_and_reads_back() {
         0,
         "the cleared fact reads back as itself, not as an unknown event"
     );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_history_and_repository_privacy_interleavings() {
+    let store: Arc<dyn EventStore> =
+        Arc::new(SqliteEventStore::in_memory("snapshot_races").await.unwrap());
+    eventlog_conformance::run_snapshot_generations(store.clone()).await;
+    let tenant = eventlog_core::TenantId::new("snapshot-races").unwrap();
+    for automatic in [true, false] {
+        let id = if automatic {
+            "automatic-sqlite"
+        } else {
+            "explicit-sqlite"
+        };
+        let repository =
+            eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone())
+                .with_policy(eventlog_core::SnapshotPolicy {
+                    every: u64::from(automatic),
+                });
+        if !automatic {
+            repository
+                .handle(
+                    &tenant,
+                    id,
+                    &(),
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        let stream = repository.stream(&tenant, id).unwrap();
+        let (observed, resume) = eventlog_conformance::pause_snapshot_serialization(id);
+        let owner = tenant.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                if automatic {
+                    repository
+                        .handle(
+                            &owner,
+                            id,
+                            &(),
+                            &eventlog_conformance::meta(id, &serde_json::json!({})),
+                        )
+                        .await
+                        .map(|outcome| outcome.version)
+                } else {
+                    repository.snapshot_now(&owner, id).await
+                }
+            })
+        });
+        tokio::task::spawn_blocking(move || {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        store.redact(&stream, 1, "privacy").await.unwrap();
+        resume.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 1);
+        let loaded =
+            eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone())
+                .load(&tenant, id)
+                .await
+                .unwrap();
+        assert_eq!(
+            loaded.state.total, 0,
+            "delayed repository cache must agree with redacted fold"
+        );
+        if automatic {
+            assert!(store.load_snapshot(&stream).await.unwrap().is_none());
+        } else {
+            assert_eq!(
+                store.load_snapshot(&stream).await.unwrap().unwrap().state["total"],
+                serde_json::json!(0)
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn committed_commands_survive_snapshot_storage_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshots.db");
+    let store = Arc::new(
+        SqliteEventStore::open(path.to_str().unwrap(), "cache_failure")
+            .await
+            .unwrap(),
+    );
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute_batch("CREATE TRIGGER cache_failure_injected BEFORE INSERT ON cache_failure_snapshots BEGIN SELECT RAISE(ABORT, 'injected cache failure'); END;").unwrap();
+    let repository = Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone())
+        .with_policy(SnapshotPolicy { every: 1 });
+    let tenant = TenantId::new("tenant").unwrap();
+    assert_eq!(
+        repository
+            .handle(&tenant, "failure", &(), &meta("failure"))
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    assert!(repository.snapshot_now(&tenant, "failure").await.is_err());
+    assert_eq!(
+        repository
+            .load(&tenant, "failure")
+            .await
+            .unwrap()
+            .state
+            .total,
+        1
+    );
+    assert_eq!(sql.query_row("SELECT count(*) FROM cache_failure_snapshot_generations WHERE cached_generation IS NOT NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "failed cache write rolls back its proof");
 }

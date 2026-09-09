@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::{
     AppendResult, CommandMeta, EventLogError, EventStore, Expected, MAX_READ_LIMIT, NewEvent,
-    RecordedEvent, Snapshot, StreamId, TenantId,
+    RecordedEvent, Snapshot, SnapshotGeneration, StreamId, TenantId,
 };
 
 /// A domain event that knows how it is written down and how it is read back.
@@ -162,8 +162,24 @@ impl<A: Aggregate> Repository<A> {
     /// Returns [`EventLogError::Backend`] when the store is unavailable, or
     /// [`EventLogError::Invalid`] when a stored body cannot be read as this aggregate's event.
     pub async fn load(&self, tenant: &TenantId, id: &str) -> Result<Loaded<A>, EventLogError> {
+        self.load_observed(tenant, id)
+            .await
+            .map(|(loaded, _)| loaded)
+    }
+
+    async fn load_observed(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+    ) -> Result<(Loaded<A>, Option<SnapshotGeneration>), EventLogError> {
         let stream = self.stream(tenant, id)?;
-        let (mut state, mut version) = match self.store.load_snapshot(&stream).await? {
+        let generation = self.store.snapshot_generation(&stream).await?;
+        let snapshot = if generation.is_some() {
+            self.store.load_snapshot(&stream).await?
+        } else {
+            None
+        };
+        let (mut state, mut version) = match snapshot {
             Some(snapshot) if snapshot.state_schema_version == A::STATE_SCHEMA_VERSION => {
                 match serde_json::from_value::<A>(snapshot.state) {
                     Ok(state) => (state, snapshot.version),
@@ -192,11 +208,14 @@ impl<A: Aggregate> Repository<A> {
                 break;
             }
         }
-        Ok(Loaded {
-            state,
-            version,
-            is_new: !seen_any,
-        })
+        Ok((
+            Loaded {
+                state,
+                version,
+                is_new: !seen_any,
+            },
+            generation,
+        ))
     }
 
     /// Load, decide, and write what was decided.
@@ -251,7 +270,7 @@ impl<A: Aggregate> Repository<A> {
         }
         let mut attempt = 0;
         loop {
-            let loaded = self.load(tenant, id).await?;
+            let (loaded, generation) = self.load_observed(tenant, id).await?;
             let decided = loaded.state.decide(command)?;
             if decided.is_empty() {
                 return Ok(Outcome {
@@ -272,7 +291,9 @@ impl<A: Aggregate> Repository<A> {
                 .append_guarded(&stream, expected, &new_events, meta, Arc::clone(&guard))
                 .await
             {
-                Ok(result) => return Ok(self.finish(loaded, result, tenant, id).await?),
+                Ok(result) => {
+                    return Ok(self.finish(loaded, generation, result, tenant, id).await?);
+                }
                 Err(EventLogError::Conflict { .. }) if attempt == 0 => {
                     attempt += 1;
                 }
@@ -284,6 +305,7 @@ impl<A: Aggregate> Repository<A> {
     async fn finish(
         &self,
         loaded: Loaded<A>,
+        generation: Option<SnapshotGeneration>,
         result: AppendResult,
         tenant: &TenantId,
         id: &str,
@@ -296,17 +318,24 @@ impl<A: Aggregate> Repository<A> {
                 version = recorded.version;
             }
         }
-        if self.policy.every > 0 && version.is_multiple_of(self.policy.every) {
+        if self.policy.every > 0
+            && version.is_multiple_of(self.policy.every)
+            && let Some(generation) = generation
+            && let Ok(serialized) = serde_json::to_value(&state)
+        {
             let stream = self.stream(tenant, id)?;
             let snapshot = Snapshot {
                 version,
                 state_schema_version: A::STATE_SCHEMA_VERSION,
-                state: serde_json::to_value(&state).map_err(|error| {
-                    EventLogError::Invalid(format!("aggregate is not serialisable: {error}"))
-                })?,
+                state: serialized,
                 recorded_at: OffsetDateTime::now_utc(),
             };
-            self.store.save_snapshot(&stream, &snapshot).await?;
+            // The append is already committed. A failed or obsolete cache must never turn
+            // that successful command into an apparent failure.
+            let _ = self
+                .store
+                .save_snapshot_checked(&stream, &snapshot, &generation)
+                .await;
         }
         Ok(Outcome {
             state,
@@ -319,20 +348,34 @@ impl<A: Aggregate> Repository<A> {
     /// Write a snapshot of this aggregate now, whatever the policy says.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Backend`] when the store is unavailable.
+    /// Returns a store error, or [`EventLogError::Invalid`] when verified caching is unsupported
+    /// or history changes during both attempts.
     pub async fn snapshot_now(&self, tenant: &TenantId, id: &str) -> Result<u64, EventLogError> {
-        let loaded = self.load(tenant, id).await?;
-        let stream = self.stream(tenant, id)?;
-        let snapshot = Snapshot {
-            version: loaded.version,
-            state_schema_version: A::STATE_SCHEMA_VERSION,
-            state: serde_json::to_value(&loaded.state).map_err(|error| {
-                EventLogError::Invalid(format!("aggregate is not serialisable: {error}"))
-            })?,
-            recorded_at: OffsetDateTime::now_utc(),
-        };
-        self.store.save_snapshot(&stream, &snapshot).await?;
-        Ok(loaded.version)
+        for _ in 0..2 {
+            let (loaded, generation) = self.load_observed(tenant, id).await?;
+            let generation = generation.ok_or_else(|| {
+                EventLogError::Invalid("checked snapshots are unsupported".into())
+            })?;
+            let stream = self.stream(tenant, id)?;
+            let snapshot = Snapshot {
+                version: loaded.version,
+                state_schema_version: A::STATE_SCHEMA_VERSION,
+                state: serde_json::to_value(&loaded.state).map_err(|error| {
+                    EventLogError::Invalid(format!("aggregate is not serialisable: {error}"))
+                })?,
+                recorded_at: OffsetDateTime::now_utc(),
+            };
+            if self
+                .store
+                .save_snapshot_checked(&stream, &snapshot, &generation)
+                .await?
+            {
+                return Ok(loaded.version);
+            }
+        }
+        Err(EventLogError::Invalid(
+            "snapshot history changed during snapshot_now".into(),
+        ))
     }
 }
 

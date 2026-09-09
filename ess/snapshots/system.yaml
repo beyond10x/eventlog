@@ -1,0 +1,5 @@
+format: ess/1
+system: eventlog
+version: v1
+domains:
+  - eventlog.snapshots

@@ -20,8 +20,8 @@ use std::{
 use eventlog_core::{
     AppendResult, BoxFuture, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError,
     EventStore, Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec,
-    ProjectionStore, Projector, RecordedEvent, Snapshot, StreamId, StreamSlice, TenantId,
-    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
+    ProjectionStore, Projector, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice,
+    TenantId, bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
     validate_field,
 };
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
@@ -243,11 +243,49 @@ impl Inner {
                  state TEXT NOT NULL,
                  recorded_at TEXT NOT NULL,
                  PRIMARY KEY (tenant_id, stream_type, stream_id)
+             );
+             CREATE TABLE IF NOT EXISTS {prefix}_snapshot_generations (
+                 tenant_id TEXT NOT NULL,
+                 stream_type TEXT NOT NULL,
+                 stream_id TEXT NOT NULL,
+                 generation TEXT NOT NULL,
+                 cached_generation TEXT,
+                 PRIMARY KEY (tenant_id, stream_type, stream_id)
              );"
         );
         let connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
-        connection.execute_batch(&statements).map_err(backend)
+        connection.execute_batch(&statements).map_err(backend)?;
+        let mut query = connection
+            .prepare(&format!("PRAGMA table_info({prefix}_snapshot_generations)"))
+            .map_err(backend)?;
+        let columns = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u32>(5)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        let expected = [
+            ("tenant_id", true, 1),
+            ("stream_type", true, 2),
+            ("stream_id", true, 3),
+            ("generation", true, 0),
+            ("cached_generation", false, 0),
+        ]
+        .map(|(name, required, key)| (name.to_owned(), "TEXT".to_owned(), required, None, key));
+        if columns != expected {
+            return Err(EventLogError::Invalid(
+                "incompatible SQLite snapshot generation schema".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -356,14 +394,37 @@ impl EventStore for SqliteEventStore {
 
     fn save_snapshot<'a>(
         &'a self,
+        _stream: &'a StreamId,
+        _snapshot: &'a Snapshot,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid("snapshot provenance is required; capture snapshot_generation before folding and use save_snapshot_checked".into()))
+        })
+    }
+
+    fn snapshot_generation<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<SnapshotGeneration>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let stream = stream.clone();
+        Box::pin(run_blocking(move || {
+            inner.snapshot_generation(&stream).map(Some)
+        }))
+    }
+
+    fn save_snapshot_checked<'a>(
+        &'a self,
         stream: &'a StreamId,
         snapshot: &'a Snapshot,
-    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        generation: &'a SnapshotGeneration,
+    ) -> BoxFuture<'a, Result<bool, EventLogError>> {
         let inner = Arc::clone(&self.inner);
         let stream = stream.clone();
         let snapshot = snapshot.clone();
+        let generation = *generation;
         Box::pin(run_blocking(move || {
-            inner.save_snapshot(&stream, &snapshot)
+            inner.save_snapshot_checked(&stream, &snapshot, generation)
         }))
     }
 
@@ -981,6 +1042,7 @@ impl Inner {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
         let now = format_time(OffsetDateTime::now_utc())?;
+        transaction.execute(&format!("INSERT INTO {prefix}_snapshot_generations (tenant_id,stream_type,stream_id,generation) VALUES (?1,?2,?3,?4) ON CONFLICT (tenant_id,stream_type,stream_id) DO UPDATE SET generation=excluded.generation"), params![stream.tenant().as_str(), stream.stream_type(), stream.stream_id(), eventlog_core::new_event_id()]).map_err(backend)?;
         let changed = transaction
             .execute(
                 &format!(
@@ -1025,10 +1087,36 @@ impl Inner {
         events.pop().ok_or(EventLogError::NotFound)
     }
 
-    fn save_snapshot(&self, stream: &StreamId, snapshot: &Snapshot) -> Result<(), EventLogError> {
+    fn snapshot_generation(&self, stream: &StreamId) -> Result<SnapshotGeneration, EventLogError> {
         let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
-        guard
+        let mut guard = self.connection.lock().map_err(poisoned)?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        transaction.execute(&format!("INSERT INTO {prefix}_snapshot_generations (tenant_id,stream_type,stream_id,generation) VALUES (?1,?2,?3,?4) ON CONFLICT (tenant_id,stream_type,stream_id) DO NOTHING"), params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),eventlog_core::new_event_id()]).map_err(backend)?;
+        let generation: String = transaction.query_row(&format!("SELECT generation FROM {prefix}_snapshot_generations WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3"), params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id()], |row| row.get(0)).map_err(backend)?;
+        let generation = generation.parse::<SnapshotGeneration>()?;
+        transaction.commit().map_err(backend)?;
+        Ok(generation)
+    }
+
+    fn save_snapshot_checked(
+        &self,
+        stream: &StreamId,
+        snapshot: &Snapshot,
+        generation: SnapshotGeneration,
+    ) -> Result<bool, EventLogError> {
+        let prefix = &self.prefix;
+        let mut guard = self.connection.lock().map_err(poisoned)?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation.as_uuid().to_string()]).map_err(backend)?;
+        if accepted == 0 {
+            transaction.rollback().map_err(backend)?;
+            return Ok(false);
+        }
+        transaction
             .execute(
                 &format!(
                     "INSERT INTO {prefix}_snapshots (
@@ -1051,8 +1139,9 @@ impl Inner {
                     format_time(snapshot.recorded_at)?,
                 ],
             )
-            .map(|_| ())
-            .map_err(backend)
+            .map_err(backend)?;
+        transaction.commit().map_err(backend)?;
+        Ok(true)
     }
 
     fn load_snapshot(&self, stream: &StreamId) -> Result<Option<Snapshot>, EventLogError> {
@@ -1062,8 +1151,10 @@ impl Inner {
             .query_row(
                 &format!(
                     "SELECT version, state_schema_version, state, recorded_at
-                     FROM {prefix}_snapshots
-                     WHERE tenant_id = ?1 AND stream_type = ?2 AND stream_id = ?3"
+                     FROM {prefix}_snapshots JOIN {prefix}_snapshot_generations
+                     USING (tenant_id, stream_type, stream_id)
+                     WHERE tenant_id = ?1 AND stream_type = ?2 AND stream_id = ?3
+                     AND cached_generation = generation"
                 ),
                 params![
                     stream.tenant().as_str(),
@@ -1102,6 +1193,7 @@ impl Inner {
             "claims",
             "identity",
             "snapshots",
+            "snapshot_generations",
             "projection_cursors",
             "blobs",
         ] {
