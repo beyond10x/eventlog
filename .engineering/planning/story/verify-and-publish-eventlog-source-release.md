@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:verify-and-publish-eventlog-source-release
 kind: story
-status: active
+status: implemented
 title: Verify integrated Eventlog and complete authorized source publication
 tags:
 - release
@@ -26,7 +26,7 @@ scope:
   path: crates/eventlog-postgres/examples/observation/laboratory-profile.json
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
-revision: 13
+revision: 15
 ---
 ## Intent and authorization boundary
 
@@ -61,3 +61,13 @@ All implementation stories are implemented. story:verify-and-publish-eventlog-so
 The operator answered “yes” to publishing Eventlog0.1.0 after the reviewed integration was complete and pushed at99ca640452de5ae397c8e3990364c714fc19a5a8. This is the separate source-release authorization required by the wave; no further release approval is pending. Release metadata follows the preserved plan: version0.1.0, Apache-2.0, source distribution with publish=false, dated changelog and annotated bare tag. Current Atlas release-unit eventlog/default declares tagged-github and required_artifacts=[]. Required persistence-proof artifacts will also be retained and verified for the exact release commit. Documentation delivery remains asynchronous.
 
 Release checkoutwt-58b0b755e313 and Atlas authoritywt-778443cc0014 are owned by session eventlog-release-20260909. Atlas is clean at remote main38033fb4557e3b01c85379be95530f9f5e15e6ca. The previous integration worktrees and task fixtures were verified removed. Source publication will be recorded only after the exact tag, checks and bot-authored GitHub Release are observed.
+
+## Verified source publication
+
+Eventlog0.1.0 was published on2026-09-09 at01:41:45UTC: https://github.com/beyond10x/eventlog/releases/tag/0.1.0 . GitHub release385169693 is neither draft nor prerelease and its author is b10x-bot[bot]. Annotated tag object1662819ec855be7c5b658545f14df761adc9c7e0 peels to release commitdce9bcdbd0596c0f0756139b859a6ff2d05d8ba8, matching remote main at publication. Tagger, direct author and committer identities were verified as the organization bot.
+
+Required Persistence proof workflow34299824161 passed on that exact clean commit:98 tests passed,0failed,0skipped,missing_required_cases=[]; formatting and clippy passed;12comparative configurations and2restart checks passed. Raw workflow artifacts were downloaded under /home/timo/.cache/eventlog-release-20260909/proof and their source identities and verdicts checked directly. Laboratory observations do not approve a production capacity budget.
+
+All four workspace crates and Cargo.lock are0.1.0; source is Apache-2.0 and publish=false. Atlas release-unit eventlog/default declares tagged-github and required_artifacts=[]. No custom binary assets are required. The GitHub source tarball was downloaded and extracted; every file matched a local git archive of the tag. Download SHA256:561b9402bff67b00bf8feae8e71c06e125c27d2046737abd142d29292b647f6a. Release JSON, source archive, policy and metadata receipts are retained in the same task evidence directory.
+
+Publication is complete. This subsequent planning-only closure does not move the release tag. Documentation publication remains pending/unverified and is handled asynchronously; no Atlas/Website source update, deployment or consumer promotion was performed. Coordinator owns publishing this closure and retiring releasewt-58b0b755e313 and authoritywt-778443cc0014 through reviewed exact-id managed cleanup. No disposable database fixture or build process was created for this metadata-only release step.
