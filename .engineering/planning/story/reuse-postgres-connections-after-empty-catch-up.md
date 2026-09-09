@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:reuse-postgres-connections-after-empty-catch-up
 kind: story
-status: active
+status: implemented
 title: Reuse PostgreSQL connections after empty catch-up polls
 tags:
 - code-review
@@ -15,11 +15,9 @@ scope:
   path: crates/eventlog-postgres/examples/production-proof.rs
 - confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
-- confidence: inferred
-  path: crates/eventlog-postgres/src/pool.rs
 - confidence: cited
   path: crates/eventlog-postgres/tests/conformance.rs
-revision: 5
+revision: 8
 ---
 ## Problem
 
@@ -55,3 +53,7 @@ Cited at reviewed main:
 Inferred edit scope: run_catch_up, focused PostgreSQL integration tests, and the proof runner if a new case must become mandatory. Pool implementation changes are not assumed necessary.
 
 This story shares `crates/eventlog-postgres/src/lib.rs` with `story:prevent-stale-snapshots-after-redaction`; sequence their edits or explicitly reconcile that shared file. No concurrency is scheduled by filing these stories.
+
+## Scope confirmation
+
+Implemented15c049633363dd0f504c7ccaeb36ee01c1bb4bd6 touched exactly src/lib.rs, tests/conformance.rs and examples/production-proof.rs within eventlog-postgres. Inferred src/pool.rs edit was unnecessary; existing quarantine behavior proved correct. Two successful early-return branches await rollback then settle; all errors/cancellation retain quarantine. Three required regressions include eight repeated no-work polls on the same backend PID and a deterministic withheld-rollback response case.

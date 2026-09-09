@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:prevent-stale-snapshots-after-redaction
 kind: story
-status: draft
+status: active
 title: Prevent stale snapshots from restoring redacted state
 tags:
 - code-review
@@ -18,6 +18,8 @@ scope:
   path: crates/eventlog-core/src/aggregate.rs
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
+- confidence: inferred
+  path: crates/eventlog-postgres/examples/production-proof.rs
 - confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
 - confidence: inferred
@@ -28,7 +30,11 @@ scope:
   path: crates/eventlog-sqlite/src/lib.rs
 - confidence: inferred
   path: crates/eventlog-sqlite/tests/repository.rs
-revision: 3
+- confidence: inferred
+  path: ess/snapshots/domains/snapshots.yaml
+- confidence: inferred
+  path: ess/snapshots/system.yaml
+revision: 9
 ---
 ## Problem
 
@@ -63,3 +69,13 @@ Cited at reviewed main:
 Inferred implementation/test scope: snapshot contract declarations in eventlog-core, additive schema admission if the selected solution requires it, shared conformance exercises, and both adapters' integration tests. Exact schema/API changes remain to be designed.
 
 This story shares `crates/eventlog-postgres/src/lib.rs` with `story:reuse-postgres-connections-after-empty-catch-up`; sequence their edits or explicitly reconcile that shared file. No concurrency is scheduled by filing these stories.
+
+## Selected design
+
+Selected from snapshot_design's read-only repository/RFC analysis on 2026-09-09. Preserve Snapshot/Loaded shapes; introduce opaque SnapshotGeneration UUID and default capability/checked-save methods. Supported adapters capture before any cache or events read, validate same generation atomically at save, and return false for changed/missing history. Legacy save_snapshot explicitly returns Invalid because provenance is required. Wrappers without checked capability fold events and do not trust/cache unproven snapshots.
+
+Add per-stream snapshot_generations metadata with tenant_id, stream_type, stream_id primary key, random generation, nullable cached_generation. Redaction rotates before invalidation; forget deletes metadata. PostgreSQL forget takes the publication gate exclusively; capture/save take it shared and lock metadata, preventing erase/recreate ABA. SQLite uses IMMEDIATE transactions and verifies additive table shape. Existing event and snapshot columns stay unchanged. Exact supported old PostgreSQL checksum/shape upgrades transactionally; partial/unknown states refuse; the version=1 ledger constraint stays intact.
+
+Repository carries the observed token from fold through append/cache. Automatic cache serialization/storage failure cannot report an already committed append as failed. snapshot_now retries one stale refusal and then returns an explicit Invalid history-changed result. A new ESS metadata model precedes implementation. This is a declared contract design change, not an assertion weakened to fit code. No current service-sdk direct snapshot/Repository caller was found by the scoper; no consumer change is required.
+
+Scope confirmation: schema.rs and both adapter tests are required by the selected design, replacing the earlier inferred choice. Add ess/snapshots/ and mandatory production-proof case roster. Coordinator owns README, CHANGELOG and tracking documents. Implementation tree wt-f0ba183ee985 starts from reviewed combined source699c0e15a2c3669d88329543f113e6302ba9dc7e; its final proof follows all merges.

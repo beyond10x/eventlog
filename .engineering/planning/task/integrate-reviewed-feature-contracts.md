@@ -2,12 +2,12 @@
 format: aep.planning-md/1
 id: task:integrate-reviewed-feature-contracts
 kind: task
-status: active
+status: implemented
 title: Integrate reviewed guarded refusal and effect contracts
 relations:
 - informed_by: story:eventlog-0-1-0-release
 - decomposes: story:integrate-reviewed-feature-contracts
-revision: 3
+revision: 4
 ---
 ## Acceptance
 

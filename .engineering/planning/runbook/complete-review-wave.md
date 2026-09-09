@@ -4,7 +4,7 @@ id: runbook:complete-review-wave
 kind: runbook
 status: draft
 title: Complete Eventlog review and integration
-revision: 2
+revision: 3
 ---
 ## Authorization and ownership
 
@@ -31,3 +31,11 @@ Initial scoping used aep-drive:story-scoper charters. Implementation uses aep-dr
 Planning baseline committed at 32bf1596c853cdedfb5477e1f790c060c5bc1d13. Catch-up worker wt-655da8b1406c and feature worker wt-21668c971b1d implement disjoint first-wave files. Snapshot design is complete and waits for the integrated contracts. Six historical foundation stories have been migrated with backlinks; verification-report:planning-consolidation-20260909 preserves independent guarded-refusal provenance.
 
 Snapshot design decision: additive per-stream random generations, observation before folding, conditional cache writes, explicit Invalid for legacy unproven saves, and best-effort automatic caching after successful append. Existing cache fields and schema ledger format remain unchanged. Exact older PostgreSQL schema checksum admits a transactional additive upgrade; malformed or partial shapes refuse. A new ESS metadata model precedes implementation. This is an explicit storage-contract design change under AGENTS invariant 4.
+
+## First wave result
+
+Feature unit096cdbe77c0adf1c8ade9b3b3985fcdbbb8cfcd9 and catch-up unit15c049633363dd0f504c7ccaeb36ee01c1bb4bd6 integrated at699c0e15a2c3669d88329543f113e6302ba9dc7e. Both bounded adversary reviews found no additional issue; exact reports retained as review-result artifacts. The AEP validator warns these reviews have no findings block despite their literal empty findings YAML lists; observed CLI rendering limitation, not missing review text.
+
+Combined production gate exit0:81 passed,0 failed,0 skipped; required-case set complete; fmt/clippy exit0. Source dirty flag reflects concurrent coordinator planning-only edits; final proof will run frozen exact source. Report: /home/timo/.cache/eventlog-complete-20260909/evidence/wave1-production-proof.json. No source release performed. Feature ESS semantic model validates; installed ESS cannot exactly project its internally tagged Rust wire layout, and its model states that limitation.
+
+Snapshot implementation is assigned wt-f0ba183ee985, branch impl/verified-snapshot-generations. Two other workers review existing PostgreSQL and core/SQLite in parallel, tests-only; their confirmed findings are queued after overlapping snapshot source edits. Harness does not expose per-agent token/tool counts or elapsed metrics; these cannot be invented. Build observations: coordinator1.4GiB, catch-up1.1GiB, features1.6GiB;29GiB currently free.

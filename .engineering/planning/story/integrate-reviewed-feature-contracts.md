@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:integrate-reviewed-feature-contracts
 kind: story
-status: active
+status: implemented
 title: Integrate reviewed guarded refusal and effect contracts
 relations:
 - informed_by: story:eventlog-0-1-0-release
@@ -17,7 +17,7 @@ scope:
   path: ess/effects/domains/effects.yaml
 - confidence: inferred
   path: ess/effects/system.yaml
-revision: 5
+revision: 6
 ---
 ## Acceptance
 
