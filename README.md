@@ -68,7 +68,7 @@ feed watermark predicate stays unchanged. Readers also stop before the first pos
 by that predicate: an unrelated transaction can hold xmin between already committed append XIDs,
 so filtering individual rows alone could skip a lower position. A separate transaction publication gate prevents a
 reader from advancing past an in-flight lower position when transaction-id and position order
-differ: append/redaction/erasure hold a shared owner gate; feed/catch-up/rebuild take it exclusively
+differ: append/redaction hold a shared owner gate; erasure/feed/catch-up/rebuild take it exclusively
 before a fresh READ COMMITTED query. Connections force that isolation even if inherited URL/role
 options differ. All active writers and feed/fold readers must use this protocol; deployment cutover
 fences older binaries. Registration compares the persisted roster and physical shape.

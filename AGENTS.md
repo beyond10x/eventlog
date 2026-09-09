@@ -171,8 +171,9 @@ commit the view and cursor atomically.
 
 The committed-XID predicate alone is not a position-contiguity proof: a guard can assign an older
 XID before another append obtains a lower sequence position. The PostgreSQL publication gate
-therefore precedes every other owner lock. Writers share it through commit; feed, catch-up and
-rebuild take it exclusively before a fresh READ COMMITTED query. Preserve the original watermark
+therefore precedes every other owner lock. Append and redaction share it through commit; tenant
+erasure takes it exclusively to prevent snapshot-generation capture from surviving erasure.
+Feed, catch-up and rebuild take it exclusively before a fresh READ COMMITTED query. Preserve the original watermark
 predicate and stop before its first withheld global position in that same statement snapshot:
 unrelated transactions can hold xmin between already committed owner XIDs. A rowwise filter can
 otherwise leave a hole even while no owner writer is active. Keep both reversed-XID/position
@@ -180,6 +181,12 @@ regressions, including the unrelated-xmin case, plus the original late-commit
 mutation case. Sequence CACHE 1 and deterministic column collations are admission requirements.
 Mixed protocol generations require a fenced cutover; retaining physical old-reader formats does
 not authorize concurrent old writer/feed binaries.
+
+Snapshot writes require a generation observed before reading the cache or folding events.
+Both backends reject delayed writes after redaction or erasure, ignore caches without matching
+persisted provenance, and refuse the legacy unproven save API. Repository automatic caching is
+best effort after a committed append; explicit snapshot creation reports storage errors and
+retries a stale generation once. Keep the real-backend interleaving and cache-failure regressions.
 
 <!-- b10x-release-operations:start -->
 ## Release completion

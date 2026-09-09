@@ -36,6 +36,12 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- Checked snapshot generations prevent delayed caches from restoring redacted or erased state.
+  Existing event/snapshot columns remain unchanged; old caches without provenance are ignored.
+  The legacy snapshot-save API now refuses writes without an observed generation.
+- Repository automatic snapshot failures preserve the successful committed command result.
+  Explicit snapshot creation retries one stale generation and reports persistent changes/errors.
+
 - PostgreSQL empty or contended catch-up polls await rollback and reuse the same settled
   connection. Failed or cancelled rollback keeps the connection quarantined.
 - PostgreSQL publication ordering and contiguous feed reads preserve lower positions across
