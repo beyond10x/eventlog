@@ -1,0 +1,67 @@
+domain: eventlog.effects
+summary: Product-neutral value metadata owners embed in durable effect evidence.
+
+# This is a semantic vocabulary, not a generated wire schema. Rust's EffectStage uses
+# an internally tagged serde object: {stage: failed, code: ...}, or {stage: attempted}.
+# ESS unions use a separate content member and reject empty struct variants, so an
+# exact projection of those unit/struct variants is not currently representable.
+# The Rust serialization tests are the authority for the existing wire shape.
+# These are values, not entities: attempt_id repeats across evidence for one attempt.
+# External authority/grant/audit identifiers do not establish ownership of external entities.
+types:
+  - name: eventlog.effects.OpaqueReference
+    kind: newtype
+    of: String
+    # Rust validation bounds these to MAX_FIELD_LEN nonempty printable ASCII bytes,
+    # excluding spaces and @; it does not resolve or authenticate a reference.
+  - name: eventlog.effects.Operation
+    kind: newtype
+    of: String
+  - name: eventlog.effects.OutcomeCode
+    kind: newtype
+    of: String
+  - name: eventlog.effects.StageName
+    kind: enum
+    variants: [attempted, succeeded, failed, refused, incomplete]
+  - name: eventlog.effects.EffectStage
+    kind: struct
+    fields:
+      - name: stage
+        type: eventlog.effects.StageName
+      - name: code
+        type: Optional<eventlog.effects.OutcomeCode>
+    # Semantic decomposition only: code belongs only to failed and refused.
+    # Rust's enum enforces that association; this specification is not a wire projection.
+  - name: eventlog.effects.EffectEvidence
+    kind: struct
+    fields:
+      - name: attempt_id
+        type: eventlog.effects.OpaqueReference
+      - name: operation
+        type: eventlog.effects.Operation
+      - name: authority_ref
+        type: eventlog.effects.OpaqueReference
+      - name: grant_ref
+        type: Optional<eventlog.effects.OpaqueReference>
+      - name: retry_of
+        type: Optional<eventlog.effects.OpaqueReference>
+      - name: downstream_audit_ref
+        type: Optional<eventlog.effects.OpaqueReference>
+      - name: stage
+        type: eventlog.effects.EffectStage
+    # Optional retry_of is an earlier attempt's opaque id, not ownership of another
+    # evidence value. Subject, actor, request and trace remain in CommandMeta.
+  - name: eventlog.effects.EffectBoundaryCoverage
+    kind: struct
+    fields:
+      - name: boundary
+        type: eventlog.effects.Operation
+      - name: records_attempt
+        type: Boolean
+      - name: records_terminal
+        type: Boolean
+      - name: records_incomplete
+        type: Boolean
+    invariants:
+      - records_attempt == true
+      - records_terminal == true or records_incomplete == true
