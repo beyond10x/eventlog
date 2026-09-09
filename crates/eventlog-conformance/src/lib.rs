@@ -2055,3 +2055,160 @@ pub async fn run_scope_atomicity(store: &dyn EventStore, permit: &eventlog_core:
         .await
         .expect("caught refusal left no partial counter");
 }
+
+/// Constructor restrictions also govern deserialized or subsequently mutated append inputs.
+///
+/// # Panics
+/// Panics if any invalid input produces durable state, or a valid retry changes its receipt.
+pub async fn run_public_input_validation(store: &std::sync::Arc<dyn EventStore>) {
+    use eventlog_core::Claim;
+    store
+        .register_inline(std::sync::Arc::new(Tally))
+        .await
+        .expect("inline projection");
+    let tenant = TenantId::new("input-validation").expect("tenant");
+    let invalid_fields = [
+        String::new(),
+        "x".repeat(eventlog_core::MAX_FIELD_LEN + 1),
+        "bad\nvalue".to_owned(),
+        "bad\0value".to_owned(),
+        "é".to_owned(),
+    ];
+    let good_claim = Claim::new("owner", "key", "digest").expect("claim");
+    let mut cases = Vec::new();
+    for invalid in &invalid_fields {
+        let mut changed_event = event("item.received", 1);
+        changed_event.name.clone_from(invalid);
+        cases.push((changed_event, good_claim.clone()));
+        for field in 0..3 {
+            let mut changed_claim = good_claim.clone();
+            match field {
+                0 => changed_claim.scope.clone_from(invalid),
+                1 => changed_claim.key.clone_from(invalid),
+                2 => changed_claim.digest.clone_from(invalid),
+                _ => unreachable!(),
+            }
+            cases.push((event("item.received", 1), changed_claim));
+        }
+    }
+    for data in [json!(null), json!(7), json!(true), json!("text"), json!([])] {
+        let mut changed_event = event("item.received", 1);
+        changed_event.data = data;
+        cases.push((changed_event, good_claim.clone()));
+    }
+    let cases: Vec<_> = cases
+        .into_iter()
+        .flat_map(|(event, claim)| {
+            let from_wire_event = serde_json::from_value::<NewEvent>(
+                serde_json::to_value(&event).expect("event wire"),
+            )
+            .expect("event deserialize");
+            let from_wire_claim =
+                serde_json::from_value::<Claim>(serde_json::to_value(&claim).expect("claim wire"))
+                    .expect("claim deserialize");
+            [(event, claim), (from_wire_event, from_wire_claim)]
+        })
+        .collect();
+    for (index, (invalid_event, claim)) in cases.into_iter().enumerate() {
+        let id = format!("invalid-{index}");
+        let stream = StreamId::new(tenant.clone(), "item", &id).expect("stream");
+        let mut command = meta(&id, &json!({"case": index}));
+        command.claim = Some(claim.clone());
+        let batch = [event("item.received", 1), invalid_event];
+        assert!(
+            matches!(
+                store
+                    .append(&stream, Expected::NoStream, &batch, &command)
+                    .await,
+                Err(EventLogError::Invalid(_))
+            ),
+            "case {index} must fail before writing the first valid event"
+        );
+        assert_eq!(store.stream_version(&stream).await.expect("head"), None);
+        assert!(
+            store
+                .recorded_command(&stream, &command.idempotency_key, &command.request_hash)
+                .await
+                .expect("receipt lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .recorded_claim(&tenant, &good_claim)
+                .await
+                .expect("valid claim lookup")
+                .is_none()
+        );
+        // PostgreSQL cannot encode NUL in a lookup parameter. Other invalid constructor
+        // values remain queryable, so also check their exact claim coordinates.
+        if ![&claim.scope, &claim.key, &claim.digest]
+            .iter()
+            .any(|value| value.contains('\0'))
+        {
+            assert!(
+                store
+                    .recorded_claim(&tenant, &claim)
+                    .await
+                    .expect("claim lookup")
+                    .is_none()
+            );
+        }
+        assert!(
+            store
+                .projection_get(&TALLY, &tenant, &format!("item/{id}"))
+                .await
+                .expect("view")
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .read_feed(&tenant, 0, 100)
+            .await
+            .expect("feed")
+            .events
+            .is_empty()
+    );
+
+    // The private identifier fields remain invalid-proof even through serde's public boundary.
+    for invalid in &invalid_fields {
+        assert!(serde_json::from_value::<TenantId>(json!(invalid)).is_err());
+        for field in ["tenant", "stream_type", "stream_id"] {
+            let mut wire =
+                json!({"tenant": tenant.as_str(), "stream_type": "item", "stream_id": "one"});
+            wire[field] = json!(invalid);
+            assert!(
+                serde_json::from_value::<StreamId>(wire).is_err(),
+                "invalid {field} must not deserialize"
+            );
+        }
+    }
+    let stream = StreamId::new(tenant.clone(), "item", "valid").expect("stream");
+    let wire = serde_json::to_value(&stream).expect("serialize stream");
+    assert_eq!(
+        wire,
+        json!({"tenant": "input-validation", "stream_type": "item", "stream_id": "valid"})
+    );
+    let stream: StreamId = serde_json::from_value(wire).expect("same stream wire");
+    let mut command = meta("valid-command", &json!({"valid": true}));
+    command.claim = Some(good_claim);
+    let batch = [event("item.received", 1)];
+    let first = store
+        .append(&stream, Expected::NoStream, &batch, &command)
+        .await
+        .expect("valid append");
+    let retry = store
+        .append(&stream, Expected::NoStream, &batch, &command)
+        .await
+        .expect("valid retry");
+    assert!(retry.deduplicated);
+    assert_eq!(retry.events, first.events);
+    assert_eq!(
+        store
+            .projection_get(&TALLY, &tenant, "item/valid")
+            .await
+            .expect("view")
+            .expect("row")["count"],
+        1
+    );
+}
