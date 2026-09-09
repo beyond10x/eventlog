@@ -12,6 +12,213 @@ use tokio_postgres::NoTls;
 /// asserts on its feed is a race by design. One at a time, deterministically.
 static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test]
+async fn rewrite_rules_are_rejected_on_every_durable_table() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: rewrite-rule admission requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let prefix = "rewrite_classes";
+    store(prefix).await.unwrap().shutdown().await.unwrap();
+    let observer = client(&url).await;
+    let tables = observer.query("SELECT tablename FROM pg_tables WHERE schemaname=current_schema() AND starts_with(tablename, $1) ORDER BY tablename", &[&format!("{prefix}_")]).await.unwrap();
+    assert!(!tables.is_empty(), "exercise every actual durable table");
+    for row in &tables {
+        let table: String = row.get(0);
+        observer
+            .batch_execute(&format!(
+                "CREATE RULE discard_insert AS ON INSERT TO {table} DO INSTEAD NOTHING"
+            ))
+            .await
+            .unwrap();
+        match PostgresEventStore::connect(&url, prefix).await {
+            Err(eventlog_core::EventLogError::Invalid(_)) => {}
+            Err(error) => panic!("{table}: expected shape refusal, got {error:?}"),
+            Ok(adapter) => {
+                adapter.shutdown().await.unwrap();
+                panic!("rewrite rule on durable table {table} was admitted");
+            }
+        }
+        observer
+            .batch_execute(&format!("DROP RULE discard_insert ON {table}"))
+            .await
+            .unwrap();
+    }
+    let adapter = PostgresEventStore::connect(&url, prefix).await.unwrap();
+    let stream = StreamId::new(TenantId::new("supported").unwrap(), "item", "one").unwrap();
+    let events = [eventlog_conformance::event("item.received", 1)];
+    let meta = eventlog_conformance::meta("same-command", &serde_json::json!({}));
+    let first = adapter
+        .append(&stream, Expected::Any, &events, &meta)
+        .await
+        .unwrap();
+    let retry = adapter
+        .append(&stream, Expected::Any, &events, &meta)
+        .await
+        .unwrap();
+    assert!(retry.deduplicated);
+    assert_eq!(retry.events, first.events);
+    assert_eq!(
+        adapter
+            .recorded_command(&stream, &meta.idempotency_key, &meta.request_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .events,
+        first.events
+    );
+    adapter.shutdown().await.unwrap();
+    eprintln!(
+        "rewrite-rule admission: refused all {} durable tables; ordinary retry retained exact receipt",
+        tables.len()
+    );
+}
+
+#[tokio::test]
+async fn rewrite_rules_are_rejected_during_projection_migration_and_registration() {
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    use std::sync::Arc;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: rewrite-rule projection admission requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let prefix = "rewrite_projection";
+    let observer = client(&url).await;
+    observer
+        .batch_execute("DROP TABLE IF EXISTS rewrite_projection_p_tally")
+        .await
+        .unwrap();
+    let adapter = store(prefix).await.unwrap();
+    adapter
+        .create_projections(Arc::new(eventlog_conformance::Tally))
+        .await
+        .unwrap();
+    observer.batch_execute("CREATE RULE discard_projection AS ON INSERT TO rewrite_projection_p_tally DO INSTEAD NOTHING").await.unwrap();
+    let migration = PostgresEventStore::migrate(
+        PostgresConfig::isolated(&url, prefix).unwrap(),
+        PoolOptions::default(),
+        &[eventlog_conformance::TALLY],
+    )
+    .await;
+    assert!(
+        matches!(migration, Err(eventlog_core::EventLogError::Invalid(_))),
+        "migration must refuse rewrite rules on declared projections: {migration:?}"
+    );
+    assert!(matches!(
+        adapter
+            .create_projections(Arc::new(eventlog_conformance::Tally))
+            .await,
+        Err(eventlog_core::EventLogError::Invalid(_))
+    ));
+    assert!(matches!(
+        adapter
+            .register_inline(Arc::new(eventlog_conformance::Tally))
+            .await,
+        Err(eventlog_core::EventLogError::Invalid(_))
+    ));
+    observer
+        .batch_execute("DROP RULE discard_projection ON rewrite_projection_p_tally")
+        .await
+        .unwrap();
+    adapter
+        .register_inline(Arc::new(eventlog_conformance::Tally))
+        .await
+        .unwrap();
+    adapter.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn schema_admission_refuses_rules_that_suppress_command_receipts() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: schema rewrite-rule review requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let prefix = "review_rewrite";
+    store(prefix).await.unwrap().shutdown().await.unwrap();
+    let observer = client(&url).await;
+    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rewrite_commands DO INSTEAD NOTHING").await.unwrap();
+    match PostgresEventStore::connect(&url, prefix).await {
+        Err(eventlog_core::EventLogError::Invalid(_)) => {}
+        Err(error) => {
+            panic!("schema admission must refuse the unsupported rewrite rule: {error:?}")
+        }
+        Ok(admitted) => {
+            let stream = StreamId::new(TenantId::new("rewrite").unwrap(), "item", "one").unwrap();
+            let event = [eventlog_conformance::event("item.received", 1)];
+            let meta = eventlog_conformance::meta("same-command", &serde_json::json!({}));
+            let first = admitted
+                .append(&stream, Expected::Any, &event, &meta)
+                .await
+                .unwrap();
+            let retry = admitted
+                .append(&stream, Expected::Any, &event, &meta)
+                .await
+                .unwrap();
+            let receipt = admitted
+                .recorded_command(&stream, &meta.idempotency_key, &meta.request_hash)
+                .await
+                .unwrap();
+            eprintln!(
+                "admitted rewrite rule: first_version={}, retry_version={}, retry_deduplicated={}, durable_receipt={receipt:?}",
+                first.first_version, retry.first_version, retry.deduplicated
+            );
+            admitted.shutdown().await.unwrap();
+            panic!(
+                "schema admission accepted a rewrite rule that discards durable command receipts"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hosted_schema_admission_refuses_rewrite_rules() {
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    use rustls::pki_types::pem::PemObject;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: hosted rewrite-rule review requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let ca = std::env::var("EVENTLOG_TEST_POSTGRES_CA").expect("real TLS fixture");
+    let app_url =
+        std::env::var("EVENTLOG_TEST_HOSTED_POSTGRES_URL").expect("dedicated application role");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from_pem_file(ca).unwrap())
+        .unwrap();
+    let observer = client(&url).await;
+    observer.batch_execute("DROP SCHEMA IF EXISTS review_rules_hosted CASCADE; CREATE SCHEMA review_rules_hosted; DO $$ BEGIN IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname='eventlog_test_application') THEN CREATE ROLE eventlog_test_application LOGIN CONNECTION LIMIT 8; END IF; END $$; ALTER ROLE eventlog_test_application CONNECTION LIMIT 8;").await.unwrap();
+    PostgresEventStore::migrate(
+        PostgresConfig::verified(&url, "review_rules_hosted", "kit", roots.clone()).unwrap(),
+        PoolOptions::default(),
+        &[],
+    )
+    .await
+    .unwrap();
+    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
+    let admitted = PostgresEventStore::open(
+        PostgresConfig::verified(&app_url, "review_rules_hosted", "kit", roots).unwrap(),
+        PoolOptions::default(),
+        20,
+        2,
+        2,
+    )
+    .await;
+    match admitted {
+        Err(eventlog_core::EventLogError::Invalid(_)) => {}
+        Err(error) => panic!("expected schema refusal, got {error:?}"),
+        Ok(adapter) => {
+            adapter.shutdown().await.unwrap();
+            panic!(
+                "verified TLS/application-role admission accepted a command-discarding rewrite rule"
+            );
+        }
+    }
+}
+
 async fn assert_catch_up_reuses_session(contended: bool) {
     use eventlog_core::CatchUpRunner;
     use std::sync::Arc;

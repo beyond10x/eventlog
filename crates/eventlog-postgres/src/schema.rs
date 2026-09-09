@@ -146,6 +146,19 @@ async fn shape<C: GenericClient>(
     let Some(relation) = relation else {
         return Ok(Vec::new());
     };
+    let rewritten: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=to_regclass($1))",
+            &[&table],
+        )
+        .await
+        .map_err(backend)?
+        .get(0);
+    if rewritten {
+        return Err(EventLogError::Invalid(format!(
+            "unadmitted rewrite rule: {table}"
+        )));
+    }
     if relation.get::<_, String>(0) != "r"
         || relation.get::<_, bool>(1)
         || relation.get::<_, bool>(2)
@@ -413,7 +426,11 @@ pub(crate) async fn create_projection<C: GenericClient>(
             "CREATE INDEX IF NOT EXISTS {table}_idx_{position} ON {table} (tenant_id, idx_{position});"
         )
     });
-    client.batch_execute(&format!("CREATE TABLE IF NOT EXISTS {table} (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)
+    client.batch_execute(&format!("CREATE TABLE IF NOT EXISTS {table} (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
+    // Migration admits existing projection tables too; IF NOT EXISTS alone does not
+    // reject hidden behavior that can discard projection writes before registration.
+    shape(client, &table, prefix).await?;
+    Ok(())
 }
 pub(crate) async fn validate_projection(
     client: &mut Client,
