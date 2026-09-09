@@ -1150,6 +1150,8 @@ impl EventStore for PostgresEventStore {
                 .map_err(backend)?
                 .get(0);
             if !locked {
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
                 return Ok(CatchUpProgress {
                     applied: 0,
                     position: 0,
@@ -1189,6 +1191,8 @@ impl EventStore for PostgresEventStore {
             let more_waiting = events.len() > batch;
             events.truncate(batch);
             if events.is_empty() {
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
                 return Ok(CatchUpProgress {
                     applied: 0,
                     position: to_u64(position)?,
