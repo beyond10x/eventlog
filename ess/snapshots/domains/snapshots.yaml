@@ -1,0 +1,22 @@
+domain: eventlog.snapshots
+entities:
+  - name: eventlog.snapshots.SnapshotGeneration
+    identity:
+      name: coordinate
+      type: String
+    fields:
+      - name: generation
+        type: Uuid
+      - name: cached_generation
+        type: Optional<Uuid>
+    lifecycle:
+      initial: Present
+      states: [Present]
+      terminal: [Present]
+    # coordinate represents the tuple (tenant_id, stream_type, stream_id) within
+    # one owner's schema. SQL stores these three components as its composite key.
+    # Capture creates a random generation even for an empty stream. Redaction
+    # rotates it; tenant erasure removes the row. Recreation never reuses it.
+    # cached_generation is set only atomically with a generation-checked cache
+    # write. A cache is usable only while the two generation values agree.
+    # This is storage metadata, not ownership of an undeclared domain aggregate.

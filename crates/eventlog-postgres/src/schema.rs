@@ -14,6 +14,7 @@ const BASE: &[&str] = &[
     "snapshots",
 ];
 const ADDED: &[&str] = &["scope_counters", "schema_version", "projection_registry"];
+const SNAPSHOT_ADDED: &[&str] = &["snapshot_generations"];
 fn base_ddl(prefix: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {prefix}_events (
@@ -99,10 +100,29 @@ fn additions(prefix: &str) -> String {
         "CREATE TABLE IF NOT EXISTS {prefix}_scope_counters (coordinate TEXT PRIMARY KEY, held BIGINT NOT NULL CHECK (held >= 0)); CREATE TABLE IF NOT EXISTS {prefix}_schema_version (version BIGINT PRIMARY KEY CHECK (version = 1), checksum TEXT NOT NULL); CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(projection_name TEXT PRIMARY KEY,indexed_fields JSONB NOT NULL);"
     )
 }
-fn checksum() -> String {
+// Frozen original schema edition: existing ledger rows must remain migratable.
+fn legacy_checksum() -> String {
     format!(
         "{:x}",
         Sha256::digest(format!("{}{}", base_ddl("owner"), additions("owner")))
+    )
+}
+
+fn snapshot_additions(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_snapshot_generations (tenant_id TEXT NOT NULL,stream_type TEXT NOT NULL,stream_id TEXT NOT NULL,generation UUID NOT NULL,cached_generation UUID,PRIMARY KEY(tenant_id,stream_type,stream_id));"
+    )
+}
+
+fn checksum() -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}{}{}",
+            base_ddl("owner"),
+            additions("owner"),
+            snapshot_additions("owner")
+        ))
     )
 }
 
@@ -217,9 +237,10 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
     transaction
         .batch_execute(
             &format!(
-                "{}{}",
+                "{}{}{}",
                 base_ddl("eventlog_expected"),
-                additions("eventlog_expected")
+                additions("eventlog_expected"),
+                snapshot_additions("eventlog_expected")
             )
             .replace("CREATE TABLE IF NOT EXISTS", "CREATE TEMP TABLE"),
         )
@@ -227,7 +248,7 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
         .map_err(backend)
 }
 async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
-    for suffix in BASE.iter().chain(ADDED) {
+    for suffix in BASE.iter().chain(ADDED).chain(SNAPSHOT_ADDED) {
         transaction
             .batch_execute(&format!("DROP TABLE pg_temp.eventlog_expected_{suffix}"))
             .await
@@ -235,7 +256,11 @@ async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogErro
     }
     Ok(())
 }
-async fn version(transaction: &Transaction<'_>, prefix: &str) -> Result<(), EventLogError> {
+async fn version(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    expected_checksum: &str,
+) -> Result<(), EventLogError> {
     let rows = transaction
         .query(
             &format!("SELECT version,checksum FROM {prefix}_schema_version"),
@@ -243,7 +268,9 @@ async fn version(transaction: &Transaction<'_>, prefix: &str) -> Result<(), Even
         )
         .await
         .map_err(backend)?;
-    if rows.len() != 1 || rows[0].get::<_, i64>(0) != 1 || rows[0].get::<_, String>(1) != checksum()
+    if rows.len() != 1
+        || rows[0].get::<_, i64>(0) != 1
+        || rows[0].get::<_, String>(1) != expected_checksum
     {
         return Err(EventLogError::Invalid(
             "unknown PostgreSQL schema version/checksum".into(),
@@ -274,16 +301,30 @@ pub(crate) async fn migrate(
         compare(&transaction, prefix, BASE).await?;
     }
     let ledger = exists(&transaction, &format!("{prefix}_schema_version")).await?;
+    let generations = exists(&transaction, &format!("{prefix}_snapshot_generations")).await?;
     if ledger {
         compare(&transaction, prefix, ADDED).await?;
-        version(&transaction, prefix).await?;
-    } else if exists(&transaction, &format!("{prefix}_scope_counters")).await? {
+        if generations {
+            compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
+            version(&transaction, prefix, &checksum()).await?;
+        } else {
+            version(&transaction, prefix, &legacy_checksum()).await?;
+        }
+    } else if generations
+        || exists(&transaction, &format!("{prefix}_scope_counters")).await?
+        || exists(&transaction, &format!("{prefix}_projection_registry")).await?
+    {
         return Err(EventLogError::Invalid(
             "partial PostgreSQL admission migration".into(),
         ));
     }
     transaction
-        .batch_execute(&format!("{}{}", base_ddl(prefix), additions(prefix)))
+        .batch_execute(&format!(
+            "{}{}{}",
+            base_ddl(prefix),
+            additions(prefix),
+            snapshot_additions(prefix)
+        ))
         .await
         .map_err(backend)?;
     if !ledger {
@@ -291,6 +332,16 @@ pub(crate) async fn migrate(
             .execute(
                 &format!("INSERT INTO {prefix}_schema_version (version,checksum) VALUES (1,$1)"),
                 &[&checksum()],
+            )
+            .await
+            .map_err(backend)?;
+    } else if !generations {
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE {prefix}_schema_version SET checksum=$1 WHERE version=1 AND checksum=$2"
+                ),
+                &[&checksum(), &legacy_checksum()],
             )
             .await
             .map_err(backend)?;
@@ -320,7 +371,8 @@ pub(crate) async fn validate(client: &mut Client, prefix: &str) -> Result<(), Ev
         .map_err(|error| EventLogError::Invalid(format!("expected schema: {error}")))?;
     compare(&transaction, prefix, BASE).await?;
     compare(&transaction, prefix, ADDED).await?;
-    version(&transaction, prefix).await?;
+    compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
+    version(&transaction, prefix, &checksum()).await?;
     drop_expected(&transaction)
         .await
         .map_err(|error| EventLogError::Invalid(format!("expected schema: {error}")))?;
@@ -330,6 +382,7 @@ pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), Eve
     let tables: Vec<_> = BASE
         .iter()
         .chain(ADDED)
+        .chain(SNAPSHOT_ADDED)
         .map(|suffix| format!("{prefix}_{suffix}"))
         .collect();
     let admitted:bool=client.query_one("SELECT COALESCE(bool_and(has_table_privilege(current_user,to_regclass(name),'SELECT') AND has_table_privilege(current_user,to_regclass(name),'INSERT') AND has_table_privilege(current_user,to_regclass(name),'UPDATE') AND has_table_privilege(current_user,to_regclass(name),'DELETE')),false) FROM unnest($1::text[]) AS name",&[&tables]).await.map_err(backend)?.get(0);
@@ -419,4 +472,138 @@ pub(crate) async fn validate_projection(
         )));
     }
     transaction.commit().await.map_err(backend)
+}
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::PostgresEventStore;
+    use eventlog_core::{EventStore, Expected, Snapshot, StreamId, TenantId};
+
+    #[tokio::test]
+    async fn snapshot_schema_upgrade_retains_history_and_refuses_partial_metadata() {
+        let Ok(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL") else {
+            eprintln!("skipped: snapshot upgrade requires EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let (mut sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let prefix = "snapshot_upgrade";
+        for suffix in BASE.iter().chain(ADDED).chain(SNAPSHOT_ADDED) {
+            sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
+                .await
+                .unwrap();
+        }
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        let stream = StreamId::new(TenantId::new("tenant").unwrap(), "item", "one").unwrap();
+        store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta("one", &serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+        sql.batch_execute("INSERT INTO snapshot_upgrade_snapshots VALUES ('tenant','item','one',1,1,'{\"total\":999}',now()); DROP TABLE snapshot_upgrade_snapshot_generations").await.unwrap();
+        sql.execute(
+            "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
+            &[&legacy_checksum()],
+        )
+        .await
+        .unwrap();
+        migrate(&mut sql, prefix, &[]).await.unwrap();
+        assert_eq!(
+            sql.query_one("SELECT checksum FROM snapshot_upgrade_schema_version", &[])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            checksum()
+        );
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        assert!(
+            store.load_snapshot(&stream).await.unwrap().is_none(),
+            "preupgrade cache has no provenance"
+        );
+        let generation = store.snapshot_generation(&stream).await.unwrap().unwrap();
+        assert!(
+            store.load_snapshot(&stream).await.unwrap().is_none(),
+            "capture must not certify old bytes"
+        );
+        let events = store.read_stream(&stream, 0, 100).await.unwrap();
+        assert_eq!(events.events.len(), 1);
+        assert!(
+            store
+                .recorded_command(
+                    &stream,
+                    "one",
+                    &eventlog_core::request_hash(&serde_json::json!({})).unwrap()
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let snapshot = Snapshot {
+            version: 1,
+            state_schema_version: 1,
+            state: serde_json::json!({"total":1}),
+            recorded_at: time::OffsetDateTime::now_utc(),
+        };
+        assert!(
+            store
+                .save_snapshot_checked(&stream, &snapshot, &generation)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.load_snapshot(&stream).await.unwrap().unwrap().state,
+            snapshot.state
+        );
+        store.shutdown().await.unwrap();
+        sql.execute(
+            "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
+            &[&legacy_checksum()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            migrate(&mut sql, prefix, &[]).await.is_err(),
+            "old checksum with new table is partial"
+        );
+        sql.execute(
+            "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
+            &[&checksum()],
+        )
+        .await
+        .unwrap();
+        sql.batch_execute("DROP TABLE snapshot_upgrade_snapshot_generations")
+            .await
+            .unwrap();
+        assert!(
+            migrate(&mut sql, prefix, &[]).await.is_err(),
+            "new checksum without table is partial"
+        );
+        sql.execute(
+            "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
+            &[&legacy_checksum()],
+        )
+        .await
+        .unwrap();
+        migrate(&mut sql, prefix, &[]).await.unwrap();
+        sql.batch_execute("ALTER TABLE snapshot_upgrade_snapshot_generations ALTER COLUMN generation TYPE TEXT USING generation::text").await.unwrap();
+        assert!(
+            migrate(&mut sql, prefix, &[]).await.is_err(),
+            "foreign metadata shape is refused"
+        );
+        assert!(validate(&mut sql, prefix).await.is_err());
+        for suffix in BASE.iter().chain(ADDED).chain(SNAPSHOT_ADDED) {
+            sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
+                .await
+                .unwrap();
+        }
+    }
 }

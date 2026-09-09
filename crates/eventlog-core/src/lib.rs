@@ -550,6 +550,33 @@ pub struct Snapshot {
     pub recorded_at: OffsetDateTime,
 }
 
+/// The history observed before a fold. Capture it before reading any cache or events.
+/// This is an observation coordinate, not an authorization capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotGeneration(Uuid);
+
+impl SnapshotGeneration {
+    #[must_use]
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for SnapshotGeneration {
+    type Err = EventLogError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|_| EventLogError::Invalid("invalid snapshot generation".into()))
+    }
+}
+
 /// Everything that can go wrong that a caller must tell apart.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EventLogError {
@@ -676,11 +703,43 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
+    /// Unproven snapshots are refused. Capture [`Self::snapshot_generation`] before folding
+    /// and use [`Self::save_snapshot_checked`] instead. The snapshot layout remains unchanged.
     fn save_snapshot<'a>(
         &'a self,
         stream: &'a StreamId,
         snapshot: &'a Snapshot,
     ) -> BoxFuture<'a, Result<(), EventLogError>>;
+
+    /// Capture the history before reading any snapshot or events. `None` disables caching
+    /// for implementations that have not opted into verified snapshot support.
+    ///
+    /// # Errors
+    /// Returns a store error when the observation cannot be obtained.
+    fn snapshot_generation<'a>(
+        &'a self,
+        _stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Option<SnapshotGeneration>, EventLogError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Cache a fold only if its observed history still exists unchanged by redaction/erasure.
+    /// Returns `false` when the observation is stale; no snapshot is written in that case.
+    ///
+    /// # Errors
+    /// Returns a store error, or [`EventLogError::Invalid`] for unsupported implementations.
+    fn save_snapshot_checked<'a>(
+        &'a self,
+        _stream: &'a StreamId,
+        _snapshot: &'a Snapshot,
+        _generation: &'a SnapshotGeneration,
+    ) -> BoxFuture<'a, Result<bool, EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid(
+                "checked snapshots are unsupported".into(),
+            ))
+        })
+    }
 
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
