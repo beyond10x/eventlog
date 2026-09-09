@@ -26,7 +26,7 @@ scope:
   path: crates/eventlog-postgres/examples/observation/laboratory-profile.json
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
-revision: 12
+revision: 13
 ---
 ## Intent and authorization boundary
 
@@ -55,3 +55,9 @@ All implementation units and adversary reports are preserved, their wanted commi
 Only coordinatorwt-82ec9daed45d and exact Atlas authoritywt-acbc7275f11d remain for final publication and cleanup. Coordinator owns their next actions: publish this planning-only closure, merge the gated integration into clean main, verify the required GitHub workflow, then end own leases, clean disposable output, finish and review exact-id GC. Source runtime and workflows are unchanged from the frozen proof. Preserve all unmerged recovery branches and delete only this wave's merged local unit branches after ancestry checks.
 
 All implementation stories are implemented. story:verify-and-publish-eventlog-source-release remains active for the separate human release stop and subsequent exact-tag source checks/artifacts. No release or documentation delivery is claimed.
+
+## Release authorization
+
+The operator answered “yes” to publishing Eventlog0.1.0 after the reviewed integration was complete and pushed at99ca640452de5ae397c8e3990364c714fc19a5a8. This is the separate source-release authorization required by the wave; no further release approval is pending. Release metadata follows the preserved plan: version0.1.0, Apache-2.0, source distribution with publish=false, dated changelog and annotated bare tag. Current Atlas release-unit eventlog/default declares tagged-github and required_artifacts=[]. Required persistence-proof artifacts will also be retained and verified for the exact release commit. Documentation delivery remains asynchronous.
+
+Release checkoutwt-58b0b755e313 and Atlas authoritywt-778443cc0014 are owned by session eventlog-release-20260909. Atlas is clean at remote main38033fb4557e3b01c85379be95530f9f5e15e6ca. The previous integration worktrees and task fixtures were verified removed. Source publication will be recorded only after the exact tag, checks and bot-authored GitHub Release are observed.

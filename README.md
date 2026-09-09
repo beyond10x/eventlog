@@ -20,12 +20,11 @@ is proved for the deployment.
 
 ## Status
 
-**Unreleased.** Version `0.1.0-dev.1`, `publish = false`, no git tag
-cut. The six foundation stories in [`docs/stories/`](docs/stories/README.md) are `done` — the log, aggregates
-and snapshots, inline and catch-up projections, schema evolution with golden vectors, erasure and
-redaction, and the async store. Everything landed so far is under `## Unreleased` in
-[`CHANGELOG.md`](CHANGELOG.md); versions are component-scoped and release under a bare-version
-tag — `0.1.0`, the version and nothing else.
+Version **0.1.0**, distributed as source under [Apache-2.0](LICENSE), with
+`publish = false`. Use the bare-version Git tag `0.1.0` to pin this release.
+The [changelog](CHANGELOG.md) covers the log, aggregates and snapshots, projections,
+schema evolution, erasure and redaction, guarded refusals, effect contracts and hosted
+PostgreSQL admission.
 
 ## Build, test, run
 

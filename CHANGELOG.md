@@ -3,7 +3,7 @@
 All notable changes to this component are recorded here. Versions are component-scoped and released
 under bare-version tags such as `0.1.0`.
 
-## Unreleased
+## 0.1.0 — 2026-09-09
 
 ### Added
 
