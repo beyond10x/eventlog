@@ -36,6 +36,12 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- Public deserialization and append validation enforce stream, event and claim constructor
+  invariants, rejecting invalid batches before any durable or projection write.
+
+- PostgreSQL rejects rewrite rules on every owned durable or projection table, including during
+  explicit projection migration, preserving command receipts and idempotent retries.
+
 - Checked snapshot generations prevent delayed caches from restoring redacted or erased state.
   Existing event/snapshot columns remain unchanged; old caches without provenance are ignored.
   The legacy snapshot-save API now refuses writes without an observed generation.

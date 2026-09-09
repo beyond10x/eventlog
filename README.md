@@ -51,6 +51,14 @@ EVENTLOG_TEST_POSTGRES_URL=postgresql://postgres:<password>@127.0.0.1:55999/post
 docker rm -f eventlog-test-pg
 ```
 
+## Public input validation
+
+`TenantId` and `StreamId` enforce their constructor checks during deserialization. Both adapters
+validate publicly mutable event and claim fields before starting an append, including every event
+in a batch. Invalid names, coordinates, claim fields or non-object event bodies are refused before
+events, receipts, claims or projections can change. Valid serialized representations and exact
+command retries retain their existing behavior.
+
 ## Hosted PostgreSQL composition
 
 `PostgresEventStore::connect` remains the isolated local convenience constructor. It accepts only
@@ -61,7 +69,7 @@ verifies both certificate chain and server name. Credentials stay in the host's 
 Run `PostgresEventStore::migrate(config, options, projections)` with the migration role before
 opening traffic. It serializes additive migrations, checks the complete old physical shape and
 records schema version/checksum plus the exact projection roster. Supply every legacy projection's
-name and indexed paths explicitly. Unknown, partial, altered, unlogged, RLS/policy/trigger or
+name and indexed paths explicitly. Unknown, partial, altered, unlogged, RLS/policy/trigger/rewrite-rule or
 foreign-sequence or inherited-table shapes refuse admission. Event sequence CACHE 1, positive unit increment and
 non-cycling BIGSERIAL range are part of admission; column collations must match and be deterministic. Existing event envelopes and the committed-transaction
 feed watermark predicate stays unchanged. Readers also stop before the first position withheld
