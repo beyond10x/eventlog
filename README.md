@@ -120,6 +120,20 @@ callbacks. The permit grants a storage operation, not authorization to another t
 policy, installation lifecycle membership, current authority and namespace bindings remain with
 the owning service. The internal stored shapes have an ESS home under `ess/admission/`.
 
+## Guard refusals and effect metadata
+
+A guard can return `EventLogError::GuardRefused { code }` with an owner-defined stable code.
+Both adapters preserve the code and roll back the entire refused append, including writes made
+through the guard's transactional projection view.
+
+`EffectStage`, `EffectEvidence` and `EffectBoundaryCoverage` describe generic external-effect
+evidence using existing command attribution. Owners explicitly validate this metadata before
+embedding it in their events. Identifiers, references, outcome codes and inventory boundary names
+must be bounded opaque values; names and addresses are refused. Eventlog does not interpret
+owner event bodies or decide effect policy. The semantic vocabulary lives in `ess/effects/`;
+the five Rust serde stage forms are tested directly because ESS cannot currently project their
+exact internally tagged wire layout.
+
 ## Required proof and comparative laboratory
 
 `bash scripts/gate.sh --production-proof` refuses missing URL, hosted-role URL or test CA, a selected

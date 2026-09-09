@@ -1,11 +1,20 @@
 # Changelog
 
 All notable changes to this component are recorded here. Versions are component-scoped and released
-under `eventlog-v*` tags.
+under bare-version tags such as `0.1.0`.
 
 ## Unreleased
 
 ### Added
+
+- Coded guard refusals preserve an owner-selected stable code while rolling back events and
+  transactional guard projection writes on both backends.
+- Generic effect stages, evidence and boundary coverage inventories, with bounded opaque
+  identifiers/codes and an ESS semantic vocabulary.
+- Hosted PostgreSQL admission with verified TLS, separate migration/application roles, exact
+  schema and projection-roster checks, bounded connection pools and transactional admission counters.
+- Required real-backend production proof and comparative capacity/restart tooling with retained
+  source, binary and runner identities.
 
 - `eventlog-core`: the event envelope, `StreamId` with a mandatory tenant, `Expected` for
   optimistic concurrency, `CommandMeta` with cause-derived idempotency, and the `EventStore` port.
@@ -24,3 +33,11 @@ under `eventlog-v*` tags.
   catch-up one is refused.
 - Both backends: projection tables, durable cursors, projection rebuild from the log, and
   `pg_try_advisory_xact_lock` around a PostgreSQL catch-up pass.
+
+### Fixed
+
+- PostgreSQL empty or contended catch-up polls await rollback and reuse the same settled
+  connection. Failed or cancelled rollback keeps the connection quarantined.
+- PostgreSQL publication ordering and contiguous feed reads preserve lower positions across
+  reversed transaction/position order and unrelated transactions holding the watermark.
+- Tenant erasure includes retained legacy projection tables and refuses ambiguous namespaces.
