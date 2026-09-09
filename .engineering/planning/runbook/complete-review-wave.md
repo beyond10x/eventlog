@@ -4,7 +4,7 @@ id: runbook:complete-review-wave
 kind: runbook
 status: draft
 title: Complete Eventlog review and integration
-revision: 5
+revision: 6
 ---
 ## Authorization and ownership
 
@@ -59,3 +59,13 @@ Final code integration09c71ec3165e187f7baf6277ffa40079d863f3cd is clean and pass
 Exact frozen-source final receipts will be retained under $HOME/.cache/eventlog-complete-20260909/evidence and the comparative run under $HOME/.cache/eventlog-complete-20260909/comparative-final. Read their source identities and verdicts directly; this prospective location record is not evidence of a future successful run. No source edits may occur during that comparative run. Source publication remains a separate human gate after integration and final proof, owned by story:verify-and-publish-eventlog-source-release.
 
 Snapshot treewt-f0ba183ee985 was published, reports retained, leases ended, Cargo cleaned1.4GiB, then worktree finish and exact-id reviewed GC removed it; its disposable PostgreSQL fixture was stopped and removed. A coordinator heartbeat accidentally named a separate snapshot-review session; that coordinator-owned record was ended, and the actual reviewer's separate lease was left to its owner. Other unit and integration cleanup follows published recovery proof, retained evidence and process/lease checks.
+
+## Observed final proof and cleanup handoff
+
+Frozen candidate9bb72d903243b7bb54341771cb4953f3418f54b4 passed the full production gate (98/0/0, required cases complete), fmt and clippy, and fresh-fixture comparative proof (12 configurations,2 restarts,exit0). verification-report:final-integration-proof-20260909 records exact identities, paths and verdicts, including the earlier failed capacity and restart observations. No acceptance threshold was relaxed. Laboratory evidence does not admit a production deployment budget.
+
+All implementation units and adversary reports are preserved, their wanted commits published, and their managed trees removed through reviewed exact-id GC: snapshotswt-f0ba183ee985, features/validationwt-21668c971b1d, catch-up/schemawt-655da8b1406c. Cargo clean reclaimed respectively1.4GiB,1.8GiB,1.4GiB. Comparative baselinewt-d3a4aefef9fc was published at recovery/comparative-proof-baseline-20260909 e40409bd5d3ed351d6effd4b5cd5ea1c5cdf5c33 after proof, Cargo cleaned232.9MiB, lease ended, finished and exact-id GC removed. All task-owned PostgreSQL fixtures have been stopped and removed with their anonymous volumes; private TLS material and small raw evidence remain outside the repositories in the task cache. Per-agent token/tool counters remain unavailable.
+
+Only coordinatorwt-82ec9daed45d and exact Atlas authoritywt-acbc7275f11d remain for final publication and cleanup. Coordinator owns their next actions: publish this planning-only closure, merge the gated integration into clean main, verify the required GitHub workflow, then end own leases, clean disposable output, finish and review exact-id GC. Source runtime and workflows are unchanged from the frozen proof. Preserve all unmerged recovery branches and delete only this wave's merged local unit branches after ancestry checks.
+
+All implementation stories are implemented. story:verify-and-publish-eventlog-source-release remains active for the separate human release stop and subsequent exact-tag source checks/artifacts. No release or documentation delivery is claimed.

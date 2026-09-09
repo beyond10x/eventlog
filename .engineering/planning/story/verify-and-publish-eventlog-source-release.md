@@ -26,7 +26,7 @@ scope:
   path: crates/eventlog-postgres/examples/observation/laboratory-profile.json
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
-revision: 11
+revision: 12
 ---
 ## Intent and authorization boundary
 
@@ -45,3 +45,13 @@ Coordinator owns Cargo.toml/Cargo.lock, LICENSE, CHANGELOG.md, README.md, requir
 ## Comparative fixture correction
 
 Before this session's comparative measurement, Docker inspection returned `volume /var/lib/postgresql/data` for the assigned integration fixture. laboratory-profile.json:10 incorrectly described a container writable layer. Update the declaration to v7 with an explicit Docker data volume; preserve existing workloads, compiler policy, CPU/memory/pid limits and every acceptance budget. This corrects measured fixture provenance before measurement, not a threshold changed to pass a result. Earlier v6 receipts remain historical evidence. Root observed this directly on 2026-09-09 at00:59UTC.
+
+## Observed implementation proof
+
+Frozen candidate9bb72d903243b7bb54341771cb4953f3418f54b4 passed the full production gate (98/0/0, required cases complete), fmt and clippy, and fresh-fixture comparative proof (12 configurations,2 restarts,exit0). verification-report:final-integration-proof-20260909 records exact identities, paths and verdicts, including the earlier failed capacity and restart observations. No acceptance threshold was relaxed. Laboratory evidence does not admit a production deployment budget.
+
+All implementation units and adversary reports are preserved, their wanted commits published, and their managed trees removed through reviewed exact-id GC: snapshotswt-f0ba183ee985, features/validationwt-21668c971b1d, catch-up/schemawt-655da8b1406c. Cargo clean reclaimed respectively1.4GiB,1.8GiB,1.4GiB. Comparative baselinewt-d3a4aefef9fc was published at recovery/comparative-proof-baseline-20260909 e40409bd5d3ed351d6effd4b5cd5ea1c5cdf5c33 after proof, Cargo cleaned232.9MiB, lease ended, finished and exact-id GC removed. All task-owned PostgreSQL fixtures have been stopped and removed with their anonymous volumes; private TLS material and small raw evidence remain outside the repositories in the task cache. Per-agent token/tool counters remain unavailable.
+
+Only coordinatorwt-82ec9daed45d and exact Atlas authoritywt-acbc7275f11d remain for final publication and cleanup. Coordinator owns their next actions: publish this planning-only closure, merge the gated integration into clean main, verify the required GitHub workflow, then end own leases, clean disposable output, finish and review exact-id GC. Source runtime and workflows are unchanged from the frozen proof. Preserve all unmerged recovery branches and delete only this wave's merged local unit branches after ancestry checks.
+
+All implementation stories are implemented. story:verify-and-publish-eventlog-source-release remains active for the separate human release stop and subsequent exact-tag source checks/artifacts. No release or documentation delivery is claimed.
