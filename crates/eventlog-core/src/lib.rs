@@ -62,6 +62,7 @@ pub const MAX_CAUSATION_DEPTH: u32 = 16;
 
 /// Whose history this is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct TenantId(String);
 
 impl TenantId {
@@ -80,6 +81,14 @@ impl TenantId {
     }
 }
 
+impl TryFrom<String> for TenantId {
+    type Error = EventLogError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
 impl std::fmt::Display for TenantId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
@@ -92,10 +101,26 @@ impl std::fmt::Display for TenantId {
 /// place for one owner to forget the tenant and for another to choose a different separator.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
+#[serde(try_from = "UncheckedStreamId")]
 pub struct StreamId {
     tenant: TenantId,
     stream_type: String,
     stream_id: String,
+}
+
+#[derive(Deserialize)]
+struct UncheckedStreamId {
+    tenant: TenantId,
+    stream_type: String,
+    stream_id: String,
+}
+
+impl TryFrom<UncheckedStreamId> for StreamId {
+    type Error = EventLogError;
+
+    fn try_from(value: UncheckedStreamId) -> Result<Self, Self::Error> {
+        Self::new(value.tenant, value.stream_type, value.stream_id)
+    }
 }
 
 impl StreamId {
@@ -167,18 +192,27 @@ impl NewEvent {
         schema_version: u32,
         data: Value,
     ) -> Result<Self, EventLogError> {
-        let name = name.into();
-        validate_field("event name", &name)?;
-        if !data.is_object() {
+        let value = Self {
+            name: name.into(),
+            schema_version,
+            data,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Check the constructor invariants after deserialization or public field mutation.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] for an unusable name or non-object body.
+    pub fn validate(&self) -> Result<(), EventLogError> {
+        validate_field("event name", &self.name)?;
+        if !self.data.is_object() {
             return Err(EventLogError::Invalid(
                 "an event body must be a JSON object".to_owned(),
             ));
         }
-        Ok(Self {
-            name,
-            schema_version,
-            data,
-        })
+        Ok(())
     }
 }
 
@@ -214,10 +248,18 @@ impl Claim {
             key: key.into(),
             digest: digest.into(),
         };
-        validate_field("claim scope", &value.scope)?;
-        validate_field("claim key", &value.key)?;
-        validate_field("claim digest", &value.digest)?;
+        value.validate()?;
         Ok(value)
+    }
+
+    /// Check the constructor invariants after deserialization or public field mutation.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] for empty, over-long or unsafe claim fields.
+    pub fn validate(&self) -> Result<(), EventLogError> {
+        validate_field("claim scope", &self.scope)?;
+        validate_field("claim key", &self.key)?;
+        validate_field("claim digest", &self.digest)
     }
 }
 
@@ -272,6 +314,9 @@ impl CommandMeta {
         validate_field("trace id", &self.trace_id)?;
         if let Some(causation_id) = &self.causation_id {
             validate_field("causation id", causation_id)?;
+        }
+        if let Some(claim) = &self.claim {
+            claim.validate()?;
         }
         if self.causation_depth > MAX_CAUSATION_DEPTH {
             return Err(EventLogError::CausationDepthExceeded {
@@ -1014,6 +1059,9 @@ pub fn validate_append(events: &[NewEvent], meta: &CommandMeta) -> Result<(), Ev
             "a command may produce at most {MAX_EVENTS_PER_APPEND} events"
         )));
     }
+    for event in events {
+        event.validate()?;
+    }
     meta.validate()
 }
 
@@ -1041,6 +1089,37 @@ mod tests {
         assert!(TenantId::new("").is_err());
         let tenant = TenantId::new("tenant-1").expect("valid tenant");
         assert!(StreamId::new(tenant, "", "id").is_err());
+    }
+
+    #[test]
+    fn input_validation_preserves_valid_wire_and_exact_field_limits() {
+        for value in ["legacy name@example".to_owned(), "x".repeat(MAX_FIELD_LEN)] {
+            let tenant = TenantId::new(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&tenant).unwrap(), json!(value));
+            assert_eq!(
+                serde_json::from_value::<TenantId>(json!(value)).unwrap(),
+                tenant
+            );
+            let stream = StreamId::new(tenant, value.clone(), value.clone()).unwrap();
+            assert_eq!(
+                serde_json::from_value::<StreamId>(serde_json::to_value(&stream).unwrap()).unwrap(),
+                stream
+            );
+            let event = NewEvent::new(&value, 1, json!({})).unwrap();
+            assert_eq!(
+                serde_json::to_value(&event).unwrap(),
+                json!({"name": value, "schema_version": 1, "data": {}})
+            );
+            assert!(event.validate().is_ok());
+            let claim = Claim::new(&value, &value, &value).unwrap();
+            assert_eq!(
+                serde_json::to_value(&claim).unwrap(),
+                json!({"scope": value, "key": value, "digest": value})
+            );
+            let mut command = meta();
+            command.claim = Some(claim);
+            assert!(validate_append(&[event], &command).is_ok());
+        }
     }
 
     #[test]
