@@ -157,12 +157,13 @@ service fixtures separately prove current authority and old-reader namespace rep
 
 | path | holds |
 |---|---|
-| `docs/stories/` | the backlog, one file per story, with a hand-written index |
+| `.engineering/planning/` | governed stories, review findings and implementation evidence |
+| `docs/stories/` | historical foundation stories with backlinks to current planning records |
 | `scripts/` | the repository gate and component checks |
 
 ## Read more
 
-- [`docs/stories/README.md`](docs/stories/README.md) — the backlog and what each story delivered.
+- [`docs/stories/README.md`](docs/stories/README.md) — the historical foundation stories and what each delivered.
 - [`CHANGELOG.md`](CHANGELOG.md) — every capability the kit has, in the order it arrived.
 - [`AGENTS.md`](AGENTS.md) — working agreements and the invariants this kit holds.
 

@@ -1,13 +1,17 @@
 ---
-id: EL-006
+format: aep.planning-md/1
+id: story:the-store-goes-async
+kind: story
+status: implemented
 title: The store goes async
-status: done
-depends_on: [EL-001]
+tags:
+- migrated-legacy
+relations:
+- depends_on: story:the-log-and-its-two-backends
+revision: 4
 ---
 
 # EL-006 — The store goes async
-
-Historical source; current tracking: [story:the-store-goes-async](../../.engineering/planning/story/the-store-goes-async.md).
 
 ## Intent
 
@@ -75,3 +79,15 @@ is deleted along with all caller-side `spawn_blocking` scaffolding.
   fmt, clippy `-D warnings`, brand). Next: the monorepo consumers (`module_eventlog` SDK + five
   modules) migrate against the new surface; every signature they touch is listed in the hand-off
   report.
+
+## Migration record
+
+This is completed legacy work, not a new implementation request. The source declares `status: done` at line 4. Its existing contracts are exercised by the 73-case production gate at main `734047203ce112b21ad5b9e3ea67fdacb8835def`, recorded in verification-report:repository-hygiene-and-code-review-20260909. New review findings have separate follow-up stories.
+
+## Provenance
+
+Migrated from `docs/stories/EL-006-the-store-goes-async.md`.
+
+- First written 2026-08-24T13:10:35+02:00; last touched 2026-08-24T16:40:03+02:00; 3 revisions.
+- Source status quoted: `status: done` (line 4).
+- Source text retained; this artifact is the governed successor.

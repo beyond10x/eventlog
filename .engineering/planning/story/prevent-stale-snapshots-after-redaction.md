@@ -10,6 +10,7 @@ tags:
 relations:
 - derived_from: verification-report:repository-hygiene-and-code-review-20260909
 - depends_on: story:integrate-reviewed-feature-contracts
+- informed_by: story:erasure-redaction-and-snapshot-invalidation
 scope:
 - confidence: cited
   path: crates/eventlog-conformance/src/lib.rs

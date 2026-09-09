@@ -9,6 +9,7 @@ tags:
 - priority-p2
 relations:
 - derived_from: verification-report:repository-hygiene-and-code-review-20260909
+- informed_by: story:projections-inline-and-catch-up
 scope:
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs

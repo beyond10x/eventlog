@@ -1,13 +1,15 @@
 ---
-id: EL-001
+format: aep.planning-md/1
+id: story:the-log-and-its-two-backends
+kind: story
+status: implemented
 title: The log and its two backends
-status: done
-depends_on: []
+tags:
+- migrated-legacy
+revision: 4
 ---
 
 # EL-001 — The log and its two backends
-
-Historical source; current tracking: [story:the-log-and-its-two-backends](../../.engineering/planning/story/the-log-and-its-two-backends.md).
 
 ## Intent
 
@@ -32,3 +34,15 @@ exercise that defines what they must agree on. No aggregates, no projections, no
   is the only shared exercise in the repository and the reason M-022 was found.
 - The component has its own workspace, gate, `CHANGELOG.md` and `AGENTS.md`, and releases under
   `eventlog-v*` tags.
+
+## Migration record
+
+This is completed legacy work, not a new implementation request. The source declares `status: done` at line 4. Its existing contracts are exercised by the 73-case production gate at main `734047203ce112b21ad5b9e3ea67fdacb8835def`, recorded in verification-report:repository-hygiene-and-code-review-20260909. New review findings have separate follow-up stories.
+
+## Provenance
+
+Migrated from `docs/stories/EL-001-the-log-and-its-two-backends.md`.
+
+- First written 2026-08-22T00:30:40+02:00; last touched 2026-08-22T00:30:40+02:00; 2 revisions.
+- Source status quoted: `status: done` (line 4).
+- Source text retained; this artifact is the governed successor.

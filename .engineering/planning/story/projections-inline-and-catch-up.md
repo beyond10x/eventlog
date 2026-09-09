@@ -1,13 +1,17 @@
 ---
-id: EL-003
+format: aep.planning-md/1
+id: story:projections-inline-and-catch-up
+kind: story
+status: implemented
 title: Projections, inline and catch-up
-status: done
-depends_on: [EL-001]
+tags:
+- migrated-legacy
+relations:
+- depends_on: story:the-log-and-its-two-backends
+revision: 4
 ---
 
 # EL-003 — Projections, inline and catch-up
-
-Historical source; current tracking: [story:projections-inline-and-catch-up](../../.engineering/planning/story/projections-inline-and-catch-up.md).
 
 ## Intent
 
@@ -30,3 +34,15 @@ decision explicit rather than accidental.
   catch-up.
 - Any projection can be dropped and rebuilt from the log, and a test does exactly that and compares
   the result byte for byte.
+
+## Migration record
+
+This is completed legacy work, not a new implementation request. The source declares `status: done` at line 4. Its existing contracts are exercised by the 73-case production gate at main `734047203ce112b21ad5b9e3ea67fdacb8835def`, recorded in verification-report:repository-hygiene-and-code-review-20260909. New review findings have separate follow-up stories.
+
+## Provenance
+
+Migrated from `docs/stories/EL-003-projections-inline-and-catch-up.md`.
+
+- First written 2026-08-22T00:30:40+02:00; last touched 2026-08-22T00:30:40+02:00; 2 revisions.
+- Source status quoted: `status: done` (line 4).
+- Source text retained; this artifact is the governed successor.

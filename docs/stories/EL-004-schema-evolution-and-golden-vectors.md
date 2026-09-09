@@ -7,6 +7,8 @@ depends_on: [EL-002]
 
 # EL-004 — Schema evolution and golden vectors
 
+Historical source; current tracking: [story:schema-evolution-and-golden-vectors](../../.engineering/planning/story/schema-evolution-and-golden-vectors.md).
+
 ## Intent
 
 Once events are the record, an event type is permanent. This is the machinery that makes that

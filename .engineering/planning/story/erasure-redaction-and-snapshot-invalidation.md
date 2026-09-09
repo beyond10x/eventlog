@@ -1,13 +1,17 @@
 ---
-id: EL-005
+format: aep.planning-md/1
+id: story:erasure-redaction-and-snapshot-invalidation
+kind: story
+status: implemented
 title: Erasure, redaction and snapshot invalidation
-status: done
-depends_on: [EL-002]
+tags:
+- migrated-legacy
+relations:
+- depends_on: story:aggregates-repository-and-snapshots
+revision: 4
 ---
 
 # EL-005 — Erasure, redaction and snapshot invalidation
-
-Historical source; current tracking: [story:erasure-redaction-and-snapshot-invalidation](../../.engineering/planning/story/erasure-redaction-and-snapshot-invalidation.md).
 
 ## Intent
 
@@ -28,3 +32,15 @@ becoming a log nobody can trust, and without erasing the audit trail along with 
   survives them.
 - Tenant erasure removes that tenant's streams, snapshots, commands and projection rows in one
   transaction, and a test proves nothing of the tenant remains in any table the kit owns.
+
+## Migration record
+
+This is completed legacy work, not a new implementation request. The source declares `status: done` at line 4. Its existing contracts are exercised by the 73-case production gate at main `734047203ce112b21ad5b9e3ea67fdacb8835def`, recorded in verification-report:repository-hygiene-and-code-review-20260909. New review findings have separate follow-up stories.
+
+## Provenance
+
+Migrated from `docs/stories/EL-005-erasure-redaction-and-snapshot-invalidation.md`.
+
+- First written 2026-08-22T00:30:40+02:00; last touched 2026-08-22T00:30:40+02:00; 1 revisions.
+- Source status quoted: `status: done` (line 4).
+- Source text retained; this artifact is the governed successor.

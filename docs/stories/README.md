@@ -1,8 +1,8 @@
-# b10x eventlog — backlog
+# b10x eventlog — historical foundation stories
 
-One file per story (`EL-NNN-<slug>.md`); frontmatter carries `id`, `title`, `status` and
-`depends_on`. Status is one of `backlog | ready | in-progress | blocked | done`. The index below is
-hand-written.
+These completed source records are preserved for provenance. Current work and migrated records
+live in [the governed planning store](../../.engineering/planning/); use
+`aep plan artifact list` to inspect current status. Each source links to its migrated artifact.
 
 This component exists because of
 `architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md`.

@@ -4,7 +4,7 @@ id: runbook:complete-review-wave
 kind: runbook
 status: draft
 title: Complete Eventlog review and integration
-revision: 1
+revision: 2
 ---
 ## Authorization and ownership
 
@@ -26,6 +26,8 @@ Coordinator: wt-82ec9daed45d, branch wave/complete-review, session eventlog-comp
 
 ## Scope and state
 
-Initial scoping is performed by aep-drive:story-scoper charters. Implementation uses aep-drive:implementor; independent attacks use aep-drive:adversary. This harness dispatches those charters through generic collaboration agents because it has no subagent_type selector; this is a reported harness deviation, not an unannounced replacement.
+Initial scoping used aep-drive:story-scoper charters. Implementation uses aep-drive:implementor; independent attacks use aep-drive:adversary. This harness dispatches those charters through generic collaboration agents because it has no subagent_type selector; this is a reported harness deviation.
 
-Planning baseline in progress. Snapshot design runs read-only against current main. Catch-up and feature implementation await this baseline commit and exact unit assignment.
+Planning baseline committed at 32bf1596c853cdedfb5477e1f790c060c5bc1d13. Catch-up worker wt-655da8b1406c and feature worker wt-21668c971b1d implement disjoint first-wave files. Snapshot design is complete and waits for the integrated contracts. Six historical foundation stories have been migrated with backlinks; verification-report:planning-consolidation-20260909 preserves independent guarded-refusal provenance.
+
+Snapshot design decision: additive per-stream random generations, observation before folding, conditional cache writes, explicit Invalid for legacy unproven saves, and best-effort automatic caching after successful append. Existing cache fields and schema ledger format remain unchanged. Exact older PostgreSQL schema checksum admits a transactional additive upgrade; malformed or partial shapes refuse. A new ESS metadata model precedes implementation. This is an explicit storage-contract design change under AGENTS invariant 4.

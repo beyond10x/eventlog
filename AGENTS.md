@@ -118,7 +118,8 @@ tag whose name is the bare version — `0.1.0`, the version and nothing else (at
 
 | What | Where |
 |---|---|
-| Stories, with `id`/`title`/`status`/`depends_on` frontmatter | `docs/stories/`, indexed by `docs/stories/README.md` |
+| Current stories, tasks, review records and evidence | `.engineering/planning/`, managed only through `aep plan artifact` |
+| Historical foundation stories, with backlinks to migrated artifacts | `docs/stories/`, indexed by `docs/stories/README.md` |
 | What shipped | `CHANGELOG.md` |
 | The decision this kit exists under | `architecture/adr/0055-durable-domain-state-is-a-fold-over-an-event-log.md` — predecessor-monorepo path, not in this tree |
 | The normative design, including the physical schema | `architecture/rfcs/0020-state-is-a-fold-over-an-event-log.md` — same |
