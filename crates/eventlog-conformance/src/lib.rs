@@ -599,7 +599,25 @@ impl eventlog_core::Guard for TallyLimit {
                 .and_then(|row| row.get("count").and_then(serde_json::Value::as_u64))
                 .unwrap_or(0);
             if count >= self.limit {
-                return Err(EventLogError::Invalid("this one is full".to_owned()));
+                // A guard has the same projection view as an inline projector. Make a write before
+                // refusing so the shared exercise proves both backends roll the whole transaction
+                // back, not merely that no event was appended.
+                store
+                    .upsert(
+                        &TALLY,
+                        &self.tenant,
+                        "item/item-1",
+                        &json!({
+                            "stream": "item-1",
+                            "kind": "item",
+                            "count": count + 100,
+                            "last": "guard.side_effect",
+                        }),
+                    )
+                    .await?;
+                return Err(EventLogError::GuardRefused {
+                    code: "tally.limit_reached".to_owned(),
+                });
             }
             Ok(())
         })
@@ -834,10 +852,11 @@ pub async fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
             guard,
         )
         .await;
-    assert!(
-        matches!(refused, Err(EventLogError::Invalid(_))),
-        "the guard refused the write at the limit"
-    );
+    let code = match refused {
+        Err(EventLogError::GuardRefused { code }) => code,
+        other => panic!("the guard must return its stable refusal code, got {other:?}"),
+    };
+    assert_eq!(code, "tally.limit_reached");
     let tenant = TenantId::new("tenant-i").expect("valid tenant");
     let stream = StreamId::new(tenant.clone(), "item", "item-1").expect("valid stream");
     assert_eq!(
@@ -845,6 +864,17 @@ pub async fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
         Some(2),
         "a refused guard wrote nothing at all"
     );
+    let row = store
+        .projection_get(&TALLY, &tenant, "item/item-1")
+        .await
+        .expect("readable")
+        .expect("the accepted inline projection remains");
+    assert_eq!(
+        row["count"],
+        json!(2),
+        "the guard's projection write was rolled back with its refused append"
+    );
+    assert_eq!(row["last"], json!("item.extracted"));
 }
 
 /// One stored event body, exactly as some past version of the code wrote it.
