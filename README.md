@@ -120,6 +120,24 @@ callbacks. The permit grants a storage operation, not authorization to another t
 policy, installation lifecycle membership, current authority and namespace bindings remain with
 the owning service. The internal stored shapes have an ESS home under `ess/admission/`.
 
+## Snapshot provenance
+
+A snapshot is a cache of an observed history. Capture `snapshot_generation` before reading a
+snapshot or folding events, then pass that token to `save_snapshot_checked`. A `false` result
+means redaction or erasure changed that history; discard the cache candidate and fold again.
+The legacy `save_snapshot` method refuses unproven writes with `Invalid`.
+
+`Repository` carries this token through its load and automatic cache write. Automatic caching
+is best effort after append, so a cache failure does not turn a committed command into an error.
+`snapshot_now` retries one stale write, then reports that history changed. Store wrappers without
+checked-snapshot support fold from events and skip caching.
+
+Both adapters add a per-stream generation table without changing existing event or snapshot
+columns. Redaction rotates the generation, erasure removes it, and recreated streams receive a
+new generation. Old caches without provenance are ignored. PostgreSQL's migration role upgrades
+the exact supported older checksum and physical shape transactionally; application-role open
+requires the complete new schema. Stop older binaries before this protocol cutover.
+
 ## Guard refusals and effect metadata
 
 A guard can return `EventLogError::GuardRefused { code }` with an owner-defined stable code.

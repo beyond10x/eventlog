@@ -18,23 +18,23 @@ scope:
   path: crates/eventlog-core/src/aggregate.rs
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
 - confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-postgres/src/schema.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-postgres/tests/conformance.rs
 - confidence: cited
   path: crates/eventlog-sqlite/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-sqlite/tests/repository.rs
-- confidence: inferred
+- confidence: cited
   path: ess/snapshots/domains/snapshots.yaml
-- confidence: inferred
+- confidence: cited
   path: ess/snapshots/system.yaml
-revision: 9
+revision: 17
 ---
 ## Problem
 
@@ -79,3 +79,9 @@ Add per-stream snapshot_generations metadata with tenant_id, stream_type, stream
 Repository carries the observed token from fold through append/cache. Automatic cache serialization/storage failure cannot report an already committed append as failed. snapshot_now retries one stale refusal and then returns an explicit Invalid history-changed result. A new ESS metadata model precedes implementation. This is a declared contract design change, not an assertion weakened to fit code. No current service-sdk direct snapshot/Repository caller was found by the scoper; no consumer change is required.
 
 Scope confirmation: schema.rs and both adapter tests are required by the selected design, replacing the earlier inferred choice. Add ess/snapshots/ and mandatory production-proof case roster. Coordinator owns README, CHANGELOG and tracking documents. Implementation tree wt-f0ba183ee985 starts from reviewed combined source699c0e15a2c3669d88329543f113e6302ba9dc7e; its final proof follows all merges.
+
+## Scope confirmation
+
+Implemented commit d25e5675e299119af905e0c2df9a8c862934e08a confirmed every previously inferred schema/test/ESS surface. Actual files: core lib.rs and aggregate.rs; shared conformance lib.rs; SQLite lib.rs and tests/repository.rs; PostgreSQL lib.rs, schema.rs, tests/conformance.rs and examples/production-proof.rs; ess/snapshots/system.yaml and domains/snapshots.yaml. No consumer or workspace metadata edits. Schema admission now includes generation metadata permissions and exact older checksum upgrades. This corrects the earlier imprecise roster-count wording: the new metadata table is additional to the original admission tables. The initial read-only scope expanded deliberately to the production-proof roster after design; no original source path was silently removed.
+
+Unit production gate ran88 cases (81 before), with0failed0skipped; both adapter stale-predicate mutants failed the required case and source restoration was byte-identical. Exact unit runner records: verification-report:snapshot-implementation-20260909. Independent review and combined-branch gate still precede lifecycle closure.
