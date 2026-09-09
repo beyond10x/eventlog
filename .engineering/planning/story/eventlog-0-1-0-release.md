@@ -8,7 +8,7 @@ summary: Open-source the Eventlog workspace and expose a stable guard refusal co
 tags:
 - eventlog
 - release
-revision: 4
+revision: 5
 ---
 ## Intent
 
@@ -25,3 +25,7 @@ Prepare the existing Eventlog workspace for its first source release and provide
 ## Constraints
 
 Eventlog remains tenant-oriented and gains no realm semantics. Its existing append-only, privacy, idempotency, projection, snapshot, redaction, and two-backend invariants remain unchanged.
+
+## Recovery provenance and current delivery
+
+This implemented record was preserved from recovery/release-candidate-20260909 at681a0ac5d407a12554e44980f7a9c186be11608f. It describes preparation on that historical branch, not a published release or the present main state. Its old source candidate was not blindly merged. Current implementation is owned by the reviewed integration stories; final exact-source proof and separately authorized publication are owned by story:verify-and-publish-eventlog-source-release. No release or tag was present at session inventory.

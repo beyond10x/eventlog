@@ -4,7 +4,7 @@ id: runbook:complete-review-wave
 kind: runbook
 status: draft
 title: Complete Eventlog review and integration
-revision: 3
+revision: 4
 ---
 ## Authorization and ownership
 
@@ -39,3 +39,13 @@ Feature unit096cdbe77c0adf1c8ade9b3b3985fcdbbb8cfcd9 and catch-up unit15c0496333
 Combined production gate exit0:81 passed,0 failed,0 skipped; required-case set complete; fmt/clippy exit0. Source dirty flag reflects concurrent coordinator planning-only edits; final proof will run frozen exact source. Report: /home/timo/.cache/eventlog-complete-20260909/evidence/wave1-production-proof.json. No source release performed. Feature ESS semantic model validates; installed ESS cannot exactly project its internally tagged Rust wire layout, and its model states that limitation.
 
 Snapshot implementation is assigned wt-f0ba183ee985, branch impl/verified-snapshot-generations. Two other workers review existing PostgreSQL and core/SQLite in parallel, tests-only; their confirmed findings are queued after overlapping snapshot source edits. Harness does not expose per-agent token/tool counts or elapsed metrics; these cannot be invented. Build observations: coordinator1.4GiB, catch-up1.1GiB, features1.6GiB;29GiB currently free.
+
+## Review follow-up sequence
+
+Broader core/SQLite review returned one NEEDS-CHANGE input-validation class with3 failing cases; broader PostgreSQL review returned one CONFIRMED rewrite-rule admission class with2 failing cases. Exact immutable reports and individual repair stories are recorded. Both are reachable through public APIs; their origin is explicitly undecided because the reviewers did not execute a separate historical checkout.
+
+The typed next-wave result places story:reject-postgres-rewrite-rules and story:validate-public-append-inputs together, collisions=[],unassessed=[],cycles=[]. Both depend on snapshot implementation to avoid its shared files. Coordinator owns their production-proof roster additions. Operator standing scope is to fix every confirmed actionable finding; no additional wave approval is required.
+
+An independent read-only review of the selected snapshot design found no reachable gap across redaction, erase/recreate ABA, pre-fold capture and publication locking. It did not claim tests on unfinished implementation.
+
+Comparative baseline managed recordwt-d3a4aefef9fc, exact20e00c1eeab5d67bd5f749bbbd871b1fbfe7f796, coordinator lease. Disposable eventlog-complete-20260909 has the required2CPU/1GiB/256pids envelope; memory-swap was set explicitly to2GiB because Docker refused changing memory alone. Source proof awaits the final frozen candidate. Final publication is tracked by story:verify-and-publish-eventlog-source-release rather than conflated with the preserved historical implemented preparation record.
