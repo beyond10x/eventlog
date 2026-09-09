@@ -12,6 +12,271 @@ use tokio_postgres::NoTls;
 /// asserts on its feed is a race by design. One at a time, deterministically.
 static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+async fn assert_catch_up_reuses_session(contended: bool) {
+    use eventlog_core::CatchUpRunner;
+    use std::sync::Arc;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: catch-up reuse requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let prefix = if contended {
+        "catchup_locked"
+    } else {
+        "catchup_empty"
+    };
+    let observer = client(&url).await;
+    observer
+        .batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_p_tally"))
+        .await
+        .unwrap();
+    store(prefix).await.unwrap().shutdown().await.unwrap();
+    let tagged_url = format!(
+        "{url}{}application_name={prefix}",
+        if url.contains('?') { '&' } else { '?' }
+    );
+    let adapter = Arc::new(
+        PostgresEventStore::connect_local(
+            &tagged_url,
+            prefix,
+            eventlog_postgres::PoolOptions {
+                max_connections: 1,
+                ..eventlog_postgres::PoolOptions::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let runner = CatchUpRunner::new(adapter.clone(), Arc::new(eventlog_conformance::Tally))
+        .await
+        .unwrap();
+    let tenant = TenantId::new("reuse").unwrap();
+    let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+    let pid: i32 = observer
+        .query_one(
+            "SELECT pid FROM pg_stat_activity WHERE application_name=$1",
+            &[&prefix],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let coordinates =
+        serde_json::to_string(&[prefix, "projector", "tally", tenant.as_str()]).unwrap();
+    if contended {
+        observer.query_one("SELECT pg_advisory_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&coordinates]).await.unwrap();
+    }
+    for expected_position in [0, 1] {
+        for _ in 0..4 {
+            let progress = runner.run_once(&tenant).await.unwrap();
+            assert_eq!(progress.applied, 0);
+            assert_eq!(
+                progress.position,
+                if contended { 0 } else { expected_position }
+            );
+            assert_eq!(progress.more_waiting, contended);
+            let state = adapter.pool_status();
+            assert_eq!(
+                (state.checked_out, state.waiting, state.idle),
+                (0, 0, 1),
+                "a successful no-work pass must return its settled connection"
+            );
+            let session = observer
+                .query_one(
+                    "SELECT pid, state FROM pg_stat_activity WHERE application_name=$1",
+                    &[&prefix],
+                )
+                .await
+                .unwrap();
+            assert_eq!(session.get::<_, i32>(0), pid, "no replacement session");
+            assert_eq!(session.get::<_, String>(1), "idle", "no open transaction");
+        }
+        if expected_position == 0 {
+            if contended {
+                observer.query_one("SELECT pg_advisory_unlock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&coordinates]).await.unwrap();
+            }
+            adapter
+                .append(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta("reuse-command", &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+            let progress = runner.run_once(&tenant).await.unwrap();
+            assert_eq!(
+                (progress.applied, progress.position, progress.more_waiting),
+                (1, 1, false)
+            );
+            if contended {
+                observer.query_one("SELECT pg_advisory_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&coordinates]).await.unwrap();
+            }
+        }
+    }
+    if contended {
+        observer.query_one("SELECT pg_advisory_unlock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&coordinates]).await.unwrap();
+    }
+    assert_eq!(
+        adapter
+            .projection_get(&eventlog_conformance::TALLY, &tenant, "item/one")
+            .await
+            .unwrap()
+            .unwrap()["count"],
+        1
+    );
+    let cursor: i64 = observer.query_one(&format!("SELECT global_seq FROM {prefix}_projection_cursors WHERE projection='tally' AND tenant_id=$1"), &[&tenant.as_str()]).await.unwrap().get(0);
+    assert_eq!(cursor, 1);
+    adapter.shutdown().await.unwrap();
+    eprintln!(
+        "catch-up reuse: contended={contended}, eight no-work polls retained backend {pid}, cursor=1, tally=1"
+    );
+}
+
+#[tokio::test]
+async fn empty_catch_up_reuses_the_same_settled_session() {
+    assert_catch_up_reuses_session(false).await;
+}
+
+#[tokio::test]
+async fn contended_catch_up_reuses_the_same_settled_session() {
+    assert_catch_up_reuses_session(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn unsettled_catch_up_rollback_never_recycles_a_session() {
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        sync::Arc,
+        time::Duration,
+    };
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: rollback response loss requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let parsed: tokio_postgres::Config = url.parse().unwrap();
+    let upstream_port = parsed.get_ports()[0];
+    for cancel in [false, true] {
+        let prefix = if cancel {
+            "catchup_cancel"
+        } else {
+            "catchup_failed"
+        };
+        store(prefix).await.unwrap().shutdown().await.unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let (intercepted, observed) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let proxy = std::thread::spawn(move || {
+            let (mut downstream, _) = listener.accept().unwrap();
+            let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).unwrap();
+            downstream.set_nodelay(true).unwrap();
+            upstream.set_nodelay(true).unwrap();
+            downstream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            upstream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut inbound = downstream.try_clone().unwrap();
+            let mut outbound = upstream.try_clone().unwrap();
+            let forward = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut inbound, &mut outbound);
+                let _ = outbound.shutdown(Shutdown::Both);
+            });
+            loop {
+                let mut header = [0_u8; 5];
+                if upstream.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let length = u32::from_be_bytes(header[1..].try_into().unwrap());
+                assert!((4..=16 * 1024 * 1024).contains(&length));
+                let mut body = vec![0; usize::try_from(length - 4).unwrap()];
+                if upstream.read_exact(&mut body).is_err() {
+                    break;
+                }
+                if header[0] == b'C' && body == b"ROLLBACK\0" {
+                    let _ = intercepted.send(());
+                    let _ = resume.recv_timeout(Duration::from_secs(5));
+                    break;
+                }
+                if downstream
+                    .write_all(&header)
+                    .and_then(|()| downstream.write_all(&body))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = upstream.shutdown(Shutdown::Both);
+            let _ = downstream.shutdown(Shutdown::Both);
+            forward.join().unwrap();
+        });
+        let proxy_url = format!("host=127.0.0.1 port={proxy_port} user=postgres dbname=postgres");
+        let adapter = Arc::new(
+            PostgresEventStore::connect_local(
+                &proxy_url,
+                prefix,
+                eventlog_postgres::PoolOptions {
+                    max_connections: 1,
+                    ..eventlog_postgres::PoolOptions::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let polling = adapter.clone();
+        let task = tokio::spawn(async move {
+            polling
+                .run_catch_up(
+                    Arc::new(eventlog_conformance::Tally),
+                    &TenantId::new("rollback").unwrap(),
+                    10,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), observed)
+            .await
+            .expect("explicit rollback must reach the server")
+            .expect("proxy observed rollback");
+        let state = adapter.pool_status();
+        assert_eq!(
+            (state.checked_out, state.waiting, state.idle),
+            (1, 0, 0),
+            "a rollback without its response remains quarantined"
+        );
+        assert!(
+            !task.is_finished(),
+            "successful settlement requires the response"
+        );
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            release.send(()).unwrap();
+        } else {
+            release.send(()).unwrap();
+            assert!(matches!(
+                task.await.unwrap(),
+                Err(eventlog_core::EventLogError::Backend(_))
+            ));
+        }
+        assert_eq!(
+            adapter.pool_status().idle,
+            0,
+            "unsettled lease cannot recycle"
+        );
+        adapter.shutdown().await.unwrap();
+        let state = adapter.pool_status();
+        assert_eq!((state.checked_out, state.waiting, state.idle), (0, 0, 0));
+        proxy.join().unwrap();
+        eprintln!(
+            "catch-up rollback: cancel={cancel}, response withheld with occupancy=1/0/0; shutdown drained=0/0/0"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pool_observation_preserves_two_connections_and_four_waiters() {
     use eventlog_core::{BoxFuture, EventLogError, Guard, ProjectionStore};
