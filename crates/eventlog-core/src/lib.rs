@@ -21,6 +21,8 @@ pub use projection::{
     ProjectionSpec, ProjectionStore, Projector, indexed_value, validate_identifier,
 };
 
+mod transaction;
+pub use transaction::{TransactionSession, TransactionalEventStore};
 mod atomic_group;
 pub use atomic_group::{
     AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend,

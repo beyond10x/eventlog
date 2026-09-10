@@ -7,6 +7,9 @@ under bare-version tags such as `0.1.0`.
 
 ### Added
 
+- PostgreSQL supports caller-scoped native transactions with stream/projection reads, identity
+  locks, sequence reservations and dynamically staged atomic groups. Caught group failures use
+  savepoints; unfinished operations cannot be turned into a successful outer commit.
 - PostgreSQL adds opt-in indexed JSON document queries over existing projections, including
   inline transaction reads. Explicit migration admits GIN/body and byte-order key indexes;
   existing scalar projections keep their layout. See `docs/design/document-queries.md`.

@@ -34,6 +34,7 @@ mod atomic_group;
 mod documents;
 mod pool;
 mod schema;
+mod transaction;
 use pool::Pool;
 pub use pool::{PoolOptions, PoolStatus, PostgresConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,70 +433,25 @@ impl EventStore for PostgresEventStore {
         limit: usize,
     ) -> BoxFuture<'a, Result<StreamSlice, EventLogError>> {
         self.bounded(async move {
-            let limit = bounded_limit(limit);
-            let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
-            let rows = client
-                .query(
-                    &format!(
-                        "SELECT {COLUMNS} FROM {prefix}_events
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
-                           AND version > $4
-                         ORDER BY version LIMIT $5"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &to_i64(after_version)?,
-                        &to_i64(limit as u64 + 1)?,
-                    ],
-                )
-                .await
-                .map_err(backend)?;
+            let result =
+                transaction::read_stream(&*client, &self.prefix, stream, after_version, limit)
+                    .await?;
             client.settled();
-            let mut events = rows
-                .iter()
-                .map(read_event)
-                .collect::<Result<Vec<_>, EventLogError>>()?;
-            let end_of_stream = events.len() <= limit;
-            events.truncate(limit);
-            let next_version = events.last().map_or(after_version, |event| event.version);
-            Ok(StreamSlice {
-                events,
-                next_version,
-                end_of_stream,
-            })
+            Ok(result)
         })
     }
-
     fn stream_version<'a>(
         &'a self,
         stream: &'a StreamId,
     ) -> BoxFuture<'a, Result<Option<u64>, EventLogError>> {
         self.bounded(async move {
-            let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
-            let head: Option<i64> = client
-                .query_one(
-                    &format!(
-                        "SELECT MAX(version) FROM {prefix}_events
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                    ],
-                )
-                .await
-                .map_err(backend)?
-                .get(0);
+            let result = transaction::stream_version(&*client, &self.prefix, stream).await?;
             client.settled();
-            head.map(to_u64).transpose()
+            Ok(result)
         })
     }
-
     fn list_streams<'a>(
         &'a self,
         tenant: &'a TenantId,
@@ -504,16 +460,18 @@ impl EventStore for PostgresEventStore {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<StreamId>, EventLogError>> {
         self.bounded(async move {
-            StreamId::new(tenant.clone(), stream_type, after_id.unwrap_or("_"))?;
             let mut client = self.pool.acquire().await?;
-            // Point inventory uses one READ COMMITTED statement and the existing stream index.
-            // A feed watermark would hide successful writes behind unrelated transactions.
-            let rows = client.query(
-                &format!("SELECT DISTINCT stream_id FROM {}_events WHERE tenant_id=$1 AND stream_type=$2 AND stream_id > $3 ORDER BY stream_id LIMIT $4", self.prefix),
-                &[&tenant.as_str(), &stream_type, &after_id.unwrap_or(""), &to_i64(bounded_limit(limit) as u64)?],
-            ).await.map_err(backend)?;
+            let result = transaction::list_streams(
+                &*client,
+                &self.prefix,
+                tenant,
+                stream_type,
+                after_id,
+                limit,
+            )
+            .await?;
             client.settled();
-            rows.iter().map(|row| StreamId::new(tenant.clone(), stream_type, row.get::<_, String>(0))).collect()
+            Ok(result)
         })
     }
 
@@ -807,9 +765,9 @@ impl EventStore for PostgresEventStore {
             transaction
                 .execute(
                     &format!(
-                        "DELETE FROM {prefix}_scope_counters WHERE left(coordinate,length($1))=$1"
+                        "DELETE FROM {prefix}_scope_counters WHERE left(coordinate,length($1))=$1 OR left(coordinate,length($2))=$2"
                     ),
-                    &[&coordinate_prefix],
+                    &[&coordinate_prefix, &format!("q{}:{}", tenant.as_str().len(), tenant.as_str())],
                 )
                 .await
                 .map_err(backend)?;

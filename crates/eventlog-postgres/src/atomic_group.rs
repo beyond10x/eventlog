@@ -257,7 +257,7 @@ impl PostgresEventStore {
         })
     }
 
-    async fn group_in_transaction(
+    pub(super) async fn group_in_transaction(
         &self,
         transaction: &tokio_postgres::Transaction<'_>,
         group: &AppendGroup,
