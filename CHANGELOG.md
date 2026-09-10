@@ -5,6 +5,11 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Shared Gates 0.1.1 rejects non-automation commit authors before scanning or reusing signed
+  evidence, including intermediate commits and merged side branches.
+
 ## 0.2.0 — 2026-09-10
 
 ### Added
