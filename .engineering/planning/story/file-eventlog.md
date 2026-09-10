@@ -10,7 +10,7 @@ refs:
 relations:
 - informed_by: architecture-decision-record:ess-evolution-05-file-and-atomic-groups
 - depends_on: story:atomic-append-groups
-revision: 7
+revision: 9
 ---
 ## Context
 The authorized ESS evolution design requires a repository-local Eventlog provider before ER and AEP migration. Existing EventStore, AtomicEventStore, event envelopes and projection ports in crates/eventlog-core define the behavior; this adds a provider and physical encoding, not a product entity. ADR ess-evolution-05-file-and-atomic-groups supersedes the predecessor RFC's two-provider restriction.
@@ -27,8 +27,8 @@ Run unchanged shared conformance and independent crash/reopen, concurrent proces
 
 ## Progress
 
-Implemented and locally verified in the retained candidate. Final mandatory gate with PostgreSQL 17.6, verified TLS and dedicated application role passed: 129 tests, no failures or skips, no missing required cases; formatting and all-target strict Clippy passed. All file-provider tests also passed on Rust 1.91.0. Four deliberate mutations (digest verification, process locking, stale-cache erasure and mixed-intent refusal) each failed their independent test and were reverted. See verification-report:file-provider-20260910 and docs/design/file-provider.md. No source publication, release, capacity approval, ER adapter or downstream migration is claimed.
+Implemented and published to main as 0d953650f161d0a43df14ce605339d9f519ba525 on 2026-09-10, verified by git ls-remote origin refs/heads/main after the bot-authenticated push. Final mandatory local gate passed: 129 tests, no failures or skips, no missing required cases; formatting and all-target strict Clippy passed. All file-provider tests also passed on Rust 1.91.0. Four deliberate mutations each failed and were reverted. See verification-report:file-provider-20260910 and docs/design/file-provider.md. No release, capacity approval, ER adapter or downstream migration is claimed.
 
 ## Publication
 
-The operator requested source publication on 2026-09-10 and explicitly requested skipping the expensive remote GitHub Actions gate. Publish the verified atomic-group and file-provider candidate to Eventlog main with [skip ci] in the commit message; preserve workflow definitions and Git hooks. Local production-proof evidence remains the validation basis: 129 passed, zero failed/skipped, formatting and strict Clippy passed, and file tests passed on Rust 1.91.0. Source checksums were reverified before publication and stable Rust remains 1.98.1. This is an interactive operator-directed publication, with no new decomposition or critic panel. Record the verified remote source revision after push; no release or downstream adoption is part of this operation.
+Source publication verified on 2026-09-10: https://github.com/beyond10x/eventlog/commit/0d953650f161d0a43df14ce605339d9f519ba525. Both author and committer are b10x-bot[bot]. The operator explicitly requested skipping the expensive remote Actions gate; the commit carries [skip ci], and workflow definitions and Git hooks were preserved. The local proof is the validation basis, not a remote CI success. This interactive operator-directed operation creates no new decomposition. Worktree cleanup follows publication of this receipt.

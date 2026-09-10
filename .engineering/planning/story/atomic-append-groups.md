@@ -9,7 +9,7 @@ refs:
   reference: initiative:ess-evolution
 relations:
 - informed_by: architecture-decision-record:ess-evolution-05-file-and-atomic-groups
-revision: 5
+revision: 6
 ---
 ## Context
 EventStore currently appends one stream per transaction. ER requires ordered multi-entity atomic recording. Existing StreamId, Expected, NewEvent, CommandMeta, AppendResult and Guard semantics are declared in crates/eventlog-core/src/lib.rs; this work adds a storage operation over them, not a product entity.
@@ -26,4 +26,4 @@ Shared behavioral cases for ordering/retries/conflicts/rollback/guards/projectio
 
 ## Publication
 
-Publish with story:file-eventlog under the operator's 2026-09-10 instruction. The complete candidate passed the local mandatory PostgreSQL/SQLite/file proof with 129 passed and no failed or skipped cases. The operator explicitly waived the expensive remote Actions gate for this source push; [skip ci] will suppress its push trigger. Source checksums match the retained verified candidate. Record remote revision after publication; no release or consumer migration is claimed.
+Published with story:file-eventlog to main as 0d953650f161d0a43df14ce605339d9f519ba525 on 2026-09-10, verified by git ls-remote after the bot-authenticated push. Commit: https://github.com/beyond10x/eventlog/commit/0d953650f161d0a43df14ce605339d9f519ba525. Both author and committer are b10x-bot[bot]. The complete candidate passed the local mandatory PostgreSQL/SQLite/file proof with 129 passed and no failed or skipped cases. The operator explicitly requested skipping the expensive remote Actions gate; the commit carries [skip ci]. No release or consumer migration is claimed.
