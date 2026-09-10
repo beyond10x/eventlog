@@ -730,6 +730,31 @@ pub trait EventStore: Send + Sync + 'static {
         stream: &'a StreamId,
     ) -> BoxFuture<'a, Result<Option<u64>, EventLogError>>;
 
+    /// Lists committed stream identities for an exact tenant and stream type in byte order.
+    ///
+    /// `after_id` is an exclusive lower bound; omit it for the first page. The limit is bounded
+    /// like event reads. Continue after the last returned id until a short or empty page.
+    /// Each page observes committed records immediately, independently of feed watermarks.
+    /// Pages do not share a snapshot: concurrent inserts before a cursor require a fresh scan.
+    /// Redaction preserves stream existence; tenant erasure removes it. This is inventory,
+    /// not a durable subscription cursor.
+    ///
+    /// # Errors
+    /// Returns a storage failure, invalid coordinates, or an explicit unsupported refusal.
+    fn list_streams<'a>(
+        &'a self,
+        _tenant: &'a TenantId,
+        _stream_type: &'a str,
+        _after_id: Option<&'a str>,
+        _limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<StreamId>, EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid(
+                "committed stream inventory is unavailable".into(),
+            ))
+        })
+    }
+
     /// Read a tenant's history in commit order, stopping short of anything still in flight.
     ///
     /// # Errors

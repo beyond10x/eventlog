@@ -8,6 +8,8 @@
 
 mod atomic_group;
 pub use atomic_group::run_atomic_groups;
+mod inventory;
+pub use inventory::run_stream_inventory;
 
 use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, NewEvent, Snapshot, StreamId, TenantId,

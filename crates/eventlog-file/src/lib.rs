@@ -668,6 +668,41 @@ impl EventStore for FileEventStore {
             })
         }))
     }
+    fn list_streams<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        stream_type: &'a str,
+        after_id: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<StreamId>, EventLogError>> {
+        let (tenant, stream_type, after) = (
+            tenant.clone(),
+            stream_type.to_owned(),
+            after_id.map(str::to_owned),
+        );
+        Box::pin(self.transaction(move |tx| {
+            Box::pin(async move {
+                StreamId::new(
+                    tenant.clone(),
+                    &stream_type,
+                    after.as_deref().unwrap_or("_"),
+                )?;
+                let ids: std::collections::BTreeSet<_> = tx
+                    .state
+                    .events
+                    .values()
+                    .filter(|event| event.tenant == tenant && event.stream_type == stream_type)
+                    .map(|event| event.stream_id.as_str())
+                    .filter(|id| after.as_deref().is_none_or(|after| *id > after))
+                    .collect();
+                ids.into_iter()
+                    .take(bounded_limit(limit))
+                    .map(|id| StreamId::new(tenant.clone(), &stream_type, id))
+                    .collect()
+            })
+        }))
+    }
+
     fn read_feed<'a>(
         &'a self,
         tenant: &'a TenantId,

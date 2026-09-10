@@ -373,6 +373,43 @@ impl EventStore for SqliteEventStore {
         Box::pin(run_blocking(move || inner.stream_version(&stream)))
     }
 
+    fn list_streams<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        stream_type: &'a str,
+        after_id: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<StreamId>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let (tenant, stream_type, after) = (
+            tenant.clone(),
+            stream_type.to_owned(),
+            after_id.map(str::to_owned),
+        );
+        Box::pin(run_blocking(move || {
+            StreamId::new(
+                tenant.clone(),
+                &stream_type,
+                after.as_deref().unwrap_or("_"),
+            )?;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let mut statement = connection.prepare(&format!("SELECT DISTINCT stream_id FROM {}_events WHERE tenant_id=?1 AND stream_type=?2 AND stream_id > ?3 ORDER BY stream_id LIMIT ?4", inner.prefix)).map_err(backend)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        tenant.as_str(),
+                        stream_type,
+                        after.as_deref().unwrap_or(""),
+                        to_i64(bounded_limit(limit) as u64)?
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(backend)?;
+            rows.map(|row| StreamId::new(tenant.clone(), &stream_type, row.map_err(backend)?))
+                .collect()
+        }))
+    }
+
     fn read_feed<'a>(
         &'a self,
         tenant: &'a TenantId,

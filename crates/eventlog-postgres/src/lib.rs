@@ -481,6 +481,27 @@ impl EventStore for PostgresEventStore {
         })
     }
 
+    fn list_streams<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        stream_type: &'a str,
+        after_id: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<StreamId>, EventLogError>> {
+        self.bounded(async move {
+            StreamId::new(tenant.clone(), stream_type, after_id.unwrap_or("_"))?;
+            let mut client = self.pool.acquire().await?;
+            // Point inventory uses one READ COMMITTED statement and the existing stream index.
+            // A feed watermark would hide successful writes behind unrelated transactions.
+            let rows = client.query(
+                &format!("SELECT DISTINCT stream_id FROM {}_events WHERE tenant_id=$1 AND stream_type=$2 AND stream_id > $3 ORDER BY stream_id LIMIT $4", self.prefix),
+                &[&tenant.as_str(), &stream_type, &after_id.unwrap_or(""), &to_i64(bounded_limit(limit) as u64)?],
+            ).await.map_err(backend)?;
+            client.settled();
+            rows.iter().map(|row| StreamId::new(tenant.clone(), stream_type, row.get::<_, String>(0))).collect()
+        })
+    }
+
     fn read_feed<'a>(
         &'a self,
         tenant: &'a TenantId,

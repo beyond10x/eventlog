@@ -5,6 +5,12 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- File, SQLite and PostgreSQL expose bounded committed stream inventory for immediate
+  enumeration without waiting for feed watermarks. Tenant/type isolation, byte ordering,
+  redaction and erasure follow the stored stream coordinates; no schema migration is needed.
+
 ## 0.2.0 — 2026-09-10
 
 ### Added
