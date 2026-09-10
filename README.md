@@ -20,8 +20,8 @@ is proved for the deployment.
 
 ## Status
 
-Version **0.1.0**, distributed as source under [Apache-2.0](LICENSE), with
-`publish = false`. Use the bare-version Git tag `0.1.0` to pin this release.
+Version **0.2.1**, distributed as source under [Apache-2.0](LICENSE), with
+`publish = false`. Use the bare-version Git tag `0.2.1` to pin this release.
 The [changelog](CHANGELOG.md) covers the log, aggregates and snapshots, projections,
 schema evolution, erasure and redaction, guarded refusals, effect contracts and hosted
 PostgreSQL admission.
