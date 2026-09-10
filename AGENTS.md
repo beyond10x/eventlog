@@ -155,8 +155,8 @@ does not contain it.
 
 ## Public source
 
-This repository is public. Organization delivery credentials and bot-authenticated remote
-operations are provided by Atlas-owned tooling outside component source.
+This repository is public. Gates provides bot-authenticated delivery operations; organization
+credentials, signing keys and private policy remain in protected configuration outside source.
 
 <!-- b10x-docs-operations:start -->
 ## Public documentation operations

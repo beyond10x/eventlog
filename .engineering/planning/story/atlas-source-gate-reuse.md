@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:atlas-source-gate-reuse
 kind: story
-status: active
+status: implemented
 title: Reuse Eventlog proof through Atlas source admission
 relations:
 - informed_by: story:verify-and-publish-eventlog-source-release
@@ -17,7 +17,7 @@ scope:
   path: CHANGELOG.md
 - confidence: cited
   path: README.md
-revision: 6
+revision: 7
 ---
 ## Superseded proposal
 
