@@ -702,6 +702,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
     let sql = client(&url).await;
     for suffix in [
         "events",
+        "append_groups",
         "commands",
         "claims",
         "identity",
@@ -2173,7 +2174,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
         .expect("old data");
     original.shutdown().await.expect("old writer stopped");
     let sql = client(&url).await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations").await.expect("exact original populated schema");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("exact original populated schema");
     let config = PostgresConfig::isolated(&url, "schema_upgrade").expect("config");
     let (a, b) = tokio::join!(
         PostgresEventStore::migrate(config.clone(), PoolOptions::default(), &[]),
@@ -2202,7 +2203,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
             .is_err(),
         "unknown version/checksum refuses before serving"
     );
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations").await.expect("restore old fixture");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("restore old fixture");
     PostgresEventStore::migrate(
         PostgresConfig::isolated(&url, "schema_upgrade").expect("config"),
         PoolOptions::default(),

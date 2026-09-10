@@ -20,7 +20,9 @@ A change here that moves none of these is a question for the operator, not a tas
 
 ## What this repository owns
 
-The shared persistence kit: an append-only log, folds, snapshots, projections, on two backends.
+The shared persistence kit: an append-only log, folds, snapshots and projections. SQLite,
+PostgreSQL and the local JSONL file provider are implemented. The file provider's recovery,
+privacy and operating boundaries are documented in `docs/design/file-provider.md`.
 Every b10x owner may build-depend on these crates. That is the constraint every invariant below
 exists to protect.
 
@@ -31,10 +33,11 @@ Each is a claim that can be checked. Breaking one is a design change, not a refa
 1. **No domain type, no product concept, no policy lives in these crates.** Every owner may
    build-depend on the kit, which is only safe while that stays true. A type that names a product
    concept has already broken it.
-2. **There are two backends and no third.** In-memory *is* SQLite `:memory:`, which is why a
-   property proved in a test is proved for the deployment. A hand-written third backend is the
-   defect class recorded in `M-022-one-replay-rule-behind-one-port.md` (predecessor-monorepo path,
-   not in this tree).
+2. **Every provider implements the same applicable conformance contracts.** In-memory remains
+   SQLite `:memory:`. ADR `ess-evolution-05-file-and-atomic-groups` explicitly supersedes the
+   former two-backend/no-third rule and admits a durable JSONL file provider. Product-specific
+   storage forks remain prohibited. Atomic append groups commit together; never emulate them
+   with independently committed single appends.
 3. **No crate or module named `common`, `shared`, `utils`, `misc` or `helpers`.**
 4. **The conformance exercise is the definition of correct behaviour.** A backend change that needs
    an exercise change is a design change — say so in the commit rather than editing the assertion.
@@ -79,7 +82,7 @@ latency. The conformance exercise drains with a bounded retry for exactly this r
 | Domain events, aggregates and projections for a product | the owner that has the domain |
 | Identity resolution behind an opaque id | `identity` |
 | Blob storage | content-addressed storage, referenced here by digest |
-| A third backend of any kind | nowhere — see invariant 2 |
+| Product-specific storage forks | nowhere — see invariant 2 |
 
 ## The gate
 

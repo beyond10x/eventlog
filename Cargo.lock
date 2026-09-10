@@ -341,6 +341,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventlog-file"
+version = "0.1.0"
+dependencies = [
+ "eventlog-conformance",
+ "eventlog-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "eventlog-postgres"
 version = "0.1.0"
 dependencies = [

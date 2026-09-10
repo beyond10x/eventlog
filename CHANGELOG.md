@@ -3,6 +3,22 @@
 All notable changes to this component are recorded here. Versions are component-scoped and released
 under bare-version tags such as `0.1.0`.
 
+## [Unreleased]
+
+- Add the local `eventlog-file` provider with versioned JSONL transactions, process-safe atomic
+  groups, durable retry identities, verified blob storage and recoverable privacy rewrites.
+  Redacted file-store projections require a complete rebuild before serving new writes; existing
+  receipts remain resolvable. File-provider verification and operating limits are documented in
+  `docs/design/file-provider.md`.
+
+- SQLite and PostgreSQL implement ordered atomic append groups with one tenant-scoped
+  idempotency identity, actual-content retry matching and transaction-local expectations.
+  Required projections and group admission commit or roll back with the entire group.
+- Projection and guard contexts can read tenant-scoped blobs inside their current transaction.
+  Existing single-stream append entrypoints retain their behavior.
+- PostgreSQL admits the new group bookkeeping through an additive, physically checked migration;
+  previous schema editions remain migratable. Hosted writers require the new table's DML grants.
+
 ## 0.1.0 — 2026-09-09
 
 ### Added

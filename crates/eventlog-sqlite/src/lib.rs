@@ -11,6 +11,8 @@
 //! `.await`s. Before this bridge was internal, every consuming module wrapped every call in
 //! `spawn_blocking` by hand, and forgetting one wrap panicked a worker at startup.
 
+mod atomic_group;
+
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
@@ -125,6 +127,12 @@ impl Inner {
             registration: Mutex::new(false),
         };
         store.create_tables()?;
+        store
+            .connection
+            .lock()
+            .map_err(poisoned)?
+            .execute_batch(&atomic_group::ddl(prefix))
+            .map_err(backend)?;
         store.connection.lock().map_err(poisoned)?.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {prefix}_scope_counters (coordinate TEXT PRIMARY KEY, held INTEGER NOT NULL CHECK(held>=0)); CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(projection_name TEXT PRIMARY KEY,indexed_fields TEXT NOT NULL)")).map_err(backend)?;
         Ok(store)
     }
@@ -605,7 +613,7 @@ impl Inner {
         let connection = &mut *connection;
         begin_immediate(connection)?;
         let result =
-            self.append_in_transaction(connection, stream, expected, events, meta, admission);
+            self.append_in_transaction(connection, stream, expected, events, meta, admission, true);
         finish_transaction(connection, result)
     }
 
@@ -614,6 +622,8 @@ impl Inner {
     /// The transaction is managed by hand rather than through rusqlite's `Transaction`: a guard
     /// or an inline projector writes through a `&mut Connection`, which the borrowing
     /// `Transaction` type cannot hand out.
+    // The flag selects legacy command bookkeeping; a group has only its group identity.
+    #[allow(clippy::too_many_arguments)]
     fn append_in_transaction(
         &self,
         connection: &mut Connection,
@@ -622,61 +632,64 @@ impl Inner {
         events: &[NewEvent],
         meta: &CommandMeta,
         admission: &dyn Guard,
+        record_command: bool,
     ) -> Result<AppendResult, EventLogError> {
         let prefix = &self.prefix;
 
-        if let Some(claim) = &meta.claim {
-            let prior:Option<(String,String,String,i64,i64)>=connection.query_row(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=?1 AND scope=?2 AND claim_key=?3"),params![stream.tenant().as_str(),claim.scope,claim.key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(backend)?;
-            if let Some((digest, kind, id, first, last)) = prior {
-                if digest != claim.digest {
-                    return Err(EventLogError::IdempotencyMismatch {
-                        key: claim.key.clone(),
+        if record_command {
+            if let Some(claim) = &meta.claim {
+                let prior:Option<(String,String,String,i64,i64)>=connection.query_row(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=?1 AND scope=?2 AND claim_key=?3"),params![stream.tenant().as_str(),claim.scope,claim.key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(backend)?;
+                if let Some((digest, kind, id, first, last)) = prior {
+                    if digest != claim.digest {
+                        return Err(EventLogError::IdempotencyMismatch {
+                            key: claim.key.clone(),
+                        });
+                    }
+                    let original = StreamId::new(stream.tenant().clone(), kind, id)?;
+                    let events = select_versions(connection, prefix, &original, first, last)?;
+                    return Ok(AppendResult {
+                        first_version: to_u64(first)?,
+                        last_version: to_u64(last)?,
+                        events,
+                        deduplicated: true,
                     });
                 }
-                let original = StreamId::new(stream.tenant().clone(), kind, id)?;
-                let events = select_versions(connection, prefix, &original, first, last)?;
+            }
+
+            let recorded: Option<(String, i64, i64)> = connection
+                .query_row(
+                    &format!(
+                        "SELECT request_hash, first_version, last_version FROM {prefix}_commands
+                     WHERE tenant_id = ?1 AND stream_type = ?2 AND stream_id = ?3
+                       AND idempotency_key = ?4"
+                    ),
+                    params![
+                        stream.tenant().as_str(),
+                        stream.stream_type(),
+                        stream.stream_id(),
+                        meta.idempotency_key
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(backend)?;
+
+            if let Some((request_hash, first_version, last_version)) = recorded {
+                if request_hash != meta.request_hash {
+                    return Err(EventLogError::IdempotencyMismatch {
+                        key: meta.idempotency_key.clone(),
+                    });
+                }
+                let stored =
+                    select_versions(connection, prefix, stream, first_version, last_version)?;
                 return Ok(AppendResult {
-                    first_version: to_u64(first)?,
-                    last_version: to_u64(last)?,
-                    events,
+                    first_version: to_u64(first_version)?,
+                    last_version: to_u64(last_version)?,
+                    events: stored,
                     deduplicated: true,
                 });
             }
         }
-
-        let recorded: Option<(String, i64, i64)> = connection
-            .query_row(
-                &format!(
-                    "SELECT request_hash, first_version, last_version FROM {prefix}_commands
-                     WHERE tenant_id = ?1 AND stream_type = ?2 AND stream_id = ?3
-                       AND idempotency_key = ?4"
-                ),
-                params![
-                    stream.tenant().as_str(),
-                    stream.stream_type(),
-                    stream.stream_id(),
-                    meta.idempotency_key
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(backend)?;
-
-        if let Some((request_hash, first_version, last_version)) = recorded {
-            if request_hash != meta.request_hash {
-                return Err(EventLogError::IdempotencyMismatch {
-                    key: meta.idempotency_key.clone(),
-                });
-            }
-            let stored = select_versions(connection, prefix, stream, first_version, last_version)?;
-            return Ok(AppendResult {
-                first_version: to_u64(first_version)?,
-                last_version: to_u64(last_version)?,
-                events: stored,
-                deduplicated: true,
-            });
-        }
-
         let head: Option<i64> = connection
             .query_row(
                 &format!(
@@ -772,27 +785,28 @@ impl Inner {
 
         let first_version = head + 1;
         let last_version = head + events.len() as u64;
-        connection
-            .execute(
-                &format!(
-                    "INSERT INTO {prefix}_commands (
+        if record_command {
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO {prefix}_commands (
                          tenant_id, stream_type, stream_id, idempotency_key, request_hash,
                          first_version, last_version, recorded_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-                ),
-                params![
-                    stream.tenant().as_str(),
-                    stream.stream_type(),
-                    stream.stream_id(),
-                    meta.idempotency_key,
-                    meta.request_hash,
-                    to_i64(first_version)?,
-                    to_i64(last_version)?,
-                    recorded_at,
-                ],
-            )
-            .map_err(backend)?;
-
+                    ),
+                    params![
+                        stream.tenant().as_str(),
+                        stream.stream_type(),
+                        stream.stream_id(),
+                        meta.idempotency_key,
+                        meta.request_hash,
+                        to_i64(first_version)?,
+                        to_i64(last_version)?,
+                        recorded_at,
+                    ],
+                )
+                .map_err(backend)?;
+        }
         let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
         for projector in &projectors {
             let mut projections = SqliteProjections {
@@ -1189,6 +1203,7 @@ impl Inner {
             .map_err(backend)?;
         for table in [
             "events",
+            "append_groups",
             "commands",
             "claims",
             "identity",
@@ -1822,6 +1837,26 @@ struct SqliteProjections<'a> {
 }
 
 impl ProjectionStore for SqliteProjections<'_> {
+    fn get_blob<'a>(
+        &'a mut self,
+        digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
+        Box::pin(async move {
+            validate_field("digest", digest)?;
+            self.connection
+                .query_row(
+                    &format!(
+                        "SELECT bytes FROM {}_blobs WHERE tenant_id=?1 AND digest=?2",
+                        self.prefix
+                    ),
+                    params![self.tenant.as_str(), digest],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)
+        })
+    }
+
     fn reserve<'a>(
         &'a mut self,
         permit: &'a eventlog_core::AdmissionPermit,

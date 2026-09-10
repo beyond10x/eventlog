@@ -1,5 +1,5 @@
 [package]
-name = "eventlog-sqlite"
+name = "eventlog-file"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,16 +10,14 @@ publish.workspace = true
 
 [dependencies]
 eventlog-core.workspace = true
-rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
-rusqlite.workspace = true
 eventlog-conformance.workspace = true
-serde.workspace = true
-time.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 

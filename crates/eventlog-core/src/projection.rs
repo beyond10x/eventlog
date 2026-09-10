@@ -53,6 +53,22 @@ pub const MAX_INDEXED_FIELDS: usize = 8;
 /// `Send` is a supertrait so that a guard's or projector's future — which holds one of these
 /// across its awaits — can itself be `Send`.
 pub trait ProjectionStore: Send {
+    /// Read referenced content within this projection's tenant and transaction.
+    /// Never re-enter the outer event store while its append holds a transaction.
+    ///
+    /// # Errors
+    /// Providers without this capability explicitly refuse the read.
+    fn get_blob<'a>(
+        &'a mut self,
+        _digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid(
+                "transaction blob reads are unavailable".into(),
+            ))
+        })
+    }
+
     /// Atomically check and apply host-authorized scope counters inside the current append.
     /// The return values follow deterministic coordinate order. A refusal changes no counter,
     /// even when its caller catches the error. Projector contexts and foreign permits refuse.

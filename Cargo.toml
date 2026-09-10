@@ -4,6 +4,7 @@ members = [
     "crates/eventlog-sqlite",
     "crates/eventlog-postgres",
     "crates/eventlog-conformance",
+    "crates/eventlog-file",
 ]
 resolver = "3"
 

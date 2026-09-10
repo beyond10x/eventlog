@@ -21,6 +21,11 @@ pub use projection::{
     ProjectionStore, Projector, indexed_value, validate_identifier,
 };
 
+mod atomic_group;
+pub use atomic_group::{
+    AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend,
+};
+
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
@@ -656,8 +661,9 @@ pub enum EventLogError {
 
 /// Where facts are kept.
 ///
-/// Two backends implement this and one exercise defines what they must agree on. In-memory is
-/// SQLite `:memory:`, so there is no third implementation for the other two to diverge from.
+/// SQLite and PostgreSQL implement this; shared conformance defines their applicable contracts.
+/// The ESS evolution decision admits a durable file provider under the same contracts.
+/// In-memory storage remains SQLite `:memory:`.
 ///
 /// Every method returns a [`BoxFuture`]: the callers are async servers, and the sync/async bridge
 /// lives inside the backends rather than in every caller. Forgetting a caller-side

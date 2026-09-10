@@ -15,6 +15,7 @@ const BASE: &[&str] = &[
 ];
 const ADDED: &[&str] = &["scope_counters", "schema_version", "projection_registry"];
 const SNAPSHOT_ADDED: &[&str] = &["snapshot_generations"];
+const GROUP_ADDED: &[&str] = &["append_groups"];
 fn base_ddl(prefix: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {prefix}_events (
@@ -114,7 +115,7 @@ fn snapshot_additions(prefix: &str) -> String {
     )
 }
 
-fn checksum() -> String {
+fn snapshot_checksum() -> String {
     format!(
         "{:x}",
         Sha256::digest(format!(
@@ -122,6 +123,25 @@ fn checksum() -> String {
             base_ddl("owner"),
             additions("owner"),
             snapshot_additions("owner")
+        ))
+    )
+}
+
+fn group_additions(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_append_groups (tenant_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,ranges JSONB NOT NULL,PRIMARY KEY(tenant_id,idempotency_key));"
+    )
+}
+
+fn checksum() -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}{}{}{}",
+            base_ddl("owner"),
+            additions("owner"),
+            snapshot_additions("owner"),
+            group_additions("owner")
         ))
     )
 }
@@ -250,10 +270,11 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
     transaction
         .batch_execute(
             &format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 base_ddl("eventlog_expected"),
                 additions("eventlog_expected"),
-                snapshot_additions("eventlog_expected")
+                snapshot_additions("eventlog_expected"),
+                group_additions("eventlog_expected")
             )
             .replace("CREATE TABLE IF NOT EXISTS", "CREATE TEMP TABLE"),
         )
@@ -261,7 +282,12 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
         .map_err(backend)
 }
 async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
-    for suffix in BASE.iter().chain(ADDED).chain(SNAPSHOT_ADDED) {
+    for suffix in BASE
+        .iter()
+        .chain(ADDED)
+        .chain(SNAPSHOT_ADDED)
+        .chain(GROUP_ADDED)
+    {
         transaction
             .batch_execute(&format!("DROP TABLE pg_temp.eventlog_expected_{suffix}"))
             .await
@@ -315,11 +341,27 @@ pub(crate) async fn migrate(
     }
     let ledger = exists(&transaction, &format!("{prefix}_schema_version")).await?;
     let generations = exists(&transaction, &format!("{prefix}_snapshot_generations")).await?;
+    let groups = exists(&transaction, &format!("{prefix}_append_groups")).await?;
+    if groups && (!ledger || !generations) {
+        return Err(EventLogError::Invalid(
+            "partial PostgreSQL group migration".into(),
+        ));
+    }
+    let prior_checksum = if groups {
+        checksum()
+    } else if generations {
+        snapshot_checksum()
+    } else {
+        legacy_checksum()
+    };
     if ledger {
         compare(&transaction, prefix, ADDED).await?;
         if generations {
             compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
-            version(&transaction, prefix, &checksum()).await?;
+            if groups {
+                compare(&transaction, prefix, GROUP_ADDED).await?;
+            }
+            version(&transaction, prefix, &prior_checksum).await?;
         } else {
             version(&transaction, prefix, &legacy_checksum()).await?;
         }
@@ -333,10 +375,11 @@ pub(crate) async fn migrate(
     }
     transaction
         .batch_execute(&format!(
-            "{}{}{}",
+            "{}{}{}{}",
             base_ddl(prefix),
             additions(prefix),
-            snapshot_additions(prefix)
+            snapshot_additions(prefix),
+            group_additions(prefix)
         ))
         .await
         .map_err(backend)?;
@@ -348,13 +391,13 @@ pub(crate) async fn migrate(
             )
             .await
             .map_err(backend)?;
-    } else if !generations {
+    } else if !groups {
         transaction
             .execute(
                 &format!(
                     "UPDATE {prefix}_schema_version SET checksum=$1 WHERE version=1 AND checksum=$2"
                 ),
-                &[&checksum(), &legacy_checksum()],
+                &[&checksum(), &prior_checksum],
             )
             .await
             .map_err(backend)?;
@@ -385,6 +428,7 @@ pub(crate) async fn validate(client: &mut Client, prefix: &str) -> Result<(), Ev
     compare(&transaction, prefix, BASE).await?;
     compare(&transaction, prefix, ADDED).await?;
     compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
+    compare(&transaction, prefix, GROUP_ADDED).await?;
     version(&transaction, prefix, &checksum()).await?;
     drop_expected(&transaction)
         .await
@@ -396,6 +440,7 @@ pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), Eve
         .iter()
         .chain(ADDED)
         .chain(SNAPSHOT_ADDED)
+        .chain(GROUP_ADDED)
         .map(|suffix| format!("{prefix}_{suffix}"))
         .collect();
     let admitted:bool=client.query_one("SELECT COALESCE(bool_and(has_table_privilege(current_user,to_regclass(name),'SELECT') AND has_table_privilege(current_user,to_regclass(name),'INSERT') AND has_table_privilege(current_user,to_regclass(name),'UPDATE') AND has_table_privilege(current_user,to_regclass(name),'DELETE')),false) FROM unnest($1::text[]) AS name",&[&tables]).await.map_err(backend)?.get(0);
@@ -509,7 +554,12 @@ mod snapshot_tests {
             let _ = connection.await;
         });
         let prefix = "snapshot_upgrade";
-        for suffix in BASE.iter().chain(ADDED).chain(SNAPSHOT_ADDED) {
+        for suffix in BASE
+            .iter()
+            .chain(ADDED)
+            .chain(SNAPSHOT_ADDED)
+            .chain(GROUP_ADDED)
+        {
             sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
                 .await
                 .unwrap();
@@ -526,7 +576,7 @@ mod snapshot_tests {
             .await
             .unwrap();
         store.shutdown().await.unwrap();
-        sql.batch_execute("INSERT INTO snapshot_upgrade_snapshots VALUES ('tenant','item','one',1,1,'{\"total\":999}',now()); DROP TABLE snapshot_upgrade_snapshot_generations").await.unwrap();
+        sql.batch_execute("INSERT INTO snapshot_upgrade_snapshots VALUES ('tenant','item','one',1,1,'{\"total\":999}',now()); DROP TABLE snapshot_upgrade_snapshot_generations; DROP TABLE snapshot_upgrade_append_groups").await.unwrap();
         sql.execute(
             "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
             &[&legacy_checksum()],
@@ -604,6 +654,9 @@ mod snapshot_tests {
             migrate(&mut sql, prefix, &[]).await.is_err(),
             "new checksum without table is partial"
         );
+        sql.batch_execute("DROP TABLE snapshot_upgrade_append_groups")
+            .await
+            .unwrap();
         sql.execute(
             "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
             &[&legacy_checksum()],
@@ -617,7 +670,97 @@ mod snapshot_tests {
             "foreign metadata shape is refused"
         );
         assert!(validate(&mut sql, prefix).await.is_err());
-        for suffix in BASE.iter().chain(ADDED).chain(SNAPSHOT_ADDED) {
+        for suffix in BASE
+            .iter()
+            .chain(ADDED)
+            .chain(SNAPSHOT_ADDED)
+            .chain(GROUP_ADDED)
+        {
+            sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_migration_tests {
+    use super::*;
+    use crate::PostgresEventStore;
+    use eventlog_core::{EventStore, Expected, StreamId, TenantId};
+
+    #[tokio::test]
+    async fn snapshot_edition_migrates_to_groups_and_foreign_group_shape_refuses() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let (mut sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let prefix = "group_upgrade";
+        for suffix in BASE
+            .iter()
+            .chain(ADDED)
+            .chain(SNAPSHOT_ADDED)
+            .chain(GROUP_ADDED)
+        {
+            sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
+                .await
+                .unwrap();
+        }
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        let stream = StreamId::new(TenantId::new("tenant").unwrap(), "item", "one").unwrap();
+        let original = store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.created", 1)],
+                &eventlog_conformance::meta("created", &serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+        sql.batch_execute("DROP TABLE group_upgrade_append_groups")
+            .await
+            .unwrap();
+        sql.execute(
+            "UPDATE group_upgrade_schema_version SET checksum=$1",
+            &[&snapshot_checksum()],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            validate(&mut sql, prefix).await,
+            Err(EventLogError::Invalid(_))
+        ));
+        migrate(&mut sql, prefix, &[]).await.unwrap();
+        validate(&mut sql, prefix).await.unwrap();
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        assert_eq!(
+            store.read_stream(&stream, 0, 100).await.unwrap().events,
+            original.events
+        );
+        store.shutdown().await.unwrap();
+        sql.batch_execute(
+            "ALTER TABLE group_upgrade_append_groups ALTER COLUMN request_hash DROP NOT NULL",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            migrate(&mut sql, prefix, &[]).await,
+            Err(EventLogError::Invalid(_))
+        ));
+        assert!(matches!(
+            validate(&mut sql, prefix).await,
+            Err(EventLogError::Invalid(_))
+        ));
+        for suffix in BASE
+            .iter()
+            .chain(ADDED)
+            .chain(SNAPSHOT_ADDED)
+            .chain(GROUP_ADDED)
+        {
             sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
                 .await
                 .unwrap();

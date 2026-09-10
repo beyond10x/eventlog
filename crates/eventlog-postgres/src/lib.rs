@@ -30,6 +30,7 @@ use eventlog_core::{
 };
 use serde_json::Value;
 use time::OffsetDateTime;
+mod atomic_group;
 mod pool;
 mod schema;
 use pool::Pool;
@@ -239,6 +240,7 @@ impl PostgresEventStore {
             .await?
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {prefix}_events;
+                 DROP TABLE IF EXISTS {prefix}_append_groups;
                  DROP TABLE IF EXISTS {prefix}_commands;
                  DROP TABLE IF EXISTS {prefix}_claims;
                  DROP TABLE IF EXISTS {prefix}_snapshots;
@@ -276,216 +278,41 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<AppendResult, EventLogError>> {
         Box::pin(async move {
             tokio::time::timeout(self.pool.options.transaction_timeout, async move {
-            validate_append(events, meta)?;
-            self.freeze().await;
-            let prefix = self.prefix.clone();
-            let mut client = self.pool.acquire().await?;
-            client.quarantine();
-            let transaction = client.transaction().await.map_err(backend)?;
-            publication_gate(&transaction,&self.prefix,false).await?;
-
-            if let Some(claim) = &meta.claim {
-                lock_identity(&transaction,&prefix,"claim",&[stream.tenant().as_str(),&claim.scope,&claim.key]).await?;
-                let prior=transaction.query_opt(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=$1 AND scope=$2 AND claim_key=$3"), &[&stream.tenant().as_str(),&claim.scope,&claim.key]).await.map_err(backend)?;
-                if let Some(row)=prior {
-                    if row.get::<_,String>(0)!=claim.digest { return Err(EventLogError::IdempotencyMismatch {key:claim.key.clone()}); }
-                    let original=StreamId::new(stream.tenant().clone(),row.get::<_,String>(1),row.get::<_,String>(2))?;
-                    let first:i64=row.get(3); let last:i64=row.get(4);
-                    let events=select_versions(&transaction,&prefix,&original,first,last).await?;
-                    transaction.rollback().await.map_err(backend)?; client.settled();
-                    return Ok(AppendResult {first_version:to_u64(first)?,last_version:to_u64(last)?,events,deduplicated:true});
-                }
-            }
-            lock_identity(&transaction,&prefix,"stream",&[stream.tenant().as_str(),stream.stream_type(),stream.stream_id()]).await?;
-
-            let recorded = transaction
-                .query_opt(
-                    &format!(
-                        "SELECT request_hash, first_version, last_version FROM {prefix}_commands
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
-                           AND idempotency_key = $4"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &meta.idempotency_key,
-                    ],
-                )
-                .await
-                .map_err(backend)?;
-
-            if let Some(row) = recorded {
-                let request_hash: String = row.get(0);
-                let first_version: i64 = row.get(1);
-                let last_version: i64 = row.get(2);
-                if request_hash != meta.request_hash {
-                    return Err(EventLogError::IdempotencyMismatch {
-                        key: meta.idempotency_key.clone(),
-                    });
-                }
-                let stored =
-                    select_versions(&transaction, &prefix, stream, first_version, last_version)
-                        .await?;
-                transaction.rollback().await.map_err(backend)?;
-                client.settled();
-                return Ok(AppendResult {
-                    first_version: to_u64(first_version)?,
-                    last_version: to_u64(last_version)?,
-                    events: stored,
-                    deduplicated: true,
-                });
-            }
-
-            let head: Option<i64> = transaction
-                .query_one(
-                    &format!(
-                        "SELECT MAX(version) FROM {prefix}_events
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                    ],
-                )
-                .await
-                .map_err(backend)?
-                .get(0);
-            let head = match head {
-                Some(value) => to_u64(value)?,
-                None => 0,
-            };
-            check_expected(expected, head)?;
-
-            {
-                let mut projections = PostgresProjections {
-                    client: &transaction,
-                    prefix: &prefix,
-                    inline: &self.inline_names,
-                    tenant: stream.tenant(),
-                    admission: Some((&self.admission_permit, stream.tenant())),
-                    reservation_pending: false,
-                };
-                admission.check(&mut projections).await?;
-                if projections.reservation_pending { return Err(EventLogError::Invalid("unfinished reservation poisons this append".into())); }
-            }
-
-            let now = OffsetDateTime::now_utc();
-            let mut written = Vec::with_capacity(events.len());
-            for (offset, event) in events.iter().enumerate() {
-                let version = head + 1 + u64::try_from(offset).unwrap_or(u64::MAX);
-                let event_id = new_event_id();
-                let uuid = parse_uuid(&event_id)?;
-                let row = transaction
-                    .query_one(
-                        &format!(
-                            "INSERT INTO {prefix}_events (
-                                 tenant_id, stream_type, stream_id, version, event_id, event_name,
-                                 event_schema_version, occurred_at, recorded_at, subject, actor,
-                                 request_id, trace_id, causation_id, causation_depth, data)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                                     $15, $16)
-                             RETURNING {COLUMNS}"
-                        ),
-                        &[
-                            &stream.tenant().as_str(),
-                            &stream.stream_type(),
-                            &stream.stream_id(),
-                            &to_i64(version)?,
-                            &uuid,
-                            &event.name,
-                            &to_i32(event.schema_version)?,
-                            &meta.occurred_at,
-                            &now,
-                            &meta.subject,
-                            &meta.actor,
-                            &meta.request_id,
-                            &meta.trace_id,
-                            &meta.causation_id,
-                            &to_i32(meta.causation_depth)?,
-                            &event.data,
-                        ],
+                validate_append(events, meta)?;
+                self.freeze().await;
+                let mut client = self.pool.acquire().await?;
+                client.quarantine();
+                let transaction = client.transaction().await.map_err(backend)?;
+                publication_gate(&transaction, &self.prefix, false).await?;
+                let result = self
+                    .append_in_transaction(
+                        &transaction,
+                        stream,
+                        expected,
+                        events,
+                        meta,
+                        admission.as_ref(),
+                        true,
                     )
-                    .await
-                    .map_err(backend)?;
-                written.push(read_event(&row)?);
-            }
-
-            let first_version = head + 1;
-            let last_version = head + u64::try_from(events.len()).unwrap_or(u64::MAX);
-            transaction
-                .execute(
-                    &format!(
-                        "INSERT INTO {prefix}_commands (
-                             tenant_id, stream_type, stream_id, idempotency_key, request_hash,
-                             first_version, last_version, recorded_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &meta.idempotency_key,
-                        &meta.request_hash,
-                        &to_i64(first_version)?,
-                        &to_i64(last_version)?,
-                        &now,
-                    ],
-                )
-                .await
-                .map_err(backend)?;
-
-            let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
-            for projector in &projectors {
-                let mut projections = PostgresProjections {
-                    client: &transaction,
-                    prefix: &prefix,
-                    inline: &self.inline_names,
-                    tenant: stream.tenant(),
-                    admission: None,
-                    reservation_pending: false,
-                };
-                for recorded in &written {
-                    projector.apply(recorded, &mut projections).await?;
+                    .await;
+                match result {
+                    Ok(result) => {
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(|_| EventLogError::UnknownCommit)?;
+                        client.settled();
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        transaction.rollback().await.map_err(backend)?;
+                        client.settled();
+                        Err(error)
+                    }
                 }
-            }
-
-            if let Some(claim) = &meta.claim {
-                transaction
-                    .execute(
-                        &format!(
-                            "INSERT INTO {prefix}_claims (
-                                 tenant_id, scope, claim_key, request_digest, stream_type,
-                                 stream_id, first_version, last_version, recorded_at)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
-                        ),
-                        &[
-                            &stream.tenant().as_str(),
-                            &claim.scope,
-                            &claim.key,
-                            &claim.digest,
-                            &stream.stream_type(),
-                            &stream.stream_id(),
-                            &to_i64(first_version)?,
-                            &to_i64(last_version)?,
-                            &now,
-                        ],
-                    )
-                    .await
-                    .map_err(backend)?;
-            }
-
-            transaction.commit().await.map_err(|_| EventLogError::UnknownCommit)?;
-            client.settled();
-
-            Ok(AppendResult {
-                first_version,
-                last_version,
-                events: written,
-                deduplicated: false,
             })
-        }).await.map_err(|_|EventLogError::UnknownCommit)?
+            .await
+            .map_err(|_| EventLogError::UnknownCommit)?
         })
     }
 
@@ -901,6 +728,7 @@ impl EventStore for PostgresEventStore {
             publication_gate(&transaction, &self.prefix, true).await?;
             for table in [
                 "events",
+                "append_groups",
                 "commands",
                 "claims",
                 "identity",
@@ -1398,6 +1226,27 @@ struct PostgresProjections<'a, 'b> {
 }
 
 impl ProjectionStore for PostgresProjections<'_, '_> {
+    fn get_blob<'a>(
+        &'a mut self,
+        digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
+        Box::pin(async move {
+            validate_field("digest", digest)?;
+            let row = self
+                .client
+                .query_opt(
+                    &format!(
+                        "SELECT bytes FROM {}_blobs WHERE tenant_id=$1 AND digest=$2",
+                        self.prefix
+                    ),
+                    &[&self.tenant.as_str(), &digest],
+                )
+                .await
+                .map_err(backend)?;
+            Ok(row.map(|row| row.get(0)))
+        })
+    }
+
     fn reserve<'a>(
         &'a mut self,
         permit: &'a eventlog_core::AdmissionPermit,

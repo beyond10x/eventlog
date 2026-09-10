@@ -6,6 +6,9 @@
 //! that agree with it. It exists because the only divergence ever found between b10x store
 //! backends was found by an exercise like this one and not by review.
 
+mod atomic_group;
+pub use atomic_group::run_atomic_groups;
+
 use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, NewEvent, Snapshot, StreamId, TenantId,
     request_hash,
