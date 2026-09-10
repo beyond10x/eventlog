@@ -5,6 +5,15 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.2.1 — 2026-09-10
+
+### Changed
+
+- Pin the shared Gates reusable workflow to `2c3c6acd0a6795768446e925a6137e17357f267a`
+  (Gates 0.1.2), which publishes the release the workflow on `main` downloads. No check, policy
+  field or receipt format changed; the version increment alone invalidates receipts retained
+  under 0.1.1.
+
 ### Fixed
 
 - Shared Gates 0.1.1 rejects non-automation commit authors before scanning or reusing signed
