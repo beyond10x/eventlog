@@ -1,9 +1,9 @@
 # AGENTS.md — eventlog
 
-The contract for changing **this** repository. Org-wide rules — the naming convention, the language rule (anything that runs is Rust, not Python), the
-former-brand rule (atlas ADR 0001) and its four exemption categories, and the rule that renaming
-anything another repo verifies is a coordinated migration with an ADR — live in `atlas/AGENTS.md`
-and are not restated here.
+The contract for changing **this** repository. Organization naming, the Rust language rule and
+coordinated migrations are recorded in `atlas/AGENTS.md`. Public Gates owns common security/privacy
+checks and bot delivery under ADR 0048. ADR 0001's old brand-exemption categories were superseded;
+they do not authorize new public associations.
 
 `README.md` orients a reader and shows how to run the backends. This file says what must not break.
 
@@ -95,6 +95,16 @@ example. In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 Green here is the bar for `main`.
 
+The required shared Gates check covers common security/privacy rules. Install coordinated local
+hooks with `b10x-gates --repository beyond10x/eventlog install`; they inspect the index, messages
+and every outgoing commit, including intermediate commits and annotated tags. Private policy and
+signing keys stay outside public source. The explicit adoption baseline records historical
+findings separately and does not authorize new occurrences.
+
+Common-check receipts never replace the persistence proof below. Rust caching and cancellation of
+superseded PR proof runs are independent cost improvements; expensive repository-specific proof
+reuse is deferred.
+
 The PostgreSQL exercise runs only when `EVENTLOG_TEST_POSTGRES_URL` is set, and **reports itself as
 not run rather than passing quietly** when it is not. A gate that skipped a backend has not proved
 that backend. The required `bash scripts/gate.sh --production-proof` mode also requires the
@@ -108,14 +118,27 @@ does not — CI installs whatever `stable` is that day, and a newer clippy can f
 passed locally. Run `rustup update` before pushing, and read the gate's own exit status, never a
 pipeline's (`gate.sh 2>&1 | tail` reports `tail`'s status, not the gate's).
 
-The former brand is fenced org-wide by `scripts/check-org-brand.sh` in the **atlas** repo, not here. There is no per-repo fence
-itself. Do not add an exemption without the category in the atlas ADR that admits it.
+Gates enforces forbidden identifiers through a private policy overlay. Exceptions require an exact
+rule, bounded location and content digest in trusted policy. Candidate ignore files and inline
+suppression comments cannot disable organization rules.
 
 ## Releases
 
 Cut `CHANGELOG.md` under a version heading at a fully gated `main` commit, then write an annotated
 tag whose name is the bare version — `0.1.0`, the version and nothing else (atlas § *Naming*). The
 `eventlog-v` prefix was the monorepo's namespace and retired with it.
+
+Direct commits, annotated tags and pushes use `b10x-gates bot`; signed common evidence is checked
+and published with `b10x-gates check`, `verify` and `publish`. GitHub delivery uses the same
+`b10x-bot[bot]` identity. Commit and publish paths require no Atlas checkout, current Atlas main or
+organization-wide admission run. Require the shared check and this repository's correctness checks
+before integration. Verify the resulting release author is the bot.
+
+The shared workflow verifies signatures, exact source/range, current public/private policies,
+scanner versions and complete common results before reusing evidence. Missing or stale receipts
+run common scanners. PostgreSQL production, comparative and restart requirements remain mandatory.
+Atlas validates documentation manifests and coordinates Website publication separately; ordinary
+source publication follows the release completion boundary below.
 
 ## Where work is tracked
 

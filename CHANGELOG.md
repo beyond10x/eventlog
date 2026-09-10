@@ -5,6 +5,9 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+- Adopt independent common security/privacy gates with signed local evidence and bot delivery.
+  Cache Rust proof builds and cancel superseded PR runs while retaining all persistence proof lanes.
+
 - Add the local `eventlog-file` provider with versioned JSONL transactions, process-safe atomic
   groups, durable retry identities, verified blob storage and recoverable privacy rewrites.
   Redacted file-store projections require a complete rebuild before serving new writes; existing

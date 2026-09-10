@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Superseded PR candidates need no further proof. Keep main/manual evidence runs.
+concurrency:
+  group: persistence-proof-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   real-backends:
     runs-on: ubuntu-latest
@@ -47,6 +52,13 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: |
+            candidate
+            baseline
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure disposable verified TLS fixture
         run: cargo run --locked -p eventlog-postgres --example production-fixture -- --container '${{ job.services.postgres.id }}' --directory '${{ runner.temp }}/eventlog-proof-tls'
       - name: Required PostgreSQL and SQLite conformance, formatter and linter
