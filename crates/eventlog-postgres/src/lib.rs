@@ -23,14 +23,15 @@ use std::{
 
 use eventlog_core::{
     AppendResult, BoxFuture, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError,
-    EventStore, Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec,
-    ProjectionStore, Projector, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice,
-    TenantId, bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
-    validate_field,
+    EventStore, Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionQuery,
+    ProjectionSpec, ProjectionStore, Projector, RecordedEvent, Snapshot, SnapshotGeneration,
+    StreamId, StreamSlice, TenantId, bounded_limit, indexed_value, new_event_id,
+    redaction_tombstone, validate_append, validate_field,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
 mod atomic_group;
+mod documents;
 mod pool;
 mod schema;
 use pool::Pool;
@@ -109,11 +110,25 @@ impl PostgresEventStore {
         options: PoolOptions,
         projections: &[ProjectionSpec],
     ) -> Result<(), EventLogError> {
+        Self::migrate_with_document_projections(config, options, projections, &[]).await
+    }
+
+    /// Add document-query indexes to the named declared projections using the migration role.
+    /// Existing scalar indexes and document bodies are preserved. Registration with a hosted
+    /// DML role requires this explicit upgrade before serving a document-query projector.
+    /// # Errors
+    /// Refuses undeclared names, incompatible roster or physical schema, and failed migration.
+    pub async fn migrate_with_document_projections(
+        config: PostgresConfig,
+        options: PoolOptions,
+        projections: &[ProjectionSpec],
+        documents: &[&str],
+    ) -> Result<(), EventLogError> {
         let prefix = config.prefix.clone();
         let pool = Pool::new(config, options)?;
         let result = async {
             let mut client = pool.acquire().await?;
-            schema::migrate(&mut client, &prefix, projections).await?;
+            schema::migrate_with_documents(&mut client, &prefix, projections, documents).await?;
             client.settled();
             Ok(())
         }
@@ -944,12 +959,29 @@ impl EventStore for PostgresEventStore {
         projector: Arc<dyn Projector>,
     ) -> BoxFuture<'_, Result<(), EventLogError>> {
         self.bounded(async move {
+            schema::validate_document_names(
+                projector.projections(),
+                projector.document_projections(),
+            )?;
             let mut client = self.pool.acquire().await?;
             if self.allow_schema_writes {
-                schema::migrate(&mut client, &self.prefix, projector.projections()).await?;
+                schema::migrate_with_documents(
+                    &mut client,
+                    &self.prefix,
+                    projector.projections(),
+                    projector.document_projections(),
+                )
+                .await?;
             }
             for spec in projector.projections() {
                 schema::validate_projection(&mut client, &self.prefix, spec).await?;
+                if projector.document_projections().contains(&spec.name)
+                    && !schema::projection_documents(&*client, &self.prefix, spec).await?
+                {
+                    return Err(EventLogError::Invalid(
+                        "document projection requires explicit migration".into(),
+                    ));
+                }
             }
             client.settled();
             Ok(())
@@ -1200,6 +1232,20 @@ impl EventStore for PostgresEventStore {
         })
     }
 
+    fn projection_query<'a>(
+        &'a self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        query: &'a ProjectionQuery,
+    ) -> BoxFuture<'a, Result<eventlog_core::ProjectionPage, EventLogError>> {
+        self.bounded(async move {
+            let mut client = self.pool.acquire().await?;
+            let page = documents::query(&*client, &self.prefix, projection, tenant, query).await?;
+            client.settled();
+            Ok(page)
+        })
+    }
+
     fn projection_find<'a>(
         &'a self,
         projection: &'a ProjectionSpec,
@@ -1247,6 +1293,32 @@ struct PostgresProjections<'a, 'b> {
 }
 
 impl ProjectionStore for PostgresProjections<'_, '_> {
+    fn query_documents<'a>(
+        &'a mut self,
+        projection: &'a ProjectionSpec,
+        tenant: &'a TenantId,
+        query: &'a ProjectionQuery,
+    ) -> BoxFuture<'a, Result<eventlog_core::ProjectionPage, EventLogError>> {
+        Box::pin(async move {
+            if tenant != self.tenant {
+                return Err(EventLogError::Invalid(
+                    "projection context cannot cross tenant".into(),
+                ));
+            }
+            if !self
+                .inline
+                .lock()
+                .map_err(poisoned)?
+                .contains(projection.name)
+            {
+                return Err(EventLogError::Invalid(
+                    "transaction document queries require an inline projection".into(),
+                ));
+            }
+            documents::query(self.client, self.prefix, projection, tenant, query).await
+        })
+    }
+
     fn get_blob<'a>(
         &'a mut self,
         digest: &'a str,

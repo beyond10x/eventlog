@@ -1474,6 +1474,11 @@ impl Inner {
     }
 
     fn create_projections(&self, projector: &dyn Projector) -> Result<(), EventLogError> {
+        if !projector.document_projections().is_empty() {
+            return Err(EventLogError::Invalid(
+                "document queries are unavailable".into(),
+            ));
+        }
         let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
         for spec in projector.projections() {

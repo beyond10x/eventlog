@@ -7,6 +7,10 @@ under bare-version tags such as `0.1.0`.
 
 ### Added
 
+- PostgreSQL adds opt-in indexed JSON document queries over existing projections, including
+  inline transaction reads. Explicit migration admits GIN/body and byte-order key indexes;
+  existing scalar projections keep their layout. See `docs/design/document-queries.md`.
+
 - File, SQLite and PostgreSQL expose bounded committed stream inventory for immediate
   enumeration without waiting for feed watermarks. Tenant/type isolation, byte ordering,
   redaction and erasure follow the stored stream coordinates; no schema migration is needed.

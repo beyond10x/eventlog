@@ -48,11 +48,46 @@ impl ProjectionSpec {
 /// The most fields one read model may be looked up by.
 pub const MAX_INDEXED_FIELDS: usize = 8;
 
+/// A bounded containment query over an opted-in projection's JSON document bodies.
+///
+/// Matching follows PostgreSQL JSONB containment: nested objects are partial matches, arrays
+/// ignore order and duplicate multiplicity, and numbers compare by value. Null differs from
+/// a missing property. Keys use UTF-8 byte order. Prefixes are literal, including `%` and `_`.
+/// The prefix itself is excluded. `after` is an exclusive row key, not a snapshot or a token
+/// bound to the predicate; adapters must bind cursors to their complete query identity.
+#[derive(Clone, Debug)]
+pub struct ProjectionQuery {
+    pub matching: Value,
+    pub prefix: Option<String>,
+    pub after: Option<String>,
+    /// Providers clamp this to the ordinary Eventlog read bound; zero selects one row.
+    pub limit: usize,
+}
+
 /// Where a projection writes, without knowing which database it is in.
 ///
 /// `Send` is a supertrait so that a guard's or projector's future — which holds one of these
 /// across its awaits — can itself be `Send`.
 pub trait ProjectionStore: Send {
+    /// Query an inline projection in this append's tenant and transaction.
+    /// Reads include this transaction's prior writes. This does not lock the predicate or
+    /// enforce a serializable cross-stream invariant; use an explicit identity/counter lock.
+    /// Never re-enter the outer event store from a guard or projector.
+    /// # Errors
+    /// Refuses unsupported providers, foreign tenants, catch-up or unadmitted projections.
+    fn query_documents<'a>(
+        &'a mut self,
+        _projection: &'a ProjectionSpec,
+        _tenant: &'a TenantId,
+        _query: &'a ProjectionQuery,
+    ) -> BoxFuture<'a, Result<crate::ProjectionPage, EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid(
+                "document queries are unavailable".into(),
+            ))
+        })
+    }
+
     /// Read referenced content within this projection's tenant and transaction.
     /// Never re-enter the outer event store while its append holds a transaction.
     ///
@@ -149,6 +184,13 @@ pub trait Projector: Send + Sync {
 
     /// Every table this projector owns. They are created on registration and dropped on rebuild.
     fn projections(&self) -> &'static [ProjectionSpec];
+
+    /// Tables requiring indexed document queries, each declared in `projections()`.
+    /// PostgreSQL adds GIN body and byte-order key indexes through explicit migration.
+    /// Providers without the capability refuse registration rather than silently scanning.
+    fn document_projections(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Fold one fact into the read model.
     ///

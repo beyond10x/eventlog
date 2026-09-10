@@ -8,6 +8,10 @@
 
 mod atomic_group;
 pub use atomic_group::run_atomic_groups;
+mod documents;
+pub use documents::{
+    DOCUMENTS, DocumentProjector, run_document_queries, run_document_queries_unavailable,
+};
 mod inventory;
 pub use inventory::run_stream_inventory;
 

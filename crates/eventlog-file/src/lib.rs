@@ -284,6 +284,11 @@ impl Transaction {
         })
     }
     fn register(&mut self, projector: &dyn Projector) -> Result<(), EventLogError> {
+        if !projector.document_projections().is_empty() {
+            return Err(EventLogError::Invalid(
+                "document queries are unavailable".into(),
+            ));
+        }
         let mut names = BTreeSet::new();
         for spec in projector.projections() {
             spec.validate()?;

@@ -322,6 +322,16 @@ pub(crate) async fn migrate(
     prefix: &str,
     projections: &[ProjectionSpec],
 ) -> Result<(), EventLogError> {
+    migrate_with_documents(client, prefix, projections, &[]).await
+}
+
+pub(crate) async fn migrate_with_documents(
+    client: &mut Client,
+    prefix: &str,
+    projections: &[ProjectionSpec],
+    documents: &[&str],
+) -> Result<(), EventLogError> {
+    validate_document_names(projections, documents)?;
     let transaction = client.transaction().await.map_err(backend)?;
     lock(&transaction, prefix).await?;
     expected(&transaction)
@@ -403,16 +413,27 @@ pub(crate) async fn migrate(
             .map_err(backend)?;
     }
     for spec in projections {
-        create_projection(&transaction, prefix, spec).await?;
-        let indexed = serde_json::to_value(spec.indexed)
-            .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
-        transaction.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES($1,$2) ON CONFLICT(projection_name) DO NOTHING"), &[&spec.name,&indexed]).await.map_err(backend)?;
-        let recorded:serde_json::Value=transaction.query_one(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=$1"), &[&spec.name]).await.map_err(backend)?.get(0);
-        if recorded != indexed {
-            return Err(EventLogError::Invalid(
-                "projection registration shape changed without a supported migration".into(),
-            ));
-        }
+        spec.validate()?;
+        let recorded = transaction.query_opt(
+            &format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=$1"),
+            &[&spec.name],
+        ).await.map_err(backend)?.map(|row| row.get::<_, serde_json::Value>(0));
+        let previous = recorded
+            .as_ref()
+            .map(|value| decode_projection(value, spec))
+            .transpose()?;
+        let document = documents.contains(&spec.name) || previous == Some(true);
+        create_projection(&transaction, prefix, spec, document).await?;
+        let indexed = if document {
+            serde_json::json!({"fields": spec.indexed, "documents": true})
+        } else {
+            serde_json::json!(spec.indexed)
+        };
+        transaction.execute(
+            &format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES($1,$2) ON CONFLICT(projection_name) DO UPDATE SET indexed_fields=EXCLUDED.indexed_fields"),
+            &[&spec.name,&indexed],
+        ).await.map_err(backend)?;
+        compare_projection(&transaction, prefix, spec, document).await?;
     }
     drop_expected(&transaction)
         .await
@@ -455,6 +476,7 @@ pub(crate) async fn create_projection<C: GenericClient>(
     client: &C,
     prefix: &str,
     spec: &ProjectionSpec,
+    documents: bool,
 ) -> Result<(), EventLogError> {
     spec.validate()?;
     let table = super::projection_table(prefix, spec.name);
@@ -472,6 +494,14 @@ pub(crate) async fn create_projection<C: GenericClient>(
         )
     });
     client.batch_execute(&format!("CREATE TABLE IF NOT EXISTS {table} (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
+    if documents {
+        // The table name can already be 63 bytes: never let PostgreSQL truncate index suffixes.
+        let name = document_index_name(prefix, spec.name);
+        client.batch_execute(&format!(
+            "CREATE INDEX IF NOT EXISTS {name}_body ON {table} USING gin (body jsonb_path_ops); \
+             CREATE INDEX IF NOT EXISTS {name}_keys ON {table} (tenant_id,row_key COLLATE \"C\");"
+        )).await.map_err(backend)?;
+    }
     // Migration admits existing projection tables too; IF NOT EXISTS alone does not
     // reject hidden behavior that can discard projection writes before registration.
     shape(client, &table, prefix).await?;
@@ -484,7 +514,49 @@ pub(crate) async fn validate_projection(
 ) -> Result<(), EventLogError> {
     spec.validate()?;
     let transaction = client.transaction().await.map_err(backend)?;
-    let recorded = transaction
+    let documents = projection_documents(&transaction, prefix, spec).await?;
+    compare_projection(&transaction, prefix, spec, documents).await?;
+    transaction.commit().await.map_err(backend)
+}
+
+/// Validate both roster encodings exactly; unknown flags/editions are not silently accepted.
+fn decode_projection(
+    value: &serde_json::Value,
+    spec: &ProjectionSpec,
+) -> Result<bool, EventLogError> {
+    if value == &serde_json::json!(spec.indexed) {
+        Ok(false)
+    } else if value == &serde_json::json!({"fields": spec.indexed, "documents": true}) {
+        Ok(true)
+    } else {
+        Err(EventLogError::Invalid(
+            "projection registration shape changed without a supported migration".into(),
+        ))
+    }
+}
+
+pub(crate) fn validate_document_names(
+    projections: &[ProjectionSpec],
+    documents: &[&str],
+) -> Result<(), EventLogError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in documents {
+        if !seen.insert(name) || !projections.iter().any(|spec| spec.name == *name) {
+            return Err(EventLogError::Invalid(
+                "document projections must be unique declared projection names".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn projection_documents<C: GenericClient>(
+    client: &C,
+    prefix: &str,
+    spec: &ProjectionSpec,
+) -> Result<bool, EventLogError> {
+    spec.validate()?;
+    let recorded = client
         .query_opt(
             &format!(
                 "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=$1"
@@ -492,15 +564,24 @@ pub(crate) async fn validate_projection(
             &[&spec.name],
         )
         .await
-        .map_err(backend)?;
-    if recorded.map(|row| row.get::<_, serde_json::Value>(0))
-        != Some(serde_json::json!(spec.indexed))
-    {
-        return Err(EventLogError::Invalid(
-            "projection is absent from the explicit migration roster or indexed paths changed"
-                .into(),
-        ));
-    }
+        .map_err(backend)?
+        .ok_or_else(|| {
+            EventLogError::Invalid("projection is absent from the explicit migration roster".into())
+        })?;
+    decode_projection(&recorded.get::<_, serde_json::Value>(0), spec)
+}
+
+fn document_index_name(prefix: &str, projection: &str) -> String {
+    let digest = Sha256::digest(format!("{prefix}:{projection}"));
+    format!("eventlog_doc_{digest:x}")[..44].to_owned()
+}
+
+async fn compare_projection<C: GenericClient>(
+    transaction: &C,
+    prefix: &str,
+    spec: &ProjectionSpec,
+    documents: bool,
+) -> Result<(), EventLogError> {
     let table = super::projection_table(prefix, spec.name);
     // The expected projection is temporary: an application role needs TEMP, not owner-schema CREATE.
     let allowed:bool=transaction.query_one("SELECT COALESCE(has_table_privilege(current_user,to_regclass($1),'SELECT') AND has_table_privilege(current_user,to_regclass($1),'INSERT') AND has_table_privilege(current_user,to_regclass($1),'UPDATE') AND has_table_privilege(current_user,to_regclass($1),'DELETE'),false)",&[&table]).await.map_err(backend)?.get(0);
@@ -521,9 +602,12 @@ pub(crate) async fn validate_projection(
             .await
             .map_err(backend)?;
     }
-    if shape(&transaction, &table, prefix).await?
+    if documents {
+        transaction.batch_execute("CREATE INDEX ON eventlog_expected_projection USING gin (body jsonb_path_ops); CREATE INDEX ON eventlog_expected_projection (tenant_id,row_key COLLATE \"C\");").await.map_err(backend)?;
+    }
+    if shape(transaction, &table, prefix).await?
         != shape(
-            &transaction,
+            transaction,
             "eventlog_expected_projection",
             "eventlog_expected",
         )
@@ -533,7 +617,10 @@ pub(crate) async fn validate_projection(
             "incompatible PostgreSQL projection: {table}"
         )));
     }
-    transaction.commit().await.map_err(backend)
+    transaction
+        .batch_execute("DROP TABLE eventlog_expected_projection")
+        .await
+        .map_err(backend)
 }
 #[cfg(test)]
 mod snapshot_tests {
@@ -765,5 +852,158 @@ mod group_migration_tests {
                 .await
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+    use crate::{PoolOptions, PostgresConfig, PostgresEventStore};
+    use eventlog_conformance::{DOCUMENTS, DocumentProjector};
+    use eventlog_core::{EventStore, ProjectionQuery, TenantId};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn document_migration_is_explicit_additive_and_physically_admitted() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let prefix = "document_upgrade";
+        let (mut sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let driver = tokio::spawn(connection);
+        migrate(&mut sql, prefix, &[DOCUMENTS]).await.unwrap();
+        validate_projection(&mut sql, prefix, &DOCUMENTS)
+            .await
+            .unwrap();
+        sql.execute(
+            "INSERT INTO document_upgrade_p_documents VALUES ('tenant','one',$1,'ready')",
+            &[&json!({"kind":"ready"})],
+        )
+        .await
+        .unwrap();
+        let mut store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        // The schema-only portion of hosted registration: no DDL is permitted on this path.
+        // Real hosted role/TLS admission remains covered separately by the production lane.
+        store.allow_schema_writes = false;
+        assert!(
+            store
+                .create_projections(Arc::new(DocumentProjector))
+                .await
+                .is_err(),
+            "old scalar roster does not admit document queries"
+        );
+        let tenant = TenantId::new("tenant").unwrap();
+        let query = ProjectionQuery {
+            matching: json!({"kind":"ready"}),
+            prefix: None,
+            after: None,
+            limit: 10,
+        };
+        assert!(
+            store
+                .projection_query(&DOCUMENTS, &tenant, &query)
+                .await
+                .is_err()
+        );
+        PostgresEventStore::migrate_with_document_projections(
+            PostgresConfig::isolated(&url, prefix).unwrap(),
+            PoolOptions::default(),
+            &[DOCUMENTS],
+            &["documents"],
+        )
+        .await
+        .unwrap();
+        store
+            .create_projections(Arc::new(DocumentProjector))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .projection_query(&DOCUMENTS, &tenant, &query)
+                .await
+                .unwrap()
+                .rows,
+            vec![("one".into(), json!({"kind":"ready"}))]
+        );
+        assert_eq!(
+            store
+                .projection_find(&DOCUMENTS, &tenant, "kind", "ready", 10)
+                .await
+                .unwrap(),
+            vec![json!({"kind":"ready"})]
+        );
+        // A legacy caller neither removes the opt-in nor rewrites existing document bytes.
+        migrate(&mut sql, prefix, &[DOCUMENTS]).await.unwrap();
+        assert!(
+            projection_documents(&sql, prefix, &DOCUMENTS)
+                .await
+                .unwrap()
+        );
+        let index = format!("{}_body", document_index_name(prefix, "documents"));
+        let definition: String = sql
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(definition.contains("USING gin (body jsonb_path_ops)"));
+        sql.batch_execute(&format!("DROP INDEX {index}"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .create_projections(Arc::new(DocumentProjector))
+                .await
+                .is_err(),
+            "roster alone cannot admit a missing GIN index"
+        );
+        sql.batch_execute(&format!(
+            "CREATE INDEX {index} ON document_upgrade_p_documents USING gin (body)"
+        ))
+        .await
+        .unwrap();
+        assert!(
+            migrate_with_documents(&mut sql, prefix, &[DOCUMENTS], &["documents"])
+                .await
+                .is_err(),
+            "same-name wrong operator class must refuse instead of satisfying IF NOT EXISTS"
+        );
+        assert!(
+            validate_projection(&mut sql, prefix, &DOCUMENTS)
+                .await
+                .is_err()
+        );
+        sql.batch_execute(&format!("DROP INDEX {index}"))
+            .await
+            .unwrap();
+        migrate_with_documents(&mut sql, prefix, &[DOCUMENTS], &["documents"])
+            .await
+            .unwrap();
+        store
+            .create_projections(Arc::new(DocumentProjector))
+            .await
+            .unwrap();
+        assert!(
+            migrate_with_documents(&mut sql, prefix, &[DOCUMENTS], &["undeclared"])
+                .await
+                .is_err()
+        );
+        assert!(
+            migrate_with_documents(&mut sql, prefix, &[DOCUMENTS], &["documents", "documents"])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .projection_query(&DOCUMENTS, &tenant, &query)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        store.shutdown().await.unwrap();
+        drop(sql);
+        driver.await.unwrap().unwrap();
     }
 }

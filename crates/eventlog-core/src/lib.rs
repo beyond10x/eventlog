@@ -17,8 +17,8 @@ mod projection;
 
 pub use aggregate::{Aggregate, Applied, DomainEvent, Loaded, Outcome, Repository, SnapshotPolicy};
 pub use projection::{
-    CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, NoGuard, ProjectionSpec,
-    ProjectionStore, Projector, indexed_value, validate_identifier,
+    CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, NoGuard, ProjectionQuery,
+    ProjectionSpec, ProjectionStore, Projector, indexed_value, validate_identifier,
 };
 
 mod atomic_group;
@@ -892,8 +892,25 @@ pub trait EventStore: Send + Sync + 'static {
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<u64, EventLogError>>;
 
+    /// Query opted-in projection documents using native indexed containment and keyset paging.
+    /// Inline rows are visible after commit independently of the feed watermark. Catch-up
+    /// rows retain their runner's lag. Each page is a fresh read, not a cross-page snapshot.
+    /// # Errors
+    /// Refuses providers or projections without the admitted capability.
+    fn projection_query<'a>(
+        &'a self,
+        _projection: &'a ProjectionSpec,
+        _tenant: &'a TenantId,
+        _query: &'a ProjectionQuery,
+    ) -> BoxFuture<'a, Result<ProjectionPage, EventLogError>> {
+        Box::pin(async {
+            Err(EventLogError::Invalid(
+                "document queries are unavailable".into(),
+            ))
+        })
+    }
+
     /// Read one projection row.
-    ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
     fn projection_get<'a>(
