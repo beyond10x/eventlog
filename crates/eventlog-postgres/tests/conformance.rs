@@ -2792,3 +2792,133 @@ async fn concurrent_differing_blob_writers_have_one_winner() {
     .await
     .expect("remove delay fixture");
 }
+
+async fn review_wait_for_blob_insert_lock(sql: &tokio_postgres::Client, prefix: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sql.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND wait_event = 'advisory' AND query LIKE $1", &[&format!("INSERT INTO {prefix}_blobs%")]).await.unwrap().get(0);
+            if count == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("put reached the exact insert pause");
+}
+
+#[tokio::test]
+async fn review_blob_deleted_after_ignored_insert_is_republished() {
+    use std::sync::Arc;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let first = Arc::new(store("review_blob_delete").await.expect("explicit fixture"));
+    let second = PostgresEventStore::connect(&url().unwrap(), "review_blob_delete")
+        .await
+        .unwrap();
+    let sql = client(&url().unwrap()).await;
+    let tenant = TenantId::new("review").unwrap();
+    first.put_blob(&tenant, "opaque", b"old").await.unwrap();
+    sql.batch_execute("SELECT pg_advisory_lock(903151); CREATE OR REPLACE FUNCTION review_blob_delete_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(903151); RETURN NULL; END $$; CREATE TRIGGER review_blob_delete_pause AFTER INSERT ON review_blob_delete_blobs FOR EACH STATEMENT EXECUTE FUNCTION review_blob_delete_pause()").await.unwrap();
+    let writer = Arc::clone(&first);
+    let owner = tenant.clone();
+    let put = tokio::spawn(async move { writer.put_blob(&owner, "opaque", b"new").await });
+    review_wait_for_blob_insert_lock(&sql, "review_blob_delete").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        second.delete_blob(&tenant, "opaque"),
+    )
+    .await
+    .expect("delete is not held by the ignored insert")
+    .unwrap();
+    assert_eq!(second.get_blob(&tenant, "opaque").await.unwrap(), None);
+    sql.batch_execute("SELECT pg_advisory_unlock(903151)")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), put)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"new"[..])
+    );
+    sql.batch_execute("DROP TRIGGER review_blob_delete_pause ON review_blob_delete_blobs; DROP FUNCTION review_blob_delete_pause()").await.unwrap();
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+    eprintln!(
+        "forced deletion after ignored INSERT: old binding absent before resume, new binding published after retry"
+    );
+}
+
+#[tokio::test]
+async fn review_blob_cancelled_insert_retires_connection_and_retries() {
+    use std::sync::Arc;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let store = Arc::new(store("review_blob_cancel").await.expect("explicit fixture"));
+    let sql = client(&url().unwrap()).await;
+    sql.batch_execute("SELECT pg_advisory_lock(903152); CREATE OR REPLACE FUNCTION review_blob_cancel_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(903152); RETURN NEW; END $$; CREATE TRIGGER review_blob_cancel_pause BEFORE INSERT ON review_blob_cancel_blobs FOR EACH ROW EXECUTE FUNCTION review_blob_cancel_pause()").await.unwrap();
+    let tenant = TenantId::new("review").unwrap();
+    let writer = Arc::clone(&store);
+    let owner = tenant.clone();
+    let put = tokio::spawn(async move { writer.put_blob(&owner, "opaque", b"cancelled").await });
+    review_wait_for_blob_insert_lock(&sql, "review_blob_cancel").await;
+    put.abort();
+    assert!(put.await.unwrap_err().is_cancelled());
+    sql.batch_execute("SELECT pg_advisory_unlock(903152)")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sql.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query LIKE 'INSERT INTO review_blob_cancel_blobs%'", &[]).await.unwrap().get(0);
+            if count == 0 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("cancelled connection driver retired");
+    assert_eq!(store.get_blob(&tenant, "opaque").await.unwrap(), None);
+    store.put_blob(&tenant, "opaque", b"retry").await.unwrap();
+    assert_eq!(
+        store.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"retry"[..])
+    );
+    sql.batch_execute("DROP TRIGGER review_blob_cancel_pause ON review_blob_cancel_blobs; DROP FUNCTION review_blob_cancel_pause()").await.unwrap();
+    store.shutdown().await.unwrap();
+    eprintln!(
+        "cancelled pre-publication INSERT: no durable binding, driver retired, next operation succeeds"
+    );
+}
+
+#[tokio::test]
+async fn review_blob_empty_content_and_conflict_rollback_reuse() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let first = store("review_blob_empty").await.expect("explicit fixture");
+    let second = PostgresEventStore::connect(&url().unwrap(), "review_blob_empty")
+        .await
+        .unwrap();
+    let tenant = TenantId::new("review").unwrap();
+    first.put_blob(&tenant, "opaque", b"").await.unwrap();
+    second.put_blob(&tenant, "opaque", b"").await.unwrap();
+    for _ in 0..32 {
+        assert!(matches!(
+            first.put_blob(&tenant, "opaque", b"nonempty").await,
+            Err(eventlog_core::EventLogError::Invalid(_))
+        ));
+        assert_eq!(
+            second.get_blob(&tenant, "opaque").await.unwrap(),
+            Some(Vec::new())
+        );
+    }
+    first.delete_blob(&tenant, "opaque").await.unwrap();
+    second
+        .put_blob(&tenant, "opaque", b"rebound")
+        .await
+        .unwrap();
+    assert!(matches!(
+        first.put_blob(&tenant, "opaque", b"").await,
+        Err(eventlog_core::EventLogError::Invalid(_))
+    ));
+    assert_eq!(
+        first.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"rebound"[..])
+    );
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+}

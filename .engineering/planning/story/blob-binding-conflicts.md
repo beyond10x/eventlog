@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:blob-binding-conflicts
 kind: story
-status: active
+status: implemented
 title: Reject conflicting bytes under an existing blob digest
 relations:
 - informed_by: story:atomic-append-groups
@@ -15,6 +15,8 @@ scope:
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
 - confidence: cited
+  path: crates/eventlog-file/tests/conformance.rs
+- confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
 - confidence: inferred
   path: crates/eventlog-postgres/tests/
@@ -24,7 +26,7 @@ scope:
   path: crates/eventlog-sqlite/tests/
 - confidence: cited
   path: docs/design/blob-binding-parity.md
-revision: 11
+revision: 14
 ---
 ## Outcome
 
@@ -68,3 +70,30 @@ Derived 2026-09-15 by the read-only Sol story-scoper and accepted by Astra.
 No DDL change, digest-algorithm restriction, event-envelope change, blob overwrite, product concept,
 release or publication. SQL tamper detection and complete group crash/restart qualification remain
 separate explicitly tracked follow-up requirements.
+
+## Verified acceptance — 2026-09-15
+
+Submitted implementation commit: 442f3090b0959ea3556f2af490336117c44105bb.
+Independent review: review-result:blob-binding-adversary-pass-1, zero findings.
+Its five regression cases were retained, including forced PostgreSQL deletion/republication,
+cancellation with driver retirement, and empty-content conflict/reuse parity.
+
+The actual bash scripts/gate.sh --production-proof exited 0 on the submitted implementation plus
+the exact reviewed test patch: 136 tests passed, none failed or skipped; formatting and strict
+workspace/all-target Clippy also passed. PostgreSQL 17.6 and hosted verified-TLS lanes executed.
+Removing the SQL comparisons had reproduced five failures; restored source passed before review.
+
+Evidence: local-evidence:ess-evolution/waves/0001-eventlog-blob/evidence/production-gate-result.md,
+production-proof.json, production-proof-raw.log and production-gate.log in that directory.
+Combined recovery tree: 25d78f8a258a83a4c9e6b0f5e0664e13fe596bdd. That snapshot includes planning
+changes and is explicitly uncommitted; it is not claimed as an accepted commit.
+
+The review's findings fence is valid and explicitly empty. AEP 0.55.0's validator classifies any
+empty parsed list as a missing block (aep-cli/src/planning.rs, summarize: Ok(found) if found.is_empty()).
+Its notice does not require rewriting the immutable review or inventing findings. The review
+required no implementation correction; the additional tests remain part of the accepted source.
+
+This closes the immutable-binding correction only. Comparative capacity, the remaining Eventlog
+qualification, consumer adoption and the six actual planning-store cutovers remain separate work.
+Final common checks and local integration are recorded by the coordinator; no publication,
+release or deployment is claimed.

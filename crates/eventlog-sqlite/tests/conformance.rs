@@ -171,3 +171,42 @@ async fn concurrent_differing_blob_writers_have_one_winner() {
         .expect("second connection");
     eventlog_conformance::run_blob_binding_race(&first, &second).await;
 }
+
+#[tokio::test]
+async fn review_blob_empty_content_and_conflict_rollback_reuse() {
+    use eventlog_core::{EventLogError, EventStore, TenantId};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("review.sqlite3");
+    let first = SqliteEventStore::open(path.to_str().unwrap(), "review")
+        .await
+        .unwrap();
+    let second = SqliteEventStore::open(path.to_str().unwrap(), "review")
+        .await
+        .unwrap();
+    let tenant = TenantId::new("review").unwrap();
+    first.put_blob(&tenant, "opaque", b"").await.unwrap();
+    second.put_blob(&tenant, "opaque", b"").await.unwrap();
+    for _ in 0..32 {
+        assert!(matches!(
+            first.put_blob(&tenant, "opaque", b"nonempty").await,
+            Err(EventLogError::Invalid(_))
+        ));
+        assert_eq!(
+            second.get_blob(&tenant, "opaque").await.unwrap(),
+            Some(Vec::new())
+        );
+    }
+    first.delete_blob(&tenant, "opaque").await.unwrap();
+    second
+        .put_blob(&tenant, "opaque", b"rebound")
+        .await
+        .unwrap();
+    assert!(matches!(
+        first.put_blob(&tenant, "opaque", b"").await,
+        Err(EventLogError::Invalid(_))
+    ));
+    assert_eq!(
+        first.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"rebound"[..])
+    );
+}
