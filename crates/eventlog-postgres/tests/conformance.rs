@@ -2771,3 +2771,24 @@ async fn snapshot_capture_waits_for_complete_tenant_erasure() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn concurrent_differing_blob_writers_have_one_winner() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(first) = store("blob_race").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().expect("selected database");
+    let second = PostgresEventStore::connect(&url, "blob_race")
+        .await
+        .expect("second connection");
+    let sql = client(&url).await;
+    sql.batch_execute("CREATE OR REPLACE FUNCTION blob_race_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.02); RETURN NEW; END $$; CREATE TRIGGER blob_race_delay BEFORE INSERT ON blob_race_blobs FOR EACH ROW EXECUTE FUNCTION blob_race_delay()").await.expect("overlapping puts");
+    eventlog_conformance::run_blob_binding_race(&first, &second).await;
+    sql.batch_execute(
+        "DROP TRIGGER blob_race_delay ON blob_race_blobs; DROP FUNCTION blob_race_delay()",
+    )
+    .await
+    .expect("remove delay fixture");
+}

@@ -5,6 +5,13 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- SQLite and PostgreSQL now refuse different bytes under an existing tenant/digest blob binding
+  with `EventLogError::Invalid`, retaining the original content. Identical retries still succeed;
+  deletion permits rebinding, and concurrent differing writers have exactly one winner, matching
+  the file provider's immutable binding contract.
+
 ## 0.2.0 — 2026-09-10
 
 ### Added

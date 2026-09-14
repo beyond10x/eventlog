@@ -157,3 +157,17 @@ async fn inline_failure_preserves_all_atomic_state_and_callback_authority() {
         .expect("file");
     eventlog_conformance::run_inline_failure_atomicity(&file, &file.admission_permit()).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_differing_blob_writers_have_one_winner() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("blob-race.sqlite3");
+    let path = path.to_str().expect("path");
+    let first = SqliteEventStore::open(path, "blob_race")
+        .await
+        .expect("first connection");
+    let second = SqliteEventStore::open(path, "blob_race")
+        .await
+        .expect("second connection");
+    eventlog_conformance::run_blob_binding_race(&first, &second).await;
+}

@@ -853,24 +853,60 @@ impl EventStore for PostgresEventStore {
             validate_field("digest", digest)?;
             let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO {prefix}_blobs (tenant_id, digest, bytes, byte_count,
-                                                     recorded_at)
-                         VALUES ($1, $2, $3, $4, $5)
-                         ON CONFLICT (tenant_id, digest) DO NOTHING"
-                    ),
-                    &[
-                        &tenant.as_str(),
-                        &digest,
-                        &bytes,
-                        &to_i64(bytes.len() as u64)?,
-                        &OffsetDateTime::now_utc(),
-                    ],
-                )
+            client.quarantine();
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                .start()
                 .await
                 .map_err(backend)?;
+            loop {
+                transaction
+                    .execute(
+                        &format!(
+                            "INSERT INTO {prefix}_blobs (tenant_id, digest, bytes, byte_count,
+                                                         recorded_at)
+                             VALUES ($1, $2, $3, $4, $5)
+                             ON CONFLICT (tenant_id, digest) DO NOTHING"
+                        ),
+                        &[
+                            &tenant.as_str(),
+                            &digest,
+                            &bytes,
+                            &to_i64(bytes.len() as u64)?,
+                            &OffsetDateTime::now_utc(),
+                        ],
+                    )
+                    .await
+                    .map_err(backend)?;
+                // A fresh READ COMMITTED statement sees a competing insert after its commit.
+                // The row lock keeps deletion from changing the binding during comparison.
+                let row = transaction
+                    .query_opt(
+                        &format!(
+                            "SELECT bytes FROM {prefix}_blobs
+                             WHERE tenant_id = $1 AND digest = $2 FOR SHARE"
+                        ),
+                        &[&tenant.as_str(), &digest],
+                    )
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    // Deletion can win between an ignored insert and locking its row.
+                    // Retry publication rather than acknowledging a binding we never observed.
+                    continue;
+                };
+                let stored: Vec<u8> = row.get(0);
+                if stored != bytes {
+                    transaction.rollback().await.map_err(backend)?;
+                    client.settled();
+                    return Err(EventLogError::Invalid(
+                        "blob digest already names different content".into(),
+                    ));
+                }
+                break;
+            }
+            transaction.commit().await.map_err(backend)?;
             client.settled();
             Ok(())
         })

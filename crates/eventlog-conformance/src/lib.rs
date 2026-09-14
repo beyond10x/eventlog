@@ -68,6 +68,7 @@ pub async fn run(store: &dyn EventStore) {
     the_feed_shows_one_tenant_only(store, &tenant, &other).await;
     a_snapshot_round_trips(store, &stream).await;
     bytes_live_outside_the_log_and_can_be_erased_alone(store, &tenant).await;
+    run_blob_binding_race(store, store).await;
     a_stream_identity_is_stable(store, &tenant, &other).await;
     redaction_keeps_the_place_and_drops_the_snapshot(store, &stream).await;
     forgetting_a_tenant_leaves_nothing(store, &other, &twin).await;
@@ -315,6 +316,7 @@ async fn bytes_live_outside_the_log_and_can_be_erased_alone(
     store: &dyn EventStore,
     tenant: &TenantId,
 ) {
+    let other = &TenantId::new("blob-other-tenant").expect("tenant");
     let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
     assert!(
         store
@@ -348,6 +350,32 @@ async fn bytes_live_outside_the_log_and_can_be_erased_alone(
             .as_deref(),
         Some(&b"the uploaded bytes"[..])
     );
+    let conflict = store.put_blob(tenant, digest, b"different bytes").await;
+    assert!(
+        matches!(conflict, Err(EventLogError::Invalid(_))),
+        "an existing digest must refuse different content as Invalid: {conflict:?}"
+    );
+    assert_eq!(
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
+        Some(&b"the uploaded bytes"[..]),
+        "a refused conflict must retain the original bytes"
+    );
+    store
+        .put_blob(other, digest, b"other tenant bytes")
+        .await
+        .expect("tenant isolated");
+    assert_eq!(
+        store
+            .get_blob(other, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
+        Some(&b"other tenant bytes"[..])
+    );
     store.delete_blob(tenant, digest).await.expect("deletable");
     assert!(
         store
@@ -357,6 +385,107 @@ async fn bytes_live_outside_the_log_and_can_be_erased_alone(
             .is_none(),
         "bytes are erasable on their own, so erasing them leaves the fact that a file arrived"
     );
+    store
+        .put_blob(tenant, digest, b"rebound bytes")
+        .await
+        .expect("deletion permits rebinding");
+    assert_eq!(
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
+        Some(&b"rebound bytes"[..])
+    );
+    assert_eq!(
+        store
+            .get_blob(other, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
+        Some(&b"other tenant bytes"[..]),
+        "deletion and rebinding cannot change another tenant's binding"
+    );
+    store.forget_tenant(other).await.expect("tenant erasable");
+    assert!(
+        store
+            .get_blob(other, digest)
+            .await
+            .expect("readable")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_blob(tenant, digest)
+            .await
+            .expect("readable")
+            .as_deref(),
+        Some(&b"rebound bytes"[..]),
+        "tenant erasure cannot change another tenant's binding"
+    );
+}
+
+/// Concurrent differing puts must have one winner, whose bytes remain readable.
+///
+/// Supply independent handles to exercise separate database connections.
+///
+/// # Panics
+/// Panics if both writes succeed, the loser has another error class, or content changes.
+pub async fn run_blob_binding_race(first: &dyn EventStore, second: &dyn EventStore) {
+    use std::{future::poll_fn, task::Poll};
+
+    let tenant = TenantId::new("blob-race").expect("tenant");
+    for round in 0..8 {
+        let digest = format!("opaque-racing-digest-{round}");
+        let mut writes = [
+            first.put_blob(&tenant, &digest, b"first writer bytes"),
+            second.put_blob(&tenant, &digest, b"second writer bytes"),
+        ];
+        let mut results = [None, None];
+        poll_fn(|cx| {
+            for (write, result) in writes.iter_mut().zip(&mut results) {
+                if result.is_none()
+                    && let Poll::Ready(value) = write.as_mut().poll(cx)
+                {
+                    *result = Some(value);
+                }
+            }
+            if results.iter().all(Option::is_some) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        let [first_result, second_result] = results.map(|result| result.expect("completed"));
+        let winner: &[u8] = match (&first_result, &second_result) {
+            (Ok(()), Err(EventLogError::Invalid(_))) => b"first writer bytes",
+            (Err(EventLogError::Invalid(_)), Ok(())) => b"second writer bytes",
+            _ => panic!(
+                "exactly one differing writer wins and the loser is Invalid: {first_result:?}, {second_result:?}"
+            ),
+        };
+        assert_eq!(
+            first
+                .get_blob(&tenant, &digest)
+                .await
+                .expect("readable")
+                .as_deref(),
+            Some(winner)
+        );
+        assert_eq!(
+            second
+                .get_blob(&tenant, &digest)
+                .await
+                .expect("readable")
+                .as_deref(),
+            Some(winner)
+        );
+        first
+            .put_blob(&tenant, &digest, winner)
+            .await
+            .expect("winner retries identically");
+    }
 }
 
 async fn a_snapshot_round_trips(store: &dyn EventStore, stream: &StreamId) {

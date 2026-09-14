@@ -1391,8 +1391,11 @@ impl Inner {
     fn put_blob(&self, tenant: &TenantId, digest: &str, bytes: &[u8]) -> Result<(), EventLogError> {
         validate_field("digest", digest)?;
         let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
-        guard
+        let mut guard = self.connection.lock().map_err(poisoned)?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        transaction
             .execute(
                 &format!(
                     "INSERT INTO {prefix}_blobs (tenant_id, digest, bytes, byte_count, recorded_at)
@@ -1407,8 +1410,20 @@ impl Inner {
                     format_time(OffsetDateTime::now_utc())?
                 ],
             )
-            .map(|_| ())
-            .map_err(backend)
+            .map_err(backend)?;
+        let stored: Vec<u8> = transaction
+            .query_row(
+                &format!("SELECT bytes FROM {prefix}_blobs WHERE tenant_id = ?1 AND digest = ?2"),
+                params![tenant.as_str(), digest],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if stored != bytes {
+            return Err(EventLogError::Invalid(
+                "blob digest already names different content".into(),
+            ));
+        }
+        transaction.commit().map_err(backend)
     }
 
     fn get_blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError> {

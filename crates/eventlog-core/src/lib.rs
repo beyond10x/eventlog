@@ -975,8 +975,14 @@ pub trait EventStore: Send + Sync + 'static {
     /// upload is a record nobody can erase. An event names the digest; the bytes are erasable on
     /// their own, and erasing them leaves the fact that a file arrived intact.
     ///
+    /// Within one tenant, the digest binds to one byte sequence until explicit deletion or
+    /// tenant erasure. Identical retries succeed; different bytes are refused without changing
+    /// the existing binding. Another tenant may bind the same opaque digest independently.
+    /// Concurrent differing writers establish exactly one binding and only one succeeds.
+    ///
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] when the digest is unusable.
+    /// Returns [`EventLogError::Invalid`] when the digest is unusable or already binds different
+    /// bytes in this tenant.
     fn put_blob<'a>(
         &'a self,
         tenant: &'a TenantId,
