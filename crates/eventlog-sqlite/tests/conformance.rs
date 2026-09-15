@@ -472,6 +472,78 @@ async fn sqlite_callback_blob_corruption_poison_rolls_back_every_owner() {
 }
 
 #[tokio::test]
+async fn review_caught_malformed_blob_metadata_poisons_sqlite_inline_append() {
+    use eventlog_core::{EventLogError, EventStore, Expected, StreamId, TenantId};
+    use std::sync::{Arc, atomic::AtomicU8};
+
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("malformed-callback.sqlite3");
+    let tenant = TenantId::new("malformed-callback").expect("tenant");
+    let store = SqliteEventStore::open(path.to_str().expect("path"), "malformed_callback")
+        .await
+        .expect("store");
+    store
+        .put_blob(&tenant, "opaque", b"original")
+        .await
+        .expect("binding");
+
+    let mode = Arc::new(AtomicU8::new(2));
+    let projector = Arc::new(eventlog_conformance::BlobReadingProjector {
+        driver_name: "malformed_callback_inline",
+        digest: "opaque".into(),
+        mode: Arc::clone(&mode),
+    });
+    store
+        .register_inline(projector)
+        .await
+        .expect("inline projector");
+
+    let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE malformed_callback_blobs SET byte_count='not-an-integer' \
+         WHERE tenant_id=?1 AND digest='opaque'",
+        rusqlite::params![tenant.as_str()],
+    )
+    .expect("malformed stored count");
+    drop(raw);
+
+    let stream = StreamId::new(tenant.clone(), "item", "caught-malformed").expect("stream");
+    let result = store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("caught-malformed", &serde_json::json!({})),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(EventLogError::Backend(_))),
+        "a caught decode error from malformed stored metadata must poison the append: {result:?}"
+    );
+    assert!(
+        store
+            .read_stream(&stream, 0, 10)
+            .await
+            .expect("read stream")
+            .events
+            .is_empty(),
+        "the poisoned append must not retain its event"
+    );
+    assert!(
+        store
+            .projection_get(
+                &eventlog_conformance::BLOB_PROBE,
+                &tenant,
+                "item/caught-malformed",
+            )
+            .await
+            .expect("read projection")
+            .is_none(),
+        "the poisoned append must not retain its view update"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_blob_migration_is_exact_explicit_atomic_and_fenced() {
     use eventlog_core::{EventLogError, EventStore, LegacyBlobMigration, TenantId};
 
@@ -607,6 +679,36 @@ async fn sqlite_blob_migration_is_exact_explicit_atomic_and_fenced() {
         .unwrap(),
         5,
         "failed migration rolls back its additive columns"
+    );
+}
+
+#[tokio::test]
+async fn review_sqlite_admission_requires_an_enforced_integrity_check() {
+    use eventlog_core::EventLogError;
+
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("foreign-integrity-check.sqlite3");
+    let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    raw.execute_batch(
+        "CREATE TABLE foreign_check_blobs (
+             tenant_id TEXT NOT NULL,
+             digest TEXT NOT NULL,
+             bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,
+             recorded_at TEXT NOT NULL,
+             integrity_sha256 TEXT,
+             integrity_v1 INTEGER NOT NULL DEFAULT 1,
+             CONSTRAINT \"CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)\" CHECK (1),
+             PRIMARY KEY (tenant_id, digest)
+         );",
+    )
+    .expect("current-like foreign table without the integrity constraint");
+    drop(raw);
+
+    let admitted = SqliteEventStore::open(path.to_str().expect("path"), "foreign_check").await;
+    assert!(
+        matches!(admitted, Err(EventLogError::Invalid(_))),
+        "SQLite admission must verify an enforced integrity check, not matching text in a constraint name"
     );
 }
 

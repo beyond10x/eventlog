@@ -102,6 +102,8 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "sqlite_blob_integrity_covers_all_read_boundaries_and_binding_controls",
         "sqlite_callback_blob_corruption_poison_rolls_back_every_owner",
         "sqlite_blob_migration_is_exact_explicit_atomic_and_fenced",
+        "review_caught_malformed_blob_metadata_poisons_sqlite_inline_append",
+        "review_sqlite_admission_requires_an_enforced_integrity_check",
         "inline_failure_preserves_all_atomic_state_and_callback_authority",
         "rebuild_preserves_other_tenants_and_previous_view_on_failure",
         "scope_reservations_are_atomic_and_confined_in_memory_and_file",

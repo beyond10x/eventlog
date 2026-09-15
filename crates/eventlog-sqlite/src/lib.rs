@@ -454,6 +454,136 @@ enum SqliteBlobShape {
     Current,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqliteSchemaToken<'a> {
+    Bare(&'a str),
+    LeftParenthesis,
+    RightParenthesis,
+    Equals,
+    Other,
+}
+
+fn sqlite_schema_tokens(sql: &str) -> Vec<SqliteSchemaToken<'_>> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            byte if byte.is_ascii_whitespace() => position += 1,
+            b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                position += 2;
+                while bytes.get(position).is_some_and(|byte| *byte != b'\n') {
+                    position += 1;
+                }
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            b'/' if bytes.get(position + 1) == Some(&b'*') => {
+                position += 2;
+                while position + 1 < bytes.len()
+                    && (bytes[position] != b'*' || bytes[position + 1] != b'/')
+                {
+                    position += 1;
+                }
+                position = (position + 2).min(bytes.len());
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                position += 1;
+                while position < bytes.len() {
+                    if bytes[position] != quote {
+                        position += 1;
+                    } else if bytes.get(position + 1) == Some(&quote) {
+                        position += 2;
+                    } else {
+                        position += 1;
+                        break;
+                    }
+                }
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            b'[' => {
+                position += 1;
+                while bytes.get(position).is_some_and(|byte| *byte != b']') {
+                    position += 1;
+                }
+                position = (position + 1).min(bytes.len());
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            b'(' => {
+                tokens.push(SqliteSchemaToken::LeftParenthesis);
+                position += 1;
+            }
+            b')' => {
+                tokens.push(SqliteSchemaToken::RightParenthesis);
+                position += 1;
+            }
+            b'=' => {
+                tokens.push(SqliteSchemaToken::Equals);
+                position += 1;
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                let start = position;
+                position += 1;
+                while bytes
+                    .get(position)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    position += 1;
+                }
+                tokens.push(SqliteSchemaToken::Bare(&sql[start..position]));
+            }
+            _ => {
+                tokens.push(SqliteSchemaToken::Other);
+                position += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn has_exact_sqlite_blob_integrity_check(sql: &str) -> bool {
+    const EXPECTED: [SqliteSchemaToken<'static>; 8] = [
+        SqliteSchemaToken::Bare("integrity_v1"),
+        SqliteSchemaToken::Equals,
+        SqliteSchemaToken::Bare("1"),
+        SqliteSchemaToken::Bare("AND"),
+        SqliteSchemaToken::Bare("integrity_sha256"),
+        SqliteSchemaToken::Bare("IS"),
+        SqliteSchemaToken::Bare("NOT"),
+        SqliteSchemaToken::Bare("NULL"),
+    ];
+    let tokens = sqlite_schema_tokens(sql);
+    let mut checks = 0;
+    let mut expected = false;
+    let mut position = 0;
+    while position + 1 < tokens.len() {
+        if tokens[position] != SqliteSchemaToken::Bare("CHECK")
+            || tokens[position + 1] != SqliteSchemaToken::LeftParenthesis
+        {
+            position += 1;
+            continue;
+        }
+        checks += 1;
+        let expression_start = position + 2;
+        let mut expression_end = expression_start;
+        let mut depth = 1_u32;
+        while expression_end < tokens.len() && depth != 0 {
+            match tokens[expression_end] {
+                SqliteSchemaToken::LeftParenthesis => depth += 1,
+                SqliteSchemaToken::RightParenthesis => depth -= 1,
+                _ => {}
+            }
+            expression_end += 1;
+        }
+        if depth != 0 {
+            return false;
+        }
+        expected = tokens[expression_start..expression_end - 1] == EXPECTED;
+        position = expression_end;
+    }
+    checks == 1 && expected
+}
+
 fn sqlite_blob_shape(
     connection: &Connection,
     prefix: &str,
@@ -529,13 +659,7 @@ fn sqlite_blob_shape(
     ]);
     let shape = if columns == legacy {
         SqliteBlobShape::Legacy
-    } else if columns == current
-        && sql
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .contains("CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)")
-    {
+    } else if columns == current && has_exact_sqlite_blob_integrity_check(&sql) {
         SqliteBlobShape::Current
     } else {
         return Err(EventLogError::Invalid(
@@ -2266,32 +2390,34 @@ impl ProjectionStore for SqliteProjections<'_> {
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
         Box::pin(async move {
-            validate_field("digest", digest)?;
-            let stored = self
-                .connection
-                .query_row(
-                    &format!(
-                        "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {}_blobs
-                         WHERE tenant_id=?1 AND digest=?2",
-                        self.blob_prefix
-                    ),
-                    params![self.tenant.as_str(), digest],
-                    |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(backend)?;
-            let result = stored
-                .map(|(bytes, count, hash, version)| {
-                    validate_stored_blob(bytes, count, hash, version)
-                })
-                .transpose();
+            let result = (|| {
+                validate_field("digest", digest)?;
+                let stored = self
+                    .connection
+                    .query_row(
+                        &format!(
+                            "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {}_blobs
+                             WHERE tenant_id=?1 AND digest=?2",
+                            self.blob_prefix
+                        ),
+                        params![self.tenant.as_str(), digest],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(backend)?;
+                stored
+                    .map(|(bytes, count, hash, version)| {
+                        validate_stored_blob(bytes, count, hash, version)
+                    })
+                    .transpose()
+            })();
             if matches!(result, Err(EventLogError::Backend(_))) {
                 self.callback_failed.store(true, Ordering::Release);
             }
@@ -2780,4 +2906,25 @@ fn backend(error: impl std::fmt::Display) -> EventLogError {
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_exact_sqlite_blob_integrity_check;
+
+    #[test]
+    fn sqlite_integrity_check_recognition_uses_sql_syntax() {
+        let required = "CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)";
+        assert!(has_exact_sqlite_blob_integrity_check(required));
+
+        for sql in [
+            "CONSTRAINT \"CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)\" CHECK (1)",
+            "CHECK ('CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)' IS NOT NULL)",
+            "/* CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL) */ CHECK (1)",
+            "CHECK (integrity_v1 = 1 OR integrity_sha256 IS NOT NULL)",
+            "CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL), CHECK (1)",
+        ] {
+            assert!(!has_exact_sqlite_blob_integrity_check(sql), "{sql}");
+        }
+    }
 }
