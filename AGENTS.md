@@ -28,17 +28,28 @@ exists to protect.
 
 ## Invariants
 
-Each is a claim that can be checked. Breaking one is a design change, not a refactor.
+Each is a claim, and each says below what holds it. Where that is **review-only**, nothing in the
+tree fails when the claim is broken — a reader of the diff is the whole enforcement, so those are
+the rows most likely to have drifted without anyone noticing. Breaking one is a design change, not
+a refactor.
 
 1. **No domain type, no product concept, no policy lives in these crates.** Every owner may
    build-depend on the kit, which is only safe while that stays true. A type that names a product
    concept has already broken it.
+   *Review-only.* No test scans these crates for domain vocabulary; the check is reading the types
+   a change adds.
 2. **Every provider implements the same applicable conformance contracts.** In-memory remains
-   SQLite `:memory:`. ADR `ess-evolution-05-file-and-atomic-groups` explicitly supersedes the
-   former two-backend/no-third rule and admits a durable JSONL file provider. Product-specific
+   SQLite `:memory:`. The **proposed** ADR `ess-evolution-05-file-and-atomic-groups` supersedes the
+   former two-backend/no-third rule and admits a durable JSONL file provider; it is still `proposed`
+   in `.engineering/planning/architecture-decision-record/`, so the provider that shipped in 0.2.0
+   runs ahead of an accepted decision — do not cite that ADR as settled. Product-specific
    storage forks remain prohibited. Atomic append groups commit together; never emulate them
    with independently committed single appends.
+   *Enforced by* `crates/eventlog-conformance`, run by each provider's `tests/conformance.rs`.
 3. **No crate or module named `common`, `shared`, `utils`, `misc` or `helpers`.**
+   *Review-only.* No fence rejects such a name; today the tree holds none
+   (`find crates -name 'common*' -o -name 'shared*' -o -name 'utils*' -o -name 'misc*' -o -name
+   'helpers*'` is empty).
 4. **The conformance exercise is the definition of correct behaviour.** A backend change that needs
    an exercise change is a design change — say so in the commit rather than editing the assertion.
 5. **A new test fails without the fix.** The watermark test earns its place by failing when
@@ -46,19 +57,29 @@ Each is a claim that can be checked. Breaking one is a design change, not a refa
    one-line mutation, watch it fail, revert.
 6. **DDL changes are additive only.** A kit release that changes a column is a migration in every
    owner at once, so a kit major version never forces one.
+   *Review-only.* No test diffs one release's DDL against the last; `grep -rn additive crates`
+   finds a doc comment and a proof-report string, not an assertion. The statements to read are
+   `base_ddl` in `crates/eventlog-postgres/src/schema.rs` and `ddl` in
+   `crates/eventlog-sqlite/src/atomic_group.rs`.
 7. **`redact` is the only `UPDATE` this kit issues against an events table**, and it deletes the
    snapshots at or after the redacted version in the same transaction. A second write path against
    an events table is a second place to forget that.
-8. **No payload bytes and no free personal text enter the log.** Blobs are content-addressed
-   elsewhere and referenced by digest; identities are opaque ids resolved through the identity
-   directory (`crates/eventlog-core/src/lib.rs:769`). This is what lets a person be forgotten in the
-   directory while the log stays append-only.
+8. **No payload bytes and no free personal text enter the events table.** The bytes do not leave
+   the kit: `EventStore` carries a blob port — `put_blob`, `get_blob` and `delete_blob`
+   (`crates/eventlog-core/src/lib.rs:980-997`), implemented for the file provider at
+   `crates/eventlog-file/src/lib.rs:787` — and an event names only the digest. Identities are
+   opaque ids resolved through the identity directory
+   (`crates/eventlog-core/src/lib.rs:1031`, `validate_identity`). This is what lets the bytes be
+   deleted and a person be forgotten while the log itself stays append-only.
 
 ## Safety envelope
 
 - **The log is append-only and holds other people's durable state.** Erasure and redaction are the
   only paths that remove anything, and invariant 7 bounds them. Never add a delete, a compaction or
   a rewrite; a projection is what gets dropped and rebuilt.
+  *Review-only.* Nothing counts the delete statements: each SQL adapter holds seven
+  (`grep -c 'DELETE FROM' crates/eventlog-sqlite/src/lib.rs crates/eventlog-postgres/src/lib.rs`),
+  and a reviewer is what keeps an eighth from arriving outside erasure and redaction.
 - **Personal data must be unable to arrive**, not merely discouraged — the envelope refuses an
   address or display name where an opaque id belongs. Never relax that refusal to make a caller's
   migration easier.
@@ -81,7 +102,7 @@ latency. The conformance exercise drains with a bounded retry for exactly this r
 |---|---|
 | Domain events, aggregates and projections for a product | the owner that has the domain |
 | Identity resolution behind an opaque id | `identity` |
-| Blob storage | content-addressed storage, referenced here by digest |
+| Blob bytes in the events table | the `EventStore` blob port beside the log, addressed by digest — an event names the digest only (invariant 8) |
 | Product-specific storage forks | nowhere — see invariant 2 |
 
 ## The gate

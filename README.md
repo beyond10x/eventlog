@@ -15,8 +15,10 @@ Consumed as a **library**, not run as a service. It depends on nothing in `beyon
 consumers are the owner modules that need durable domain state. See
 [the public architecture map](https://beyond10x.github.io/architecture/) for where those sit.
 
-Two backends and no third. In-memory is SQLite `:memory:`, which is why a property proved in a test
-is proved for the deployment.
+Three providers under one conformance contract — SQLite, PostgreSQL and the local JSONL file
+provider — and no product-specific fourth. In-memory is SQLite `:memory:`, which is why a property
+proved in a test is proved for the deployment. The file provider's recovery, privacy and operating
+boundaries are documented in [`docs/design/file-provider.md`](docs/design/file-provider.md).
 
 ## Status
 
@@ -25,6 +27,13 @@ Version **0.2.1**, distributed as source under [Apache-2.0](LICENSE), with
 The [changelog](CHANGELOG.md) covers the log, aggregates and snapshots, projections,
 schema evolution, erasure and redaction, guarded refusals, effect contracts and hosted
 PostgreSQL admission.
+
+**0.2.x is complete**, and this repository states no next of its own: its planning store holds no
+epic, no initiative and no active story. The only artifact that scopes what follows is the Atlas
+epic `epic:eventlog-persistence-unification` — "Unify service persistence through Eventlog and
+Platform SDK", `draft` as of 2026-09-15 — whose first delivery is a common persistence baseline and
+a service migration map. Until that epic is decomposed, read work here as maintenance of what
+0.2.x shipped.
 
 ## Build, test, run
 
