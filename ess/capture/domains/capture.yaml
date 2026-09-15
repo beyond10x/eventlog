@@ -1,0 +1,32 @@
+domain: eventlog.capture
+
+# Transient values at the native read boundary; no persistent entity or lifecycle is invented.
+# The payload envelope remains RecordedEvent and the existing Rust projection/blob vocabulary.
+types:
+  - name: eventlog.capture.CaptureScope
+    kind: struct
+    fields:
+      - name: tenant_id
+        type: String
+      - name: stream_identity
+        type: String
+    # Both are existing opaque coordinates inside one provider owner. A pair identifies the
+    # observed tenant generation, not a unique capture instant, signed receipt or authorization.
+  - name: eventlog.capture.CaptureLimits
+    kind: struct
+    fields:
+      - name: max_events
+        type: Integer
+      - name: max_blobs
+        type: Integer
+      - name: max_projection_rows
+        type: Integer
+      - name: max_payload_bytes
+        type: Integer
+    invariants:
+      - max_events >= 0
+      - max_blobs >= 0
+      - max_projection_rows >= 0
+      - max_payload_bytes >= 0
+    # Rust refines each count to u64 with checked arithmetic. Zero is a cap, not a default.
+    # The design defines payload bytes exactly and does not claim a process peak-memory limit.
