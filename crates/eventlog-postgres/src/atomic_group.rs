@@ -2,8 +2,8 @@
 use super::{
     AppendResult, Arc, BTreeSet, BoxFuture, COLUMNS, CommandMeta, EventLogError, Expected, Guard,
     NewEvent, NoGuard, OffsetDateTime, PostgresEventStore, PostgresProjections, Projector,
-    StreamId, backend, check_expected, lock_identity, new_event_id, parse_uuid, poisoned,
-    publication_gate, read_event, select_versions, to_i32, to_i64, to_u64,
+    StreamId, backend, check_expected, ensure_callback_integrity, lock_identity, new_event_id,
+    parse_uuid, poisoned, publication_gate, read_event, select_versions, to_i32, to_i64, to_u64,
 };
 use eventlog_core::{AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange};
 
@@ -19,6 +19,7 @@ impl PostgresEventStore {
         meta: &CommandMeta,
         admission: &dyn Guard,
         record_command: bool,
+        callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendResult, EventLogError> {
         let prefix = self.prefix.clone();
         if record_command {
@@ -129,13 +130,17 @@ impl PostgresEventStore {
         {
             let mut projections = PostgresProjections {
                 client: transaction,
-                prefix: &prefix,
+                blob_prefix: &prefix,
+                projection_prefix: &prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
                 admission: Some((&self.admission_permit, stream.tenant())),
                 reservation_pending: false,
+                callback_failed: Arc::clone(callback_failed),
             };
-            admission.check(&mut projections).await?;
+            let result = admission.check(&mut projections).await;
+            ensure_callback_integrity(callback_failed)?;
+            result?;
             if projections.reservation_pending {
                 return Err(EventLogError::Invalid(
                     "unfinished reservation poisons this append".into(),
@@ -213,14 +218,18 @@ impl PostgresEventStore {
         for projector in &projectors {
             let mut projections = PostgresProjections {
                 client: transaction,
-                prefix: &prefix,
+                blob_prefix: &prefix,
+                projection_prefix: &prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
                 admission: None,
                 reservation_pending: false,
+                callback_failed: Arc::clone(callback_failed),
             };
             for recorded in &written {
-                projector.apply(recorded, &mut projections).await?;
+                let result = projector.apply(recorded, &mut projections).await;
+                ensure_callback_integrity(callback_failed)?;
+                result?;
             }
         }
 
@@ -249,6 +258,7 @@ impl PostgresEventStore {
                 .map_err(backend)?;
         }
 
+        ensure_callback_integrity(callback_failed)?;
         Ok(AppendResult {
             first_version,
             last_version,
@@ -263,6 +273,7 @@ impl PostgresEventStore {
         group: &AppendGroup,
         fingerprint: &str,
         admission: &dyn Guard,
+        callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
         let prefix = &self.prefix;
         lock_identity(
@@ -327,13 +338,17 @@ impl PostgresEventStore {
         {
             let mut projections = PostgresProjections {
                 client: transaction,
-                prefix,
+                blob_prefix: prefix,
+                projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: &group.tenant,
                 admission: Some((&self.admission_permit, &group.tenant)),
                 reservation_pending: false,
+                callback_failed: Arc::clone(callback_failed),
             };
-            admission.check(&mut projections).await?;
+            let result = admission.check(&mut projections).await;
+            ensure_callback_integrity(callback_failed)?;
+            result?;
             if projections.reservation_pending {
                 return Err(EventLogError::Invalid(
                     "unfinished reservation poisons this append".into(),
@@ -352,6 +367,7 @@ impl PostgresEventStore {
                     &group.meta,
                     &NoGuard,
                     false,
+                    callback_failed,
                 )
                 .await?;
             ranges.push(GroupRange {
@@ -363,6 +379,7 @@ impl PostgresEventStore {
         }
         transaction.execute(&format!("INSERT INTO {prefix}_append_groups (tenant_id,idempotency_key,request_hash,ranges) VALUES ($1,$2,$3,$4)"),
             &[&group.tenant.as_str(),&group.meta.idempotency_key,&fingerprint,&serde_json::to_value(&ranges).map_err(|_| EventLogError::Invalid("invalid group ranges".into()))?]).await.map_err(backend)?;
+        ensure_callback_integrity(callback_failed)?;
         Ok(AppendGroupResult {
             appends,
             deduplicated: false,
@@ -384,8 +401,15 @@ impl AtomicEventStore for PostgresEventStore {
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
                 publication_gate(&transaction, &self.prefix, false).await?;
+                let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = self
-                    .group_in_transaction(&transaction, group, &fingerprint, admission.as_ref())
+                    .group_in_transaction(
+                        &transaction,
+                        group,
+                        &fingerprint,
+                        admission.as_ref(),
+                        &callback_failed,
+                    )
                     .await;
                 match result {
                     Ok(result) => {

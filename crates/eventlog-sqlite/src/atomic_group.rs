@@ -1,8 +1,9 @@
 //! One BEGIN IMMEDIATE owns the complete group, including inline projectors and admission.
 use super::{
     AppendResult, Arc, BoxFuture, Connection, EventLogError, Guard, Inner, NoGuard,
-    SqliteEventStore, SqliteProjections, backend, begin_immediate, drive, finish_transaction,
-    params, poisoned, run_blocking, select_versions, to_i64,
+    SqliteEventStore, SqliteProjections, backend, begin_immediate, drive,
+    ensure_callback_integrity, finish_transaction, params, poisoned, run_blocking, select_versions,
+    to_i64,
 };
 use eventlog_core::{AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange};
 use rusqlite::OptionalExtension as _;
@@ -28,11 +29,13 @@ impl AtomicEventStore for SqliteEventStore {
             *inner.registration.lock().map_err(poisoned)? = true;
             let mut connection = inner.connection.lock().map_err(poisoned)?;
             begin_immediate(&connection)?;
+            let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let result = inner.group_in_transaction(
                 &mut connection,
                 &group,
                 &fingerprint,
                 admission.as_ref(),
+                &callback_failed,
             );
             finish_transaction(&connection, result)
         }))
@@ -46,6 +49,7 @@ impl Inner {
         group: &AppendGroup,
         fingerprint: &str,
         admission: &dyn Guard,
+        callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
         let prefix = &self.prefix;
         let prior: Option<(String,String)> = connection.query_row(
@@ -88,12 +92,16 @@ impl Inner {
         {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
-                prefix,
+                blob_prefix: prefix,
+                projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: &group.tenant,
                 admission: Some((&self.admission_permit, &group.tenant)),
+                callback_failed: Arc::clone(callback_failed),
             };
-            drive(admission.check(&mut projections))?;
+            let result = drive(admission.check(&mut projections));
+            ensure_callback_integrity(callback_failed)?;
+            result?;
         }
         let mut appends = Vec::with_capacity(group.appends.len());
         let mut ranges = Vec::with_capacity(group.appends.len());
@@ -106,6 +114,7 @@ impl Inner {
                 &group.meta,
                 &NoGuard,
                 false,
+                callback_failed,
             )?;
             ranges.push(GroupRange {
                 stream: entry.stream.clone(),
@@ -116,6 +125,7 @@ impl Inner {
         }
         connection.execute(&format!("INSERT INTO {prefix}_append_groups (tenant_id,idempotency_key,request_hash,ranges) VALUES (?1,?2,?3,?4)"),
             params![group.tenant.as_str(),group.meta.idempotency_key,fingerprint,serde_json::to_string(&ranges).map_err(backend)?]).map_err(backend)?;
+        ensure_callback_integrity(callback_failed)?;
         Ok(AppendGroupResult {
             appends,
             deduplicated: false,

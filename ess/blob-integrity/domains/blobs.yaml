@@ -1,0 +1,29 @@
+domain: eventlog.blobs
+entities:
+  - name: eventlog.blobs.BlobIntegrity
+    identity:
+      name: coordinate
+      type: String
+    fields:
+      - name: tenant_id
+        type: String
+      - name: digest
+        type: String
+      - name: byte_count
+        type: Integer
+      - name: integrity_sha256
+        type: String
+      - name: integrity_v1
+        type: Integer
+    lifecycle:
+      initial: Present
+      states: [Present]
+      terminal: [Present]
+    # coordinate represents the existing composite (tenant_id, digest) key in one owner's
+    # schema; it is not a new physical column or a lossy concatenation of the components.
+    # The digest is an opaque binding identity. integrity_sha256 is a separate computed
+    # lowercase SHA256 over the complete stored bytes. Payload bytes are not modeled here.
+    # byte_count is nonnegative and equals that byte length; integrity_v1 is exactly1.
+    # These refinements are enforced by the Rust/SQL boundaries in the binding design.
+    # Present means a current integrity-bearing binding exists. Explicit deletion/erasure
+    # removes it, and a later put may establish a new binding. No product lifecycle is implied.

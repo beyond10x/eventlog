@@ -1,7 +1,7 @@
 //! Bounded leases. A cancelled transaction never returns its connection to the idle list.
 use eventlog_core::EventLogError;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
@@ -193,6 +193,8 @@ pub(crate) struct Pool {
     driver_pause: Mutex<Option<RecyclePause>>,
     #[cfg(test)]
     connect_attempts: AtomicUsize,
+    #[cfg(test)]
+    fail_shutdown: AtomicBool,
 }
 
 #[derive(Default)]
@@ -251,6 +253,8 @@ impl Pool {
             driver_pause: Mutex::new(None),
             #[cfg(test)]
             connect_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_shutdown: AtomicBool::new(false),
         }))
     }
     pub(crate) async fn acquire(self: &Arc<Self>) -> Result<Lease, EventLogError> {
@@ -461,7 +465,19 @@ impl Pool {
         .await
         .map_err(|_| EventLogError::Deadline {
             operation: "shutdown",
-        })?
+        })??;
+        #[cfg(test)]
+        if self.fail_shutdown.swap(false, Ordering::AcqRel) {
+            return Err(EventLogError::Backend(
+                "injected temporary-pool shutdown failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_shutdown(&self) {
+        self.fail_shutdown.store(true, Ordering::Release);
     }
 }
 

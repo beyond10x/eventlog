@@ -16,6 +16,94 @@ use eventlog_core::{
 use serde_json::json;
 use time::OffsetDateTime;
 
+/// Projection row used by SQL blob-integrity callback conformance cases.
+pub const BLOB_PROBE: eventlog_core::ProjectionSpec = eventlog_core::ProjectionSpec {
+    name: "blob_integrity_probe",
+    indexed: &[],
+};
+
+/// A projector whose mode can propagate or catch a transactional blob-read failure.
+pub struct BlobReadingProjector {
+    pub driver_name: &'static str,
+    pub digest: String,
+    /// 0 requires a successful present read, 1 propagates failure, 2 catches failure.
+    pub mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl eventlog_core::Projector for BlobReadingProjector {
+    fn name(&self) -> &'static str {
+        self.driver_name
+    }
+
+    fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+        std::slice::from_ref(&BLOB_PROBE)
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a eventlog_core::RecordedEvent,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        use std::sync::atomic::Ordering;
+        Box::pin(async move {
+            store
+                .upsert(
+                    &BLOB_PROBE,
+                    &event.tenant,
+                    &format!("{}/{}", event.stream_type, event.stream_id),
+                    &json!({"version": event.version}),
+                )
+                .await?;
+            let result = store.get_blob(&self.digest).await;
+            match self.mode.load(Ordering::Acquire) {
+                0 => {
+                    if result?.is_none() {
+                        return Err(EventLogError::Invalid("fixture blob is absent".into()));
+                    }
+                }
+                1 => {
+                    result?;
+                }
+                2 => {
+                    let _ = result;
+                }
+                _ => return Err(EventLogError::Invalid("invalid blob probe mode".into())),
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A guard that proves caught blob corruption still poisons its append transaction.
+pub struct BlobReadingGuard {
+    pub digest: String,
+    pub catch_failure: bool,
+    pub reservation: Option<(
+        eventlog_core::AdmissionPermit,
+        Vec<eventlog_core::Reservation>,
+    )>,
+}
+
+impl eventlog_core::Guard for BlobReadingGuard {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if let Some((permit, reservations)) = &self.reservation {
+                store.reserve(permit, reservations).await?;
+            }
+            let result = store.get_blob(&self.digest).await;
+            if self.catch_failure {
+                let _ = result;
+                Ok(())
+            } else {
+                result.map(|_| ())
+            }
+        })
+    }
+}
+
 /// Build a command meta for the exercise.
 ///
 /// # Panics

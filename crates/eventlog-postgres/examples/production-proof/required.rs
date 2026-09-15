@@ -46,6 +46,8 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "group_retry_survives_database_reopen",
     ));
     required.extend(cases!("eventlog-postgres", "lib", "eventlog_postgres";
+        "schema::blob_integrity_tests::historical_editions_and_old_reader_are_frozen",
+        "blob_migration_tests::acknowledged_report_survives_cleanup_failure",
         "schema::group_migration_tests::snapshot_edition_migrates_to_groups_and_foreign_group_shape_refuses",
         "schema::snapshot_tests::snapshot_schema_upgrade_retains_history_and_refuses_partial_metadata",
         "pool::tests::reusable_retirement_preserves_two_connection_four_waiter_snapshot",
@@ -58,6 +60,10 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "pool::tests::shutdown_does_not_recycle_a_returning_connection_after_close",
     ));
     required.extend(cases!("eventlog-postgres", "test", "conformance";
+        "postgres_blob_integrity_covers_all_read_boundaries_and_binding_controls",
+        "postgres_callback_blob_corruption_poison_rolls_back_every_owner",
+        "postgres_blob_migration_is_exact_explicit_atomic_and_fenced",
+        "postgres_blob_migration_unknown_commit_has_no_report",
         "snapshot_history_and_repository_privacy_interleavings",
         "committed_commands_survive_snapshot_storage_failure",
         "snapshot_capture_waits_for_complete_tenant_erasure",
@@ -93,6 +99,9 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "committed_commands_survive_snapshot_storage_failure",
     ));
     required.extend(cases!("eventlog-sqlite", "test", "conformance";
+        "sqlite_blob_integrity_covers_all_read_boundaries_and_binding_controls",
+        "sqlite_callback_blob_corruption_poison_rolls_back_every_owner",
+        "sqlite_blob_migration_is_exact_explicit_atomic_and_fenced",
         "inline_failure_preserves_all_atomic_state_and_callback_authority",
         "rebuild_preserves_other_tenants_and_previous_view_on_failure",
         "scope_reservations_are_atomic_and_confined_in_memory_and_file",

@@ -13,9 +13,14 @@
 mod admission;
 mod aggregate;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
+mod blob_integrity;
 mod projection;
 
 pub use aggregate::{Aggregate, Applied, DomainEvent, Loaded, Outcome, Repository, SnapshotPolicy};
+pub use blob_integrity::{
+    BlobMigrationReport, LegacyBlobMigration, blob_integrity_sha256, validate_legacy_blob_count,
+    validate_stored_blob,
+};
 pub use projection::{
     CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, NoGuard, ProjectionSpec,
     ProjectionStore, Projector, indexed_value, validate_identifier,
@@ -646,6 +651,13 @@ pub enum EventLogError {
     Deadline { operation: &'static str },
     #[error("commit outcome unknown; reconnect and resolve the same command identity")]
     UnknownCommit,
+    #[error("blob migration commit outcome unknown; reinspect the owner schema")]
+    BlobMigrationCommitUnknown,
+    #[error("blob migration completed, but temporary pool cleanup failed: {cleanup}")]
+    BlobMigrationCompleted {
+        report: BlobMigrationReport,
+        cleanup: Box<EventLogError>,
+    },
 
     #[error("stream is at version {actual}, not {expected}")]
     Conflict { expected: u64, actual: u64 },

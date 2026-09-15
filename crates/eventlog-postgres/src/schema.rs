@@ -1,6 +1,9 @@
 //! Additive, serialized schema admission; checks every column, default, constraint and index.
 use super::backend;
-use eventlog_core::{EventLogError, ProjectionSpec};
+use eventlog_core::{
+    BlobMigrationReport, EventLogError, LegacyBlobMigration, ProjectionSpec, blob_integrity_sha256,
+    validate_field, validate_legacy_blob_count, validate_stored_blob,
+};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
@@ -16,7 +19,12 @@ const BASE: &[&str] = &[
 const ADDED: &[&str] = &["scope_counters", "schema_version", "projection_registry"];
 const SNAPSHOT_ADDED: &[&str] = &["snapshot_generations"];
 const GROUP_ADDED: &[&str] = &["append_groups"];
-fn base_ddl(prefix: &str) -> String {
+const LEGACY_CHECKSUM: &str = "68bf4ddeee1655b94ea9b30bab82641b898bdaaa413ce46e1e384697e6e24841";
+const SNAPSHOT_CHECKSUM: &str = "f91f4eadc46ca90544177b2a3fdb8bd7b727400601effb8d274bc9ce2a8e6358";
+const ATOMIC_GROUP_CHECKSUM: &str =
+    "9d31a95af97bbdb3f675197383851f73758e1459166837171ef367c46530aa1f";
+
+fn legacy_base_ddl(prefix: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {prefix}_events (
                  global_seq BIGSERIAL PRIMARY KEY,
@@ -96,6 +104,26 @@ fn base_ddl(prefix: &str) -> String {
              );"
     )
 }
+
+fn base_ddl(prefix: &str) -> String {
+    legacy_base_ddl(prefix).replace(
+        "                 recorded_at TIMESTAMPTZ NOT NULL,\n                 PRIMARY KEY (tenant_id, digest)\n             );",
+        "                 recorded_at TIMESTAMPTZ NOT NULL,\n                 integrity_sha256 TEXT,\n                 integrity_v1 INTEGER NOT NULL DEFAULT 1\n                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),\n                 PRIMARY KEY (tenant_id, digest)\n             );",
+    )
+}
+
+fn legacy_blob_ddl(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_blobs (
+             tenant_id TEXT NOT NULL,
+             digest TEXT NOT NULL,
+             bytes BYTEA NOT NULL,
+             byte_count BIGINT NOT NULL,
+             recorded_at TIMESTAMPTZ NOT NULL,
+             PRIMARY KEY (tenant_id, digest)
+         );"
+    )
+}
 fn additions(prefix: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {prefix}_scope_counters (coordinate TEXT PRIMARY KEY, held BIGINT NOT NULL CHECK (held >= 0)); CREATE TABLE IF NOT EXISTS {prefix}_schema_version (version BIGINT PRIMARY KEY CHECK (version = 1), checksum TEXT NOT NULL); CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(projection_name TEXT PRIMARY KEY,indexed_fields JSONB NOT NULL);"
@@ -103,10 +131,7 @@ fn additions(prefix: &str) -> String {
 }
 // Frozen original schema edition: existing ledger rows must remain migratable.
 fn legacy_checksum() -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!("{}{}", base_ddl("owner"), additions("owner")))
-    )
+    LEGACY_CHECKSUM.into()
 }
 
 fn snapshot_additions(prefix: &str) -> String {
@@ -116,15 +141,7 @@ fn snapshot_additions(prefix: &str) -> String {
 }
 
 fn snapshot_checksum() -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!(
-            "{}{}{}",
-            base_ddl("owner"),
-            additions("owner"),
-            snapshot_additions("owner")
-        ))
-    )
+    SNAPSHOT_CHECKSUM.into()
 }
 
 fn group_additions(prefix: &str) -> String {
@@ -144,6 +161,10 @@ fn checksum() -> String {
             group_additions("owner")
         ))
     )
+}
+
+fn atomic_group_checksum() -> String {
+    ATOMIC_GROUP_CHECKSUM.into()
 }
 
 async fn lock(transaction: &Transaction<'_>, prefix: &str) -> Result<(), EventLogError> {
@@ -279,6 +300,13 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
             .replace("CREATE TABLE IF NOT EXISTS", "CREATE TEMP TABLE"),
         )
         .await
+        .map_err(backend)?;
+    transaction
+        .batch_execute(
+            &legacy_blob_ddl("eventlog_expected_legacy")
+                .replace("CREATE TABLE IF NOT EXISTS", "CREATE TEMP TABLE"),
+        )
+        .await
         .map_err(backend)
 }
 async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
@@ -293,6 +321,10 @@ async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogErro
             .await
             .map_err(backend)?;
     }
+    transaction
+        .batch_execute("DROP TABLE pg_temp.eventlog_expected_legacy_blobs")
+        .await
+        .map_err(backend)?;
     Ok(())
 }
 async fn version(
@@ -317,11 +349,106 @@ async fn version(
     }
     Ok(())
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostgresBlobShape {
+    Legacy,
+    Current,
+}
+
+async fn blob_shape(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+) -> Result<PostgresBlobShape, EventLogError> {
+    let actual = shape(transaction, &format!("{prefix}_blobs"), prefix).await?;
+    let current = shape(transaction, "eventlog_expected_blobs", "eventlog_expected").await?;
+    if actual == current {
+        return Ok(PostgresBlobShape::Current);
+    }
+    let legacy = shape(
+        transaction,
+        "eventlog_expected_legacy_blobs",
+        "eventlog_expected",
+    )
+    .await?;
+    if actual == legacy {
+        return Ok(PostgresBlobShape::Legacy);
+    }
+    Err(EventLogError::Invalid(format!(
+        "incompatible PostgreSQL schema: {prefix}_blobs; explicit supported migration required"
+    )))
+}
+
+async fn validate_all_postgres_blobs(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+) -> Result<(), EventLogError> {
+    let table = format!("{prefix}_blobs");
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let row = if let Some((tenant, digest)) = &after {
+            transaction
+                .query_opt(
+                    &format!(
+                "SELECT tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1
+                 FROM {table} WHERE tenant_id > $1 OR (tenant_id = $1 AND digest > $2)
+                 ORDER BY tenant_id,digest LIMIT 1"
+            ),
+                    &[tenant, digest],
+                )
+                .await
+        } else {
+            transaction
+                .query_opt(
+                    &format!(
+                "SELECT tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1
+                 FROM {table} ORDER BY tenant_id,digest LIMIT 1"
+            ),
+                    &[],
+                )
+                .await
+        }
+        .map_err(backend)?;
+        let Some(row) = row else { break };
+        let tenant: String = row.get(0);
+        let digest: String = row.get(1);
+        validate_field("stored blob tenant", &tenant)
+            .map_err(|_| EventLogError::Backend("stored blob identity is invalid".into()))?;
+        validate_field("stored blob digest", &digest)
+            .map_err(|_| EventLogError::Backend("stored blob identity is invalid".into()))?;
+        let _: time::OffsetDateTime = row.get(4);
+        validate_stored_blob(
+            row.get(2),
+            row.get(3),
+            row.get(5),
+            i64::from(row.get::<_, i32>(6)),
+        )?;
+        after = Some((tenant, digest));
+    }
+    Ok(())
+}
+
 pub(crate) async fn migrate(
     client: &mut Client,
     prefix: &str,
     projections: &[ProjectionSpec],
 ) -> Result<(), EventLogError> {
+    migrate_with_blob_migration(
+        client,
+        prefix,
+        projections,
+        LegacyBlobMigration::RefusePopulated,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub(crate) async fn migrate_with_blob_migration(
+    client: &mut Client,
+    prefix: &str,
+    projections: &[ProjectionSpec],
+    migration: LegacyBlobMigration,
+) -> Result<BlobMigrationReport, EventLogError> {
     let transaction = client.transaction().await.map_err(backend)?;
     lock(&transaction, prefix).await?;
     expected(&transaction)
@@ -337,24 +464,48 @@ pub(crate) async fn migrate(
         )));
     }
     if existing != 0 {
-        compare(&transaction, prefix, BASE).await?;
+        for suffix in BASE.iter().copied().filter(|suffix| *suffix != "blobs") {
+            compare(&transaction, prefix, &[suffix]).await?;
+        }
     }
     let ledger = exists(&transaction, &format!("{prefix}_schema_version")).await?;
     let generations = exists(&transaction, &format!("{prefix}_snapshot_generations")).await?;
     let groups = exists(&transaction, &format!("{prefix}_append_groups")).await?;
+    let counters = exists(&transaction, &format!("{prefix}_scope_counters")).await?;
+    let registry = exists(&transaction, &format!("{prefix}_projection_registry")).await?;
+    if existing == 0 && (ledger || generations || groups || counters || registry) {
+        return Err(EventLogError::Invalid(
+            "partial PostgreSQL admission migration".into(),
+        ));
+    }
     if groups && (!ledger || !generations) {
         return Err(EventLogError::Invalid(
             "partial PostgreSQL group migration".into(),
         ));
     }
     let prior_checksum = if groups {
-        checksum()
+        atomic_group_checksum()
     } else if generations {
         snapshot_checksum()
     } else {
         legacy_checksum()
     };
-    if ledger {
+    let prior_blob_shape = if existing == 0 {
+        None
+    } else {
+        Some(blob_shape(&transaction, prefix).await?)
+    };
+    if prior_blob_shape == Some(PostgresBlobShape::Current) {
+        if !ledger || !generations || !groups {
+            return Err(EventLogError::Invalid(
+                "current PostgreSQL blob schema has an inconsistent ledger edition".into(),
+            ));
+        }
+        compare(&transaction, prefix, ADDED).await?;
+        compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
+        compare(&transaction, prefix, GROUP_ADDED).await?;
+        version(&transaction, prefix, &checksum()).await?;
+    } else if ledger {
         compare(&transaction, prefix, ADDED).await?;
         if generations {
             compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
@@ -365,14 +516,99 @@ pub(crate) async fn migrate(
         } else {
             version(&transaction, prefix, &legacy_checksum()).await?;
         }
-    } else if generations
-        || exists(&transaction, &format!("{prefix}_scope_counters")).await?
-        || exists(&transaction, &format!("{prefix}_projection_registry")).await?
-    {
+    } else if generations || counters || registry || groups {
         return Err(EventLogError::Invalid(
             "partial PostgreSQL admission migration".into(),
         ));
     }
+    let mut report = BlobMigrationReport::default();
+    if prior_blob_shape == Some(PostgresBlobShape::Legacy) {
+        let table = format!("{prefix}_blobs");
+        transaction
+            .batch_execute(&format!("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE"))
+            .await
+            .map_err(backend)?;
+        let rows: i64 = transaction
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await
+            .map_err(backend)?
+            .get(0);
+        let rows = u64::try_from(rows)
+            .map_err(|_| EventLogError::Backend("stored blob row count is invalid".into()))?;
+        if rows != 0 && migration == LegacyBlobMigration::RefusePopulated {
+            return Err(EventLogError::Invalid(format!(
+                "populated predecessor blob table has {rows} rows; explicit TrustObservedBytes migration required"
+            )));
+        }
+        transaction
+            .batch_execute(&format!(
+                "ALTER TABLE {table} ADD COLUMN integrity_sha256 TEXT"
+            ))
+            .await
+            .map_err(backend)?;
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let row = if let Some((tenant, digest)) = &after {
+                transaction
+                    .query_opt(
+                        &format!(
+                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+                     WHERE tenant_id > $1 OR (tenant_id = $1 AND digest > $2)
+                     ORDER BY tenant_id,digest LIMIT 1"
+                        ),
+                        &[tenant, digest],
+                    )
+                    .await
+            } else {
+                transaction
+                    .query_opt(
+                        &format!(
+                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+                     ORDER BY tenant_id,digest LIMIT 1"
+                        ),
+                        &[],
+                    )
+                    .await
+            }
+            .map_err(backend)?;
+            let Some(row) = row else { break };
+            let tenant: String = row.get(0);
+            let digest: String = row.get(1);
+            let bytes: Vec<u8> = row.get(2);
+            let count: i64 = row.get(3);
+            let _: time::OffsetDateTime = row.get(4);
+            validate_field("stored blob tenant", &tenant)
+                .map_err(|_| EventLogError::Backend("stored blob identity is invalid".into()))?;
+            validate_field("stored blob digest", &digest)
+                .map_err(|_| EventLogError::Backend("stored blob identity is invalid".into()))?;
+            validate_legacy_blob_count(&bytes, count)?;
+            let hash = blob_integrity_sha256(&bytes);
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET integrity_sha256=$1 WHERE tenant_id=$2 AND digest=$3"
+                    ),
+                    &[&hash, &tenant, &digest],
+                )
+                .await
+                .map_err(backend)?;
+            after = Some((tenant, digest));
+        }
+        transaction
+            .batch_execute(&format!(
+                "ALTER TABLE {table} ADD COLUMN integrity_v1 INTEGER NOT NULL DEFAULT 1
+                 CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)"
+            ))
+            .await
+            .map_err(backend)?;
+        report = BlobMigrationReport {
+            upgraded: true,
+            trusted_legacy_rows: rows,
+        };
+    } else if prior_blob_shape.is_none() {
+        report.upgraded = true;
+    }
+
     transaction
         .batch_execute(&format!(
             "{}{}{}{}",
@@ -391,7 +627,7 @@ pub(crate) async fn migrate(
             )
             .await
             .map_err(backend)?;
-    } else if !groups {
+    } else if prior_blob_shape == Some(PostgresBlobShape::Legacy) {
         transaction
             .execute(
                 &format!(
@@ -414,10 +650,22 @@ pub(crate) async fn migrate(
             ));
         }
     }
+    compare(&transaction, prefix, BASE).await?;
+    compare(&transaction, prefix, ADDED).await?;
+    compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
+    compare(&transaction, prefix, GROUP_ADDED).await?;
+    version(&transaction, prefix, &checksum()).await?;
+    if report.upgraded {
+        validate_all_postgres_blobs(&transaction, prefix).await?;
+    }
     drop_expected(&transaction)
         .await
         .map_err(|error| EventLogError::Invalid(format!("expected schema: {error}")))?;
-    transaction.commit().await.map_err(backend)
+    transaction
+        .commit()
+        .await
+        .map_err(|_| EventLogError::BlobMigrationCommitUnknown)?;
+    Ok(report)
 }
 pub(crate) async fn validate(client: &mut Client, prefix: &str) -> Result<(), EventLogError> {
     let transaction = client.transaction().await.map_err(backend)?;
@@ -535,6 +783,42 @@ pub(crate) async fn validate_projection(
     }
     transaction.commit().await.map_err(backend)
 }
+
+#[cfg(test)]
+async fn downgrade_blob_fixture(client: &Client, prefix: &str) {
+    client
+        .batch_execute(&format!(
+            "BEGIN;
+             ALTER TABLE {prefix}_blobs RENAME TO {prefix}_blobs_current;
+             CREATE TABLE {prefix}_blobs (
+                 tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BYTEA NOT NULL,
+                 byte_count BIGINT NOT NULL,recorded_at TIMESTAMPTZ NOT NULL,
+                 PRIMARY KEY(tenant_id,digest));
+             INSERT INTO {prefix}_blobs(tenant_id,digest,bytes,byte_count,recorded_at)
+                 SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {prefix}_blobs_current;
+             DROP TABLE {prefix}_blobs_current;
+             COMMIT;"
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
+mod blob_integrity_tests {
+    use super::{
+        ATOMIC_GROUP_CHECKSUM, LEGACY_CHECKSUM, SNAPSHOT_CHECKSUM, atomic_group_checksum, checksum,
+        legacy_checksum, snapshot_checksum,
+    };
+
+    #[test]
+    fn historical_editions_and_old_reader_are_frozen() {
+        assert_eq!(legacy_checksum(), LEGACY_CHECKSUM);
+        assert_eq!(snapshot_checksum(), SNAPSHOT_CHECKSUM);
+        assert_eq!(atomic_group_checksum(), ATOMIC_GROUP_CHECKSUM);
+        assert_ne!(checksum(), ATOMIC_GROUP_CHECKSUM);
+    }
+}
+
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
@@ -576,6 +860,7 @@ mod snapshot_tests {
             .await
             .unwrap();
         store.shutdown().await.unwrap();
+        downgrade_blob_fixture(&sql, prefix).await;
         sql.batch_execute("INSERT INTO snapshot_upgrade_snapshots VALUES ('tenant','item','one',1,1,'{\"total\":999}',now()); DROP TABLE snapshot_upgrade_snapshot_generations; DROP TABLE snapshot_upgrade_append_groups").await.unwrap();
         sql.execute(
             "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
@@ -657,6 +942,7 @@ mod snapshot_tests {
         sql.batch_execute("DROP TABLE snapshot_upgrade_append_groups")
             .await
             .unwrap();
+        downgrade_blob_fixture(&sql, prefix).await;
         sql.execute(
             "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
             &[&legacy_checksum()],
@@ -721,6 +1007,7 @@ mod group_migration_tests {
             .await
             .unwrap();
         store.shutdown().await.unwrap();
+        downgrade_blob_fixture(&sql, prefix).await;
         sql.batch_execute("DROP TABLE group_upgrade_append_groups")
             .await
             .unwrap();

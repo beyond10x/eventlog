@@ -7,6 +7,11 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- SQLite and PostgreSQL verify stored blob length, integrity edition and SHA-256 at ordinary,
+  transactional callback and binding readback boundaries. Populated predecessor tables require an
+  explicit locked trust-of-observed-bytes migration, with typed acknowledged, unknown-commit and
+  post-commit cleanup outcomes.
+
 - Production proof binds every required case to its exact Cargo package and test target, refusing
   cross-provider masking, incomplete or ambiguous execution while retaining workspace and doc tests.
 
