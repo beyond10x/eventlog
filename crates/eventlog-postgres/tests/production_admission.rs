@@ -180,8 +180,24 @@ fn complete_roster_passes_with_exact_provider_and_target_attribution() {
         }
     }
 }
+fn package_metadata(id: &str, name: &str, manifest_path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "version": "0.2.1",
+        "authors": [],
+        "description": null,
+        "homepage": null,
+        "repository": null,
+        "license": null,
+        "license_file": null,
+        "readme": null,
+        "rust_version": null,
+        "manifest_path": manifest_path,
+    })
+}
 fn metadata() -> String {
-    serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/crates/eventlog-postgres/Cargo.toml"}, {"id":"opaque-sqlite-id","name":"eventlog-sqlite","manifest_path":"/workspace/crates/eventlog-sqlite/Cargo.toml"}],
+    serde_json::json!({"packages":[package_metadata("opaque-postgres-id", "eventlog-postgres", "/workspace/crates/eventlog-postgres/Cargo.toml"), package_metadata("opaque-sqlite-id", "eventlog-sqlite", "/workspace/crates/eventlog-sqlite/Cargo.toml")],
         "workspace_members":["opaque-postgres-id", "opaque-sqlite-id"]}).to_string()
 }
 fn artifact(package: &str, kind: &str, target: &str, executable: &str) -> String {
@@ -219,6 +235,90 @@ fn exact_cargo_artifact_identity_does_not_depend_on_executable_path_substrings()
         selected[0].working_directory.to_str(),
         Some("/workspace/crates/eventlog-postgres")
     );
+    assert_eq!(selected[0].package_environment.len(), 16);
+    for name in [
+        "CARGO_PKG_AUTHORS",
+        "CARGO_PKG_DESCRIPTION",
+        "CARGO_PKG_HOMEPAGE",
+        "CARGO_PKG_LICENSE",
+        "CARGO_PKG_LICENSE_FILE",
+        "CARGO_PKG_README",
+        "CARGO_PKG_REPOSITORY",
+        "CARGO_PKG_RUST_VERSION",
+        "CARGO_PKG_VERSION_PRE",
+    ] {
+        assert_eq!(
+            selected[0]
+                .package_environment
+                .get(name)
+                .and_then(|value| value.to_str()),
+            Some(""),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn complete_cargo_package_environment_comes_from_exact_metadata() {
+    let package = serde_json::json!({
+        "id": "opaque-peer-id",
+        "name": "peer-package",
+        "version": "12.34.56-alpha.7+build.9",
+        "authors": ["Ada Example <ada@example.invalid>", "Grace Example"],
+        "description": "peer description",
+        "homepage": "https://example.invalid/home",
+        "repository": "https://example.invalid/repository",
+        "license": null,
+        "license_file": "LICENSE.custom",
+        "readme": "README.custom",
+        "rust_version": "1.91",
+        "manifest_path": "/workspace/peer/Cargo.toml",
+    });
+    let metadata = serde_json::json!({
+        "packages": [package],
+        "workspace_members": ["opaque-peer-id"],
+    })
+    .to_string();
+    let artifacts = format!(
+        "{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+        artifact("opaque-peer-id", "test", "environment", "/opaque/peer")
+    );
+    let selected = select_artifacts(&metadata, &artifacts).unwrap();
+    let mut command = std::process::Command::new("/opaque/peer");
+    selected[0].apply_execution_context(&mut command);
+    assert_eq!(
+        command.get_current_dir(),
+        Some(std::path::Path::new("/workspace/peer"))
+    );
+    let environment = &selected[0].package_environment;
+    assert_eq!(environment.len(), 16);
+    for (name, value) in [
+        ("CARGO_MANIFEST_DIR", "/workspace/peer"),
+        ("CARGO_MANIFEST_PATH", "/workspace/peer/Cargo.toml"),
+        (
+            "CARGO_PKG_AUTHORS",
+            "Ada Example <ada@example.invalid>:Grace Example",
+        ),
+        ("CARGO_PKG_DESCRIPTION", "peer description"),
+        ("CARGO_PKG_HOMEPAGE", "https://example.invalid/home"),
+        ("CARGO_PKG_LICENSE", ""),
+        ("CARGO_PKG_LICENSE_FILE", "LICENSE.custom"),
+        ("CARGO_PKG_NAME", "peer-package"),
+        ("CARGO_PKG_README", "README.custom"),
+        ("CARGO_PKG_REPOSITORY", "https://example.invalid/repository"),
+        ("CARGO_PKG_RUST_VERSION", "1.91"),
+        ("CARGO_PKG_VERSION", "12.34.56-alpha.7+build.9"),
+        ("CARGO_PKG_VERSION_MAJOR", "12"),
+        ("CARGO_PKG_VERSION_MINOR", "34"),
+        ("CARGO_PKG_VERSION_PATCH", "56"),
+        ("CARGO_PKG_VERSION_PRE", "alpha.7"),
+    ] {
+        assert_eq!(
+            environment.get(name).and_then(|value| value.to_str()),
+            Some(value),
+            "{name}"
+        );
+    }
 }
 #[test]
 fn absent_truncated_failed_unknown_and_duplicate_cargo_artifacts_refuse() {
@@ -304,20 +404,53 @@ fn missing_or_malformed_package_execution_context_refuses_artifact_selection() {
             "/opaque/executable"
         )
     );
-    for metadata in [
-        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres"}],
-            "workspace_members":["opaque-postgres-id"]}).to_string(),
-        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"Cargo.toml"}],
-            "workspace_members":["opaque-postgres-id"]}).to_string(),
-        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"crates/eventlog-postgres/Cargo.toml"}],
-            "workspace_members":["opaque-postgres-id"]}).to_string(),
-        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/crates/eventlog-postgres/Other.toml"}],
-            "workspace_members":["opaque-postgres-id"]}).to_string(),
-        serde_json::json!({"packages":[
-            {"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/first/Cargo.toml"},
-            {"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/second/Cargo.toml"}],
-            "workspace_members":["opaque-postgres-id"]}).to_string(),
+    let mut missing_manifest = package_metadata(
+        "opaque-postgres-id",
+        "eventlog-postgres",
+        "/workspace/Cargo.toml",
+    );
+    missing_manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("manifest_path");
+    let mut malformed_version = package_metadata(
+        "opaque-postgres-id",
+        "eventlog-postgres",
+        "/workspace/Cargo.toml",
+    );
+    malformed_version["version"] = "1.2".into();
+    for package in [
+        missing_manifest,
+        package_metadata("opaque-postgres-id", "eventlog-postgres", "Cargo.toml"),
+        package_metadata(
+            "opaque-postgres-id",
+            "eventlog-postgres",
+            "crates/eventlog-postgres/Cargo.toml",
+        ),
+        package_metadata(
+            "opaque-postgres-id",
+            "eventlog-postgres",
+            "/workspace/crates/eventlog-postgres/Other.toml",
+        ),
+        malformed_version,
     ] {
-        assert!(select_artifacts(&metadata, &artifacts).is_err(), "{metadata}");
+        let metadata = serde_json::json!({
+            "packages": [package],
+            "workspace_members": ["opaque-postgres-id"],
+        })
+        .to_string();
+        assert!(
+            select_artifacts(&metadata, &artifacts).is_err(),
+            "{metadata}"
+        );
     }
+    let duplicate = serde_json::json!({
+        "packages": [
+            package_metadata("opaque-postgres-id", "eventlog-postgres", "/workspace/first/Cargo.toml"),
+            package_metadata("opaque-postgres-id", "eventlog-postgres", "/workspace/second/Cargo.toml"),
+        ],
+        "workspace_members": ["opaque-postgres-id"],
+    })
+    .to_string();
+    assert!(select_artifacts(&duplicate, &artifacts).is_err());
 }

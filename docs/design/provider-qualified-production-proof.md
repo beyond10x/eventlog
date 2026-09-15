@@ -21,6 +21,13 @@ A free-form test-output line, matching filename substring, global successful nam
 positive count cannot establish that tuple. Independent stdout/stderr capture cannot be zipped
 together after execution to manufacture target association.
 
+Direct artifact execution preserves the owning package's Cargo working directory and runtime
+package environment. Exact Cargo metadata supplies the manifest paths, package identity, version
+components and optional metadata. Clear inherited manifest and package variables before applying
+that context, including empty values for absent optional metadata. A peer package must never run
+under the production example's package context. The two independent review regressions pin both
+the working directory and runtime environment; preserve their assertions.
+
 Retain every existing required case, assign it to each applicable provider/target in current
 source, and cover the supported SQLite storage modes where their established case owns both.
 Do not silently narrow the required package, target or test selection. Preserve the workspace

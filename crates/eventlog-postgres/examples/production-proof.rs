@@ -81,8 +81,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             selected.target.name,
             selected.executable.display()
         );
-        let output = Command::new(&selected.executable)
-            .current_dir(&selected.working_directory)
+        let mut process = Command::new(&selected.executable);
+        selected.apply_execution_context(&mut process);
+        let output = process
             .args(["--show-output", "--test-threads=1", "--format=pretty"])
             .env("EVENTLOG_REQUIRE_POSTGRES", "1")
             .env("RUST_TEST_THREADS", "1")

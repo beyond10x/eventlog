@@ -2,7 +2,9 @@
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     path::PathBuf,
+    process::Command,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,6 +43,23 @@ pub struct SelectedTarget {
     pub target: Target,
     pub executable: PathBuf,
     pub working_directory: PathBuf,
+    pub package_environment: BTreeMap<&'static str, OsString>,
+}
+impl SelectedTarget {
+    pub fn apply_execution_context(&self, command: &mut Command) {
+        command.current_dir(&self.working_directory);
+        for (name, _) in std::env::vars_os() {
+            if name == "CARGO_MANIFEST_DIR"
+                || name == "CARGO_MANIFEST_PATH"
+                || name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("CARGO_PKG_"))
+            {
+                command.env_remove(name);
+            }
+        }
+        command.envs(&self.package_environment);
+    }
 }
 #[derive(Deserialize)]
 struct Metadata {
@@ -51,7 +70,22 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    version: String,
+    authors: Vec<String>,
+    description: Option<String>,
+    homepage: Option<String>,
+    repository: Option<String>,
+    license: Option<String>,
+    license_file: Option<PathBuf>,
+    readme: Option<PathBuf>,
+    rust_version: Option<String>,
     manifest_path: PathBuf,
+}
+#[derive(Clone)]
+struct PackageContext {
+    name: String,
+    working_directory: PathBuf,
+    environment: BTreeMap<&'static str, OsString>,
 }
 #[derive(Deserialize)]
 struct Artifact {
@@ -70,6 +104,96 @@ struct Profile {
     test: bool,
 }
 
+fn package_context(package: Package) -> Result<(String, PackageContext), String> {
+    if !package.manifest_path.is_absolute()
+        || package.manifest_path.file_name() != Some(OsStr::new("Cargo.toml"))
+    {
+        return Err("package manifest path must be an absolute Cargo.toml path".into());
+    }
+    let working_directory = package
+        .manifest_path
+        .parent()
+        .ok_or("package manifest has no working directory")?
+        .to_path_buf();
+    let version_without_build = package
+        .version
+        .split_once('+')
+        .map_or(package.version.as_str(), |(version, _)| version);
+    let (release, prerelease) = version_without_build
+        .split_once('-')
+        .map_or((version_without_build, ""), |(release, prerelease)| {
+            (release, prerelease)
+        });
+    let mut release = release.split('.');
+    let (Some(major), Some(minor), Some(patch), None) = (
+        release.next(),
+        release.next(),
+        release.next(),
+        release.next(),
+    ) else {
+        return Err("package version must contain major, minor, and patch components".into());
+    };
+    if [major, minor, patch]
+        .iter()
+        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("package version components must be numeric".into());
+    }
+
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "CARGO_MANIFEST_DIR",
+        working_directory.clone().into_os_string(),
+    );
+    environment.insert(
+        "CARGO_MANIFEST_PATH",
+        package.manifest_path.into_os_string(),
+    );
+    environment.insert("CARGO_PKG_AUTHORS", package.authors.join(":").into());
+    environment.insert(
+        "CARGO_PKG_DESCRIPTION",
+        package.description.unwrap_or_default().into(),
+    );
+    environment.insert(
+        "CARGO_PKG_HOMEPAGE",
+        package.homepage.unwrap_or_default().into(),
+    );
+    environment.insert(
+        "CARGO_PKG_LICENSE",
+        package.license.unwrap_or_default().into(),
+    );
+    environment.insert(
+        "CARGO_PKG_LICENSE_FILE",
+        package.license_file.unwrap_or_default().into_os_string(),
+    );
+    environment.insert("CARGO_PKG_NAME", package.name.clone().into());
+    environment.insert(
+        "CARGO_PKG_README",
+        package.readme.unwrap_or_default().into_os_string(),
+    );
+    environment.insert(
+        "CARGO_PKG_REPOSITORY",
+        package.repository.unwrap_or_default().into(),
+    );
+    environment.insert(
+        "CARGO_PKG_RUST_VERSION",
+        package.rust_version.unwrap_or_default().into(),
+    );
+    environment.insert("CARGO_PKG_VERSION", package.version.clone().into());
+    environment.insert("CARGO_PKG_VERSION_MAJOR", major.into());
+    environment.insert("CARGO_PKG_VERSION_MINOR", minor.into());
+    environment.insert("CARGO_PKG_VERSION_PATCH", patch.into());
+    environment.insert("CARGO_PKG_VERSION_PRE", prerelease.into());
+    Ok((
+        package.id,
+        PackageContext {
+            name: package.name,
+            working_directory,
+            environment,
+        },
+    ))
+}
+
 /// Identity comes only from the exact workspace Cargo selected and its test artifacts.
 pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedTarget>, String> {
     let metadata: Metadata = serde_json::from_str(metadata).map_err(|error| error.to_string())?;
@@ -79,24 +203,8 @@ pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedT
         .into_iter()
         .filter(|package| metadata.workspace_members.contains(&package.id))
     {
-        if !package.manifest_path.is_absolute()
-            || package
-                .manifest_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                != Some("Cargo.toml")
-        {
-            return Err("package manifest path must be an absolute Cargo.toml path".into());
-        }
-        let working_directory = package
-            .manifest_path
-            .parent()
-            .ok_or("package manifest has no working directory")?
-            .to_path_buf();
-        if packages
-            .insert(package.id, (package.name, working_directory))
-            .is_some()
-        {
+        let (id, context) = package_context(package)?;
+        if packages.insert(id, context).is_some() {
             return Err("duplicate package metadata identity".into());
         }
     }
@@ -119,14 +227,14 @@ pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedT
                 let Some(executable) = artifact.executable else {
                     continue;
                 };
-                let (package, working_directory) = packages
+                let context = packages
                     .get(&artifact.package_id)
                     .ok_or("test artifact outside selected workspace")?;
                 let [kind] = artifact.target.kind.as_slice() else {
                     return Err("ambiguous target kind".into());
                 };
                 let target = Target {
-                    package: package.clone(),
+                    package: context.name.clone(),
                     kind: kind.clone(),
                     name: artifact.target.name,
                 };
@@ -138,7 +246,8 @@ pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedT
                     SelectedTarget {
                         target,
                         executable,
-                        working_directory: working_directory.clone(),
+                        working_directory: context.working_directory.clone(),
+                        package_environment: context.environment.clone(),
                     },
                 );
             }
