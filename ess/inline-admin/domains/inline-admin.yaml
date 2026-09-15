@@ -1,0 +1,16 @@
+domain: eventlog.inline_admin
+
+# A transient administration result, not a persisted entity or a serving certificate.
+types:
+  - name: eventlog.inline_admin.InlineRebuildResult
+    kind: struct
+    fields:
+      - name: applied
+        type: Integer
+      - name: position
+        type: Integer
+    invariants:
+      - applied >= 0
+      - position >= 0
+    # Rust refines both counts to checked u64. Applied counts folded tenant events;
+    # position is their actual last global sequence (zero for empty), with gaps preserved.
