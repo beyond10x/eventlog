@@ -82,13 +82,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             selected.executable.display()
         );
         let output = Command::new(&selected.executable)
+            .current_dir(&selected.working_directory)
             .args(["--show-output", "--test-threads=1", "--format=pretty"])
             .env("EVENTLOG_REQUIRE_POSTGRES", "1")
             .env("RUST_TEST_THREADS", "1")
             .output()?;
         executions.push(record_execution(
             selected.target,
-            &command,
+            &format!("cwd {}: {command}", selected.working_directory.display()),
             output,
             &mut raw,
         )?);

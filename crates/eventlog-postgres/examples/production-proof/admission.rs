@@ -40,6 +40,7 @@ pub struct Execution {
 pub struct SelectedTarget {
     pub target: Target,
     pub executable: PathBuf,
+    pub working_directory: PathBuf,
 }
 #[derive(Deserialize)]
 struct Metadata {
@@ -50,6 +51,7 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    manifest_path: PathBuf,
 }
 #[derive(Deserialize)]
 struct Artifact {
@@ -71,12 +73,33 @@ struct Profile {
 /// Identity comes only from the exact workspace Cargo selected and its test artifacts.
 pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedTarget>, String> {
     let metadata: Metadata = serde_json::from_str(metadata).map_err(|error| error.to_string())?;
-    let packages: BTreeMap<_, _> = metadata
+    let mut packages = BTreeMap::new();
+    for package in metadata
         .packages
         .into_iter()
         .filter(|package| metadata.workspace_members.contains(&package.id))
-        .map(|package| (package.id, package.name))
-        .collect();
+    {
+        if !package.manifest_path.is_absolute()
+            || package
+                .manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("Cargo.toml")
+        {
+            return Err("package manifest path must be an absolute Cargo.toml path".into());
+        }
+        let working_directory = package
+            .manifest_path
+            .parent()
+            .ok_or("package manifest has no working directory")?
+            .to_path_buf();
+        if packages
+            .insert(package.id, (package.name, working_directory))
+            .is_some()
+        {
+            return Err("duplicate package metadata identity".into());
+        }
+    }
     let mut selected = BTreeMap::new();
     let mut executables = BTreeSet::new();
     let mut finished = false;
@@ -96,7 +119,7 @@ pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedT
                 let Some(executable) = artifact.executable else {
                     continue;
                 };
-                let package = packages
+                let (package, working_directory) = packages
                     .get(&artifact.package_id)
                     .ok_or("test artifact outside selected workspace")?;
                 let [kind] = artifact.target.kind.as_slice() else {
@@ -110,7 +133,14 @@ pub fn select_artifacts(metadata: &str, artifacts: &str) -> Result<Vec<SelectedT
                 if !executables.insert(executable.clone()) || selected.contains_key(&target) {
                     return Err("duplicate or ambiguous test artifact".into());
                 }
-                selected.insert(target.clone(), SelectedTarget { target, executable });
+                selected.insert(
+                    target.clone(),
+                    SelectedTarget {
+                        target,
+                        executable,
+                        working_directory: working_directory.clone(),
+                    },
+                );
             }
             Some("build-finished") if value["success"].as_bool() == Some(true) => finished = true,
             Some("build-finished") => return Err("workspace test build failed".into()),

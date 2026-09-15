@@ -181,7 +181,7 @@ fn complete_roster_passes_with_exact_provider_and_target_attribution() {
     }
 }
 fn metadata() -> String {
-    serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres"}, {"id":"opaque-sqlite-id","name":"eventlog-sqlite"}],
+    serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/crates/eventlog-postgres/Cargo.toml"}, {"id":"opaque-sqlite-id","name":"eventlog-sqlite","manifest_path":"/workspace/crates/eventlog-sqlite/Cargo.toml"}],
         "workspace_members":["opaque-postgres-id", "opaque-sqlite-id"]}).to_string()
 }
 fn artifact(package: &str, kind: &str, target: &str, executable: &str) -> String {
@@ -214,6 +214,10 @@ fn exact_cargo_artifact_identity_does_not_depend_on_executable_path_substrings()
     assert_eq!(
         selected[0].executable.to_str(),
         Some("/opaque/sqlite-looks-like-a-peer")
+    );
+    assert_eq!(
+        selected[0].working_directory.to_str(),
+        Some("/workspace/crates/eventlog-postgres")
     );
 }
 #[test]
@@ -286,5 +290,34 @@ fn an_exact_selected_target_still_requires_the_fully_qualified_case_name() {
         let result = assess(&[execution], &REQUIRED[1..]);
         assert!(!result.valid);
         assert_eq!(result.missing.len(), 1);
+    }
+}
+
+#[test]
+fn missing_or_malformed_package_execution_context_refuses_artifact_selection() {
+    let artifacts = format!(
+        "{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+        artifact(
+            "opaque-postgres-id",
+            "test",
+            "atomic_groups",
+            "/opaque/executable"
+        )
+    );
+    for metadata in [
+        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres"}],
+            "workspace_members":["opaque-postgres-id"]}).to_string(),
+        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"Cargo.toml"}],
+            "workspace_members":["opaque-postgres-id"]}).to_string(),
+        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"crates/eventlog-postgres/Cargo.toml"}],
+            "workspace_members":["opaque-postgres-id"]}).to_string(),
+        serde_json::json!({"packages":[{"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/crates/eventlog-postgres/Other.toml"}],
+            "workspace_members":["opaque-postgres-id"]}).to_string(),
+        serde_json::json!({"packages":[
+            {"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/first/Cargo.toml"},
+            {"id":"opaque-postgres-id","name":"eventlog-postgres","manifest_path":"/workspace/second/Cargo.toml"}],
+            "workspace_members":["opaque-postgres-id"]}).to_string(),
+    ] {
+        assert!(select_artifacts(&metadata, &artifacts).is_err(), "{metadata}");
     }
 }
