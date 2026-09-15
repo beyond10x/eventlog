@@ -7,6 +7,9 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- Production proof binds every required case to its exact Cargo package and test target, refusing
+  cross-provider masking, incomplete or ambiguous execution while retaining workspace and doc tests.
+
 - SQLite and PostgreSQL now refuse different bytes under an existing tenant/digest blob binding
   with `EventLogError::Invalid`, retaining the original content. Identical retries still succeed;
   deletion permits rebinding, and concurrent differing writers have exactly one winner, matching
