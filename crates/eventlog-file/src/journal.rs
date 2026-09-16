@@ -1,5 +1,5 @@
 //! Durable JSONL framing. The manifest is the commit point, never a best-effort cache.
-use eventlog_core::{EventLogError, new_event_id};
+use eventlog_core::{CaptureError, CaptureMaterial, EventLogError, new_event_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -253,28 +253,7 @@ impl Journal {
     }
 
     pub fn extends(&self, observed: &Manifest) -> Result<bool, EventLogError> {
-        if observed.store != self.manifest.store
-            || observed.epoch != self.manifest.epoch
-            || observed.sequence > self.manifest.sequence
-        {
-            return Ok(false);
-        }
-        let mut previous = ZERO.to_owned();
-        for (index, transaction) in self
-            .transactions
-            .iter()
-            .take(usize::try_from(observed.sequence).map_err(backend)?)
-            .enumerate()
-        {
-            previous = encode(
-                &self.manifest,
-                index as u64 + 1,
-                &previous,
-                transaction.clone(),
-            )?
-            .1;
-        }
-        Ok(previous == observed.digest)
+        extends_observed(&self.manifest, &self.transactions, observed)
     }
 
     /// Privacy is the only rewrite path. The caller supplies history with only erased data removed.
@@ -310,6 +289,122 @@ impl Journal {
         self.transactions = transactions;
         Ok(())
     }
+}
+
+/// Whether the committed history still contains the exact prefix a handle observed.
+///
+/// One implementation, used by the ordinary opener's per-handle guard and by the strict reader's:
+/// a second copy of this walk is a second chance to compare the wrong thing.
+pub(crate) fn extends_observed(
+    manifest: &Manifest,
+    transactions: &[Value],
+    observed: &Manifest,
+) -> Result<bool, EventLogError> {
+    if observed.store != manifest.store
+        || observed.epoch != manifest.epoch
+        || observed.sequence > manifest.sequence
+    {
+        return Ok(false);
+    }
+    let mut previous = ZERO.to_owned();
+    for (index, transaction) in transactions
+        .iter()
+        .take(usize::try_from(observed.sequence).map_err(backend)?)
+        .enumerate()
+    {
+        previous = encode(manifest, index as u64 + 1, &previous, transaction.clone())?.1;
+    }
+    Ok(previous == observed.digest)
+}
+
+/// One committed history, read without the authority to change it.
+///
+/// The interprocess lock is held for as long as this value lives, exactly as an ordinary writer
+/// holds it, so an observation cannot straddle somebody else's commit.
+pub(crate) struct Strict {
+    _lock: File,
+    pub manifest: Manifest,
+    pub transactions: Vec<Value>,
+}
+
+fn unavailable(reason: &str) -> CaptureError {
+    CaptureError::Store(EventLogError::Backend(reason.to_owned()))
+}
+
+fn damaged() -> CaptureError {
+    CaptureError::Corrupt {
+        material: CaptureMaterial::Journal,
+    }
+}
+
+/// Open an existing store for reading only.
+///
+/// [`Journal::open`] is the wrong entry point for an inspector, and not by a little: it creates a
+/// store where there is none, runs append and privacy recovery, truncates a torn frame, deletes
+/// unselected staging files and rewrites `manifest.json` — all before the caller's read closure is
+/// ever invoked. This path does none of it. A missing root, lock or manifest is a storage refusal
+/// rather than an invitation to make one; a pending durable intent is somebody else's recovery;
+/// and damage is refused with the evidence left exactly where it was found.
+pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
+    if !fs::symlink_metadata(root)
+        .map_err(|_| unavailable("file store root is not present"))?
+        .is_dir()
+    {
+        return Err(unavailable("file store root is not a physical directory"));
+    }
+    let lock_path = root.join("writer.lock");
+    if !fs::symlink_metadata(&lock_path)
+        .map_err(|_| unavailable("file store writer lock is not present"))?
+        .is_file()
+    {
+        return Err(damaged());
+    }
+    // No create, no truncate: this opens the writers' own lock, it does not establish one.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|_| unavailable("file store writer lock cannot be opened"))?;
+    lock.lock()
+        .map_err(|_| unavailable("file store writer lock cannot be held"))?;
+    // A pending intent is the authority of an ordinary opener. Reading past one would either
+    // repair history without permission or hand back bytes an erasure has already claimed.
+    if root.join("append.json").exists() || root.join("privacy.json").exists() {
+        return Err(CaptureError::RecoveryRequired);
+    }
+    let manifest_path = root.join("manifest.json");
+    if !fs::symlink_metadata(&manifest_path)
+        .map_err(|_| unavailable("file store manifest is not present"))?
+        .is_file()
+    {
+        return Err(damaged());
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| damaged())?)
+            .map_err(|_| damaged())?;
+    if manifest.format != FORMAT {
+        return Err(damaged());
+    }
+    let events_path = root.join("events.jsonl");
+    if !fs::symlink_metadata(&events_path)
+        .map_err(|_| damaged())?
+        .is_file()
+    {
+        return Err(damaged());
+    }
+    let committed = fs::read(&events_path).map_err(|_| damaged())?;
+    // Surplus bytes are as much a refusal as missing ones: neither is history this manifest commits.
+    if committed.len() as u64 != manifest.length {
+        return Err(damaged());
+    }
+    let transactions = decode(&committed, &manifest).map_err(|_| damaged())?;
+    Ok(Strict {
+        _lock: lock,
+        manifest,
+        transactions,
+    })
 }
 
 fn recover_append(root: &Path, current: &Manifest) -> Result<(), EventLogError> {

@@ -12,6 +12,7 @@
 //! `spawn_blocking` by hand, and forgetting one wrap panicked a worker at startup.
 
 mod atomic_group;
+mod capture;
 
 use std::{
     collections::BTreeSet,
@@ -2097,24 +2098,16 @@ impl Inner {
         for spec in projector.projections() {
             spec.validate()?;
             let table = projection_table(prefix, spec.name);
-            let columns: String = joined(spec.indexed.len(), |position| {
-                format!(", idx_{position} TEXT")
-            });
+            let body = projection_table_body(spec.indexed.len());
             let indexes: String = joined(spec.indexed.len(), |position| {
+                let index = projection_index(&table, position);
                 format!(
-                    "CREATE INDEX IF NOT EXISTS {table}_idx_{position}
-                         ON {table} (tenant_id, idx_{position});"
+                    "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
                 )
             });
             guard
                 .execute_batch(&format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (
-                         tenant_id TEXT NOT NULL,
-                         row_key TEXT NOT NULL,
-                         body TEXT NOT NULL{columns},
-                         PRIMARY KEY (tenant_id, row_key)
-                     );
-                     {indexes}"
+                    "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
                 ))
                 .map_err(backend)?;
         }
@@ -2856,6 +2849,25 @@ fn joined(count: usize, render: impl Fn(usize) -> String) -> String {
 
 fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
+}
+
+/// The one `CREATE TABLE` body every projection table in this kit is written with.
+///
+/// Capture admits an actual stored table by comparing its whole declared body against this, so the
+/// shape that is created and the shape that is recognised come from one place and cannot drift.
+/// A `COLLATE` on `row_key`, a second `CHECK`, a `REFERENCES ... ON DELETE CASCADE` or a clause
+/// nobody has thought of yet is refused by that equality without being named here.
+fn projection_table_body(indexed: usize) -> String {
+    let columns: String = joined(indexed, |position| format!(", idx_{position} TEXT"));
+    format!(
+        "tenant_id TEXT NOT NULL, row_key TEXT NOT NULL, body TEXT NOT NULL{columns}, \
+         PRIMARY KEY (tenant_id, row_key)"
+    )
+}
+
+/// The one name a declared field's index is created and recognised under.
+fn projection_index(table: &str, position: usize) -> String {
+    format!("{table}_idx_{position}")
 }
 
 fn select_versions(

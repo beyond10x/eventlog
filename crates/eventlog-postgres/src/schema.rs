@@ -699,6 +699,28 @@ pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), Eve
     }
     Ok(())
 }
+/// Every column a projection table has, named and typed the way the catalog reports them.
+///
+/// The DDL below is built from this, and read-only capture admission compares an actual stored
+/// table against the same list. One description, so the shape that is created and the shape that
+/// is recognised cannot drift apart without a compiler error between them.
+pub(crate) fn projection_columns(spec: &ProjectionSpec) -> Vec<(String, &'static str, bool)> {
+    let mut columns = vec![
+        ("tenant_id".to_owned(), "text", true),
+        ("row_key".to_owned(), "text", true),
+        ("body".to_owned(), "jsonb", true),
+    ];
+    for position in 0..spec.indexed.len() {
+        columns.push((format!("idx_{position}"), "text", false));
+    }
+    columns
+}
+
+/// The one name a declared field's index is created and recognised under.
+pub(crate) fn projection_index(table: &str, position: usize) -> String {
+    format!("{table}_idx_{position}")
+}
+
 pub(crate) async fn create_projection<C: GenericClient>(
     client: &C,
     prefix: &str,
@@ -711,15 +733,19 @@ pub(crate) async fn create_projection<C: GenericClient>(
             "projection SQL identifier exceeds PostgreSQL's exact length limit".into(),
         ));
     }
-    let columns = super::joined(spec.indexed.len(), |position| {
-        format!(", idx_{position} TEXT")
-    });
+    let declarations: Vec<String> = projection_columns(spec)
+        .into_iter()
+        .map(|(name, kind, required)| {
+            let required = if required { " NOT NULL" } else { "" };
+            format!("{name} {kind}{required}")
+        })
+        .collect();
+    let columns = declarations.join(",");
     let indexes = super::joined(spec.indexed.len(), |position| {
-        format!(
-            "CREATE INDEX IF NOT EXISTS {table}_idx_{position} ON {table} (tenant_id, idx_{position});"
-        )
+        let index = projection_index(&table, position);
+        format!("CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});")
     });
-    client.batch_execute(&format!("CREATE TABLE IF NOT EXISTS {table} (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
+    client.batch_execute(&format!("CREATE TABLE IF NOT EXISTS {table} ({columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
     // Migration admits existing projection tables too; IF NOT EXISTS alone does not
     // reject hidden behavior that can discard projection writes before registration.
     shape(client, &table, prefix).await?;

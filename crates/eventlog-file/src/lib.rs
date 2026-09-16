@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 //! Repository-local Eventlog. JSONL transactions are authoritative; snapshots are disposable.
+mod capture;
 mod journal;
 mod projection;
 mod state;
+
+pub use capture::FileTenantCapture;
 
 use eventlog_core::{
     AdmissionPermit, AppendGroup, AppendGroupResult, AppendResult, AtomicEventStore, BoxFuture,
@@ -61,11 +64,7 @@ impl FileEventStore {
     /// # Errors
     /// Refuses corrupt history, unknown formats and inaccessible storage.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, EventLogError> {
-        let root = if path.as_ref().is_absolute() {
-            path.as_ref().to_owned()
-        } else {
-            std::env::current_dir().map_err(backend)?.join(path)
-        };
+        let root = root_path(path.as_ref())?;
         let path = root.clone();
         let journal = blocking(move || Journal::open(&path)).await?;
         State::replay(&journal.transactions)?;
@@ -444,6 +443,14 @@ impl Transaction {
         })
     }
 }
+/// One store root, resolved the same way for the ordinary opener and the read-only handle.
+fn root_path(path: &Path) -> Result<PathBuf, EventLogError> {
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    Ok(std::env::current_dir().map_err(backend)?.join(path))
+}
+
 fn validate_object(id: &str) -> Result<(), EventLogError> {
     if id.len() != 36 || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
         return Err(backend("invalid blob object name"));

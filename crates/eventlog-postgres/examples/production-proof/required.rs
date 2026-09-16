@@ -20,7 +20,36 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "file_rebuild_contract",
         "file_public_inputs_contract",
     ));
+    required.extend(cases!("eventlog-file", "test", "consistent_capture";
+        "file_consistent_capture_contract",
+        "a_read_only_handle_inspects_a_store_nobody_opened_for_writing",
+        "opening_and_capturing_change_no_stored_entry_or_byte",
+        "a_pending_intent_refuses_without_recovery_cleanup_or_initialization",
+        "missing_store_files_refuse_and_create_nothing",
+        "capture_queues_behind_another_process_holding_the_writer_lock",
+        "another_process_rewriting_history_invalidates_an_observing_handle",
+        "every_key_an_existing_writer_admits_round_trips_including_an_embedded_nul",
+    ));
+    required.extend(cases!("eventlog-sqlite", "test", "consistent_capture";
+        "sqlite_consistent_capture_contract",
+        "capture_orders_against_append_and_erasure_across_separate_handles",
+        "a_rebuild_paused_before_replacement_never_exposes_mixed_rows",
+        "a_stored_identity_is_preserved_exactly_or_refused_as_corruption",
+        "registry_and_physical_shape_drift_refuse_capture",
+        "admitted_projection_keys_include_an_embedded_nul",
+    ));
+    required.extend(cases!("eventlog-postgres", "test", "consistent_capture";
+        "postgres_consistent_capture_contract",
+        "capture_returns_committed_history_the_feed_watermark_withholds",
+        "capture_observes_an_erasure_that_completed_during_its_lock_wait",
+        "cancellation_and_deadline_retire_the_lease_and_recover_capacity",
+        "a_rebuild_paused_before_replacement_never_exposes_mixed_rows",
+        "registry_and_physical_shape_drift_refuse_capture",
+        "a_stored_identity_is_preserved_exactly_or_refused_as_corruption",
+    ));
     required.extend(cases!("eventlog-file", "lib", "eventlog_file";
+        "capture::tests::stored_identity_bytes_survive_exactly_and_an_empty_one_is_corruption",
+        "capture::tests::the_strict_reader_holds_the_writer_lock_for_its_whole_life",
         "journal::tests::process_death_at_each_append_boundary",
         "journal::tests::process_death_at_each_privacy_boundary",
         "journal::tests::privacy_crash_cleans_cached_bodies_and_blobs_on_open",
@@ -137,6 +166,9 @@ pub fn required_cases() -> Vec<RequiredCase> {
     ));
     required.extend(cases!("eventlog-core", "lib", "eventlog_core";
         "tests::input_validation_preserves_valid_wire_and_exact_field_limits",
+        "capture::tests::every_cap_is_exact_including_zero_and_never_saturates",
+        "capture::tests::stored_order_identity_and_request_shapes_are_checked",
+        "capture::tests::captured_content_is_ordered_bytewise_and_never_repeats_a_coordinate",
     ));
     required
 }

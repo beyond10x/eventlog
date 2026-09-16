@@ -32,6 +32,7 @@ use eventlog_core::{
 use serde_json::Value;
 use time::OffsetDateTime;
 mod atomic_group;
+mod capture;
 mod pool;
 mod schema;
 use pool::Pool;
@@ -1779,6 +1780,19 @@ mod uuid_shim {
     pub use uuid::Uuid;
 }
 
+/// The one expression every advisory coordinate in this owner is hashed with.
+///
+/// Capture's session-level publication lock and the transaction-level gate below must name the
+/// same lock. Two spellings of this expression are two locks, and nothing would say so.
+const ADVISORY_KEY: &str =
+    "hashtextextended(current_database() || ':' || current_schema() || $1,0)";
+
+/// The publication coordinate, derived the one way, for the gate and for capture alike.
+fn publication_identity(prefix: &str) -> Result<String, EventLogError> {
+    serde_json::to_string(&[prefix, "publication"])
+        .map_err(|_| EventLogError::Invalid("publication coordinates".into()))
+}
+
 // JSON arrays encode string components injectively; hash collisions serialize unrelated work only.
 async fn lock_identity(
     transaction: &Transaction<'_>,
@@ -1788,7 +1802,13 @@ async fn lock_identity(
 ) -> Result<(), EventLogError> {
     let identity = serde_json::to_string(&(prefix, kind, fields))
         .map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))?;
-    transaction.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || $1,0))", &[&identity]).await.map_err(backend)?;
+    transaction
+        .query_one(
+            &format!("SELECT pg_advisory_xact_lock({ADVISORY_KEY})"),
+            &[&identity],
+        )
+        .await
+        .map_err(backend)?;
     Ok(())
 }
 
@@ -1811,14 +1831,16 @@ async fn publication_gate(
     prefix: &str,
     exclusive: bool,
 ) -> Result<(), EventLogError> {
-    let identity = serde_json::to_string(&[prefix, "publication"])
-        .map_err(|_| EventLogError::Invalid("publication coordinates".into()))?;
+    let identity = publication_identity(prefix)?;
     let function = if exclusive {
         "pg_advisory_xact_lock"
     } else {
         "pg_advisory_xact_lock_shared"
     };
-    transaction.query_one(&format!("SELECT {function}(hashtextextended(current_database() || ':' || current_schema() || $1,0))"),&[&identity]).await.map_err(backend)?;
+    transaction
+        .query_one(&format!("SELECT {function}({ADVISORY_KEY})"), &[&identity])
+        .await
+        .map_err(backend)?;
     Ok(())
 }
 

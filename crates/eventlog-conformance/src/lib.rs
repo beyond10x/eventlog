@@ -9,6 +9,11 @@
 mod atomic_group;
 pub use atomic_group::run_atomic_groups;
 
+mod consistent_capture;
+pub use consistent_capture::{
+    CAPTURE_LEDGER, CAPTURE_SIDECAR, CaptureLedger, run_consistent_capture,
+};
+
 use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, NewEvent, Snapshot, StreamId, TenantId,
     request_hash,
