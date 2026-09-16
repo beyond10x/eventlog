@@ -750,3 +750,492 @@ async fn review_blob_empty_content_and_conflict_rollback_reuse() {
         Some(&b"rebound"[..])
     );
 }
+
+#[tokio::test]
+async fn review2_sqlite_admission_refuses_hidden_collation_and_conflict_clauses() {
+    use eventlog_core::EventLogError;
+
+    // Every table below has the exact admitted columns, declared types, nullability, defaults,
+    // primary key, single pk index and the exact integrity CHECK. Each also carries one clause
+    // that PRAGMA table_xinfo, index_list and the CHECK tokenizer cannot observe.
+    let mut admitted_clauses = Vec::new();
+    for (label, ddl) in [
+        (
+            "nocase-digest",
+            "CREATE TABLE hidden_blobs (
+                 tenant_id TEXT NOT NULL,
+                 digest TEXT NOT NULL COLLATE NOCASE,
+                 bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 integrity_sha256 TEXT,
+                 integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+                 PRIMARY KEY (tenant_id, digest)
+             );",
+        ),
+        (
+            "pk-on-conflict-replace",
+            "CREATE TABLE hidden_blobs (
+                 tenant_id TEXT NOT NULL,
+                 digest TEXT NOT NULL,
+                 bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 integrity_sha256 TEXT,
+                 integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+                 PRIMARY KEY (tenant_id, digest) ON CONFLICT REPLACE
+             );",
+        ),
+        (
+            "foreign-key-cascade",
+            "CREATE TABLE hidden_parent (id TEXT PRIMARY KEY);
+             CREATE TABLE hidden_blobs (
+                 tenant_id TEXT NOT NULL REFERENCES hidden_parent(id) ON DELETE CASCADE,
+                 digest TEXT NOT NULL,
+                 bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 integrity_sha256 TEXT,
+                 integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+                 PRIMARY KEY (tenant_id, digest)
+             );",
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join(format!("{label}.sqlite3"));
+        rusqlite::Connection::open(&path)
+            .expect("raw connection")
+            .execute_batch(ddl)
+            .expect("foreign current-like blob table");
+        let admitted = SqliteEventStore::open(path.to_str().expect("path"), "hidden").await;
+        let refused = matches!(&admitted, Err(EventLogError::Invalid(_)));
+        eprintln!("{label}: refused={refused} admitted={}", admitted.is_ok());
+        if !refused {
+            admitted_clauses.push(label);
+        }
+    }
+    assert!(
+        admitted_clauses.is_empty(),
+        "similar foreign blob tables must be refused before they are served; admitted clauses: {admitted_clauses:?}"
+    );
+}
+
+#[tokio::test]
+async fn review2_sqlite_nocase_digest_table_must_not_serve_another_identity() {
+    use eventlog_core::{EventStore, TenantId};
+
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("nocase.sqlite3");
+    rusqlite::Connection::open(&path)
+        .expect("raw connection")
+        .execute_batch(
+            "CREATE TABLE nocase_blobs (
+                 tenant_id TEXT NOT NULL,
+                 digest TEXT NOT NULL COLLATE NOCASE,
+                 bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 integrity_sha256 TEXT,
+                 integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+                 PRIMARY KEY (tenant_id, digest)
+             );",
+        )
+        .expect("foreign table");
+    // Refusal at open is the required behaviour; this case then has nothing left to prove.
+    let Ok(store) = SqliteEventStore::open(path.to_str().expect("path"), "nocase").await else {
+        return;
+    };
+    let tenant = TenantId::new("nocase").expect("tenant");
+    store
+        .put_blob(&tenant, "opaque", b"original")
+        .await
+        .expect("first binding");
+    assert_eq!(
+        store.get_blob(&tenant, "OPAQUE").await.expect("read"),
+        None,
+        "a distinct opaque digest spelling must not return another identity's bytes"
+    );
+    assert!(
+        store
+            .put_blob(&tenant, "OPAQUE", b"different")
+            .await
+            .is_ok(),
+        "a never-bound opaque digest spelling must be bindable"
+    );
+}
+
+#[tokio::test]
+async fn review2_sqlite_similar_legacy_predecessors_are_refused_before_any_persistent_change() {
+    use eventlog_core::{EventStore, LegacyBlobMigration, TenantId};
+
+    fn downgrade_with(path: &std::path::Path, prefix: &str, extra_clause: &str) {
+        let sql = rusqlite::Connection::open(path).unwrap();
+        sql.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE {prefix}_blobs RENAME TO {prefix}_blobs_current;
+             CREATE TABLE {prefix}_blobs (
+                 tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+                 PRIMARY KEY (tenant_id,digest){extra_clause});
+             INSERT INTO {prefix}_blobs(tenant_id,digest,bytes,byte_count,recorded_at)
+                 SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {prefix}_blobs_current;
+             DROP TABLE {prefix}_blobs_current;
+             COMMIT;"
+        ))
+        .unwrap();
+    }
+    fn column_count(path: &std::path::Path, table: &str) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                &format!("SELECT count(*) FROM pragma_table_info('{table}')"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let tenant = TenantId::new("legacy-tenant").unwrap();
+
+    // (a) A five-column predecessor that also carries an extra CHECK: the migration must refuse
+    //     and leave no additive column behind.
+    let extra = directory.path().join("extra-check.sqlite3");
+    let store = SqliteEventStore::open(extra.to_str().unwrap(), "legacy")
+        .await
+        .unwrap();
+    store.put_blob(&tenant, "opaque", b"bytes").await.unwrap();
+    drop(store);
+    downgrade_with(&extra, "legacy", ", CHECK (byte_count >= 0)");
+    let result = SqliteEventStore::open_with_blob_migration(
+        extra.to_str().unwrap(),
+        "legacy",
+        LegacyBlobMigration::TrustObservedBytes,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a predecessor with an extra CHECK is not the exact supported predecessor"
+    );
+    drop(result);
+    assert_eq!(
+        column_count(&extra, "legacy_blobs"),
+        5,
+        "refusal must roll back additive columns"
+    );
+
+    // (b) A predecessor row whose recorded_at cannot be parsed: refuse, roll back.
+    let clock = directory.path().join("bad-clock.sqlite3");
+    let store = SqliteEventStore::open(clock.to_str().unwrap(), "legacy")
+        .await
+        .unwrap();
+    store.put_blob(&tenant, "opaque", b"bytes").await.unwrap();
+    drop(store);
+    downgrade_with(&clock, "legacy", "");
+    rusqlite::Connection::open(&clock)
+        .unwrap()
+        .execute_batch("UPDATE legacy_blobs SET recorded_at='yesterday'")
+        .unwrap();
+    let result = SqliteEventStore::open_with_blob_migration(
+        clock.to_str().unwrap(),
+        "legacy",
+        LegacyBlobMigration::TrustObservedBytes,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a malformed predecessor row aborts the complete migration"
+    );
+    drop(result);
+    assert_eq!(column_count(&clock, "legacy_blobs"), 5);
+
+    // (c) A fresh current table refuses the old five-column INSERT shape outright.
+    let fresh = directory.path().join("fresh.sqlite3");
+    let store = SqliteEventStore::open(fresh.to_str().unwrap(), "fresh")
+        .await
+        .unwrap();
+    drop(store);
+    let raw = rusqlite::Connection::open(&fresh).unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO fresh_blobs (tenant_id,digest,bytes,byte_count,recorded_at) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params!["old-writer", "opaque", b"bytes".as_slice(), 5, "2026-01-01T00:00:00Z"],
+        )
+        .is_err(),
+        "an old five-column writer must be refused by the fresh edition too"
+    );
+}
+
+#[tokio::test]
+async fn review2_sqlite_hidden_clauses_change_binding_semantics_once_admitted() {
+    use eventlog_core::{EventLogError, EventStore, TenantId};
+
+    let directory = tempfile::tempdir().expect("directory");
+    let tenant = TenantId::new("hidden").expect("tenant");
+
+    // (a) PRIMARY KEY ... ON CONFLICT REPLACE: what does a conflicting put do?
+    let replace = directory.path().join("replace.sqlite3");
+    rusqlite::Connection::open(&replace)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE hidden_blobs (
+                 tenant_id TEXT NOT NULL, digest TEXT NOT NULL, bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL, recorded_at TEXT NOT NULL, integrity_sha256 TEXT,
+                 integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+                 PRIMARY KEY (tenant_id, digest) ON CONFLICT REPLACE);",
+        )
+        .unwrap();
+    if let Ok(store) = SqliteEventStore::open(replace.to_str().unwrap(), "hidden").await {
+        store
+            .put_blob(&tenant, "opaque", b"original")
+            .await
+            .unwrap();
+        let second = store.put_blob(&tenant, "opaque", b"replaced").await;
+        let stored = store.get_blob(&tenant, "opaque").await.unwrap();
+        eprintln!("on-conflict-replace: second put={second:?} stored={stored:?}");
+        assert!(
+            matches!(second, Err(EventLogError::Invalid(_))),
+            "immutable binding must refuse different content"
+        );
+        assert_eq!(
+            stored,
+            Some(b"original".to_vec()),
+            "immutable binding must keep the first bytes"
+        );
+    }
+
+    // (b) REFERENCES ... ON DELETE CASCADE: a foreign delete path removes an admitted binding.
+    let cascade = directory.path().join("cascade.sqlite3");
+    rusqlite::Connection::open(&cascade)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE hidden_parent (id TEXT PRIMARY KEY);
+             INSERT INTO hidden_parent VALUES ('hidden');
+             CREATE TABLE hidden_blobs (
+                 tenant_id TEXT NOT NULL REFERENCES hidden_parent(id) ON DELETE CASCADE,
+                 digest TEXT NOT NULL, bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL, recorded_at TEXT NOT NULL, integrity_sha256 TEXT,
+                 integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+                 PRIMARY KEY (tenant_id, digest));",
+        )
+        .unwrap();
+    if let Ok(store) = SqliteEventStore::open(cascade.to_str().unwrap(), "hidden").await {
+        store
+            .put_blob(&tenant, "opaque", b"original")
+            .await
+            .unwrap();
+        rusqlite::Connection::open(&cascade)
+            .unwrap()
+            .execute_batch("PRAGMA foreign_keys=ON; DELETE FROM hidden_parent;")
+            .unwrap();
+        let stored = store.get_blob(&tenant, "opaque").await.unwrap();
+        eprintln!("cascade: stored after foreign parent delete={stored:?}");
+        assert_eq!(
+            stored,
+            Some(b"original".to_vec()),
+            "an admitted binding must not be deletable through a foreign cascade path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn review2_sqlite_legacy_admission_refuses_hidden_clauses_before_additive_migration() {
+    use eventlog_core::{EventStore, LegacyBlobMigration, TenantId};
+
+    fn downgrade_to_predecessor(path: &std::path::Path, prefix: &str, digest_column: &str) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE {prefix}_blobs RENAME TO {prefix}_blobs_current;
+                 CREATE TABLE {prefix}_blobs (
+                     tenant_id TEXT NOT NULL,{digest_column},bytes BLOB NOT NULL,
+                     byte_count INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id,digest));
+                 INSERT INTO {prefix}_blobs(tenant_id,digest,bytes,byte_count,recorded_at)
+                     SELECT tenant_id,digest,bytes,byte_count,recorded_at
+                     FROM {prefix}_blobs_current;
+                 DROP TABLE {prefix}_blobs_current;
+                 COMMIT;"
+            ))
+            .unwrap();
+    }
+    fn column_count(path: &std::path::Path, table: &str) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                &format!("SELECT count(*) FROM pragma_table_info('{table}')"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+    fn stored_sql(path: &std::path::Path, table: &str) -> String {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let tenant = TenantId::new("legacy-tenant").unwrap();
+
+    // A clause no column, index or check pragma reports survives the whole legacy path: the
+    // predecessor is recognised, the additive columns are committed onto it, and the result is
+    // then admitted as current. The refusal has to happen before the first ALTER.
+    let hidden = directory.path().join("hidden-collation.sqlite3");
+    let store = SqliteEventStore::open(hidden.to_str().unwrap(), "legacy")
+        .await
+        .unwrap();
+    store
+        .put_blob(&tenant, "opaque", b"original")
+        .await
+        .unwrap();
+    drop(store);
+    downgrade_to_predecessor(&hidden, "legacy", "digest TEXT NOT NULL COLLATE NOCASE");
+    assert!(
+        SqliteEventStore::open_with_blob_migration(
+            hidden.to_str().unwrap(),
+            "legacy",
+            LegacyBlobMigration::TrustObservedBytes,
+        )
+        .await
+        .is_err(),
+        "a predecessor carrying an unrecognised clause must not be migrated"
+    );
+    assert_eq!(
+        column_count(&hidden, "legacy_blobs"),
+        5,
+        "the refusal precedes the additive columns"
+    );
+    assert!(
+        stored_sql(&hidden, "legacy_blobs").contains("COLLATE"),
+        "the refused predecessor is left exactly as it was found"
+    );
+
+    // Control: the same fixture without that clause is the exact supported predecessor, migrates,
+    // and is admitted again on reopen.
+    let supported = directory.path().join("supported.sqlite3");
+    let store = SqliteEventStore::open(supported.to_str().unwrap(), "legacy")
+        .await
+        .unwrap();
+    store
+        .put_blob(&tenant, "opaque", b"original")
+        .await
+        .unwrap();
+    drop(store);
+    downgrade_to_predecessor(&supported, "legacy", "digest TEXT NOT NULL");
+    let (migrated, report) = SqliteEventStore::open_with_blob_migration(
+        supported.to_str().unwrap(),
+        "legacy",
+        LegacyBlobMigration::TrustObservedBytes,
+    )
+    .await
+    .expect("the exact supported predecessor still migrates");
+    assert!(report.upgraded);
+    assert_eq!(report.trusted_legacy_rows, 1);
+    assert_eq!(
+        migrated.get_blob(&tenant, "opaque").await.unwrap(),
+        Some(b"original".to_vec())
+    );
+    drop(migrated);
+    assert_eq!(column_count(&supported, "legacy_blobs"), 7);
+    SqliteEventStore::open(supported.to_str().unwrap(), "legacy")
+        .await
+        .expect("the migrated table is admitted on reopen");
+}
+
+#[tokio::test]
+async fn review2_sqlite_admission_refuses_unrecognized_blob_table_semantics() {
+    use eventlog_core::EventLogError;
+
+    // Every body below declares the admitted columns, types, nullability, defaults, primary key,
+    // single key index and exact integrity check. Each carries one further clause, and each clause
+    // is a member of the same class: physical behaviour the stored table declares and no pragma
+    // this admission reads reports back.
+    let current = "tenant_id TEXT NOT NULL,
+             digest TEXT NOT NULL,
+             bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,
+             recorded_at TEXT NOT NULL,
+             integrity_sha256 TEXT,
+             integrity_v1 INTEGER NOT NULL DEFAULT 1
+                 CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+             PRIMARY KEY (tenant_id, digest)";
+    let key = "PRIMARY KEY (tenant_id, digest)";
+
+    let mut admitted = Vec::new();
+    for (label, body) in [
+        ("exact-current", current.to_owned()),
+        (
+            "collate-on-a-value-column",
+            current.replace(
+                "recorded_at TEXT NOT NULL",
+                "recorded_at TEXT NOT NULL COLLATE NOCASE",
+            ),
+        ),
+        (
+            "column-conflict-clause",
+            current.replace(
+                "byte_count INTEGER NOT NULL",
+                "byte_count INTEGER NOT NULL ON CONFLICT ROLLBACK",
+            ),
+        ),
+        (
+            "second-check",
+            current.replace(key, &format!("CHECK (byte_count >= 0), {key}")),
+        ),
+        (
+            "extra-unique",
+            current.replace(key, &format!("{key}, UNIQUE (digest)")),
+        ),
+        (
+            "generated-column",
+            current.replace(
+                "recorded_at TEXT NOT NULL",
+                "recorded_at TEXT NOT NULL, shadow TEXT GENERATED ALWAYS AS (digest) VIRTUAL",
+            ),
+        ),
+        (
+            "table-foreign-key",
+            current.replace(
+                key,
+                &format!(
+                    "{key}, FOREIGN KEY (tenant_id) REFERENCES hidden_parent(id) ON DELETE CASCADE"
+                ),
+            ),
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("shape.sqlite3");
+        rusqlite::Connection::open(&path)
+            .expect("raw connection")
+            .execute_batch(&format!(
+                "CREATE TABLE hidden_parent (id TEXT PRIMARY KEY);
+                 CREATE TABLE hidden_blobs ({body});"
+            ))
+            .unwrap_or_else(|error| panic!("{label} is not valid SQLite: {error}"));
+        let opened = SqliteEventStore::open(path.to_str().expect("path"), "hidden").await;
+        let refused = matches!(&opened, Err(EventLogError::Invalid(_)));
+        eprintln!("{label}: refused={refused} admitted={}", opened.is_ok());
+        if label == "exact-current" {
+            assert!(opened.is_ok(), "the exact current body stays admitted");
+        } else if !refused {
+            admitted.push(label);
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "a clause this admission does not recognise must be refused, not served; admitted: {admitted:?}"
+    );
+}

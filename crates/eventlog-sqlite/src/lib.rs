@@ -201,6 +201,12 @@ impl Inner {
         migration: LegacyBlobMigration,
     ) -> Result<BlobMigrationReport, EventLogError> {
         let prefix = &self.prefix;
+        let blobs = sqlite_blob_table_body(&[
+            SQLITE_BLOB_PREDECESSOR_COLUMNS,
+            SQLITE_BLOB_HASH_COLUMN,
+            SQLITE_BLOB_EDITION_COLUMN,
+            SQLITE_BLOB_PRIMARY_KEY,
+        ]);
         let statements = format!(
             "CREATE TABLE IF NOT EXISTS {prefix}_events (
                  global_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,17 +259,7 @@ impl Inner {
                  tenant_id TEXT NOT NULL PRIMARY KEY,
                  stream_identity TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS {prefix}_blobs (
-                 tenant_id TEXT NOT NULL,
-                 digest TEXT NOT NULL,
-                 bytes BLOB NOT NULL,
-                 byte_count INTEGER NOT NULL,
-                 recorded_at TEXT NOT NULL,
-                 integrity_sha256 TEXT,
-                 integrity_v1 INTEGER NOT NULL DEFAULT 1
-                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
-                 PRIMARY KEY (tenant_id, digest)
-             );
+             CREATE TABLE IF NOT EXISTS {prefix}_blobs ({blobs});
              CREATE TABLE IF NOT EXISTS {prefix}_projection_cursors (
                  projection TEXT NOT NULL,
                  tenant_id TEXT NOT NULL,
@@ -329,7 +325,7 @@ impl Inner {
                 }
                 transaction
                     .execute_batch(&format!(
-                        "ALTER TABLE {table} ADD COLUMN integrity_sha256 TEXT"
+                        "ALTER TABLE {table} ADD COLUMN {SQLITE_BLOB_HASH_COLUMN}"
                     ))
                     .map_err(backend)?;
                 let mut after: Option<(String, String)> = None;
@@ -393,8 +389,7 @@ impl Inner {
                 }
                 transaction
                     .execute_batch(&format!(
-                        "ALTER TABLE {table} ADD COLUMN integrity_v1 INTEGER NOT NULL DEFAULT 1
-                         CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)"
+                        "ALTER TABLE {table} ADD COLUMN {SQLITE_BLOB_EDITION_COLUMN}"
                     ))
                     .map_err(backend)?;
                 report = BlobMigrationReport {
@@ -452,6 +447,32 @@ enum SqliteBlobShape {
     Missing,
     Legacy,
     Current,
+}
+
+/// The predecessor's five blob columns, which the integrity edition keeps untouched.
+const SQLITE_BLOB_PREDECESSOR_COLUMNS: &str = "tenant_id TEXT NOT NULL,
+                 digest TEXT NOT NULL,
+                 bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL";
+
+/// The nullable hash column an admitted predecessor is backfilled through.
+const SQLITE_BLOB_HASH_COLUMN: &str = "integrity_sha256 TEXT";
+
+/// The edition tag whose closed check refuses an old five-column `INSERT`.
+const SQLITE_BLOB_EDITION_COLUMN: &str = "integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)";
+
+/// The only key this table has.
+const SQLITE_BLOB_PRIMARY_KEY: &str = "PRIMARY KEY (tenant_id, digest)";
+
+/// One `CREATE TABLE` body, written the one way this kit writes it.
+///
+/// `create_tables` builds its own DDL through this function and admission builds what it expects
+/// through the same one, so the shape that is written and the shape that is recognised cannot
+/// drift apart.
+fn sqlite_blob_table_body(parts: &[&str]) -> String {
+    parts.join(",\n                 ")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -584,6 +605,73 @@ fn has_exact_sqlite_blob_integrity_check(sql: &str) -> bool {
     checks == 1 && expected
 }
 
+/// The tokens between a stored `CREATE TABLE` statement's outermost parentheses.
+///
+/// `None` when there is no balanced parenthesised body, or when any token follows the closing
+/// parenthesis — table options such as `WITHOUT ROWID` and `STRICT` arrive there.
+fn sqlite_table_body_tokens(sql: &str) -> Option<Vec<SqliteSchemaToken<'_>>> {
+    let tokens = sqlite_schema_tokens(sql);
+    let open = tokens
+        .iter()
+        .position(|token| *token == SqliteSchemaToken::LeftParenthesis)?;
+    let mut depth = 0_u32;
+    for (offset, token) in tokens[open..].iter().enumerate() {
+        match token {
+            SqliteSchemaToken::LeftParenthesis => depth += 1,
+            SqliteSchemaToken::RightParenthesis => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    if open + offset + 1 != tokens.len() {
+                        return None;
+                    }
+                    return Some(tokens[open + 1..open + offset].to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Recognise a stored blob table by its complete declared body.
+///
+/// `PRAGMA table_xinfo`, `PRAGMA index_list` and the check tokenizer each answer one question, and
+/// a clause they were not asked about is admitted by all three: a `COLLATE` on `digest` makes one
+/// opaque identity answer for another, a primary-key `ON CONFLICT` replaces the kit's own conflict
+/// resolution, a `REFERENCES ... ON DELETE CASCADE` lets a foreign row delete an admitted binding.
+/// Enumerating those three clauses would leave the next one, so this compares the whole body
+/// instead: every token of an admitted table is a token this kit itself wrote. `GENERATED`,
+/// `UNIQUE`, `AUTOINCREMENT`, a second `CHECK`, a different `DEFAULT` and every clause nobody has
+/// thought of yet are refused by the same equality, without naming any of them.
+fn recognized_sqlite_blob_shape(sql: &str) -> Option<SqliteBlobShape> {
+    let body = sqlite_table_body_tokens(sql)?;
+    let predecessor =
+        sqlite_blob_table_body(&[SQLITE_BLOB_PREDECESSOR_COLUMNS, SQLITE_BLOB_PRIMARY_KEY]);
+    if body == sqlite_schema_tokens(&predecessor) {
+        return Some(SqliteBlobShape::Legacy);
+    }
+    let created = sqlite_blob_table_body(&[
+        SQLITE_BLOB_PREDECESSOR_COLUMNS,
+        SQLITE_BLOB_HASH_COLUMN,
+        SQLITE_BLOB_EDITION_COLUMN,
+        SQLITE_BLOB_PRIMARY_KEY,
+    ]);
+    // `ALTER TABLE ... ADD COLUMN` rewrites the stored statement by inserting the added column
+    // after the last column definition, which leaves the key last again. The second ordering is
+    // accepted so that a table whose statement SQLite rewrote some other way is still the same
+    // table: identical columns in identical order, types, nullability, defaults, key and check.
+    let migrated = sqlite_blob_table_body(&[
+        SQLITE_BLOB_PREDECESSOR_COLUMNS,
+        SQLITE_BLOB_PRIMARY_KEY,
+        SQLITE_BLOB_HASH_COLUMN,
+        SQLITE_BLOB_EDITION_COLUMN,
+    ]);
+    if body == sqlite_schema_tokens(&created) || body == sqlite_schema_tokens(&migrated) {
+        return Some(SqliteBlobShape::Current);
+    }
+    None
+}
+
 fn sqlite_blob_shape(
     connection: &Connection,
     prefix: &str,
@@ -619,6 +707,8 @@ fn sqlite_blob_shape(
             "unsupported SQLite blob trigger or table behavior".into(),
         ));
     }
+    let recognized = recognized_sqlite_blob_shape(&sql)
+        .ok_or_else(|| EventLogError::Invalid("unrecognized SQLite blob table semantics".into()))?;
     let columns = {
         let mut statement = connection
             .prepare(&format!("PRAGMA table_xinfo({table})"))
@@ -666,6 +756,26 @@ fn sqlite_blob_shape(
             "incompatible SQLite blob schema".into(),
         ));
     };
+    if shape != recognized {
+        return Err(EventLogError::Invalid(
+            "incompatible SQLite blob schema".into(),
+        ));
+    }
+    let foreign_keys = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    if !foreign_keys.is_empty() {
+        return Err(EventLogError::Invalid(
+            "unsupported SQLite blob foreign key behavior".into(),
+        ));
+    }
     let indexes = {
         let mut statement = connection
             .prepare(&format!("PRAGMA index_list({table})"))
@@ -701,6 +811,27 @@ fn sqlite_blob_shape(
     if index_columns != ["tenant_id", "digest"] {
         return Err(EventLogError::Invalid(
             "incompatible SQLite blob primary key".into(),
+        ));
+    }
+    // The key's collation decides which spellings of an opaque digest are one identity, and no
+    // column pragma reports it. The key index does.
+    let key_collations = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_xinfo({})", indexes[0].0))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| row.get::<_, Option<String>>(4))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    if key_collations
+        .iter()
+        .flatten()
+        .any(|collation| !collation.eq_ignore_ascii_case("BINARY"))
+    {
+        return Err(EventLogError::Invalid(
+            "unsupported SQLite blob key collation".into(),
         ));
     }
     Ok(shape)
@@ -2910,7 +3041,79 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
 
 #[cfg(test)]
 mod tests {
-    use super::has_exact_sqlite_blob_integrity_check;
+    use super::{
+        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, recognized_sqlite_blob_shape,
+    };
+
+    #[test]
+    fn sqlite_blob_admission_recognises_only_the_bodies_this_kit_writes() {
+        let created = "CREATE TABLE owner_blobs (
+             tenant_id TEXT NOT NULL,
+             digest TEXT NOT NULL,
+             bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,
+             recorded_at TEXT NOT NULL,
+             integrity_sha256 TEXT,
+             integrity_v1 INTEGER NOT NULL DEFAULT 1
+                 CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+             PRIMARY KEY (tenant_id, digest))";
+        let migrated = "CREATE TABLE owner_blobs (
+             tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+             PRIMARY KEY (tenant_id,digest), integrity_sha256 TEXT,
+             integrity_v1 INTEGER NOT NULL DEFAULT 1
+                 CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL))";
+        let predecessor = "CREATE TABLE owner_blobs (
+             tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+             PRIMARY KEY (tenant_id,digest))";
+        assert_eq!(
+            recognized_sqlite_blob_shape(created),
+            Some(SqliteBlobShape::Current)
+        );
+        assert_eq!(
+            recognized_sqlite_blob_shape(migrated),
+            Some(SqliteBlobShape::Current)
+        );
+        assert_eq!(
+            recognized_sqlite_blob_shape(predecessor),
+            Some(SqliteBlobShape::Legacy)
+        );
+
+        // One member per clause a column or index pragma cannot report, on both editions.
+        for clause in [
+            "digest TEXT NOT NULL",
+            "digest TEXT NOT NULL COLLATE NOCASE",
+            "digest TEXT NOT NULL COLLATE RTRIM",
+            "digest TEXT NOT NULL REFERENCES elsewhere(id) ON DELETE CASCADE",
+            "digest TEXT NOT NULL UNIQUE",
+            "digest TEXT NOT NULL ON CONFLICT REPLACE",
+            "digest TEXT NOT NULL GENERATED ALWAYS AS (tenant_id) VIRTUAL",
+            "digest TEXT NOT NULL DEFAULT ''",
+        ] {
+            for body in [created, migrated, predecessor] {
+                let altered = body.replace("digest TEXT NOT NULL", clause);
+                assert_eq!(
+                    recognized_sqlite_blob_shape(&altered).is_some(),
+                    clause == "digest TEXT NOT NULL",
+                    "{clause}"
+                );
+            }
+        }
+        for suffix in [
+            "PRIMARY KEY (tenant_id, digest) ON CONFLICT REPLACE",
+            "PRIMARY KEY (tenant_id, digest), CHECK (byte_count >= 0)",
+            "PRIMARY KEY (tenant_id, digest), UNIQUE (digest)",
+            "PRIMARY KEY (tenant_id, digest), FOREIGN KEY (tenant_id) REFERENCES elsewhere(id)",
+        ] {
+            let altered = created.replace("PRIMARY KEY (tenant_id, digest)", suffix);
+            assert!(recognized_sqlite_blob_shape(&altered).is_none(), "{suffix}");
+        }
+        for option in ["WITHOUT ROWID", "STRICT"] {
+            let altered = format!("{created} {option}");
+            assert!(recognized_sqlite_blob_shape(&altered).is_none(), "{option}");
+        }
+    }
 
     #[test]
     fn sqlite_integrity_check_recognition_uses_sql_syntax() {

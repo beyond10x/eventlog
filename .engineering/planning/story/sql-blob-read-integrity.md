@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:sql-blob-read-integrity
 kind: story
-status: active
+status: implemented
 title: Verify SQL blob integrity and explicitly import legacy bindings
 relations:
 - serves: vision:O2
@@ -43,7 +43,7 @@ scope:
   path: ess/blob-integrity/domains/blobs.yaml
 - confidence: cited
   path: ess/blob-integrity/system.yaml
-revision: 37
+revision: 40
 ---
 ## Outcome
 
@@ -133,3 +133,58 @@ together. Explicit legacy trust establishes an observed boundary and does not pr
 No real store cutover, deployment, AEP migration, ER adapter or consumer release occurs in this unit.
 Whole-group crash/unknown/restart recovery, frozen file vectors and all consumer migrations remain
 required under the full initiative. A green narrow suite does not complete those obligations.
+
+## Final examination correction contract
+
+Approved requirement: ESS evolution M1 provider acceptance; existing exact SQLite old/current
+blob-shape admission in this story. M1 blocks the ER adapter, migration commands and store cutovers.
+Existing 165-case production proof is insufficient because the supplied second examination
+demonstrates admission of hidden table semantics with three failing cases.
+
+Bounded correction assignment: reuse the integrity implementation checkout at 209ac320,
+preserve the supplied review test patch, correct the complete hidden-semantics admission class in
+crates/eventlog-sqlite/src/lib.rs for original and current tables, and register all supplied
+regressions in crates/eventlog-postgres/examples/production-proof/required.rs. Test additions are
+limited to crates/eventlog-sqlite/tests/conformance.rs and the supplied PostgreSQL conformance
+control. No schema weakening, baseline changes, dependency updates or new reviewer cycle.
+
+Completion contract: exact reported cases green, affected complete SQLite/PostgreSQL suites,
+format/strict Clippy, both bash scripts/gate.sh and bash scripts/gate.sh --production-proof,
+real disposable PostgreSQL17.6/TLS, unchanged prior required roster and added exact case names,
+own exits/raw summaries, and source/test hashes. Root verifies evidence, resolves the one finding
+and owns common checks and integration. One heavy build token remains with the ER worker; the
+correction worker prepares source without Cargo or SQL until explicit token transfer. If waiting,
+it returns WAITING_FOR_BUILD with exact commands; the assignment remains incomplete.
+Stop when this contract is satisfied. No third substantive examination or expanded work is assigned.
+
+## Final correction verification
+
+The supplied second examination's single hidden-semantics admission finding is corrected for both
+legacy and current SQLite blob tables. The implementation recognizes the full supported body and
+retains physical column/index/trigger/integrity checks, additionally checking key collation and
+foreign keys. It preserves all supplied regression assertions, adds bounded class/legacy controls
+and retains every prior production-roster line (7 added, 0 removed).
+
+Actual supplied cases, added class/legacy cases and affected full SQLite/PostgreSQL suites pass.
+New cases have pre-fix failures and restored green; the recognizer unit control fails under its
+documented bypass mutation. Root independently read the exact case logs and observed source.
+
+Root ran the two required whole gates after the worker's background gate was killed. The first
+root attempt failed due to /tmp quota in dependency compilation, not an accepted test result.
+With only a tree-local TMPDIR correction, bash scripts/gate.sh exited0 (handle79544/582ee6) and
+bash scripts/gate.sh --production-proof exited0 (handle24673/92a5db). Production report shows
+PostgreSQL17.6, 173passed/0failed/0skipped, missing_required_cases[], conformance_valid true;
+format and strict workspace Clippy also passed. No capacity/deployment approval is inferred.
+
+Evidence: ESS evolution wave0006/correction-pass-2-evidence/coordinator/{gate-local-tmp.log,
+gate-local-tmp.exit,production-proof.log,production-proof.exit,production-proof.json,
+source-before-gates.sha256,source-before-gates.patch,source-after-gates.patch}.
+All four source hashes match before/after and the complete crates patch compares byte-identically.
+The report correctly names HEAD209ac320 with source_dirty true: it measures the exact retained
+correction patch, not unmodified209ac320. The forthcoming local commit preserves these tested bytes.
+
+Both substantive code examinations are now received; their original findings and interruptions
+remain immutable. Root's execution and correction verification resolve this final finding; no
+third substantive examination or equivalent denied review was commissioned. Local bot submission,
+required common checks and local integration follow before provider capture starts. Provider
+capture/admin, ER adapter and full ESS evolution remain separate unfinished approved requirements.

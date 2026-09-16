@@ -3462,3 +3462,80 @@ async fn review_blob_empty_content_and_conflict_rollback_reuse() {
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn review2_postgres_admission_refuses_unenforced_check_and_unmigrated_legacy_shape() {
+    use eventlog_core::EventLogError;
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(weakened) = store("reviewtwo_check").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().unwrap();
+    weakened.shutdown().await.unwrap();
+    let sql = client(&url).await;
+    // Keep the constraint name, weaken the enforced expression to CHECK (true).
+    let name: String = sql
+        .query_one(
+            "SELECT conname FROM pg_constraint WHERE conrelid='reviewtwo_check_blobs'::regclass AND contype='c'",
+            &[],
+        )
+        .await
+        .expect("exactly one CHECK on the blob table")
+        .get(0);
+    sql.batch_execute(&format!(
+        "ALTER TABLE reviewtwo_check_blobs DROP CONSTRAINT {name};
+         ALTER TABLE reviewtwo_check_blobs ADD CONSTRAINT {name} CHECK (true);"
+    ))
+    .await
+    .unwrap();
+    let five_column_insert_accepted = sql
+        .execute(
+            "INSERT INTO reviewtwo_check_blobs (tenant_id,digest,bytes,byte_count,recorded_at) VALUES ('t','d',$1,1,now())",
+            &[&b"x".as_slice()],
+        )
+        .await
+        .is_ok();
+    assert!(
+        five_column_insert_accepted,
+        "fixture control: the weakened table really admits an old five-column INSERT"
+    );
+    let config = PostgresConfig::isolated(&url, "reviewtwo_check").unwrap();
+    assert!(
+        matches!(
+            PostgresEventStore::migrate(config, PoolOptions::default(), &[]).await,
+            Err(EventLogError::Invalid(_))
+        ),
+        "migration admission must compare the enforced CHECK expression, not its name"
+    );
+    assert!(
+        PostgresEventStore::connect(&url, "reviewtwo_check")
+            .await
+            .is_err(),
+        "an unenforced integrity check must not be served"
+    );
+
+    // A populated predecessor is not served by the ordinary constructor without explicit trust.
+    let legacy = store("reviewtwo_legacy").await.unwrap();
+    let tenant = TenantId::new("legacy").unwrap();
+    legacy.put_blob(&tenant, "opaque", b"bytes").await.unwrap();
+    legacy.shutdown().await.unwrap();
+    downgrade_blob_table(&sql, "reviewtwo_legacy").await;
+    assert!(
+        matches!(
+            PostgresEventStore::connect(&url, "reviewtwo_legacy").await,
+            Err(EventLogError::Invalid(_))
+        ),
+        "connect must refuse a populated predecessor instead of migrating or serving it"
+    );
+    let columns: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid='reviewtwo_legacy_blobs'::regclass AND attnum>0 AND NOT attisdropped",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(columns, 5, "refusal leaves the predecessor shape untouched");
+}

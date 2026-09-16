@@ -93,6 +93,7 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "rewrite_rules_are_rejected_during_projection_migration_and_registration",
         "scope_reservations_are_atomic_and_confined",
         "rebuild_preserves_other_tenants_and_previous_view_on_failure",
+        "review2_postgres_admission_refuses_unenforced_check_and_unmigrated_legacy_shape",
     ));
     required.extend(cases!("eventlog-sqlite", "test", "repository";
         "snapshot_history_and_repository_privacy_interleavings",
@@ -104,6 +105,12 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "sqlite_blob_migration_is_exact_explicit_atomic_and_fenced",
         "review_caught_malformed_blob_metadata_poisons_sqlite_inline_append",
         "review_sqlite_admission_requires_an_enforced_integrity_check",
+        "review2_sqlite_admission_refuses_hidden_collation_and_conflict_clauses",
+        "review2_sqlite_nocase_digest_table_must_not_serve_another_identity",
+        "review2_sqlite_hidden_clauses_change_binding_semantics_once_admitted",
+        "review2_sqlite_similar_legacy_predecessors_are_refused_before_any_persistent_change",
+        "review2_sqlite_legacy_admission_refuses_hidden_clauses_before_additive_migration",
+        "review2_sqlite_admission_refuses_unrecognized_blob_table_semantics",
         "inline_failure_preserves_all_atomic_state_and_callback_authority",
         "rebuild_preserves_other_tenants_and_previous_view_on_failure",
         "scope_reservations_are_atomic_and_confined_in_memory_and_file",
