@@ -127,14 +127,26 @@ async fn capture(
         Ok((strict.manifest.clone(), extended, outcome))
     })
     .await?;
-    // A refusal is answered from the validated observation itself. Only a value has to survive the
-    // per-handle guard, and no refusal lets this handle quietly adopt a history it never observed.
-    let value = outcome?;
+    // The design names exactly two refusals that may be answered from validated state ahead of the
+    // per-handle guard: a tenant with no stored identity, and a history that was redacted. Both
+    // are facts about the tenant rather than about this observation, and both stay true across the
+    // rewrite that invalidated the handle. Everything else — a value, a crossed cap, an
+    // unavailable projection, corruption — describes the content of one particular history, and a
+    // handle whose observed history was replaced has no business describing the new one. Either
+    // way no refusal lets this handle quietly adopt a history it never observed: `observed` moves
+    // only when a value passes the guard.
+    if matches!(
+        outcome,
+        Err(CaptureError::TenantIdentityMissing | CaptureError::RedactedHistory)
+    ) {
+        return outcome;
+    }
     if !extended {
         return Err(CaptureError::Store(EventLogError::Backend(
             "file history diverged from this handle's observed history".to_owned(),
         )));
     }
+    let value = outcome?;
     *observed = Some(manifest);
     Ok(value)
 }

@@ -110,6 +110,10 @@ the accepted SQL count/version/lowercase SHA256 validator. Digest identity remai
 
 Validate each requested projection's syntax, exact registry entry/indexed-field order and actual
 physical table/column/index shape without DDL. File also refuses an existing dirty-view marker.
+The only current producer of that marker is redaction, which also leaves redacted history.
+`RedactedHistory` therefore wins before projection admission, including after rebuild; `Dirty`
+remains a declared refusal reason without a currently reachable public producer. Do not create a
+new dirty-state writer or change redaction precedence merely to exercise that reason.
 SQL must read the actual schema; a name in the registry alone is not shape admission. Preserve
 the existing supported physical shape and role/profile requirements, including refusal of
 foreign rules or authority, rather than broadening them for capture. Read-only validation must
@@ -226,7 +230,8 @@ Round-trip empty, whitespace and Unicode projection keys; provider-specific case
 every additional admitted key, including embedded NUL where supported, without normalizing bytes.
 Exercise
 all four exact caps including zero and payload aggregation, tenant isolation, order, orphan blob
-inclusion, missing references as absence, duplicate requests and all projection refusal kinds.
+inclusion, missing references as absence, duplicate requests and every reachable projection refusal
+kind. Pin the redacted-history precedence that makes `Dirty` unreachable with current producers.
 It must show an intentionally lagging projection is returned faithfully without claiming currentness.
 
 Provider cases must prove File interprocess serialization and unchanged file entries/bytes on

@@ -5,16 +5,19 @@
 //! view, and that a stored identity or a projection table nobody here wrote is refused rather than
 //! transcribed.
 
-use std::sync::{
-    Arc, Barrier,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use eventlog_conformance::{CAPTURE_LEDGER, CAPTURE_SIDECAR, CaptureLedger};
 use eventlog_core::{
     AppendGroup, AtomicEventStore, BoxFuture, CaptureError, CaptureLimits, CaptureMaterial,
-    CatchUpRunner, ConsistentTenantCapture, EventLogError, EventStore, Expected, NewEvent,
-    ProjectionCaptureRefusal, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
+    CaptureResource, CatchUpRunner, ConsistentTenantCapture, EventLogError, EventStore, Expected,
+    NewEvent, ProjectionCaptureRefusal, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
     StreamAppend, StreamId, TenantId,
 };
 use eventlog_sqlite::SqliteEventStore;
@@ -551,5 +554,253 @@ async fn admitted_projection_keys_include_an_embedded_nul() {
             .collect::<Vec<_>>(),
         expected,
         "exact decoded bytes, in bytewise order, including the NUL this provider admits"
+    );
+}
+
+/// Both paged reads decide their resume point from a storage class, not only from a value.
+///
+/// `read_rows` and `read_blobs` resume with `column > ?`, binding the previous page's last
+/// coordinate as text. SQLite orders storage classes before values, so a BLOB coordinate is
+/// greater than every text one *and* greater than any text bound as the resume point: the row is
+/// re-selected on every page, `after` never advances past it, and what the caller is handed is a
+/// cap its content never crossed. Neither column can hold such a value through this kit —
+/// `ProjectionStore::upsert` takes `&str` and `put_blob` derives its digest — so both are
+/// corruption. The class is both of them, not the one that was reported.
+///
+/// The caps keep the probe bounded: if the reading is right, the loop ends at a cap rather than
+/// running forever. The timeout is only there so a wrong reading is reported instead of hanging.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paged_coordinate_outside_text_is_corruption_in_both_reads() {
+    async fn admitted(store: &SqliteEventStore, tenant: &TenantId) -> Vec<String> {
+        store
+            .capture_tenant(tenant, &[CAPTURE_SIDECAR], limits())
+            .await
+            .expect("complete observation")
+            .projections[0]
+            .rows
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = database(&directory);
+    let concrete = Arc::new(opened(&path).await);
+    let port: Arc<dyn EventStore> = concrete.clone();
+    let tenant = TenantId::new("sqlite-capture-classes").expect("valid tenant");
+    concrete
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    let runner = CatchUpRunner::new(Arc::clone(&port), Arc::new(CaptureLedger))
+        .await
+        .expect("declared projections");
+    // Every key this provider admits, so the refusals below cannot be a key grammar in disguise.
+    let keys = ["", "\u{0}", "a\u{0}b", " ", "é"];
+    for (index, key) in keys.iter().enumerate() {
+        let index = i64::try_from(index).expect("small index");
+        port.append(
+            &StreamId::new(tenant.clone(), "item", "one").expect("valid stream"),
+            Expected::Any,
+            &[appended(key, index)],
+            &eventlog_conformance::meta(&format!("key-{index}"), &json!({})),
+        )
+        .await
+        .expect("appended");
+    }
+    eventlog_conformance::drain_at_least(&runner, &tenant, keys.len() as u64).await;
+    concrete
+        .put_blob(&tenant, "bound", b"bound-bytes")
+        .await
+        .expect("bound content");
+    let mut expected: Vec<String> = keys.iter().map(|key| (*key).to_owned()).collect();
+    expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    assert_eq!(
+        admitted(&concrete, &tenant).await,
+        expected,
+        "the control: every admitted key round-trips exactly, before anything foreign is stored"
+    );
+
+    let sql = Connection::open(&path).expect("second connection");
+    sql.execute(
+        &format!(
+            "INSERT INTO {PREFIX}_p_capture_sidecar (tenant_id,row_key,body)
+             VALUES (?1, x'7a', '{{\"foreign\":true}}')"
+        ),
+        params![tenant.as_str()],
+    )
+    .expect("stored a row key this kit could not write");
+    // What SQLite actually put in the column, measured rather than assumed: TEXT affinity converts
+    // a numeric literal before storing it, and leaves a BLOB alone.
+    let class: String = sql
+        .query_row(
+            &format!(
+                "SELECT typeof(row_key) FROM {PREFIX}_p_capture_sidecar
+                 WHERE tenant_id=?1 AND CAST(row_key AS BLOB)=x'7a'"
+            ),
+            params![tenant.as_str()],
+            |row| row.get(0),
+        )
+        .expect("stored row key");
+    assert_eq!(
+        class, "blob",
+        "the fixture only means something while the column holds a class TEXT affinity keeps"
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            concrete.capture_tenant(&tenant, &[CAPTURE_SIDECAR], limits()),
+        )
+        .await
+        .expect("the capture terminated"),
+        Err(CaptureError::Corrupt {
+            material: CaptureMaterial::Projection
+        }),
+        "a stored row key no writer here produced is projection corruption, refused before it can \
+         become a text resume bound"
+    );
+
+    let removed = sql
+        .execute(
+            &format!("DELETE FROM {PREFIX}_p_capture_sidecar WHERE typeof(row_key)<>'text'"),
+            [],
+        )
+        .expect("removed the foreign row");
+    assert_eq!(removed, 1, "exactly one row was foreign");
+    assert_eq!(
+        admitted(&concrete, &tenant).await,
+        expected,
+        "removing that one row restores the whole observation: nothing else was refused"
+    );
+
+    // The same fault on the other paged coordinate. Every other column is copied from a row this
+    // kit wrote, so the digest's storage class is the only difference between the two bindings.
+    let copied = sql
+        .execute(
+            &format!(
+                "INSERT INTO {PREFIX}_blobs
+                     (tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1)
+                 SELECT tenant_id,CAST(digest AS BLOB),bytes,byte_count,recorded_at,
+                        integrity_sha256,integrity_v1
+                 FROM {PREFIX}_blobs WHERE tenant_id=?1 AND typeof(digest)='text'"
+            ),
+            params![tenant.as_str()],
+        )
+        .expect("stored a digest this kit could not write");
+    assert_eq!(
+        copied, 1,
+        "one foreign binding, differing only in storage class"
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            concrete.capture_tenant(&tenant, &[], limits()),
+        )
+        .await
+        .expect("the capture terminated"),
+        Err(CaptureError::Corrupt {
+            material: CaptureMaterial::Blob
+        }),
+        "a stored digest no writer here produced is blob corruption, refused before it can become \
+         a text resume bound"
+    );
+}
+
+/// A stored length proves nothing about a payload until it is proven against the bytes.
+///
+/// `preflight` decides the payload cap from the blob table inside the capture transaction, before
+/// any blob is decoded. The design asks for that preflight *and* for "a malformed length is
+/// corruption" *and* for "every reported limit must actually have been exceeded", so the length it
+/// sums has to be the length the bytes actually have. The observation stays native and bounded:
+/// SQLite computes the lengths inside the same transaction and no blob is loaded, let alone
+/// allocated, to find one out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_blob_length_is_proven_against_the_bytes_before_any_payload_cap() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = database(&directory);
+    let store = opened(&path).await;
+    let tenant = TenantId::new("sqlite-capture-lengths").expect("valid tenant");
+    store
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    store
+        .put_blob(&tenant, "bound", b"bound-bytes")
+        .await
+        .expect("bound content");
+    // The control: eleven bytes, and every cap here is far above them.
+    assert_eq!(
+        store
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation")
+            .blobs[0]
+            .bytes,
+        b"bound-bytes".to_vec()
+    );
+
+    let sql = Connection::open(&path).expect("second connection");
+    let set = |count: i64| {
+        assert_eq!(
+            sql.execute(
+                &format!("UPDATE {PREFIX}_blobs SET byte_count=?2 WHERE tenant_id=?1"),
+                params![tenant.as_str(), count],
+            )
+            .expect("replaced the stored length"),
+            1,
+            "the fixture only means something while exactly one stored length is a lie"
+        );
+    };
+    // A tight cap the eleven real bytes do cross, so an understatement that fits it is still the
+    // value the old preflight would have proven the refusal from.
+    let tight = CaptureLimits {
+        max_events: 16,
+        max_blobs: 16,
+        max_projection_rows: 16,
+        max_payload_bytes: 4,
+    };
+    for (count, caps, what) in [
+        (
+            1_099_511_627_776_i64,
+            limits(),
+            "an overstated length, under a cap the content never reaches",
+        ),
+        (
+            5,
+            tight,
+            "an understated length, under a cap it alone crosses",
+        ),
+        (-1, limits(), "a length no writer here could have stored"),
+    ] {
+        set(count);
+        assert_eq!(
+            store.capture_tenant(&tenant, &[], caps).await,
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            }),
+            "{what}: a malformed stored length is corruption, not a crossed payload cap"
+        );
+    }
+
+    // Restored, the same reader still refuses a cap the content does cross, and names the resource
+    // and the caller's own limit. Validating a length is not an excuse to stop counting.
+    set(11);
+    assert_eq!(
+        store.capture_tenant(&tenant, &[], tight).await,
+        Err(CaptureError::LimitExceeded {
+            resource: CaptureResource::PayloadBytes,
+            limit: 4
+        }),
+        "eleven stored bytes cross a four-byte cap, and that limit was actually exceeded"
+    );
+    assert_eq!(
+        store
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation")
+            .blobs[0]
+            .bytes,
+        b"bound-bytes".to_vec(),
+        "and the restored store is the one the control read"
     );
 }

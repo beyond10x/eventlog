@@ -228,13 +228,20 @@ async fn preflight(
     admitted: &[ProjectionSpec],
     budget: &CaptureBudget,
 ) -> Result<(), CaptureError> {
+    // The stored length is what a payload cap would be proven from, so it is checked against the
+    // bytes first — a column is not evidence about content it merely claims to describe, and a
+    // length that is a lie would otherwise report a cap the tenant's content never crossed. The
+    // server measures the bytes inside this same snapshot: no blob crosses the wire here, and an
+    // oversized one is never allocated on this side to find out how long it is.
     let totals = transaction
         .query_one(
             &format!(
                 "SELECT (SELECT COUNT(*) FROM {prefix}_events WHERE tenant_id = $1),
                         (SELECT COUNT(*) FROM {prefix}_blobs WHERE tenant_id = $1),
-                        (SELECT COALESCE(SUM(byte_count),0)::bigint FROM {prefix}_blobs
-                         WHERE tenant_id = $1)"
+                        (SELECT COALESCE(SUM(octet_length(bytes)),0)::bigint FROM {prefix}_blobs
+                         WHERE tenant_id = $1),
+                        (SELECT COUNT(*) FROM {prefix}_blobs WHERE tenant_id = $1
+                         AND byte_count IS DISTINCT FROM octet_length(bytes)::bigint)"
             ),
             &[&tenant.as_str()],
         )
@@ -242,6 +249,11 @@ async fn preflight(
         .map_err(operational)?;
     budget.proven(CaptureResource::Events, to_u64(totals.get(0))?)?;
     budget.proven(CaptureResource::Blobs, to_u64(totals.get(1))?)?;
+    if totals.get::<_, i64>(3) != 0 {
+        return Err(corrupt(CaptureMaterial::Blob));
+    }
+    // Now a real lower bound on the payload: the bytes this tenant actually holds. Each blob is
+    // still validated and charged one at a time as it is decoded; this only refuses early.
     budget.proven(
         CaptureResource::PayloadBytes,
         u64::try_from(totals.get::<_, i64>(2)).map_err(|_| corrupt(CaptureMaterial::Blob))?,

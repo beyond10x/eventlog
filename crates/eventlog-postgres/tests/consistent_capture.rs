@@ -15,7 +15,7 @@ use std::{
 
 use eventlog_conformance::{CAPTURE_LEDGER, CAPTURE_SIDECAR, CaptureLedger};
 use eventlog_core::{
-    BoxFuture, CaptureError, CaptureLimits, CaptureMaterial, CatchUpRunner,
+    BoxFuture, CaptureError, CaptureLimits, CaptureMaterial, CaptureResource, CatchUpRunner,
     ConsistentTenantCapture, EventLogError, EventStore, Expected, Guard, NewEvent,
     ProjectionCaptureRefusal, ProjectionSpec, ProjectionStore, Projector, RecordedEvent, StreamId,
     TenantId,
@@ -736,4 +736,104 @@ async fn a_stored_identity_is_preserved_exactly_or_refused_as_corruption() {
     );
     store.drop_tables().await.expect("dropped");
     store.shutdown().await.expect("closed");
+}
+
+/// A stored length proves nothing about a payload until it is proven against the bytes.
+///
+/// `preflight` decides the payload cap from the blob table inside the same repeatable-read
+/// snapshot, before any blob is decoded. The design asks for that preflight *and* for "a malformed
+/// length is corruption" *and* for "every reported limit must actually have been exceeded", so the
+/// length it sums has to be the length the bytes actually have. The observation stays native and
+/// bounded: the server computes the lengths inside the same snapshot and no blob crosses the wire,
+/// let alone gets allocated here, to find one out.
+#[tokio::test]
+async fn a_stored_blob_length_is_proven_against_the_bytes_before_any_payload_cap() {
+    let prefix = prefix("lengths");
+    let store = PostgresEventStore::connect(&url(), &prefix)
+        .await
+        .expect("connected");
+    let tenant = TenantId::new("postgres-capture-lengths").expect("valid tenant");
+    store
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    store
+        .put_blob(&tenant, "bound", b"bound-bytes")
+        .await
+        .expect("bound content");
+    // The control: eleven bytes, and every cap here is far above them.
+    assert_eq!(
+        store
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation")
+            .blobs[0]
+            .bytes,
+        b"bound-bytes".to_vec()
+    );
+
+    let fixture = sql().await;
+    let statement = format!("UPDATE {prefix}_blobs SET byte_count=$2 WHERE tenant_id=$1");
+    // A tight cap the eleven real bytes do cross, so an understatement that fits it is still the
+    // value the old preflight would have proven the refusal from.
+    let tight = CaptureLimits {
+        max_events: 16,
+        max_blobs: 16,
+        max_projection_rows: 16,
+        max_payload_bytes: 4,
+    };
+    for (count, caps, what) in [
+        (
+            1_099_511_627_776_i64,
+            limits(),
+            "an overstated length, under a cap the content never reaches",
+        ),
+        (
+            5,
+            tight,
+            "an understated length, under a cap it alone crosses",
+        ),
+        (-1, limits(), "a length no writer here could have stored"),
+    ] {
+        assert_eq!(
+            fixture
+                .execute(&statement, &[&tenant.as_str(), &count])
+                .await
+                .expect("replaced the stored length"),
+            1,
+            "the fixture only means something while exactly one stored length is a lie"
+        );
+        assert_eq!(
+            store.capture_tenant(&tenant, &[], caps).await,
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            }),
+            "{what}: a malformed stored length is corruption, not a crossed payload cap"
+        );
+    }
+
+    // Restored, the same reader still refuses a cap the content does cross, and names the resource
+    // and the caller's own limit. Validating a length is not an excuse to stop counting.
+    fixture
+        .execute(&statement, &[&tenant.as_str(), &11_i64])
+        .await
+        .expect("restored the stored length");
+    assert_eq!(
+        store.capture_tenant(&tenant, &[], tight).await,
+        Err(CaptureError::LimitExceeded {
+            resource: CaptureResource::PayloadBytes,
+            limit: 4
+        }),
+        "eleven stored bytes cross a four-byte cap, and that limit was actually exceeded"
+    );
+    assert_eq!(
+        store
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation")
+            .blobs[0]
+            .bytes,
+        b"bound-bytes".to_vec(),
+        "and the restored store is the one the control read"
+    );
 }

@@ -28,6 +28,7 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "missing_store_files_refuse_and_create_nothing",
         "capture_queues_behind_another_process_holding_the_writer_lock",
         "another_process_rewriting_history_invalidates_an_observing_handle",
+        "only_missing_identity_and_redacted_history_answer_ahead_of_the_divergence_guard",
         "every_key_an_existing_writer_admits_round_trips_including_an_embedded_nul",
     ));
     required.extend(cases!("eventlog-sqlite", "test", "consistent_capture";
@@ -37,6 +38,8 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "a_stored_identity_is_preserved_exactly_or_refused_as_corruption",
         "registry_and_physical_shape_drift_refuse_capture",
         "admitted_projection_keys_include_an_embedded_nul",
+        "a_paged_coordinate_outside_text_is_corruption_in_both_reads",
+        "a_stored_blob_length_is_proven_against_the_bytes_before_any_payload_cap",
     ));
     required.extend(cases!("eventlog-postgres", "test", "consistent_capture";
         "postgres_consistent_capture_contract",
@@ -46,6 +49,7 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "a_rebuild_paused_before_replacement_never_exposes_mixed_rows",
         "registry_and_physical_shape_drift_refuse_capture",
         "a_stored_identity_is_preserved_exactly_or_refused_as_corruption",
+        "a_stored_blob_length_is_proven_against_the_bytes_before_any_payload_cap",
     ));
     required.extend(cases!("eventlog-file", "lib", "eventlog_file";
         "capture::tests::stored_identity_bytes_survive_exactly_and_an_empty_one_is_corruption",

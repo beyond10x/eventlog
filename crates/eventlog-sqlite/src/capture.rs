@@ -200,18 +200,30 @@ fn preflight(
         )
         .map_err(operational)?;
     budget.proven(CaptureResource::Events, to_u64(events)?)?;
-    let (blobs, bytes): (i64, i64) = connection
+    // The stored length is what a payload cap would be proven from, so it is checked against the
+    // bytes first — a column is not evidence about content it merely claims to describe, and a
+    // length that is a lie would otherwise report a cap the tenant's content never crossed.
+    // SQLite measures the bytes inside this same transaction: nothing is decoded here, and an
+    // oversized blob is never loaded, let alone allocated, to find out how long it is.
+    let (blobs, bytes, malformed): (i64, i64, i64) = connection
         .query_row(
             &format!(
-                "SELECT COUNT(*), COALESCE(SUM(byte_count),0) FROM {prefix}_blobs
-                 WHERE tenant_id = ?1"
+                "SELECT COUNT(*),
+                        COALESCE(SUM(length(CAST(bytes AS BLOB))),0),
+                        COALESCE(SUM(CASE WHEN byte_count IS NOT length(CAST(bytes AS BLOB))
+                                          THEN 1 ELSE 0 END),0)
+                 FROM {prefix}_blobs WHERE tenant_id = ?1"
             ),
             params![tenant.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(operational)?;
     budget.proven(CaptureResource::Blobs, to_u64(blobs)?)?;
-    // Stored blob lengths are a real lower bound on the payload, so this cap is already decided.
+    if malformed != 0 {
+        return Err(corrupt(CaptureMaterial::Blob));
+    }
+    // Now a real lower bound on the payload: the bytes this tenant actually holds. Each blob is
+    // still validated and charged one at a time as it is decoded; this only refuses early.
     budget.proven(
         CaptureResource::PayloadBytes,
         u64::try_from(bytes).map_err(|_| corrupt(CaptureMaterial::Blob))?,
@@ -279,15 +291,16 @@ fn read_blobs(
     tenant: &TenantId,
     budget: &mut CaptureBudget,
 ) -> Result<Vec<CapturedBlob>, CaptureError> {
-    let columns = "CAST(digest AS BLOB), bytes, byte_count, \
+    let columns = "typeof(digest), CAST(digest AS BLOB), bytes, byte_count, \
                    CAST(integrity_sha256 AS BLOB), integrity_v1";
     let read = |row: &Row<'_>| {
         Ok((
-            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(0)?,
             row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, Option<Vec<u8>>>(3)?,
-            row.get::<_, i64>(4)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     };
     let owner = tenant.as_str();
@@ -328,7 +341,16 @@ fn read_blobs(
             order_blobs(&mut blobs)?;
             return Ok(blobs);
         }
-        for (digest, bytes, count, hash, edition) in page {
+        for (class, digest, bytes, count, hash, edition) in page {
+            // A resume point is a value *and* a storage class. SQLite orders classes before
+            // values, so a BLOB digest outranks every text digest and every text bound as the
+            // resume point: it would be re-selected on every page, `after` would never pass it,
+            // and the caller would be handed a cap this tenant's bindings never crossed. No writer
+            // here can store one — `put_blob` binds a Rust `&str` — so it is corruption, refused
+            // before it can become a resume bound.
+            if class != "text" {
+                return Err(corrupt(CaptureMaterial::Blob));
+            }
             let digest = String::from_utf8(digest).map_err(|_| corrupt(CaptureMaterial::Blob))?;
             validate_captured_digest(&digest)?;
             let hash = hash
@@ -353,7 +375,13 @@ fn read_rows(
     budget: &mut CaptureBudget,
 ) -> Result<Vec<(String, Value)>, CaptureError> {
     let table = projection_table(prefix, specification.name);
-    let read = |row: &Row<'_>| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?));
+    let read = |row: &Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    };
     let owner = tenant.as_str();
     let chunk = CHUNK;
     let mut rows: Vec<(String, Value)> = Vec::new();
@@ -364,14 +392,16 @@ fn read_rows(
             let (statement, bound): (String, Vec<&dyn rusqlite::ToSql>) = match &after {
                 None => (
                     format!(
-                        "SELECT CAST(row_key AS BLOB), CAST(body AS BLOB) FROM {table}
+                        "SELECT typeof(row_key), CAST(row_key AS BLOB), CAST(body AS BLOB)
+                         FROM {table}
                          WHERE tenant_id = ?1 ORDER BY row_key LIMIT ?2"
                     ),
                     vec![&owner, &chunk],
                 ),
                 Some(after) => (
                     format!(
-                        "SELECT CAST(row_key AS BLOB), CAST(body AS BLOB) FROM {table}
+                        "SELECT typeof(row_key), CAST(row_key AS BLOB), CAST(body AS BLOB)
+                         FROM {table}
                          WHERE tenant_id = ?1 AND row_key > ?2 ORDER BY row_key LIMIT ?3"
                     ),
                     vec![&owner, after, &chunk],
@@ -391,7 +421,13 @@ fn read_rows(
             order_rows(&mut rows)?;
             return Ok(rows);
         }
-        for (key, body) in page {
+        for (class, key, body) in page {
+            // The same reason as the digest above: a BLOB key outranks every text key and every
+            // text resume bound, so the page would never advance past it. `ProjectionStore::upsert`
+            // takes `&str`, so no row this kit wrote can be here.
+            if class != "text" {
+                return Err(corrupt(CaptureMaterial::Projection));
+            }
             // Every byte a writer here admitted comes back: no grammar, no normalization.
             let key = String::from_utf8(key).map_err(|_| corrupt(CaptureMaterial::Projection))?;
             let body: Value =

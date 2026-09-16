@@ -16,7 +16,7 @@ use std::{
 
 use eventlog_core::{
     CaptureError, CaptureLimits, ConsistentTenantCapture, EventLogError, EventStore, Expected,
-    NewEvent, StreamId, TenantId,
+    NewEvent, ProjectionSpec, StreamId, TenantId,
 };
 use eventlog_file::{FileEventStore, FileTenantCapture};
 use serde_json::json;
@@ -367,6 +367,116 @@ async fn another_process_rewriting_history_invalidates_an_observing_handle() {
             .events
             .len(),
         1
+    );
+}
+
+/// Only the two refusals the design names are answered ahead of the per-handle divergence guard.
+///
+/// "Missing-identity or redacted-history refusals may be returned from validated state before that
+/// guard; a successful value must pass it." A crossed cap, an unavailable projection, corruption
+/// and required recovery are none of those two, and each of them is a statement about a history
+/// this handle no longer holds: it says what the caller's request would have met in an epoch that
+/// has since been replaced. The guard's own rule is unchanged — no refusal lets the handle reset
+/// its observation — so every answer below is the same on the second round as on the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_missing_identity_and_redacted_history_answer_ahead_of_the_divergence_guard() {
+    const UNDECLARED: ProjectionSpec = ProjectionSpec {
+        name: "nobody_declared_this",
+        indexed: &[],
+    };
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = FileEventStore::open(directory.path())
+        .await
+        .expect("opened store");
+    let erased = TenantId::new("file-guard-erased").expect("valid tenant");
+    let intact = TenantId::new("file-guard-intact").expect("valid tenant");
+    let stranger = TenantId::new("file-guard-stranger").expect("valid tenant");
+    for tenant in [&erased, &intact] {
+        store
+            .stream_identity(tenant)
+            .await
+            .expect("provisioned identity");
+        store
+            .append(
+                &StreamId::new(tenant.clone(), "item", "one").expect("valid stream"),
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta(tenant.as_str(), &json!({})),
+            )
+            .await
+            .expect("appended");
+    }
+
+    let handle = FileTenantCapture::open(directory.path())
+        .await
+        .expect("opened read-only");
+    handle
+        .capture_tenant(&intact, &[], limits())
+        .await
+        .expect("complete observation");
+    // A redaction is a privacy rewrite: it replaces the epoch, so the history this handle observed
+    // is gone and every answer below would be given against one it never read.
+    store
+        .redact(
+            &StreamId::new(erased.clone(), "item", "one").expect("valid stream"),
+            1,
+            "erased",
+        )
+        .await
+        .expect("redacted event");
+
+    let zero = CaptureLimits {
+        max_events: 0,
+        max_blobs: 0,
+        max_projection_rows: 0,
+        max_payload_bytes: 0,
+    };
+    let none: &[ProjectionSpec] = &[];
+    let undeclared: &[ProjectionSpec] = &[UNDECLARED];
+    for round in 0..2 {
+        assert_eq!(
+            handle.capture_tenant(&erased, none, limits()).await,
+            Err(CaptureError::RedactedHistory),
+            "round {round}: redacted history is one of the two the design names"
+        );
+        assert_eq!(
+            handle.capture_tenant(&stranger, none, limits()).await,
+            Err(CaptureError::TenantIdentityMissing),
+            "round {round}: a missing identity is the other"
+        );
+        for (request, caps, what) in [
+            (none, zero, "a crossed cap"),
+            (undeclared, limits(), "an unavailable projection"),
+            (none, limits(), "a complete value"),
+        ] {
+            assert!(
+                matches!(
+                    handle.capture_tenant(&intact, request, caps).await,
+                    Err(CaptureError::Store(EventLogError::Backend(_)))
+                ),
+                "round {round}: {what} is not an answer this handle may give from a history it \
+                 never observed"
+            );
+        }
+    }
+
+    // Reopening is still the only way to observe the new epoch, and it observes all of it.
+    let reopened = FileTenantCapture::open(directory.path())
+        .await
+        .expect("explicitly observing the new epoch");
+    assert_eq!(
+        reopened
+            .capture_tenant(&intact, none, limits())
+            .await
+            .expect("complete observation")
+            .events
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened.capture_tenant(&erased, none, limits()).await,
+        Err(CaptureError::RedactedHistory),
+        "and the refusal a fresh handle gives is the one the stale handle gave"
     );
 }
 
