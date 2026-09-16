@@ -371,7 +371,7 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
         .map_err(|_| unavailable("file store writer lock cannot be held"))?;
     // A pending intent is the authority of an ordinary opener. Reading past one would either
     // repair history without permission or hand back bytes an erasure has already claimed.
-    if root.join("append.json").exists() || root.join("privacy.json").exists() {
+    if pending_intent_exists(root)? {
         return Err(CaptureError::RecoveryRequired);
     }
     let manifest_path = root.join("manifest.json");
@@ -405,6 +405,22 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
         manifest,
         transactions,
     })
+}
+
+/// Observe reserved intent names as directory entries, without following or changing them.
+///
+/// `Path::exists` follows links and treats every metadata error as absence. A strict reader may
+/// read past only an actually absent name: a dangling link is still recovery authority, while an
+/// inability to inspect either name is an operational refusal.
+fn pending_intent_exists(root: &Path) -> Result<bool, CaptureError> {
+    for name in ["append.json", "privacy.json"] {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unavailable("file store pending intent cannot be inspected")),
+        }
+    }
+    Ok(false)
 }
 
 fn recover_append(root: &Path, current: &Manifest) -> Result<(), EventLogError> {

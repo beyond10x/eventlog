@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 use eventlog_core::{
     CaptureError, CaptureLimits, ConsistentTenantCapture, EventLogError, EventStore, Expected,
     NewEvent, ProjectionSpec, StreamId, TenantId,
@@ -185,6 +188,48 @@ async fn a_pending_intent_refuses_without_recovery_cleanup_or_initialization() {
             );
             assert_eq!(inventory(directory.path()), before, "{intents:?}");
         }
+    }
+}
+
+/// A reserved pending-intent name is present when the directory entry exists, even if following
+/// that entry cannot reach a target. Both strict entry points share this rule and leave the entry
+/// untouched for an authorized ordinary opener.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dangling_pending_intent_entry_refuses_strict_open_and_capture() {
+    for intent in ["append.json", "privacy.json"] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let tenant = populated(directory.path()).await;
+        let handle = FileTenantCapture::open(directory.path())
+            .await
+            .expect("strict handle opened before the intent");
+        let target = directory.path().join(format!("missing-{intent}-target"));
+        let entry = directory.path().join(intent);
+        symlink(&target, &entry).expect("dangling pending-intent entry");
+
+        assert!(
+            matches!(
+                FileTenantCapture::open(directory.path()).await,
+                Err(CaptureError::RecoveryRequired)
+            ),
+            "{intent}: strict open read past the reserved directory entry"
+        );
+        assert_eq!(
+            handle.capture_tenant(&tenant, &[], limits()).await,
+            Err(CaptureError::RecoveryRequired),
+            "{intent}: capture read past the reserved directory entry"
+        );
+        assert!(
+            fs::symlink_metadata(&entry)
+                .expect("intent entry remains")
+                .file_type()
+                .is_symlink(),
+            "{intent}: capture changed the pending entry"
+        );
+        assert!(
+            !target.exists(),
+            "{intent}: capture created the link target"
+        );
     }
 }
 

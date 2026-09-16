@@ -158,6 +158,12 @@ fn stored_identity(
     prefix: &str,
     tenant: &TenantId,
 ) -> Result<String, CaptureError> {
+    refuse_malformed_tenant_coordinate(
+        connection,
+        &format!("{prefix}_identity"),
+        tenant,
+        CaptureMaterial::Identity,
+    )?;
     let stored: Option<(String, Vec<u8>)> = connection
         .query_row(
             &format!(
@@ -192,6 +198,12 @@ fn preflight(
     admitted: &[ProjectionSpec],
     budget: &CaptureBudget,
 ) -> Result<(), CaptureError> {
+    refuse_malformed_tenant_coordinate(
+        connection,
+        &format!("{prefix}_events"),
+        tenant,
+        CaptureMaterial::Event,
+    )?;
     let events: i64 = connection
         .query_row(
             &format!("SELECT COUNT(*) FROM {prefix}_events WHERE tenant_id = ?1"),
@@ -200,6 +212,12 @@ fn preflight(
         )
         .map_err(operational)?;
     budget.proven(CaptureResource::Events, to_u64(events)?)?;
+    refuse_malformed_tenant_coordinate(
+        connection,
+        &format!("{prefix}_blobs"),
+        tenant,
+        CaptureMaterial::Blob,
+    )?;
     // The stored length is what a payload cap would be proven from, so it is checked against the
     // bytes first — a column is not evidence about content it merely claims to describe, and a
     // length that is a lie would otherwise report a cap the tenant's content never crossed.
@@ -231,6 +249,12 @@ fn preflight(
     let mut rows = 0_u64;
     for specification in admitted {
         let table = projection_table(prefix, specification.name);
+        refuse_malformed_tenant_coordinate(
+            connection,
+            &table,
+            tenant,
+            CaptureMaterial::Projection,
+        )?;
         let count: i64 = connection
             .query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = ?1"),
@@ -243,6 +267,33 @@ fn preflight(
             .ok_or_else(|| corrupt(CaptureMaterial::Projection))?;
     }
     budget.proven(CaptureResource::ProjectionRows, rows)
+}
+
+/// Refuse a row the normal TEXT equality predicate would omit from the selected tenant.
+///
+/// The probe compares only the tenant coordinate's exact bytes inside the capture transaction. It
+/// neither reads payloads nor widens the selection to another tenant, and it leaves ordinary TEXT
+/// rows to the provider's indexed count and paged reads.
+fn refuse_malformed_tenant_coordinate(
+    connection: &Connection,
+    table: &str,
+    tenant: &TenantId,
+    material: CaptureMaterial,
+) -> Result<(), CaptureError> {
+    let malformed: bool = connection
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {table}
+                 WHERE typeof(tenant_id)<>'text' AND CAST(tenant_id AS BLOB)=?1)"
+            ),
+            params![tenant.as_str().as_bytes()],
+            |row| row.get(0),
+        )
+        .map_err(operational)?;
+    if malformed {
+        return Err(corrupt(material));
+    }
+    Ok(())
 }
 
 fn read_events(
@@ -548,6 +599,25 @@ fn admit_indexes(
         if *partial {
             return Err(refuse());
         }
+        let (expected, expected_unique) = match origin.as_str() {
+            "pk" => {
+                primary += 1;
+                ([String::from("tenant_id"), String::from("row_key")], true)
+            }
+            "c" => {
+                // A foreign catalog name is already a shape mismatch. Classify it before the name
+                // can become PRAGMA syntax; legal quoted/punctuation identifiers must not escape
+                // the typed refusal as an operational SQL parse error.
+                let position = (0..specification.indexed.len())
+                    .find(|position| &projection_index(table, *position) == name)
+                    .ok_or_else(refuse)?;
+                (
+                    [String::from("tenant_id"), format!("idx_{position}")],
+                    false,
+                )
+            }
+            _ => return Err(refuse()),
+        };
         let columns = index_columns(connection, name)?;
         // The key's collation decides which spellings of a key are one row, and no column pragma
         // reports it. The index does.
@@ -558,23 +628,8 @@ fn admit_indexes(
         {
             return Err(refuse());
         }
-        match origin.as_str() {
-            "pk" => {
-                primary += 1;
-                if !*unique || columns != ["tenant_id", "row_key"] {
-                    return Err(refuse());
-                }
-            }
-            "c" => {
-                let position = (0..specification.indexed.len())
-                    .find(|position| &projection_index(table, *position) == name)
-                    .ok_or_else(refuse)?;
-                let expected = [String::from("tenant_id"), format!("idx_{position}")];
-                if *unique || columns != expected {
-                    return Err(refuse());
-                }
-            }
-            _ => return Err(refuse()),
+        if *unique != expected_unique || columns != expected {
+            return Err(refuse());
         }
     }
     if primary != 1 {

@@ -18,7 +18,7 @@ use eventlog_core::{
     AppendGroup, AtomicEventStore, BoxFuture, CaptureError, CaptureLimits, CaptureMaterial,
     CaptureResource, CatchUpRunner, ConsistentTenantCapture, EventLogError, EventStore, Expected,
     NewEvent, ProjectionCaptureRefusal, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
-    StreamAppend, StreamId, TenantId,
+    StreamAppend, StreamId, TenantCapture, TenantId,
 };
 use eventlog_sqlite::SqliteEventStore;
 use rusqlite::{Connection, params};
@@ -494,6 +494,27 @@ async fn registry_and_physical_shape_drift_refuse_capture() {
         }
     );
 
+    // Keep the expected number of indexes while replacing the declared one with a quoted catalog
+    // identifier. Shape admission must classify the foreign name before trying to introspect it as
+    // SQL syntax, including punctuation that cannot be interpolated into a bare PRAGMA argument.
+    sql.execute_batch(&format!(
+        "DROP INDEX {PREFIX}_p_capture_ledger_extra;
+         DROP INDEX {PREFIX}_p_capture_ledger_idx_0;
+         CREATE INDEX \"foreign-index\"\"quoted\"
+             ON {PREFIX}_p_capture_ledger(tenant_id,idx_0);"
+    ))
+    .expect("replaced the declared index with a quoted foreign index");
+    assert_eq!(
+        concrete
+            .capture_tenant(&tenant, &[CAPTURE_LEDGER], limits())
+            .await
+            .expect_err("a quoted foreign index is not the declared projection shape"),
+        CaptureError::ProjectionUnavailable {
+            projection: "capture_ledger".to_owned(),
+            reason: ProjectionCaptureRefusal::PhysicalShapeMismatch
+        }
+    );
+
     sql.execute(
         &format!(
             "UPDATE {PREFIX}_projection_registry SET indexed_fields='[\"other\"]'
@@ -511,6 +532,113 @@ async fn registry_and_physical_shape_drift_refuse_capture() {
             projection: "capture_ledger".to_owned(),
             reason: ProjectionCaptureRefusal::DeclarationMismatch
         }
+    );
+}
+
+/// Equality by a bound TEXT value must not make a row disappear when its malformed tenant
+/// coordinate has the selected tenant's exact bytes. The finite class is every captured material
+/// table: identity, event, blob, and each requested projection.
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_non_text_tenant_coordinates_are_corruption_for_every_captured_material() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = database(&directory);
+    let concrete = Arc::new(opened(&path).await);
+    let port: Arc<dyn EventStore> = concrete.clone();
+    let tenant = TenantId::new("sqlite-capture-tenant-coordinate").expect("valid tenant");
+    concrete
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    let runner = CatchUpRunner::new(Arc::clone(&port), Arc::new(CaptureLedger))
+        .await
+        .expect("declared projections");
+    port.append(
+        &StreamId::new(tenant.clone(), "item", "one").expect("valid stream"),
+        Expected::NoStream,
+        &[appended("coordinate", 1)],
+        &eventlog_conformance::meta("tenant-coordinate", &json!({})),
+    )
+    .await
+    .expect("appended event");
+    eventlog_conformance::drain_at_least(&runner, &tenant, 1).await;
+    concrete
+        .put_blob(&tenant, "bound", b"bound-bytes")
+        .await
+        .expect("bound content");
+
+    let sql = Connection::open(&path).expect("foreign storage connection");
+    let no_projections: &[ProjectionSpec] = &[];
+    let sidecar: &[ProjectionSpec] = &[CAPTURE_SIDECAR];
+    let mut observed = Vec::new();
+    for (table, projections) in [
+        ("identity", no_projections),
+        ("events", no_projections),
+        ("blobs", no_projections),
+        ("p_capture_sidecar", sidecar),
+    ] {
+        assert_eq!(
+            sql.execute(
+                &format!(
+                    "UPDATE {PREFIX}_{table} SET tenant_id=CAST(tenant_id AS BLOB)
+                     WHERE tenant_id=?1"
+                ),
+                params![tenant.as_str()],
+            )
+            .expect("changed only the coordinate storage class"),
+            1,
+            "{table}: the fixture needs exactly one selected row"
+        );
+        let stored: (String, Vec<u8>) = sql
+            .query_row(
+                &format!(
+                    "SELECT typeof(tenant_id),CAST(tenant_id AS BLOB) FROM {PREFIX}_{table}
+                     WHERE CAST(tenant_id AS BLOB)=?1"
+                ),
+                params![tenant.as_str().as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("stored malformed tenant coordinate");
+        assert_eq!(
+            stored.0, "blob",
+            "{table}: the fixture must evade TEXT equality"
+        );
+        assert_eq!(stored.1, tenant.as_str().as_bytes(), "{table}: exact bytes");
+
+        observed.push(
+            concrete
+                .capture_tenant(&tenant, projections, limits())
+                .await,
+        );
+
+        assert_eq!(
+            sql.execute(
+                &format!(
+                    "UPDATE {PREFIX}_{table} SET tenant_id=CAST(tenant_id AS TEXT)
+                     WHERE typeof(tenant_id)<>'text' AND CAST(tenant_id AS BLOB)=?1"
+                ),
+                params![tenant.as_str().as_bytes()],
+            )
+            .expect("restored coordinate storage class"),
+            1,
+            "{table}: exactly the malformed selected coordinate is restored"
+        );
+        concrete
+            .capture_tenant(&tenant, projections, limits())
+            .await
+            .expect("restoring that coordinate restores complete capture");
+    }
+    let expected: Vec<Result<TenantCapture, CaptureError>> = [
+        CaptureMaterial::Identity,
+        CaptureMaterial::Event,
+        CaptureMaterial::Blob,
+        CaptureMaterial::Projection,
+    ]
+    .into_iter()
+    .map(|material| Err(CaptureError::Corrupt { material }))
+    .collect();
+    assert_eq!(
+        observed, expected,
+        "each malformed exact tenant coordinate must be typed material corruption"
     );
 }
 
