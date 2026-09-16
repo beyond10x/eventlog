@@ -15,6 +15,7 @@ mod aggregate;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod blob_integrity;
 mod capture;
+mod inline_admin;
 mod projection;
 
 pub use capture::{
@@ -23,6 +24,7 @@ pub use capture::{
     ProjectionCaptureRefusal, TenantCapture, order_blobs, order_rows, validate_capture_request,
     validate_captured_digest, validate_captured_event, validate_captured_order,
 };
+pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 
 pub use aggregate::{Aggregate, Applied, DomainEvent, Loaded, Outcome, Repository, SnapshotPolicy};
 pub use blob_integrity::{

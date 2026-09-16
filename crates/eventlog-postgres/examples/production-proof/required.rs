@@ -32,6 +32,12 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "only_missing_identity_and_redacted_history_answer_ahead_of_the_divergence_guard",
         "every_key_an_existing_writer_admits_round_trips_including_an_embedded_nul",
     ));
+    required.extend(cases!("eventlog-file", "test", "inline_admin";
+        "file_inline_admin_contract",
+        "attach_and_attached_rebuild_refuse_each_pending_intent_without_changing_a_byte",
+        "dirty_markers_survive_reopen_and_attach_until_the_selected_rebuild_publishes",
+        "replay_holds_registration_coordination_and_cancelled_waiter_leaves_no_deadlock",
+    ));
     required.extend(cases!("eventlog-sqlite", "test", "consistent_capture";
         "sqlite_consistent_capture_contract",
         "capture_orders_against_append_and_erasure_across_separate_handles",
@@ -43,6 +49,14 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "a_paged_coordinate_outside_text_is_corruption_in_both_reads",
         "a_stored_blob_length_is_proven_against_the_bytes_before_any_payload_cap",
     ));
+    required.extend(cases!("eventlog-sqlite", "test", "inline_admin";
+        "sqlite_inline_admin_contract",
+        "structural_attach_changes_neither_catalog_nor_registry_and_drift_installs_nothing",
+        "corrupt_active_blob_aborts_the_complete_admin_fold",
+        "paused_admin_rebuild_keeps_rows_cursor_registration_and_other_tenant_atomic",
+        "cancelled_waiter_continues_as_one_worker_after_replay_releases_registration",
+        "cancelled_rebuild_caller_leaves_one_continuing_worker_and_whole_publication",
+    ));
     required.extend(cases!("eventlog-postgres", "test", "consistent_capture";
         "postgres_consistent_capture_contract",
         "capture_returns_committed_history_the_feed_watermark_withholds",
@@ -53,7 +67,18 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "a_stored_identity_is_preserved_exactly_or_refused_as_corruption",
         "a_stored_blob_length_is_proven_against_the_bytes_before_any_payload_cap",
     ));
+    required.extend(cases!("eventlog-postgres", "test", "inline_admin";
+        "postgres_inline_admin_contract",
+        "restricted_application_role_attaches_existing_shapes_without_ddl",
+        "rebuild_reads_a_committed_event_the_feed_watermark_withholds",
+        "cancelled_registration_waiter_cannot_cross_replay_and_capacity_recovers",
+        "cancellation_while_waiting_for_publication_retires_the_session_and_writer_recovers",
+        "cancellation_during_replay_retires_the_session_and_later_rebuild_proceeds",
+        "commit_and_unlock_response_loss_are_unknown_and_retire_before_capacity_returns",
+        "replay_holds_publishers_and_keeps_one_active_blob_snapshot",
+    ));
     required.extend(cases!("eventlog-file", "lib", "eventlog_file";
+        "inline_admin::tests::process_death_at_each_inline_rebuild_publication_boundary",
         "capture::tests::stored_identity_bytes_survive_exactly_and_an_empty_one_is_corruption",
         "capture::tests::the_strict_reader_holds_the_writer_lock_for_its_whole_life",
         "journal::tests::process_death_at_each_append_boundary",

@@ -403,7 +403,7 @@ async fn read_rows(
 /// not write is the contradiction, and the hosted application role is not given schema authority
 /// anyway. So the expected shape is described in Rust — from the same list the create path builds
 /// its DDL from — and compared against what the catalog actually reports.
-async fn admit_projection(
+pub(crate) async fn admit_projection(
     transaction: &Transaction<'_>,
     prefix: &str,
     specification: &ProjectionSpec,

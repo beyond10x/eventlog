@@ -132,11 +132,13 @@ impl PostgresEventStore {
                 client: transaction,
                 blob_prefix: &prefix,
                 projection_prefix: &prefix,
+                lock_prefix: &prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
                 admission: Some((&self.admission_permit, stream.tenant())),
                 reservation_pending: false,
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             let result = admission.check(&mut projections).await;
             ensure_callback_integrity(callback_failed)?;
@@ -220,11 +222,13 @@ impl PostgresEventStore {
                 client: transaction,
                 blob_prefix: &prefix,
                 projection_prefix: &prefix,
+                lock_prefix: &prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
                 admission: None,
                 reservation_pending: false,
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             for recorded in &written {
                 let result = projector.apply(recorded, &mut projections).await;
@@ -340,11 +344,13 @@ impl PostgresEventStore {
                 client: transaction,
                 blob_prefix: prefix,
                 projection_prefix: prefix,
+                lock_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: &group.tenant,
                 admission: Some((&self.admission_permit, &group.tenant)),
                 reservation_pending: false,
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             let result = admission.check(&mut projections).await;
             ensure_callback_integrity(callback_failed)?;

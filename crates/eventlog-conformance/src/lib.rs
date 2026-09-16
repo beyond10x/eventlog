@@ -14,6 +14,12 @@ pub use consistent_capture::{
     CAPTURE_LEDGER, CAPTURE_SIDECAR, CaptureLedger, run_consistent_capture,
 };
 
+mod inline_admin;
+pub use inline_admin::{
+    ADMIN_LEDGER, ADMIN_SIDECAR, ADMIN_SPARE, AdminProjector, CoordinatedProjector, SpareProjector,
+    run_inline_admin,
+};
+
 use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, NewEvent, Snapshot, StreamId, TenantId,
     request_hash,

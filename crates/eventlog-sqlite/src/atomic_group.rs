@@ -98,6 +98,7 @@ impl Inner {
                 tenant: &group.tenant,
                 admission: Some((&self.admission_permit, &group.tenant)),
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             let result = drive(admission.check(&mut projections));
             ensure_callback_integrity(callback_failed)?;

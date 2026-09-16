@@ -13,6 +13,7 @@
 
 mod atomic_group;
 mod capture;
+mod inline_admin;
 
 use std::{
     collections::BTreeSet,
@@ -1326,6 +1327,7 @@ impl Inner {
                 tenant: stream.tenant(),
                 admission: Some((&self.admission_permit, stream.tenant())),
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             let result = drive(admission.check(&mut projections));
             ensure_callback_integrity(callback_failed)?;
@@ -1426,6 +1428,7 @@ impl Inner {
                 tenant: stream.tenant(),
                 admission: None,
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             for recorded in &written {
                 let result = drive(projector.apply(recorded, &mut projections));
@@ -2245,6 +2248,7 @@ impl Inner {
                 tenant,
                 admission: None,
                 callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             for recorded in &page.events {
                 let result = drive(projector.apply(recorded, &mut projections));
@@ -2324,6 +2328,7 @@ impl Inner {
                     tenant,
                     admission: None,
                     callback_failed: Arc::clone(&callback_failed),
+                    selected: None,
                 };
                 for event in &events {
                     let result = drive(projector.apply(event, &mut projections));
@@ -2506,6 +2511,7 @@ struct SqliteProjections<'a> {
     tenant: &'a TenantId,
     admission: Option<(&'a eventlog_core::AdmissionPermit, &'a TenantId)>,
     callback_failed: Arc<AtomicBool>,
+    selected: Option<&'a [ProjectionSpec]>,
 }
 
 impl ProjectionStore for SqliteProjections<'_> {
@@ -2607,6 +2613,18 @@ impl ProjectionStore for SqliteProjections<'_> {
 }
 
 impl SqliteProjections<'_> {
+    fn validate_target(&self, projection: &ProjectionSpec) -> Result<(), EventLogError> {
+        if self
+            .selected
+            .is_some_and(|selected| !selected.iter().any(|admitted| admitted == projection))
+        {
+            return Err(EventLogError::Invalid(
+                "projection is outside this rebuild's selected tables".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn reserve_now(
         &mut self,
         permit: &eventlog_core::AdmissionPermit,
@@ -2672,6 +2690,7 @@ impl SqliteProjections<'_> {
         key: &str,
         body: &Value,
     ) -> Result<(), EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
@@ -2715,6 +2734,7 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<(), EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
@@ -2737,6 +2757,7 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
@@ -2767,6 +2788,7 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
@@ -2794,6 +2816,7 @@ impl SqliteProjections<'_> {
         value: &str,
         limit: usize,
     ) -> Result<Vec<Value>, EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),

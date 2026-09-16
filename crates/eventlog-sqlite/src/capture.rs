@@ -496,7 +496,7 @@ fn read_rows(
 /// when a table of that name already exists, whatever shape it has, so the registry alone would
 /// admit somebody else's table under this kit's name. Nothing here creates an expected temporary
 /// table: a read-only capture that writes to prove it is read-only has proved the opposite.
-fn admit_projection(
+pub(crate) fn admit_projection(
     connection: &Connection,
     prefix: &str,
     specification: &ProjectionSpec,

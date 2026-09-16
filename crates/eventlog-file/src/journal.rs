@@ -322,9 +322,21 @@ pub(crate) fn extends_observed(
 /// The interprocess lock is held for as long as this value lives, exactly as an ordinary writer
 /// holds it, so an observation cannot straddle somebody else's commit.
 pub(crate) struct Strict {
-    _lock: File,
+    lock: File,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
+}
+
+impl Strict {
+    /// Turn a fully validated strict observation into a writer without reopening or recovering it.
+    pub(crate) fn into_journal(self, root: &Path) -> Journal {
+        Journal {
+            root: root.to_owned(),
+            _lock: self.lock,
+            manifest: self.manifest,
+            transactions: self.transactions,
+        }
+    }
 }
 
 fn unavailable(reason: &str) -> CaptureError {
@@ -401,7 +413,7 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
     }
     let transactions = decode(&committed, &manifest).map_err(|_| damaged())?;
     Ok(Strict {
-        _lock: lock,
+        lock,
         manifest,
         transactions,
     })

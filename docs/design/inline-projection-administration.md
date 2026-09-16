@@ -1,8 +1,9 @@
 # Inline projection administration
 
 Status: design accepted after review-result:inline-projection-admin-design-pass-2 under
-story:inline-projection-administration. Capture and SQL integrity remain unaccepted implementation
-dependencies. No source implementation is admitted by this page.
+story:inline-projection-administration. Capture and SQL integrity are accepted implementation
+dependencies. Administration implementation passes the required provider gates; source examination
+and local integration remain pending. This page alone does not admit source implementation.
 
 ## Outcome and boundaries
 
@@ -85,8 +86,8 @@ projection-use and capture refusals remain, and only an authorized successful re
 marker for its selected tenant/tables. Attachment never returns a clean-state claim.
 
 Uniform consumer readiness remains strict: capture refuses redacted history for a valid identified
-tenant on every provider, including SQL and requests for no projections. Capture implementation
-is still missing; SQL integrity does not introduce dirty tracking. For nonredacted history, the
+tenant on every provider, including SQL and requests for no projections. The accepted capture
+implementation supplies this refusal; SQL integrity does not introduce dirty tracking. For nonredacted history, the
 consumer compares complete captured row/key sets with a separate deterministic derivation before
 serving. A missing, extra, changed or stale row refuses. Cursor equality and registry equality
 cannot replace that comparison: inline appends do not advance catch-up cursors, and other handles

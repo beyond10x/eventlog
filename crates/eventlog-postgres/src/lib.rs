@@ -33,6 +33,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 mod atomic_group;
 mod capture;
+mod inline_admin;
 mod pool;
 mod schema;
 use pool::Pool;
@@ -1189,11 +1190,13 @@ impl EventStore for PostgresEventStore {
                     client: &transaction,
                     blob_prefix: &prefix,
                     projection_prefix: &prefix,
+                    lock_prefix: &prefix,
                     inline: &self.inline_names,
                     tenant,
                     admission: None,
                     reservation_pending: false,
                     callback_failed: Arc::clone(&callback_failed),
+                    selected: None,
                 };
                 for recorded in &events {
                     let result = projector.apply(recorded, &mut projections).await;
@@ -1258,7 +1261,7 @@ impl EventStore for PostgresEventStore {
             loop {
                 let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
                 if rows.is_empty() {break;}
-                let mut projections=PostgresProjections {client:&transaction,blob_prefix:&self.prefix,projection_prefix:"eventlog_rebuild",inline:&self.inline_names,tenant,admission:None,reservation_pending:false,callback_failed:Arc::clone(&callback_failed)};
+                let mut projections=PostgresProjections {client:&transaction,blob_prefix:&self.prefix,projection_prefix:"eventlog_rebuild",lock_prefix:&self.prefix,inline:&self.inline_names,tenant,admission:None,reservation_pending:false,callback_failed:Arc::clone(&callback_failed),selected:None};
                 for row in &rows {let event=read_event(row)?; let result=projector.apply(&event,&mut projections).await; ensure_callback_integrity(&callback_failed)?; result?; position=to_i64(event.global_seq)?; applied+=1;}
             }
             // MVCC keeps the original visible until this replacement and cursor commit together.
@@ -1337,11 +1340,13 @@ struct PostgresProjections<'a, 'b> {
     client: &'a Transaction<'b>,
     blob_prefix: &'a str,
     projection_prefix: &'a str,
+    lock_prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
     tenant: &'a TenantId,
     admission: Option<(&'a eventlog_core::AdmissionPermit, &'a TenantId)>,
     reservation_pending: bool,
     callback_failed: Arc<AtomicBool>,
+    selected: Option<&'a [ProjectionSpec]>,
 }
 
 impl ProjectionStore for PostgresProjections<'_, '_> {
@@ -1406,8 +1411,8 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .await
                 .map_err(backend)?;
             let result=async {
-                for (coordinate,_) in &ordered {lock_identity(self.client,self.projection_prefix,"admission",&[coordinate]).await?;}
-                let table=format!("{}_scope_counters",self.projection_prefix);
+                for (coordinate,_) in &ordered {lock_identity(self.client,self.lock_prefix,"admission",&[coordinate]).await?;}
+                let table=format!("{}_scope_counters",self.lock_prefix);
                 let mut next=Vec::with_capacity(ordered.len());
                 // Validate every scope before any writes, including absent zero counters.
                 for (coordinate,reservation) in &ordered {
@@ -1441,6 +1446,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         body: &'a Value,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
+            self.validate_target(projection)?;
             if tenant != self.tenant {
                 return Err(EventLogError::Invalid(
                     "projection context cannot cross tenant".into(),
@@ -1489,6 +1495,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         key: &'a str,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
+            self.validate_target(projection)?;
             if tenant != self.tenant {
                 return Err(EventLogError::Invalid(
                     "projection context cannot cross tenant".into(),
@@ -1514,6 +1521,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
         Box::pin(async move {
+            self.validate_target(projection)?;
             if tenant != self.tenant {
                 return Err(EventLogError::Invalid(
                     "projection context cannot cross tenant".into(),
@@ -1540,6 +1548,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
         Box::pin(async move {
+            self.validate_target(projection)?;
             if tenant != self.tenant {
                 return Err(EventLogError::Invalid(
                     "projection context cannot cross tenant".into(),
@@ -1557,7 +1566,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
             }
             lock_identity(
                 self.client,
-                self.projection_prefix,
+                self.lock_prefix,
                 "projection-row",
                 &[projection.name, tenant.as_str(), key],
             )
@@ -1587,6 +1596,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>> {
         Box::pin(async move {
+            self.validate_target(projection)?;
             if tenant != self.tenant {
                 return Err(EventLogError::Invalid(
                     "projection context cannot cross tenant".into(),
@@ -1615,6 +1625,20 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .map_err(backend)?;
             Ok(rows.iter().map(|row| row.get(0)).collect())
         })
+    }
+}
+
+impl PostgresProjections<'_, '_> {
+    fn validate_target(&self, projection: &ProjectionSpec) -> Result<(), EventLogError> {
+        if self
+            .selected
+            .is_some_and(|selected| !selected.iter().any(|admitted| admitted == projection))
+        {
+            return Err(EventLogError::Invalid(
+                "projection is outside this rebuild's selected tables".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

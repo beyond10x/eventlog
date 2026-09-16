@@ -5,6 +5,13 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- File, SQLite and PostgreSQL can attach an existing inline projector without writing durable
+  state and atomically rebuild its complete tenant row sets through `InlineProjectionAdmin`.
+  Rebuild uses the attached instance, complete committed history and active blobs, preserving
+  unrelated tenants and publishing selected rows and cursor together.
+
 ### Fixed
 
 - SQLite and PostgreSQL verify stored blob length, integrity edition and SHA-256 at ordinary,

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Repository-local Eventlog. JSONL transactions are authoritative; snapshots are disposable.
 mod capture;
+mod inline_admin;
 mod journal;
 mod projection;
 mod state;
@@ -261,6 +262,7 @@ impl Transaction {
             for spec in projector.projections() {
                 projection::View {
                     admission: false,
+                    selected: None,
                     tx: self,
                     tenant: stream.tenant(),
                 }
@@ -269,6 +271,7 @@ impl Transaction {
             for event in &written {
                 let mut projection = projection::View {
                     admission: false,
+                    selected: None,
                     tx: self,
                     tenant: stream.tenant(),
                 };
@@ -424,6 +427,7 @@ impl Transaction {
                     event,
                     &mut projection::View {
                         admission: false,
+                        selected: None,
                         tx: self,
                         tenant,
                     },
@@ -495,6 +499,7 @@ impl AtomicEventStore for FileEventStore {
                     guard
                         .check(&mut projection::View {
                             admission: true,
+                            selected: None,
                             tx,
                             tenant: &group.tenant,
                         })
@@ -578,6 +583,7 @@ impl EventStore for FileEventStore {
                     guard
                         .check(&mut projection::View {
                             admission: true,
+                            selected: None,
                             tx,
                             tenant: stream.tenant(),
                         })
@@ -1025,6 +1031,7 @@ impl EventStore for FileEventStore {
                             event,
                             &mut projection::View {
                                 admission: false,
+                                selected: None,
                                 tx,
                                 tenant: &tenant,
                             },
@@ -1051,6 +1058,7 @@ impl EventStore for FileEventStore {
             Box::pin(async move {
                 projection::View {
                     admission: false,
+                    selected: None,
                     tx,
                     tenant: &tenant,
                 }
@@ -1073,6 +1081,7 @@ impl EventStore for FileEventStore {
             Box::pin(async move {
                 projection::View {
                     admission: false,
+                    selected: None,
                     tx,
                     tenant: &tenant,
                 }
@@ -1093,6 +1102,7 @@ impl EventStore for FileEventStore {
             Box::pin(async move {
                 projection::View {
                     admission: false,
+                    selected: None,
                     tx,
                     tenant: &tenant,
                 }
