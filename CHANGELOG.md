@@ -7,6 +7,9 @@ under bare-version tags such as `0.1.0`.
 
 ### Added
 
+- PostgreSQL accepts a caller-owned connection authority for custom and mutual-TLS transports
+  while retaining the provider's bounded pool, role/schema admission, quarantine and shutdown.
+
 - File, SQLite and PostgreSQL can attach an existing inline projector without writing durable
   state and atomically rebuild its complete tenant row sets through `InlineProjectionAdmin`.
   Rebuild uses the attached instance, complete committed history and active blobs, preserving

@@ -37,7 +37,10 @@ mod inline_admin;
 mod pool;
 mod schema;
 use pool::Pool;
-pub use pool::{PoolOptions, PoolStatus, PostgresConfig};
+pub use pool::{
+    AuthorizedConnection, PoolOptions, PoolStatus, PostgresConfig, PostgresConnectionAuthority,
+    PostgresTransportAssurance,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_postgres::{GenericClient, Row, Transaction};
 

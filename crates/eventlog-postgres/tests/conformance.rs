@@ -3,9 +3,45 @@
 //! Set `EVENTLOG_TEST_POSTGRES_URL` to run these. Without it they report themselves as not run
 //! rather than passing quietly, because a backend nobody exercised is not a backend anybody proved.
 
-use eventlog_core::{EventStore, Expected, StreamId, TenantId};
-use eventlog_postgres::PostgresEventStore;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use eventlog_core::{BoxFuture, EventLogError, EventStore, Expected, StreamId, TenantId};
+use eventlog_postgres::{
+    AuthorizedConnection, PostgresConnectionAuthority, PostgresEventStore,
+    PostgresTransportAssurance,
+};
 use tokio_postgres::NoTls;
+
+struct VerifiedTlsAuthority {
+    config: tokio_postgres::Config,
+    tls: rustls::ClientConfig,
+    calls: AtomicUsize,
+}
+
+impl PostgresConnectionAuthority for VerifiedTlsAuthority {
+    fn assurance(&self) -> PostgresTransportAssurance {
+        PostgresTransportAssurance::Verified
+    }
+
+    fn connect(
+        &self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let mut config = self.config.clone();
+        config.connect_timeout(timeout);
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(self.tls.clone());
+        Box::pin(async move {
+            let (client, driver) = config.connect(tls).await.map_err(|_| {
+                EventLogError::Backend("caller-owned verified TLS connection failed".to_owned())
+            })?;
+            Ok(AuthorizedConnection::new(client, driver))
+        })
+    }
+}
 
 /// The watermark couples feed visibility across every connection in the instance
 /// (`pg_snapshot_xmin` is cluster-wide), so a test holding a transaction open while another
@@ -1331,6 +1367,54 @@ async fn verified_tls_requires_matching_server_and_separate_application_role() {
             .is_err(),
         "missing connection reserve cannot be admitted"
     );
+    let mut caller_config: tokio_postgres::Config = app_url.parse().expect("application config");
+    caller_config.ssl_mode(tokio_postgres::config::SslMode::Require);
+    let caller_authority = Arc::new(VerifiedTlsAuthority {
+        config: caller_config,
+        tls: rustls::ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+        calls: AtomicUsize::new(0),
+    });
+    let caller_owned = PostgresEventStore::open(
+        PostgresConfig::caller_owned("hosted_owner", "kit", caller_authority.clone())
+            .expect("caller-owned config"),
+        PoolOptions::default(),
+        16,
+        2,
+        8,
+    )
+    .await
+    .expect("caller-owned verified TLS authority is admitted");
+    let caller_stream = StreamId::new(
+        TenantId::new("caller-owned-tenant").expect("tenant"),
+        "item",
+        "one",
+    )
+    .expect("stream");
+    caller_owned
+        .append(
+            &caller_stream,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("caller-owned-tls", &serde_json::json!({})),
+        )
+        .await
+        .expect("caller-owned TLS append");
+    assert_eq!(
+        caller_owned
+            .read_stream(&caller_stream, 0, 10)
+            .await
+            .expect("caller-owned TLS read")
+            .events
+            .len(),
+        1
+    );
+    caller_owned
+        .shutdown()
+        .await
+        .expect("caller-owned shutdown");
+    assert!(caller_authority.calls.load(Ordering::Acquire) >= 1);
     let store = PostgresEventStore::open(config, PoolOptions::default(), 16, 2, 8)
         .await
         .expect("verified DML-only application");
