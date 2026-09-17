@@ -65,9 +65,28 @@ impl FileEventStore {
     /// # Errors
     /// Refuses corrupt history, unknown formats and inaccessible storage.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, EventLogError> {
-        let root = root_path(path.as_ref())?;
+        Self::open_with_creation(path.as_ref(), true).await
+    }
+
+    /// Open an already provisioned store without creating a missing root, lock or manifest.
+    /// A pending committed intent is still recovered as part of ordinary store opening.
+    /// # Errors
+    /// Refuses missing or corrupt authority, unknown formats and inaccessible storage.
+    pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self, EventLogError> {
+        Self::open_with_creation(path.as_ref(), false).await
+    }
+
+    async fn open_with_creation(path: &Path, create: bool) -> Result<Self, EventLogError> {
+        let root = root_path(path)?;
         let path = root.clone();
-        let journal = blocking(move || Journal::open(&path)).await?;
+        let journal = blocking(move || {
+            if create {
+                Journal::open(&path)
+            } else {
+                Journal::open_existing(&path)
+            }
+        })
+        .await?;
         State::replay(&journal.transactions)?;
         let observed = Some(journal.manifest.clone());
         drop(journal);
@@ -89,7 +108,7 @@ impl FileEventStore {
     {
         let mut runtime = self.runtime.lock().await;
         let path = self.root.clone();
-        let journal = blocking(move || Journal::open(&path)).await?;
+        let journal = blocking(move || Journal::open_existing(&path)).await?;
         if let Some(observed) = &runtime.observed
             && !journal.extends(observed)?
         {

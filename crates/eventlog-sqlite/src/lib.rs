@@ -32,7 +32,7 @@ use eventlog_core::{
     bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
     validate_field, validate_legacy_blob_count, validate_stored_blob,
 };
-use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, TransactionBehavior, params};
 use serde_json::Value;
 
 /// Every envelope column, in the order [`read_event`] expects them.
@@ -72,6 +72,20 @@ impl SqliteEventStore {
         Self::open_with_blob_migration(path, prefix, LegacyBlobMigration::RefusePopulated)
             .await
             .map(|(store, _)| store)
+    }
+
+    /// Open an already provisioned file-backed owner without creating a database or tables.
+    /// This path never performs a predecessor blob migration.
+    ///
+    /// # Errors
+    /// Refuses a missing database, missing or incompatible owner schema, and inaccessible storage.
+    pub async fn open_existing(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+        let path = path.to_owned();
+        let prefix = prefix.to_owned();
+        let inner = run_blocking(move || Inner::open_existing(&path, &prefix)).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Open or create the store with an explicit predecessor blob-import choice.
@@ -127,6 +141,23 @@ where
 }
 
 impl Inner {
+    fn open_existing(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+        validate_prefix(prefix)?;
+        if path.is_empty() || path == ":memory:" {
+            return Err(EventLogError::Invalid(
+                "existing SQLite authority requires a file path".into(),
+            ));
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(backend)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(backend)?;
+        let inner = Self::new(connection, prefix);
+        inner.require_existing_schema()?;
+        Ok(inner)
+    }
+
     fn open(
         path: &str,
         prefix: &str,
@@ -150,16 +181,59 @@ impl Inner {
         connection
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(backend)?;
-        let store = Self {
+        let store = Self::new(connection, prefix);
+        let report = store.create_tables(migration)?;
+        Ok((store, report))
+    }
+
+    fn new(connection: Connection, prefix: &str) -> Self {
+        Self {
             connection: Mutex::new(connection),
             prefix: prefix.to_owned(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
             admission_permit: eventlog_core::AdmissionPermit::default(),
             registration: Mutex::new(false),
-        };
-        let report = store.create_tables(migration)?;
-        Ok((store, report))
+        }
+    }
+
+    fn require_existing_schema(&self) -> Result<(), EventLogError> {
+        let connection = self.connection.lock().map_err(poisoned)?;
+        self.refuse_foreign_tables(&connection)?;
+        for suffix in [
+            "events",
+            "commands",
+            "claims",
+            "identity",
+            "blobs",
+            "projection_cursors",
+            "snapshots",
+            "snapshot_generations",
+            "append_groups",
+            "scope_counters",
+            "projection_registry",
+        ] {
+            let name = format!("{}_{}", self.prefix, suffix);
+            let present: Option<String> = connection
+                .query_row(
+                    "SELECT type FROM sqlite_master WHERE name=?1 AND type='table'",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if present.is_none() {
+                return Err(EventLogError::Invalid(format!(
+                    "SQLite owner table {name} is absent"
+                )));
+            }
+        }
+        if sqlite_blob_shape(&connection, &self.prefix)? != SqliteBlobShape::Current {
+            return Err(EventLogError::Invalid(
+                "existing SQLite owner has an unupgraded blob schema".into(),
+            ));
+        }
+        self.validate_snapshot_generation_schema(&connection)
     }
 
     /// Refuse a table of ours that somebody else made.
@@ -409,8 +483,20 @@ impl Inner {
         if report.upgraded {
             validate_all_sqlite_blobs(&transaction, prefix)?;
         }
-        let mut query = transaction
-            .prepare(&format!("PRAGMA table_info({prefix}_snapshot_generations)"))
+        self.validate_snapshot_generation_schema(&transaction)?;
+        transaction.commit().map_err(backend)?;
+        Ok(report)
+    }
+
+    fn validate_snapshot_generation_schema(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), EventLogError> {
+        let mut query = connection
+            .prepare(&format!(
+                "PRAGMA table_info({}_snapshot_generations)",
+                self.prefix
+            ))
             .map_err(backend)?;
         let columns = query
             .query_map([], |row| {
@@ -439,8 +525,7 @@ impl Inner {
             ));
         }
         drop(query);
-        transaction.commit().map_err(backend)?;
-        Ok(report)
+        Ok(())
     }
 }
 

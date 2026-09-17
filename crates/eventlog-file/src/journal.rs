@@ -111,24 +111,38 @@ fn atomic_json(root: &Path, name: &str, value: &impl Serialize) -> Result<(), Ev
 
 impl Journal {
     pub fn open(root: &Path) -> Result<Self, EventLogError> {
-        fs::create_dir_all(root).map_err(backend)?;
+        Self::open_with_creation(root, true)
+    }
+
+    /// Open a provisioned journal without minting any missing authority.
+    pub fn open_existing(root: &Path) -> Result<Self, EventLogError> {
+        Self::open_with_creation(root, false)
+    }
+
+    fn open_with_creation(root: &Path, create: bool) -> Result<Self, EventLogError> {
+        if create {
+            fs::create_dir_all(root).map_err(backend)?;
+        }
         if !fs::symlink_metadata(root).map_err(backend)?.is_dir() {
             return Err(corrupt());
         }
         let lock_path = root.join("writer.lock");
-        if fs::symlink_metadata(&lock_path).is_ok() {
+        if !create || fs::symlink_metadata(&lock_path).is_ok() {
             regular(&lock_path)?;
         }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
             .open(lock_path)
             .map_err(backend)?;
         lock.lock().map_err(backend)?;
         let manifest_path = root.join("manifest.json");
         if !manifest_path.exists() {
+            if !create {
+                return Err(corrupt());
+            }
             // Never interpret an existing history without its commit authority as a new store.
             if root.join("events.jsonl").exists() || root.join("privacy.json").exists() {
                 return Err(corrupt());

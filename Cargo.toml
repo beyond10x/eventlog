@@ -23,7 +23,7 @@ eventlog-core = { path = "crates/eventlog-core" }
 eventlog-sqlite = { path = "crates/eventlog-sqlite" }
 eventlog-postgres = { path = "crates/eventlog-postgres" }
 eventlog-conformance = { path = "crates/eventlog-conformance" }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

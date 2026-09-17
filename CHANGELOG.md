@@ -7,6 +7,10 @@ under bare-version tags such as `0.1.0`.
 
 ### Added
 
+- File and SQLite expose existing-only open paths for callers that already hold provider
+  authority. They refuse absent or incomplete stores without creating a root, lock, database or
+  owner tables; explicit creation and File journal recovery retain their prior behavior.
+
 - PostgreSQL accepts a caller-owned connection authority for custom and mutual-TLS transports
   while retaining the provider's bounded pool, role/schema admission, quarantine and shutdown.
 
@@ -16,6 +20,10 @@ under bare-version tags such as `0.1.0`.
   unrelated tenants and publishing selected rows and cursor together.
 
 ### Fixed
+
+- SQLite selects the exact bundled `rusqlite` 0.40.2 line so composed consumers use one native
+  SQLite dependency that satisfies their existing 3.51.3 admission floor. Eventlog schemas,
+  envelopes and storage semantics are unchanged.
 
 - SQLite and PostgreSQL verify stored blob length, integrity edition and SHA-256 at ordinary,
   transactional callback and binding readback boundaries. Populated predecessor tables require an
