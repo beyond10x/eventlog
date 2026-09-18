@@ -7,6 +7,13 @@ use super::{
 };
 use eventlog_core::{AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange};
 
+#[cfg(test)]
+fn checkpoint(point: &str) {
+    if std::env::var("EVENTLOG_POSTGRES_GROUP_CRASH_AT").as_deref() == Ok(point) {
+        std::process::exit(73);
+    }
+}
+
 impl PostgresEventStore {
     // Both ports share event writing, guards and projectors; only command bookkeeping differs.
     #[allow(clippy::too_many_arguments)]
@@ -188,6 +195,10 @@ impl PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            #[cfg(test)]
+            if !record_command && offset == 0 {
+                checkpoint("group-event-1");
+            }
             written.push(read_event(&row)?);
         }
 
@@ -363,6 +374,8 @@ impl PostgresEventStore {
         }
         let mut appends = Vec::with_capacity(group.appends.len());
         let mut ranges = Vec::with_capacity(group.appends.len());
+        #[cfg(test)]
+        let mut member = 0;
         for entry in &group.appends {
             let result = self
                 .append_in_transaction(
@@ -376,6 +389,11 @@ impl PostgresEventStore {
                     callback_failed,
                 )
                 .await?;
+            #[cfg(test)]
+            {
+                member += 1;
+                checkpoint(&format!("group-member-{member}"));
+            }
             ranges.push(GroupRange {
                 stream: entry.stream.clone(),
                 first_version: result.first_version,
@@ -385,6 +403,8 @@ impl PostgresEventStore {
         }
         transaction.execute(&format!("INSERT INTO {prefix}_append_groups (tenant_id,idempotency_key,request_hash,ranges) VALUES ($1,$2,$3,$4)"),
             &[&group.tenant.as_str(),&group.meta.idempotency_key,&fingerprint,&serde_json::to_value(&ranges).map_err(|_| EventLogError::Invalid("invalid group ranges".into()))?]).await.map_err(backend)?;
+        #[cfg(test)]
+        checkpoint("group-bookkeeping");
         ensure_callback_integrity(callback_failed)?;
         Ok(AppendGroupResult {
             appends,
@@ -419,11 +439,15 @@ impl AtomicEventStore for PostgresEventStore {
                     .await;
                 match result {
                     Ok(result) => {
+                        #[cfg(test)]
+                        checkpoint("group-precommit");
                         transaction
                             .commit()
                             .await
                             .map_err(|_| EventLogError::UnknownCommit)?;
                         client.settled();
+                        #[cfg(test)]
+                        checkpoint("group-postcommit");
                         Ok(result)
                     }
                     Err(error) => {
@@ -436,5 +460,169 @@ impl AtomicEventStore for PostgresEventStore {
             .await
             .map_err(|_| EventLogError::UnknownCommit)?
         })
+    }
+}
+
+#[cfg(test)]
+mod native_group_crash {
+    use super::*;
+    use eventlog_conformance::{TALLY, Tally, event, meta};
+    use eventlog_core::{EventStore, StreamAppend, TenantId};
+    use std::process::Command;
+
+    fn tenant() -> TenantId {
+        TenantId::new("native-crash").unwrap()
+    }
+
+    fn stream(id: &str) -> StreamId {
+        StreamId::new(tenant(), "item", id).unwrap()
+    }
+
+    fn group() -> AppendGroup {
+        AppendGroup {
+            tenant: tenant(),
+            meta: meta("native-group", &serde_json::json!({})),
+            appends: ["a", "z", "a"]
+                .into_iter()
+                .map(|id| StreamAppend {
+                    stream: stream(id),
+                    expected: Expected::Any,
+                    events: vec![event("item.changed", 1)],
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn child() {
+        let Ok(prefix) = std::env::var("EVENTLOG_POSTGRES_GROUP_CHILD_PREFIX") else {
+            return;
+        };
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").unwrap();
+        let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+        store.register_inline(Arc::new(Tally)).await.unwrap();
+        store.append_group(&group()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_native_group_boundary_recovers_one_complete_outcome() {
+        let url =
+            std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned real PostgreSQL URL");
+        let run: String = OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .to_string()
+            .bytes()
+            .map(|digit| char::from(b'a' + digit - b'0'))
+            .collect();
+        for (index, (point, committed)) in [
+            ("group-event-1", false),
+            ("group-member-1", false),
+            ("group-member-2", false),
+            ("group-member-3", false),
+            ("group-bookkeeping", false),
+            ("group-precommit", false),
+            ("group-postcommit", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let prefix = format!(
+                "ng_{run}_{}",
+                char::from(b'a' + u8::try_from(index).unwrap())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "atomic_group::native_group_crash::child",
+                    "--nocapture",
+                ])
+                .env("EVENTLOG_POSTGRES_GROUP_CHILD_PREFIX", &prefix)
+                .env("EVENTLOG_POSTGRES_GROUP_CRASH_AT", point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{point}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+            let before = store.read_feed(&tenant(), 0, 10).await.unwrap().events;
+            assert_eq!(before.len(), if committed { 3 } else { 0 }, "{point}");
+            for (id, count) in [("a", 2), ("z", 1)] {
+                assert_eq!(
+                    store.stream_version(&stream(id)).await.unwrap(),
+                    committed.then_some(count),
+                    "{point}"
+                );
+                let row = store
+                    .projection_get(&TALLY, &tenant(), &format!("item/{id}"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row.and_then(|value| value["count"].as_u64()),
+                    committed.then_some(count),
+                    "{point}"
+                );
+            }
+
+            store.register_inline(Arc::new(Tally)).await.unwrap();
+            let retry = store
+                .append_group(&group())
+                .await
+                .unwrap_or_else(|error| panic!("{point}: retry refused after reopen: {error}"));
+            assert_eq!(retry.deduplicated, committed, "{point}");
+            assert_eq!(retry.appends.len(), 3, "{point}");
+            assert_eq!(
+                retry
+                    .appends
+                    .iter()
+                    .map(|append| (append.first_version, append.last_version))
+                    .collect::<Vec<_>>(),
+                [(1, 1), (1, 1), (2, 2)],
+                "{point}: original repeated-stream ranges"
+            );
+            let received: Vec<_> = retry
+                .appends
+                .iter()
+                .flat_map(|append| append.events.iter().cloned())
+                .collect();
+            assert_eq!(received.len(), 3, "{point}");
+            if committed {
+                assert_eq!(received, before, "{point}: original event coordinates");
+            } else {
+                assert_eq!(received[0].version, 1, "{point}: fresh retry");
+            }
+            assert_eq!(
+                store.read_feed(&tenant(), 0, 10).await.unwrap().events,
+                received,
+                "{point}: no duplicate or missing group member"
+            );
+            for (id, count) in [("a", 2), ("z", 1)] {
+                let row = store
+                    .projection_get(&TALLY, &tenant(), &format!("item/{id}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row["count"].as_u64(), Some(count), "{point}");
+            }
+            store.shutdown().await.unwrap();
+            let reopened = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+            let second_retry = reopened.append_group(&group()).await.unwrap();
+            assert!(
+                second_retry.deduplicated,
+                "{point}: retry after recovery reopen"
+            );
+            assert_eq!(second_retry.appends.len(), retry.appends.len(), "{point}");
+            for (original, again) in retry.appends.iter().zip(&second_retry.appends) {
+                assert_eq!(again.first_version, original.first_version, "{point}");
+                assert_eq!(again.last_version, original.last_version, "{point}");
+                assert_eq!(again.events, original.events, "{point}");
+                assert!(again.deduplicated, "{point}");
+            }
+            reopened.drop_tables().await.unwrap();
+            reopened.shutdown().await.unwrap();
+        }
     }
 }

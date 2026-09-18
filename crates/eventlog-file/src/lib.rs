@@ -151,8 +151,18 @@ impl FileEventStore {
                 tx.journal.privacy(tx.journal.transactions.clone())?;
                 tx.clear_snapshots()?;
             } else if !tx.pending.is_empty() {
+                #[cfg(test)]
+                let group_pending = tx.pending.iter().any(|op| matches!(op, Op::Group { .. }));
+                #[cfg(test)]
+                if group_pending {
+                    journal::checkpoint("group-precommit");
+                }
                 tx.journal
                     .append(serde_json::to_value(&tx.pending).map_err(backend)?)?;
+                #[cfg(test)]
+                if group_pending {
+                    journal::checkpoint("group-postcommit");
+                }
             }
             tx.clean_blobs()?;
             Ok(tx.journal.manifest.clone())
@@ -525,10 +535,17 @@ impl AtomicEventStore for FileEventStore {
                         .await?;
                     let mut appends = Vec::new();
                     let mut ranges = Vec::new();
+                    #[cfg(test)]
+                    let mut member = 0;
                     for entry in &group.appends {
                         let result = tx
                             .append(&entry.stream, entry.expected, &entry.events, &group.meta)
                             .await?;
+                        #[cfg(test)]
+                        {
+                            member += 1;
+                            journal::checkpoint(&format!("group-member-{member}"));
+                        }
                         ranges.push(GroupRange {
                             stream: entry.stream.clone(),
                             first_version: result.first_version,
@@ -542,6 +559,8 @@ impl AtomicEventStore for FileEventStore {
                         digest,
                         ranges,
                     })?;
+                    #[cfg(test)]
+                    journal::checkpoint("group-bookkeeping");
                     Ok(AppendGroupResult {
                         appends,
                         deduplicated: false,
@@ -1140,5 +1159,154 @@ impl EventStore for FileEventStore {
                     .collect())
             })
         }))
+    }
+}
+
+#[cfg(test)]
+mod native_group_crash {
+    use super::*;
+    use eventlog_conformance::{TALLY, Tally, event, meta};
+    use eventlog_core::StreamAppend;
+    use std::process::Command;
+
+    fn tenant() -> TenantId {
+        TenantId::new("native-crash").unwrap()
+    }
+
+    fn stream(id: &str) -> StreamId {
+        StreamId::new(tenant(), "item", id).unwrap()
+    }
+
+    fn group() -> AppendGroup {
+        AppendGroup {
+            tenant: tenant(),
+            meta: meta("native-group", &serde_json::json!({})),
+            appends: ["a", "z", "a"]
+                .into_iter()
+                .map(|id| StreamAppend {
+                    stream: stream(id),
+                    expected: Expected::Any,
+                    events: vec![event("item.changed", 1)],
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn child() {
+        let Ok(root) = std::env::var("EVENTLOG_FILE_GROUP_CHILD_ROOT") else {
+            return;
+        };
+        let store = FileEventStore::open(root).await.unwrap();
+        store.register_inline(Arc::new(Tally)).await.unwrap();
+        store.append_group(&group()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_native_group_boundary_recovers_one_complete_outcome() {
+        for (point, committed) in [
+            ("group-member-1", false),
+            ("group-member-2", false),
+            ("group-member-3", false),
+            ("group-bookkeeping", false),
+            ("group-precommit", false),
+            ("append-prepared", false),
+            ("append-torn", false),
+            ("append-synced", false),
+            ("append-committed", true),
+            ("group-postcommit", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let prepared = FileEventStore::open(root.path()).await.unwrap();
+            prepared.register_inline(Arc::new(Tally)).await.unwrap();
+            drop(prepared);
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "native_group_crash::child", "--nocapture"])
+                .env("EVENTLOG_FILE_GROUP_CHILD_ROOT", root.path())
+                .env("EVENTLOG_FILE_CRASH_AT", point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{point}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let store = FileEventStore::open(root.path()).await.unwrap();
+            let before = store.read_feed(&tenant(), 0, 10).await.unwrap().events;
+            assert_eq!(before.len(), if committed { 3 } else { 0 }, "{point}");
+            for (id, count) in [("a", 2), ("z", 1)] {
+                assert_eq!(
+                    store.stream_version(&stream(id)).await.unwrap(),
+                    committed.then_some(count),
+                    "{point}"
+                );
+                let row = store
+                    .projection_get(&TALLY, &tenant(), &format!("item/{id}"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row.and_then(|value| value["count"].as_u64()),
+                    committed.then_some(count),
+                    "{point}"
+                );
+            }
+
+            store.register_inline(Arc::new(Tally)).await.unwrap();
+            let retry = store
+                .append_group(&group())
+                .await
+                .unwrap_or_else(|error| panic!("{point}: retry refused after reopen: {error}"));
+            assert_eq!(retry.deduplicated, committed, "{point}");
+            assert_eq!(retry.appends.len(), 3, "{point}");
+            assert_eq!(
+                retry
+                    .appends
+                    .iter()
+                    .map(|append| (append.first_version, append.last_version))
+                    .collect::<Vec<_>>(),
+                [(1, 1), (1, 1), (2, 2)],
+                "{point}: original repeated-stream ranges"
+            );
+            let received: Vec<_> = retry
+                .appends
+                .iter()
+                .flat_map(|append| append.events.iter().cloned())
+                .collect();
+            assert_eq!(received.len(), 3, "{point}");
+            if committed {
+                assert_eq!(received, before, "{point}: original event coordinates");
+            } else {
+                assert_eq!(received[0].global_seq, 1, "{point}: fresh retry");
+            }
+            assert_eq!(
+                store.read_feed(&tenant(), 0, 10).await.unwrap().events,
+                received,
+                "{point}: no duplicate or missing group member"
+            );
+            for (id, count) in [("a", 2), ("z", 1)] {
+                let row = store
+                    .projection_get(&TALLY, &tenant(), &format!("item/{id}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row["count"].as_u64(), Some(count), "{point}");
+            }
+            drop(store);
+            let reopened = FileEventStore::open(root.path()).await.unwrap();
+            let second_retry = reopened.append_group(&group()).await.unwrap();
+            assert!(
+                second_retry.deduplicated,
+                "{point}: retry after recovery reopen"
+            );
+            assert_eq!(second_retry.appends.len(), retry.appends.len(), "{point}");
+            for (original, again) in retry.appends.iter().zip(&second_retry.appends) {
+                assert_eq!(again.first_version, original.first_version, "{point}");
+                assert_eq!(again.last_version, original.last_version, "{point}");
+                assert_eq!(again.events, original.events, "{point}");
+                assert!(again.deduplicated, "{point}");
+            }
+        }
     }
 }

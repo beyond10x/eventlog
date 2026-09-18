@@ -1457,6 +1457,10 @@ impl Inner {
                 )
                 .map_err(backend)?;
             let global_seq = to_u64(connection.last_insert_rowid())?;
+            #[cfg(test)]
+            if !record_command && offset == 0 {
+                atomic_group::checkpoint("group-event-1");
+            }
             written.push(RecordedEvent {
                 global_seq,
                 tenant: stream.tenant().clone(),

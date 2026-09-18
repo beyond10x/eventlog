@@ -78,6 +78,7 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "replay_holds_publishers_and_keeps_one_active_blob_snapshot",
     ));
     required.extend(cases!("eventlog-file", "lib", "eventlog_file";
+        "native_group_crash::every_native_group_boundary_recovers_one_complete_outcome",
         "inline_admin::tests::process_death_at_each_inline_rebuild_publication_boundary",
         "capture::tests::stored_identity_bytes_survive_exactly_and_an_empty_one_is_corruption",
         "capture::tests::the_strict_reader_holds_the_writer_lock_for_its_whole_life",
@@ -100,12 +101,16 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "ordered_groups_commit_and_rollback_as_one_unit",
         "concurrent_groups_preserve_order_without_partial_commits",
     ));
+    required.extend(cases!("eventlog-sqlite", "lib", "eventlog_sqlite";
+        "atomic_group::native_group_crash::every_native_group_boundary_recovers_one_complete_outcome",
+    ));
     required.extend(cases!("eventlog-sqlite", "test", "atomic_groups";
         "ordered_groups_commit_and_rollback_as_one_unit",
         "concurrent_groups_preserve_order_without_partial_commits",
         "group_retry_survives_database_reopen",
     ));
     required.extend(cases!("eventlog-postgres", "lib", "eventlog_postgres";
+        "atomic_group::native_group_crash::every_native_group_boundary_recovers_one_complete_outcome",
         "schema::blob_integrity_tests::historical_editions_and_old_reader_are_frozen",
         "blob_migration_tests::acknowledged_report_survives_cleanup_failure",
         "schema::group_migration_tests::snapshot_edition_migrates_to_groups_and_foreign_group_shape_refuses",

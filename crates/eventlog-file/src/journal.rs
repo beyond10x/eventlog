@@ -13,7 +13,7 @@ const FORMAT: &str = "eventlog-file/1";
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[cfg(test)]
-fn checkpoint(name: &str) {
+pub(crate) fn checkpoint(name: &str) {
     if std::env::var("EVENTLOG_FILE_CRASH_AT").as_deref() == Ok(name) {
         std::process::exit(73);
     }
