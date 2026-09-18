@@ -286,10 +286,10 @@ async fn read_events(
     let chunk = CHUNK;
     let statement = format!(
         "SELECT {COLUMNS} FROM {prefix}_events
-         WHERE tenant_id = $1 AND global_seq > $2 ORDER BY global_seq LIMIT $3"
+         WHERE tenant_id = $1 AND ($2::bigint IS NULL OR global_seq > $2) ORDER BY global_seq LIMIT $3"
     );
     let mut events = Vec::new();
-    let mut after = 0_i64;
+    let mut after: Option<i64> = None;
     loop {
         let page = transaction
             .query(&statement, &[&owner, &after, &chunk])
@@ -301,7 +301,7 @@ async fn read_events(
         for row in &page {
             let event = read_event(row).map_err(|_| corrupt(CaptureMaterial::Event))?;
             budget.admit_event(&event)?;
-            after = to_i64(event.global_seq)?;
+            after = Some(to_i64(event.global_seq)?);
             events.push(event);
         }
     }

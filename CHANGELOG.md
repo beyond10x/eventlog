@@ -21,6 +21,10 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- Inline rebuild validates complete stored event history before applying projectors. SQL capture
+  and rebuild also read nonpositive stored positions so malformed rows are refused rather than
+  silently omitted; failed rebuilds preserve existing projection rows and cursors.
+
 - SQLite selects the exact bundled `rusqlite` 0.40.2 line so composed consumers use one native
   SQLite dependency that satisfies their existing 3.51.3 admission floor. Eventlog schemas,
   envelopes and storage semantics are unchanged.

@@ -7,8 +7,9 @@ use std::{
 };
 
 use eventlog_core::{
-    BoxFuture, EventLogError, EventStore, Expected, InlineProjectionAdmin, ProjectionStore,
-    Projector, RecordedEvent, StreamId, TenantId,
+    BoxFuture, CaptureError, CaptureLimits, CaptureMaterial, ConsistentTenantCapture,
+    EventLogError, EventStore, Expected, InlineProjectionAdmin, ProjectionStore, Projector,
+    RecordedEvent, StreamId, TenantId,
 };
 use eventlog_postgres::{PoolOptions, PostgresConfig, PostgresEventStore};
 
@@ -34,6 +35,20 @@ async fn sql() -> tokio_postgres::Client {
         let _ = connection.await;
     });
     client
+}
+
+async fn stored_cursor(client: &tokio_postgres::Client, prefix: &str, tenant: &TenantId) -> i64 {
+    client
+        .query_one(
+            &format!(
+                "SELECT global_seq FROM {prefix}_projection_cursors \
+                 WHERE projection='admin_projector' AND tenant_id=$1"
+            ),
+            &[&tenant.as_str()],
+        )
+        .await
+        .expect("published cursor")
+        .get(0)
 }
 
 async fn publication_key(client: &tokio_postgres::Client, prefix: &str) -> i64 {
@@ -128,6 +143,153 @@ async fn postgres_inline_admin_contract() {
     eventlog_conformance::run_inline_admin(&store, admin).await;
     concrete.drop_tables().await.expect("dropped");
     concrete.shutdown().await.expect("closed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_stored_event_cannot_replace_postgres_rows_or_cursor() {
+    for mutation in ["data='[1,2,3]'::jsonb", "global_seq=0", "global_seq=-1"] {
+        assert_corrupt_stored_event_cannot_replace_postgres_rows_or_cursor(mutation).await;
+    }
+}
+
+async fn assert_corrupt_stored_event_cannot_replace_postgres_rows_or_cursor(mutation: &str) {
+    let prefix = prefix();
+    let owner = TenantId::new("corrupt-owner").expect("owner");
+    let neighbour = TenantId::new("unrelated-owner").expect("neighbour");
+    let projector = Arc::new(eventlog_conformance::AdminProjector::default());
+    let writer = PostgresEventStore::connect(&url(), &prefix)
+        .await
+        .expect("connected");
+    writer
+        .create_projections(projector.clone())
+        .await
+        .expect("admitted tables");
+    writer
+        .stream_identity(&owner)
+        .await
+        .expect("owner identity");
+    writer
+        .append(
+            &StreamId::new(owner.clone(), "item", "one").expect("stream"),
+            Expected::NoStream,
+            &[
+                eventlog_conformance::event("item.recorded", 1),
+                eventlog_conformance::event("item.recorded", 2),
+            ],
+            &eventlog_conformance::meta("owner", &serde_json::json!({})),
+        )
+        .await
+        .expect("owner history");
+    writer
+        .append(
+            &StreamId::new(neighbour.clone(), "item", "other").expect("stream"),
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.recorded", 3)],
+            &eventlog_conformance::meta("neighbour", &serde_json::json!({})),
+        )
+        .await
+        .expect("unrelated history");
+    writer.shutdown().await.expect("writer closed");
+
+    let store = PostgresEventStore::connect(&url(), &prefix)
+        .await
+        .expect("reopened");
+    store
+        .attach_inline_existing(projector.clone())
+        .await
+        .expect("attached");
+    for tenant in [&owner, &neighbour] {
+        store
+            .rebuild_inline_projection(projector.name(), tenant)
+            .await
+            .expect("first publication");
+    }
+    let client = sql().await;
+    let owner_cursor = stored_cursor(&client, &prefix, &owner).await;
+    let neighbour_cursor = stored_cursor(&client, &prefix, &neighbour).await;
+    let mut before = Vec::new();
+    for tenant in [&owner, &neighbour] {
+        for specification in [
+            &eventlog_conformance::ADMIN_LEDGER,
+            &eventlog_conformance::ADMIN_SIDECAR,
+        ] {
+            before.push(
+                store
+                    .projection_get(
+                        specification,
+                        tenant,
+                        if tenant == &owner { "one" } else { "other" },
+                    )
+                    .await
+                    .expect("published row")
+                    .expect("row exists"),
+            );
+        }
+    }
+    assert_eq!(
+        client
+            .execute(
+                &format!(
+                    "UPDATE {prefix}_events SET {mutation} \
+                     WHERE tenant_id=$1 AND version=2"
+                ),
+                &[&owner.as_str()],
+            )
+            .await
+            .expect("tampered last event"),
+        1
+    );
+    assert!(matches!(
+        store
+            .capture_tenant(
+                &owner,
+                &[],
+                CaptureLimits {
+                    max_events: 4096,
+                    max_blobs: 256,
+                    max_projection_rows: 4096,
+                    max_payload_bytes: 1 << 22,
+                },
+            )
+            .await,
+        Err(CaptureError::Corrupt {
+            material: CaptureMaterial::Event
+        })
+    ));
+    let refused = store
+        .rebuild_inline_projection(projector.name(), &owner)
+        .await;
+    assert!(
+        refused.is_err(),
+        "rebuild admitted corrupt history: {refused:?}"
+    );
+    assert_eq!(stored_cursor(&client, &prefix, &owner).await, owner_cursor);
+    assert_eq!(
+        stored_cursor(&client, &prefix, &neighbour).await,
+        neighbour_cursor
+    );
+    let mut after = Vec::new();
+    for tenant in [&owner, &neighbour] {
+        for specification in [
+            &eventlog_conformance::ADMIN_LEDGER,
+            &eventlog_conformance::ADMIN_SIDECAR,
+        ] {
+            after.push(
+                store
+                    .projection_get(
+                        specification,
+                        tenant,
+                        if tenant == &owner { "one" } else { "other" },
+                    )
+                    .await
+                    .expect("published row")
+                    .expect("row exists"),
+            );
+        }
+    }
+    assert_eq!(after, before, "failed rebuild changed active rows");
+    store.drop_tables().await.expect("dropped fixture tables");
+    store.shutdown().await.expect("closed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

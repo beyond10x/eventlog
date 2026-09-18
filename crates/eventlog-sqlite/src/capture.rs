@@ -303,13 +303,13 @@ fn read_events(
     budget: &mut CaptureBudget,
 ) -> Result<Vec<RecordedEvent>, CaptureError> {
     let mut events = Vec::new();
-    let mut after = 0_i64;
+    let mut after: Option<i64> = None;
     loop {
         let page = {
             let mut statement = connection
                 .prepare(&format!(
                     "SELECT {COLUMNS} FROM {prefix}_events
-                     WHERE tenant_id = ?1 AND global_seq > ?2
+                     WHERE tenant_id = ?1 AND (?2 IS NULL OR global_seq > ?2)
                      ORDER BY global_seq LIMIT ?3"
                 ))
                 .map_err(operational)?;
@@ -330,7 +330,7 @@ fn read_events(
         }
         for event in page {
             budget.admit_event(&event)?;
-            after = to_i64(event.global_seq)?;
+            after = Some(to_i64(event.global_seq)?);
             events.push(event);
         }
     }

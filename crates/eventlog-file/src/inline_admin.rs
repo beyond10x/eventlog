@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use eventlog_core::{
     CaptureError, EventLogError, InlineProjectionAdmin, InlineRebuildResult, Projector, TenantId,
-    validate_identifier,
+    validate_captured_order, validate_identifier,
 };
 
 use crate::{Transaction, blocking, journal, projection, state::Op, state::State};
@@ -163,6 +163,7 @@ impl InlineProjectionAdmin for crate::FileEventStore {
                 .filter(|event| &event.tenant == tenant)
                 .cloned()
                 .collect();
+            validate_captured_order(tenant, &events).map_err(capture_error)?;
             let mut applied = 0_u64;
             let mut position = 0_u64;
             for event in &events {

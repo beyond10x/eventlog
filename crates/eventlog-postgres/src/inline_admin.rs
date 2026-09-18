@@ -10,7 +10,7 @@ use std::{
 
 use eventlog_core::{
     CaptureError, EventLogError, InlineProjectionAdmin, InlineRebuildResult, MAX_READ_LIMIT,
-    Projector, TenantId, validate_identifier,
+    Projector, TenantId, validate_captured_order, validate_identifier,
 };
 use time::OffsetDateTime;
 use tokio_postgres::IsolationLevel;
@@ -227,19 +227,19 @@ impl PostgresEventStore {
                     }
 
                     let callback_failed = Arc::new(AtomicBool::new(false));
-                    let mut position = 0_i64;
-                    let mut applied = 0_u64;
+                    let mut events = Vec::new();
+                    let mut after: Option<i64> = None;
                     loop {
                         let rows = transaction
                             .query(
                                 &format!(
                                     "SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND \
-                                     global_seq>$2 ORDER BY global_seq LIMIT $3",
+                                     ($2::bigint IS NULL OR global_seq>$2) ORDER BY global_seq LIMIT $3",
                                     self.prefix
                                 ),
                                 &[
                                     &tenant.as_str(),
-                                    &position,
+                                    &after,
                                     &to_i64(MAX_READ_LIMIT as u64)?,
                                 ],
                             )
@@ -248,28 +248,35 @@ impl PostgresEventStore {
                         if rows.is_empty() {
                             break;
                         }
-                        let mut projections = PostgresProjections {
-                            client: &transaction,
-                            blob_prefix: &self.prefix,
-                            projection_prefix: "eventlog_rebuild",
-                            lock_prefix: &self.prefix,
-                            inline: &self.inline_names,
-                            tenant,
-                            admission: None,
-                            reservation_pending: false,
-                            callback_failed: Arc::clone(&callback_failed),
-                            selected: Some(projector.projections()),
-                        };
                         for row in &rows {
                             let event = read_event(row)?;
-                            let result = projector.apply(&event, &mut projections).await;
-                            ensure_callback_integrity(&callback_failed)?;
-                            result?;
-                            position = to_i64(event.global_seq)?;
-                            applied = applied.checked_add(1).ok_or_else(|| {
-                                EventLogError::Backend("inline rebuild event count overflow".into())
-                            })?;
+                            after = Some(to_i64(event.global_seq)?);
+                            events.push(event);
                         }
+                    }
+                    validate_captured_order(tenant, &events).map_err(capture_error)?;
+                    let mut projections = PostgresProjections {
+                        client: &transaction,
+                        blob_prefix: &self.prefix,
+                        projection_prefix: "eventlog_rebuild",
+                        lock_prefix: &self.prefix,
+                        inline: &self.inline_names,
+                        tenant,
+                        admission: None,
+                        reservation_pending: false,
+                        callback_failed: Arc::clone(&callback_failed),
+                        selected: Some(projector.projections()),
+                    };
+                    let mut position = 0_i64;
+                    let mut applied = 0_u64;
+                    for event in &events {
+                        let result = projector.apply(event, &mut projections).await;
+                        ensure_callback_integrity(&callback_failed)?;
+                        result?;
+                        position = to_i64(event.global_seq)?;
+                        applied = applied.checked_add(1).ok_or_else(|| {
+                            EventLogError::Backend("inline rebuild event count overflow".into())
+                        })?;
                     }
                     for specification in projector.projections() {
                         let active = projection_table(&self.prefix, specification.name);
