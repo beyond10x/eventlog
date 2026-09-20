@@ -66,6 +66,34 @@ pub(crate) struct Journal {
     _lock: File,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
+    content: Content,
+}
+
+/// A running SHA-256 over the committed bytes of `events.jsonl`, to the committed length.
+///
+/// A handle that resumes onto a head it already chained trusts committed bytes it is not decoding
+/// again. This carries what those bytes were when it verified them, so [`Journal::resume`] can
+/// re-read exactly them and hand a history whose committed prefix is no longer the one this handle
+/// verified to the complete opener, which refuses it. Without it, damage inside the committed
+/// prefix is invisible to every later transaction, including the one that appends onto it.
+#[derive(Clone)]
+pub(crate) struct Content(Sha256);
+
+impl Content {
+    fn empty() -> Self {
+        Self(Sha256::new())
+    }
+    fn of(bytes: &[u8]) -> Self {
+        let mut content = Self::empty();
+        content.absorb(bytes);
+        content
+    }
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    fn digest(&self) -> String {
+        format!("{:x}", self.0.clone().finalize())
+    }
 }
 
 pub(crate) fn backend(error: impl std::fmt::Display) -> EventLogError {
@@ -196,26 +224,15 @@ impl Journal {
         if events.metadata().map_err(backend)?.len() > manifest.length {
             return Err(corrupt());
         }
-        // These files were never selected by a durable intent. They may contain sensitive bytes.
-        for entry in fs::read_dir(root).map_err(backend)? {
-            let entry = entry.map_err(backend)?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name == "privacy.next"
-                || name.strip_prefix(".write-").is_some_and(|id| {
-                    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
-                })
-            {
-                regular(&entry.path())?;
-                fs::remove_file(entry.path()).map_err(backend)?;
-            }
-        }
+        let content = Content::of(&committed);
+        sweep_unselected(root)?;
         sync_dir(root)?;
         Ok(Self {
             root: root.to_owned(),
             _lock: lock,
             manifest,
             transactions,
+            content,
         })
     }
 
@@ -263,27 +280,45 @@ impl Journal {
             .map_err(|_| EventLogError::UnknownCommit)?;
         self.manifest = next;
         self.transactions.push(transaction);
+        self.content.absorb(&line);
         Ok(())
+    }
+
+    /// The hash of the committed bytes this journal decoded, for a test that resumes onto them.
+    #[cfg(test)]
+    pub fn content(&self) -> Content {
+        self.content.clone()
     }
 
     pub fn extends(&self, observed: &Manifest) -> Result<bool, EventLogError> {
         extends_observed(&self.manifest, &self.transactions, observed)
     }
 
-    /// Release the lock and keep what it protected: the manifest and the verified frames.
-    pub fn into_parts(self) -> (Manifest, Vec<Value>) {
-        (self.manifest, self.transactions)
+    /// Release the lock and keep what it protected: the manifest, the verified frames, and the
+    /// hash of the committed bytes those frames were decoded from.
+    pub fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
+        (self.manifest, self.transactions, self.content)
     }
 
     /// Take the lock and decide from `manifest.json` whether the committed history is exactly
     /// `observed` or extends it, reading and verifying only the frames past `observed.length`,
     /// chained from `observed.digest` to the new manifest digest.
     ///
+    /// The committed bytes behind `observed` are re-read and hashed against `content` before any
+    /// of them is trusted, so a frame damaged in place after this handle verified it is never
+    /// served, folded onto, or appended after: it is handed to the complete opener, which refuses
+    /// it before the caller can write.
+    ///
     /// `None` hands the decision to the complete opener: a pending recovery intent, a missing
     /// manifest, a manifest that is not on the observed store and epoch or is shorter, a file
-    /// whose length is not the committed length, or a tail that does not chain. That path rereads
-    /// and re-verifies everything and refuses with the same errors it always has.
-    pub fn resume(root: &Path, observed: &Manifest) -> Result<Option<Resumed>, EventLogError> {
+    /// whose length is not the committed length, a committed prefix that is not the bytes this
+    /// handle verified, or a tail that does not chain. That path rereads and re-verifies
+    /// everything and refuses with the same errors it always has.
+    pub fn resume(
+        root: &Path,
+        observed: &Manifest,
+        content: &Content,
+    ) -> Result<Option<Resumed>, EventLogError> {
         if !fs::symlink_metadata(root).map_err(backend)?.is_dir() {
             return Err(corrupt());
         }
@@ -321,25 +356,46 @@ impl Journal {
         if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
             return Ok(None);
         }
-        // An unchanged head opens nothing but the lock and the manifest.
+        // The committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
+        // rechaining it, and the only way a handle can tell that what it verified is still there.
+        let mut events = File::open(&events_path).map_err(backend)?;
+        let mut observed_content = Content::empty();
+        let mut remaining = observed.length;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while remaining > 0 {
+            let want = usize::try_from(remaining.min(buffer.len() as u64)).map_err(backend)?;
+            let read = events.read(&mut buffer[..want]).map_err(backend)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            observed_content.absorb(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        if observed_content.digest() != content.digest() {
+            return Ok(None);
+        }
+        // Past the prefix: an unchanged head reads nothing more.
         let fresh = if manifest == *observed {
             Vec::new()
         } else {
-            let mut events = File::open(&events_path).map_err(backend)?;
-            events
-                .seek(SeekFrom::Start(observed.length))
-                .map_err(backend)?;
             let mut tail = Vec::new();
             events.read_to_end(&mut tail).map_err(backend)?;
             match decode_chain(&tail, &manifest, observed.sequence, &observed.digest) {
-                Ok(fresh) => fresh,
+                Ok(fresh) => {
+                    observed_content.absorb(&tail);
+                    fresh
+                }
                 Err(_) => return Ok(None),
             }
         };
+        if sweep_unselected(root)? {
+            sync_dir(root)?;
+        }
         Ok(Some(Resumed {
             lock,
             manifest,
             fresh,
+            content: observed_content,
         }))
     }
 
@@ -374,6 +430,7 @@ impl Journal {
         self.manifest = recover_privacy(&self.root, &self.manifest)
             .map_err(|_| EventLogError::UnknownCommit)?;
         self.transactions = transactions;
+        self.content = Content::of(&bytes);
         Ok(())
     }
 }
@@ -404,11 +461,13 @@ pub(crate) fn extends_observed(
     Ok(previous == observed.digest)
 }
 
-/// The lock, the committed manifest and the frames a handle has not verified yet.
+/// The lock, the committed manifest, the frames a handle has not verified yet, and the hash of
+/// the committed bytes this resume re-read and validated.
 pub(crate) struct Resumed {
     lock: File,
     pub manifest: Manifest,
     pub fresh: Vec<Value>,
+    content: Content,
 }
 
 impl Resumed {
@@ -420,6 +479,7 @@ impl Resumed {
             _lock: self.lock,
             manifest: self.manifest,
             transactions,
+            content: self.content,
         }
     }
 }
@@ -432,6 +492,7 @@ pub(crate) struct Strict {
     lock: File,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
+    content: Content,
 }
 
 impl Strict {
@@ -442,6 +503,7 @@ impl Strict {
             _lock: self.lock,
             manifest: self.manifest,
             transactions: self.transactions,
+            content: self.content,
         }
     }
 }
@@ -519,10 +581,12 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
         return Err(damaged());
     }
     let transactions = decode(&committed, &manifest).map_err(|_| damaged())?;
+    let content = Content::of(&committed);
     Ok(Strict {
         lock,
         manifest,
         transactions,
+        content,
     })
 }
 
@@ -540,6 +604,30 @@ fn pending_intent_exists(root: &Path) -> Result<bool, CaptureError> {
         }
     }
     Ok(false)
+}
+
+/// Remove reserved names that no durable intent ever selected, reporting whether any was there.
+///
+/// A complete open has always done this; a resumed handle does it too, because the files may hold
+/// sensitive bytes and a handle that stays open across a failed rename is otherwise the one path
+/// that never sweeps them. The caller syncs the directory when something was actually removed.
+fn sweep_unselected(root: &Path) -> Result<bool, EventLogError> {
+    let mut swept = false;
+    for entry in fs::read_dir(root).map_err(backend)? {
+        let entry = entry.map_err(backend)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "privacy.next"
+            || name.strip_prefix(".write-").is_some_and(|id| {
+                id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            })
+        {
+            regular(&entry.path())?;
+            fs::remove_file(entry.path()).map_err(backend)?;
+            swept = true;
+        }
+    }
+    Ok(swept)
 }
 
 fn recover_append(root: &Path, current: &Manifest) -> Result<(), EventLogError> {
@@ -831,8 +919,11 @@ mod tests {
         let mut journal = Journal::open(root.path()).unwrap();
         journal.append(json!({"value": 1})).unwrap();
         let observed = journal.manifest.clone();
+        let observed_content = journal.content();
         drop(journal);
-        let same = Journal::resume(root.path(), &observed).unwrap().unwrap();
+        let same = Journal::resume(root.path(), &observed, &observed_content)
+            .unwrap()
+            .unwrap();
         assert!(same.fresh.is_empty());
         assert_eq!(same.manifest, observed);
         drop(same);
@@ -840,8 +931,11 @@ mod tests {
         journal.append(json!({"value": 2})).unwrap();
         journal.append(json!({"value": 3})).unwrap();
         let head = journal.manifest.clone();
+        let head_content = journal.content();
         drop(journal);
-        let extended = Journal::resume(root.path(), &observed).unwrap().unwrap();
+        let extended = Journal::resume(root.path(), &observed, &observed_content)
+            .unwrap()
+            .unwrap();
         assert_eq!(extended.fresh, [json!({"value": 2}), json!({"value": 3})]);
         let journal = extended.into_journal(root.path(), vec![json!({"value": 1})]);
         assert_eq!(journal.manifest, head);
@@ -859,7 +953,32 @@ mod tests {
             serde_json::to_vec(&observed).unwrap(),
         )
         .unwrap();
-        assert!(Journal::resume(root.path(), &head).unwrap().is_none());
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
+        // The observed prefix left exactly as this handle verified it, and one more frame that
+        // does not chain from the observed digest: the prefix hash passes and the chain check is
+        // what refuses.
+        let mut unchained = head.clone();
+        let (line, digest) = encode(&unchained, 4, ZERO, json!({"value": 11})).unwrap();
+        let mut rebuilt = bytes.clone();
+        rebuilt.extend(line);
+        unchained.sequence = 4;
+        unchained.length = rebuilt.len() as u64;
+        unchained.digest = digest;
+        fs::write(root.path().join("events.jsonl"), &rebuilt).unwrap();
+        fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&unchained).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
         // A fork whose first three frames have the observed lengths and one frame more: the tail
         // starts exactly at the observed offset and must fail to chain from the observed digest.
         let mut fork = head.clone();
@@ -880,19 +999,56 @@ mod tests {
             serde_json::to_vec(&fork).unwrap(),
         )
         .unwrap();
-        assert!(Journal::resume(root.path(), &head).unwrap().is_none());
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
         // A privacy epoch: the complete opener decides, while the new head resumes as itself.
         let mut journal = Journal::open(root.path()).unwrap();
         journal.privacy(vec![json!({"value": "erased"})]).unwrap();
         let sanitized = journal.manifest.clone();
+        let sanitized_content = journal.content();
         drop(journal);
-        assert!(Journal::resume(root.path(), &fork).unwrap().is_none());
+        assert!(
+            Journal::resume(root.path(), &fork, &Content::of(&forked))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            Journal::resume(root.path(), &sanitized)
+            Journal::resume(root.path(), &sanitized, &sanitized_content)
                 .unwrap()
                 .unwrap()
                 .manifest,
             sanitized
+        );
+    }
+
+    #[test]
+    fn a_resumed_handle_sweeps_unselected_staging_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 1})).unwrap();
+        let observed = journal.manifest.clone();
+        let content = journal.content();
+        drop(journal);
+        // Neither name was ever selected by a durable intent, and both may hold sensitive bytes.
+        let staging = root.path().join(format!(".write-{}", new_event_id()));
+        fs::write(&staging, b"unselected").unwrap();
+        let replacement = root.path().join("privacy.next");
+        fs::write(&replacement, b"unselected").unwrap();
+        let resumed = Journal::resume(root.path(), &observed, &content)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.manifest, observed);
+        drop(resumed);
+        assert!(
+            !staging.exists(),
+            "a resumed handle removes .write-<uuid> staging files, as a complete open does"
+        );
+        assert!(
+            !replacement.exists(),
+            "a resumed handle removes privacy.next, as a complete open does"
         );
     }
 

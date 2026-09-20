@@ -507,3 +507,49 @@ async fn a_bound_blob_removed_after_open_refuses_reads_without_changing_state() 
         Err(EventLogError::Invalid(_))
     ));
 }
+/// `docs/design/file-provider.md` line 16: damaged committed frames "refuse without altering the
+/// history". The refusal is owed *before* the write — a frame committed after a damaged one leaves
+/// a history no opener accepts, which is the opposite of leaving the history alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_committed_frame_refuses_the_next_append_without_altering_the_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    store
+        .append(
+            &stream("a"),
+            Expected::NoStream,
+            &[event("item.created", 4242)],
+            &meta("first-frame", &json!({})),
+        )
+        .await
+        .unwrap();
+    // Damage inside the committed frame, leaving the committed length and the manifest untouched.
+    let events = directory.path().join("events.jsonl");
+    let committed = String::from_utf8(fs::read(&events).unwrap()).unwrap();
+    assert!(committed.contains("4242"));
+    fs::write(&events, committed.replacen("4242", "4243", 1)).unwrap();
+    let damaged = fs::read(&events).unwrap();
+    let manifest = fs::read(directory.path().join("manifest.json")).unwrap();
+    let appended = store
+        .append(
+            &stream("b"),
+            Expected::NoStream,
+            &[event("item.created", 1)],
+            &meta("after-damage", &json!({})),
+        )
+        .await;
+    assert!(
+        matches!(&appended, Err(EventLogError::Backend(message)) if message.contains("integrity")),
+        "the append refuses on the damaged prefix: {appended:?}"
+    );
+    assert_eq!(
+        fs::read(&events).unwrap(),
+        damaged,
+        "the refused append wrote no frame"
+    );
+    assert_eq!(
+        fs::read(directory.path().join("manifest.json")).unwrap(),
+        manifest,
+        "the refused append did not move the commit point"
+    );
+}

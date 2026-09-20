@@ -55,6 +55,10 @@ struct Verified {
     manifest: journal::Manifest,
     transactions: Vec<Value>,
     state: State,
+    /// The hash of the committed bytes these frames were decoded from. A resumed transaction
+    /// re-reads exactly those bytes and refuses to reuse the view when they are not them, so a
+    /// committed frame damaged in place after `open` is never served and never appended onto.
+    content: journal::Content,
 }
 struct Transaction {
     journal: Journal,
@@ -140,7 +144,7 @@ impl FileEventStore {
         let mut tx =
             blocking(move || enter(&path, observed.as_ref(), verified, inline, permit)).await?;
         let result = work(&mut tx).await?;
-        let (manifest, transactions, state, cacheable) = blocking(move || {
+        let (manifest, transactions, state, cacheable, content) = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
                     position: tx.state.next_position,
@@ -176,8 +180,8 @@ impl FileEventStore {
             // A privacy rewrite mints a new epoch over replaced bytes. Reverify it from scratch.
             let cacheable = !tx.privacy;
             let state = tx.state;
-            let (manifest, transactions) = tx.journal.into_parts();
-            Ok((manifest, transactions, state, cacheable))
+            let (manifest, transactions, content) = tx.journal.into_parts();
+            Ok((manifest, transactions, state, cacheable, content))
         })
         .await?;
         runtime.observed = Some(manifest.clone());
@@ -186,6 +190,7 @@ impl FileEventStore {
                 manifest,
                 transactions,
                 state,
+                content,
             });
         }
         Ok(result)
@@ -498,12 +503,19 @@ impl Transaction {
 /// Take the process lock and produce the transaction's journal and folded state.
 ///
 /// With a verified view of `observed` in hand, [`Journal::resume`] compares `manifest.json` with
-/// it: identical history costs the lock and that comparison; an extended history costs the frames
-/// past the observed length, chained from the observed digest, folded onto the cached state, and
-/// the objects those frames bind. Anything else — no cached view, a pending recovery intent, a new
-/// epoch, a shorter or unchained file — falls to the complete opener, which rereads and rechains
-/// the whole history, refuses one that does not extend what this handle observed, hashes every
-/// active object and disposes of snapshots and objects nothing references.
+/// it and re-hashes the committed bytes behind it: identical history costs the lock, that
+/// comparison and one raw pass over the committed prefix; an extended history costs the same pass
+/// plus the frames past the observed length, chained from the observed digest, folded onto the
+/// cached state, and the objects those frames bind. Anything else — no cached view, a pending
+/// recovery intent, a new epoch, a shorter or unchained file, or a committed prefix that is no
+/// longer the bytes this handle verified — falls to the complete opener, which rereads and
+/// rechains the whole history, refuses one that does not extend what this handle observed, hashes
+/// every active object and disposes of snapshots and objects nothing references.
+///
+/// The prefix hash is what makes the resumed path safe to *write* from: `Journal::append` seeks to
+/// the committed length and writes, so a transaction that were handed append authority over a
+/// prefix nobody re-read could commit a valid frame after a damaged one and leave a history no
+/// opener accepts. Every resumed transaction passes that check before this function returns.
 fn enter(
     root: &Path,
     observed: Option<&journal::Manifest>,
@@ -512,7 +524,7 @@ fn enter(
     permit: AdmissionPermit,
 ) -> Result<Transaction, EventLogError> {
     if let (Some(observed), Some(verified)) = (observed, verified)
-        && let Some(resumed) = Journal::resume(root, observed)?
+        && let Some(resumed) = Journal::resume(root, observed, &verified.content)?
     {
         let mut state = verified.state;
         let mut bound = Vec::new();

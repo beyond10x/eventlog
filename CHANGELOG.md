@@ -26,7 +26,12 @@ under bare-version tags such as `0.1.0`.
   `manifest.json` with the head it observed, and either reuses the frames and fold it already
   verified or reads, chains, folds and blob-verifies only the frames the file gained. A new epoch,
   a pending recovery intent, a shorter or unchained file or an unfolded head still falls back to
-  the complete reread. The divergence, blob-integrity and disposal refusals are unchanged.
+  the complete reread. Before reusing anything, the operation re-reads the committed bytes behind
+  the head it observed and hashes them against what the opener read, so a committed frame damaged
+  in place after open still refuses a read and still refuses the next append without altering the
+  history, and a history whose observed prefix was rewritten under a genuine tail is still refused.
+  A resumed operation also removes the staging names no durable intent selected. The divergence,
+  blob-integrity and disposal refusals are unchanged.
 
 ### Fixed
 

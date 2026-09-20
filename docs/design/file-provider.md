@@ -57,17 +57,24 @@ They are never a substitute for history and unproven snapshot writes refuse.
 
 A handle verifies the complete history and every active blob once, when the store is opened: every
 frame is rechained from the zero digest to the manifest digest, every active object is read and
-hashed, and stale snapshots and unreferenced objects are disposed of. Each later operation takes
-the lock and reads `manifest.json` only. When it names the same store, epoch, sequence, byte length
-and digest the handle observed, the handle reuses the frames and the fold it already verified and
-reads neither `events.jsonl` nor any blob. When it names a longer history on the same store and
-epoch, the handle reads only the bytes past its observed length, chains them from its observed
-digest to the new manifest digest, folds those frames onto the state it had, verifies the objects
-those frames bind, and disposes of snapshots they retired. Anything else — a new epoch, a pending
-recovery intent, a shorter or unchained file, a byte length that disagrees with the manifest, or a
-head this handle never folded — falls back to the complete reread, which refuses a history that
-does not extend the observed head exactly as before. So an operation costs what it touches plus
-what the file gained since the handle last looked, not the size of the store.
+hashed, and stale snapshots and unreferenced objects are disposed of. The opener also keeps a
+SHA-256 over the raw committed bytes it read. Each later operation takes the lock, reads
+`manifest.json`, and re-reads the committed bytes behind the head it observed and hashes them
+against that value. That raw pass is what makes it safe for a handle to trust frames it is not
+decoding again: a committed frame damaged in place after the handle verified it fails the
+comparison, so the handle neither serves it nor appends after it. When the manifest names the same
+store, epoch, sequence, byte length and digest the handle observed and the committed bytes are
+still the bytes it verified, the handle reuses the frames and the fold it already has, decoding no
+frame and reading no blob. When it names a longer history on the same store and epoch, the handle
+reads only the bytes past its observed length, chains them from its observed digest to the new
+manifest digest, folds those frames onto the state it had, verifies the objects those frames bind,
+and disposes of snapshots they retired. A resumed operation also removes the staging names no
+durable intent selected, as a complete open does. Anything else — a new epoch, a pending recovery
+intent, a shorter or unchained file, a byte length that disagrees with the manifest, a committed
+prefix that is not the bytes this handle verified, or a head this handle never folded — falls back
+to the complete reread, which refuses a history that does not extend the observed head exactly as
+before. So an operation costs one raw pass over the committed bytes plus what the file gained
+since the handle last looked: no frame is decoded twice and no object is read twice.
 
 ## Content and privacy
 
@@ -111,8 +118,12 @@ Journal unit tests kill subprocesses at prepared, torn-write, synchronized and p
 boundaries, and at prepared, renamed and published privacy boundaries. They also check that
 corruption and unexplained tails are preserved on refusal and that a longer fork does not extend
 a previously observed head. A journal unit test checks that a resumed handle reads only the frames
-past its observed head and hands a shorter file, an unchained fork and a new privacy epoch back to
-the complete opener; durability tests check that a blob damaged after open no longer fails an
-unrelated transaction while its own read still refuses, that frames another handle committed are
-folded and the objects they bind verified, that a longer fork of the same store is still refused,
-and that a bound object removed after open refuses its read without changing state. These are process-death tests, not simulated drive power failure.
+past its observed head and hands a shorter file, an unchained tail, an unchained fork and a new
+privacy epoch back to the complete opener, and a second checks that a resumed handle removes the
+staging names no durable intent selected; durability tests check that a blob damaged after open no
+longer fails an unrelated transaction while its own read still refuses, that frames another handle
+committed are folded and the objects they bind verified, that a longer fork of the same store is
+still refused, that a bound object removed after open refuses its read without changing state, and
+that a committed frame damaged in place after open refuses the next append without altering the
+history. A separate suite checks the same damage against an open handle's reads, its appends and a
+history whose observed prefix was rewritten under a genuine tail. These are process-death tests, not simulated drive power failure.
