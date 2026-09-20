@@ -38,6 +38,23 @@ struct Runtime {
     inline: Vec<Arc<dyn Projector>>,
     frozen: bool,
     observed: Option<journal::Manifest>,
+    /// The history behind `observed`, already verified by this handle. Present only while every
+    /// frame in it has been chained and every object its fold binds has been hashed, so a later
+    /// transaction may reuse it and pay only for what the file gained since.
+    verified: Option<Verified>,
+}
+/// One handle's verified view of the committed history, carrying the head it was folded from.
+///
+/// The head travels with the view because `runtime.observed` is advanced from five places
+/// (`transaction`, `register_inline`, `attach_inline_existing`, `rebuild_inline_projection` and
+/// the capture entry point) and only one of them folds the frames it advances over. A cache that
+/// had to be invalidated by hand at each of the others would be one edit away from serving a stale
+/// fold; instead the view is used only when its own manifest is still the observed head, so any
+/// site that moves that head — today's or tomorrow's — retires the view by moving it.
+struct Verified {
+    manifest: journal::Manifest,
+    transactions: Vec<Value>,
+    state: State,
 }
 struct Transaction {
     journal: Journal,
@@ -98,6 +115,8 @@ impl FileEventStore {
             }),
             permit: AdmissionPermit::default(),
         };
+        // The cache starts empty, so this transaction is the complete one: it rereads and chains
+        // the whole history, hashes every active object and disposes of what nothing references.
         store.transaction(|_| Box::pin(async { Ok(()) })).await?;
         Ok(store)
     }
@@ -108,35 +127,20 @@ impl FileEventStore {
     {
         let mut runtime = self.runtime.lock().await;
         let path = self.root.clone();
-        let journal = blocking(move || Journal::open_existing(&path)).await?;
-        if let Some(observed) = &runtime.observed
-            && !journal.extends(observed)?
-        {
-            return Err(backend(
-                "file history diverged from this handle's observed history",
-            ));
-        }
-        let state = State::replay(&journal.transactions)?;
-        let mut tx = Transaction {
-            journal,
-            state,
-            pending: Vec::new(),
-            inline: runtime.inline.clone(),
-            root: self.root.clone(),
-            privacy: false,
-            permit: self.permit.clone(),
-        };
-        tx = blocking(move || {
-            tx.clear_snapshots()?;
-            tx.clean_blobs()?;
-            for (tenant, digest) in tx.state.blobs.keys() {
-                tx.blob(&TenantId::new(tenant)?, digest)?;
-            }
-            Ok(tx)
-        })
-        .await?;
+        let observed = runtime.observed.clone();
+        // Taken, not borrowed: a transaction that refuses leaves no cache behind, so the next one
+        // reverifies everything rather than trusting a view assembled beside a refusal. Filtered,
+        // because another entry point may have moved the observed head past what this view folded.
+        let verified = runtime
+            .verified
+            .take()
+            .filter(|verified| Some(&verified.manifest) == observed.as_ref());
+        let inline = runtime.inline.clone();
+        let permit = self.permit.clone();
+        let mut tx =
+            blocking(move || enter(&path, observed.as_ref(), verified, inline, permit)).await?;
         let result = work(&mut tx).await?;
-        let manifest = blocking(move || {
+        let (manifest, transactions, state, cacheable) = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
                     position: tx.state.next_position,
@@ -164,11 +168,26 @@ impl FileEventStore {
                     journal::checkpoint("group-postcommit");
                 }
             }
-            tx.clean_blobs()?;
-            Ok(tx.journal.manifest.clone())
+            // Disposal belongs to the writer that changed what is referenced.
+            let committed = tx.privacy || !tx.pending.is_empty();
+            if committed {
+                tx.clean_blobs()?;
+            }
+            // A privacy rewrite mints a new epoch over replaced bytes. Reverify it from scratch.
+            let cacheable = !tx.privacy;
+            let state = tx.state;
+            let (manifest, transactions) = tx.journal.into_parts();
+            Ok((manifest, transactions, state, cacheable))
         })
         .await?;
-        runtime.observed = Some(manifest);
+        runtime.observed = Some(manifest.clone());
+        if cacheable {
+            runtime.verified = Some(Verified {
+                manifest,
+                transactions,
+                state,
+            });
+        }
         Ok(result)
     }
     async fn freeze(&self) {
@@ -476,6 +495,75 @@ impl Transaction {
         })
     }
 }
+/// Take the process lock and produce the transaction's journal and folded state.
+///
+/// With a verified view of `observed` in hand, [`Journal::resume`] compares `manifest.json` with
+/// it: identical history costs the lock and that comparison; an extended history costs the frames
+/// past the observed length, chained from the observed digest, folded onto the cached state, and
+/// the objects those frames bind. Anything else — no cached view, a pending recovery intent, a new
+/// epoch, a shorter or unchained file — falls to the complete opener, which rereads and rechains
+/// the whole history, refuses one that does not extend what this handle observed, hashes every
+/// active object and disposes of snapshots and objects nothing references.
+fn enter(
+    root: &Path,
+    observed: Option<&journal::Manifest>,
+    verified: Option<Verified>,
+    inline: Vec<Arc<dyn Projector>>,
+    permit: AdmissionPermit,
+) -> Result<Transaction, EventLogError> {
+    if let (Some(observed), Some(verified)) = (observed, verified)
+        && let Some(resumed) = Journal::resume(root, observed)?
+    {
+        let mut state = verified.state;
+        let mut bound = Vec::new();
+        for transaction in &resumed.fresh {
+            bound.extend(state.fold(transaction)?);
+        }
+        let advanced = !resumed.fresh.is_empty();
+        let tx = Transaction {
+            journal: resumed.into_journal(root, verified.transactions),
+            state,
+            pending: Vec::new(),
+            inline,
+            root: root.to_owned(),
+            privacy: false,
+            permit,
+        };
+        // Only the objects the new frames bind are new to this handle; the rest it already hashed.
+        for (tenant, digest) in &bound {
+            tx.blob(tenant, digest)?;
+        }
+        if advanced {
+            // Another writer's frames can retire a generation this handle still has cached.
+            tx.clear_snapshots()?;
+        }
+        return Ok(tx);
+    }
+    let journal = Journal::open_existing(root)?;
+    if let Some(observed) = observed
+        && !journal.extends(observed)?
+    {
+        return Err(backend(
+            "file history diverged from this handle's observed history",
+        ));
+    }
+    let tx = Transaction {
+        state: State::replay(&journal.transactions)?,
+        journal,
+        pending: Vec::new(),
+        inline,
+        root: root.to_owned(),
+        privacy: false,
+        permit,
+    };
+    tx.clear_snapshots()?;
+    tx.clean_blobs()?;
+    for (tenant, digest) in tx.state.blobs.keys() {
+        tx.blob(&TenantId::new(tenant)?, digest)?;
+    }
+    Ok(tx)
+}
+
 /// One store root, resolved the same way for the ordinary opener and the read-only handle.
 fn root_path(path: &Path) -> Result<PathBuf, EventLogError> {
     if path.is_absolute() {

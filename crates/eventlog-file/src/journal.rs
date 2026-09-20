@@ -270,6 +270,79 @@ impl Journal {
         extends_observed(&self.manifest, &self.transactions, observed)
     }
 
+    /// Release the lock and keep what it protected: the manifest and the verified frames.
+    pub fn into_parts(self) -> (Manifest, Vec<Value>) {
+        (self.manifest, self.transactions)
+    }
+
+    /// Take the lock and decide from `manifest.json` whether the committed history is exactly
+    /// `observed` or extends it, reading and verifying only the frames past `observed.length`,
+    /// chained from `observed.digest` to the new manifest digest.
+    ///
+    /// `None` hands the decision to the complete opener: a pending recovery intent, a missing
+    /// manifest, a manifest that is not on the observed store and epoch or is shorter, a file
+    /// whose length is not the committed length, or a tail that does not chain. That path rereads
+    /// and re-verifies everything and refuses with the same errors it always has.
+    pub fn resume(root: &Path, observed: &Manifest) -> Result<Option<Resumed>, EventLogError> {
+        if !fs::symlink_metadata(root).map_err(backend)?.is_dir() {
+            return Err(corrupt());
+        }
+        let lock_path = root.join("writer.lock");
+        regular(&lock_path)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(backend)?;
+        lock.lock().map_err(backend)?;
+        if root.join("append.json").exists() || root.join("privacy.json").exists() {
+            return Ok(None);
+        }
+        let manifest_path = root.join("manifest.json");
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(&read(&manifest_path)?).map_err(|_| corrupt())?;
+        if manifest.format != FORMAT {
+            return Err(corrupt());
+        }
+        if manifest.store != observed.store
+            || manifest.epoch != observed.epoch
+            || manifest.sequence < observed.sequence
+            || manifest.length < observed.length
+        {
+            return Ok(None);
+        }
+        let events_path = root.join("events.jsonl");
+        regular(&events_path)?;
+        if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
+            return Ok(None);
+        }
+        // An unchanged head opens nothing but the lock and the manifest.
+        let fresh = if manifest == *observed {
+            Vec::new()
+        } else {
+            let mut events = File::open(&events_path).map_err(backend)?;
+            events
+                .seek(SeekFrom::Start(observed.length))
+                .map_err(backend)?;
+            let mut tail = Vec::new();
+            events.read_to_end(&mut tail).map_err(backend)?;
+            match decode_chain(&tail, &manifest, observed.sequence, &observed.digest) {
+                Ok(fresh) => fresh,
+                Err(_) => return Ok(None),
+            }
+        };
+        Ok(Some(Resumed {
+            lock,
+            manifest,
+            fresh,
+        }))
+    }
+
     /// Privacy is the only rewrite path. The caller supplies history with only erased data removed.
     pub fn privacy(&mut self, transactions: Vec<Value>) -> Result<(), EventLogError> {
         let mut next = self.manifest.clone();
@@ -329,6 +402,26 @@ pub(crate) fn extends_observed(
         previous = encode(manifest, index as u64 + 1, &previous, transaction.clone())?.1;
     }
     Ok(previous == observed.digest)
+}
+
+/// The lock, the committed manifest and the frames a handle has not verified yet.
+pub(crate) struct Resumed {
+    lock: File,
+    pub manifest: Manifest,
+    pub fresh: Vec<Value>,
+}
+
+impl Resumed {
+    /// Assemble the writer from the handle's verified frames followed by the fresh ones.
+    pub fn into_journal(self, root: &Path, mut transactions: Vec<Value>) -> Journal {
+        transactions.extend(self.fresh);
+        Journal {
+            root: root.to_owned(),
+            _lock: self.lock,
+            manifest: self.manifest,
+            transactions,
+        }
+    }
 }
 
 /// One committed history, read without the authority to change it.
@@ -505,18 +598,31 @@ fn encode(
     Ok((bytes, frame.digest))
 }
 fn decode(bytes: &[u8], manifest: &Manifest) -> Result<Vec<Value>, EventLogError> {
-    if bytes.len() as u64 != manifest.length || (!bytes.is_empty() && bytes.last() != Some(&b'\n'))
-    {
+    if bytes.len() as u64 != manifest.length {
         return Err(corrupt());
     }
-    let mut previous = ZERO.to_owned();
+    decode_chain(bytes, manifest, 0, ZERO)
+}
+/// Verify the frames `sequence + 1..=manifest.sequence`, chained from `previous` to the manifest
+/// digest. The complete history starts at zero; a resumed handle starts at its observed head.
+fn decode_chain(
+    bytes: &[u8],
+    manifest: &Manifest,
+    mut sequence: u64,
+    previous: &str,
+) -> Result<Vec<Value>, EventLogError> {
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(corrupt());
+    }
+    let mut previous = previous.to_owned();
     let mut transactions = Vec::new();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let mut frame: Frame = serde_json::from_slice(line).map_err(|_| corrupt())?;
+        sequence = sequence.checked_add(1).ok_or_else(corrupt)?;
         if frame.format != FORMAT
             || frame.store != manifest.store
             || frame.epoch != manifest.epoch
-            || frame.sequence != transactions.len() as u64 + 1
+            || frame.sequence != sequence
             || frame.previous != previous
         {
             return Err(corrupt());
@@ -528,7 +634,7 @@ fn decode(bytes: &[u8], manifest: &Manifest) -> Result<Vec<Value>, EventLogError
         previous = digest;
         transactions.push(frame.transaction);
     }
-    if transactions.len() as u64 != manifest.sequence || previous != manifest.digest {
+    if sequence != manifest.sequence || previous != manifest.digest {
         return Err(corrupt());
     }
     Ok(transactions)
@@ -717,6 +823,77 @@ mod tests {
         drop(journal);
         let fork = Journal::open(root.path()).unwrap();
         assert!(!fork.extends(&observed).unwrap());
+    }
+
+    #[test]
+    fn resume_reads_only_frames_past_the_observed_head() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 1})).unwrap();
+        let observed = journal.manifest.clone();
+        drop(journal);
+        let same = Journal::resume(root.path(), &observed).unwrap().unwrap();
+        assert!(same.fresh.is_empty());
+        assert_eq!(same.manifest, observed);
+        drop(same);
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 2})).unwrap();
+        journal.append(json!({"value": 3})).unwrap();
+        let head = journal.manifest.clone();
+        drop(journal);
+        let extended = Journal::resume(root.path(), &observed).unwrap().unwrap();
+        assert_eq!(extended.fresh, [json!({"value": 2}), json!({"value": 3})]);
+        let journal = extended.into_journal(root.path(), vec![json!({"value": 1})]);
+        assert_eq!(journal.manifest, head);
+        assert_eq!(journal.transactions.len(), 3);
+        drop(journal);
+        // Shorter than observed: the complete opener decides.
+        let bytes = fs::read(root.path().join("events.jsonl")).unwrap();
+        fs::write(
+            root.path().join("events.jsonl"),
+            &bytes[..usize::try_from(observed.length).unwrap()],
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&observed).unwrap(),
+        )
+        .unwrap();
+        assert!(Journal::resume(root.path(), &head).unwrap().is_none());
+        // A fork whose first three frames have the observed lengths and one frame more: the tail
+        // starts exactly at the observed offset and must fail to chain from the observed digest.
+        let mut fork = head.clone();
+        let mut previous = ZERO.to_owned();
+        let mut forked = Vec::new();
+        for (sequence, value) in [(1, 7), (2, 8), (3, 9), (4, 10)] {
+            let (line, digest) =
+                encode(&fork, sequence, &previous, json!({"value": value})).unwrap();
+            forked.extend(line);
+            previous = digest;
+        }
+        fork.sequence = 4;
+        fork.length = forked.len() as u64;
+        fork.digest = previous;
+        fs::write(root.path().join("events.jsonl"), &forked).unwrap();
+        fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&fork).unwrap(),
+        )
+        .unwrap();
+        assert!(Journal::resume(root.path(), &head).unwrap().is_none());
+        // A privacy epoch: the complete opener decides, while the new head resumes as itself.
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.privacy(vec![json!({"value": "erased"})]).unwrap();
+        let sanitized = journal.manifest.clone();
+        drop(journal);
+        assert!(Journal::resume(root.path(), &fork).unwrap().is_none());
+        assert_eq!(
+            Journal::resume(root.path(), &sanitized)
+                .unwrap()
+                .unwrap()
+                .manifest,
+            sanitized
+        );
     }
 
     #[test]

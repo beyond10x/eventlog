@@ -16,8 +16,8 @@ frame with an empty digest field. Unknown physical fields, wrong sequence/previo
 missing committed bytes and damaged committed frames refuse without altering the history.
 
 `writer.lock` is permanent and outside the disposable cache. Each operation opens its own lock
-file description, takes an exclusive process lock, verifies the journal and folds its operations,
-then retains that lock through callbacks and commit. Never unlink the lock file while a process
+file description, takes an exclusive process lock, establishes the committed history it will work
+against, and retains that lock through callbacks and commit. Never unlink the lock file while a process
 can use the directory. All writers serialize, including absent streams and reverse-order groups.
 Callbacks access blobs and projections through their transaction context. Re-entering the outer
 store from a callback is unsupported, as with the SQL providers.
@@ -55,16 +55,28 @@ rebuild. A rebuild commits all rows and its cursor together. Snapshots live unde
 a persisted history-generation coordinate, and may be deleted or discarded when unreadable.
 They are never a substitute for history and unproven snapshot writes refuse.
 
-The v1 implementation rereads and verifies history per operation. This deliberately has no
-production throughput or large-history claim. A later accelerator must preserve the same
-verification and disposal contracts.
+A handle verifies the complete history and every active blob once, when the store is opened: every
+frame is rechained from the zero digest to the manifest digest, every active object is read and
+hashed, and stale snapshots and unreferenced objects are disposed of. Each later operation takes
+the lock and reads `manifest.json` only. When it names the same store, epoch, sequence, byte length
+and digest the handle observed, the handle reuses the frames and the fold it already verified and
+reads neither `events.jsonl` nor any blob. When it names a longer history on the same store and
+epoch, the handle reads only the bytes past its observed length, chains them from its observed
+digest to the new manifest digest, folds those frames onto the state it had, verifies the objects
+those frames bind, and disposes of snapshots they retired. Anything else — a new epoch, a pending
+recovery intent, a shorter or unchained file, a byte length that disagrees with the manifest, or a
+head this handle never folded — falls back to the complete reread, which refuses a history that
+does not extend the observed head exactly as before. So an operation costs what it touches plus
+what the file gained since the handle last looked, not the size of the store.
 
 ## Content and privacy
 
 Blob bytes live separately in `blobs/`; journal entries contain a tenant/digest binding, object
 identity and content hash. Bytes and their directory entry are synchronized before the binding
-commits. Reusing a binding for different bytes refuses. Reads and reopen verify active content
-hashes. Deletion and tenant erasure remove unreferenced objects from the active directory.
+commits. Reusing a binding for different bytes refuses. Open and reopen verify every active content hash;
+afterwards a read verifies the bytes it reads, and the first sight of a frame another writer
+committed verifies the objects that frame binds, so damaged bytes are refused whether they are
+read or newly bound. Deletion and tenant erasure remove unreferenced objects from the active directory.
 The public digest spelling retains the existing blob-port compatibility; an additional computed
 SHA-256 verifies the actual stored bytes.
 
@@ -98,4 +110,9 @@ expectations, blob corruption, missing authority, physical privacy and projectio
 Journal unit tests kill subprocesses at prepared, torn-write, synchronized and published append
 boundaries, and at prepared, renamed and published privacy boundaries. They also check that
 corruption and unexplained tails are preserved on refusal and that a longer fork does not extend
-a previously observed head. These are process-death tests, not simulated drive power failure.
+a previously observed head. A journal unit test checks that a resumed handle reads only the frames
+past its observed head and hands a shorter file, an unchained fork and a new privacy epoch back to
+the complete opener; durability tests check that a blob damaged after open no longer fails an
+unrelated transaction while its own read still refuses, that frames another handle committed are
+folded and the objects they bind verified, that a longer fork of the same store is still refused,
+and that a bound object removed after open refuses its read without changing state. These are process-death tests, not simulated drive power failure.

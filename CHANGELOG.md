@@ -19,6 +19,15 @@ under bare-version tags such as `0.1.0`.
   Rebuild uses the attached instance, complete committed history and active blobs, preserving
   unrelated tenants and publishing selected rows and cursor together.
 
+### Changed
+
+- File verifies the complete committed history and every active blob once, when the store is
+  opened, instead of on every operation. A later operation takes the process lock, compares
+  `manifest.json` with the head it observed, and either reuses the frames and fold it already
+  verified or reads, chains, folds and blob-verifies only the frames the file gained. A new epoch,
+  a pending recovery intent, a shorter or unchained file or an unfolded head still falls back to
+  the complete reread. The divergence, blob-integrity and disposal refusals are unchanged.
+
 ### Fixed
 
 - Inline rebuild validates complete stored event history before applying projectors. SQL capture

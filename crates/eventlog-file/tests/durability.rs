@@ -5,7 +5,11 @@ use eventlog_core::{
 };
 use eventlog_file::FileEventStore;
 use serde_json::json;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn tenant() -> TenantId {
     TenantId::new("durable-owner").unwrap()
@@ -342,4 +346,164 @@ async fn redaction_fences_projection_reads_and_new_writes_until_complete_rebuild
             .event_id,
         first.appends[0].events[0].event_id
     );
+}
+
+fn blob_object(root: &Path, bytes: &[u8]) -> PathBuf {
+    fs::read_dir(root.join("blobs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| fs::read(path).unwrap() == bytes)
+        .expect("bound blob object")
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_that_does_not_touch_a_blob_does_not_reverify_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    store
+        .put_blob(&tenant(), "digest", b"original")
+        .await
+        .unwrap();
+    let object = blob_object(directory.path(), b"original");
+    fs::write(&object, b"tampered").unwrap();
+    // History and blobs were verified at open; work that does not read this blob costs no reread.
+    assert_eq!(store.stream_version(&stream("a")).await.unwrap(), None);
+    let appended = store
+        .append(
+            &stream("a"),
+            Expected::NoStream,
+            &[event("item.created", 1)],
+            &meta("untouched", &json!({})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(appended.last_version, 1);
+    // The bytes are verified when they are read.
+    assert!(matches!(
+        store.get_blob(&tenant(), "digest").await,
+        Err(EventLogError::Backend(message)) if message.contains("integrity")
+    ));
+    assert_eq!(
+        fs::read(&object).unwrap(),
+        b"tampered",
+        "refusal preserves evidence"
+    );
+    drop(store);
+    assert!(
+        FileEventStore::open(directory.path()).await.is_err(),
+        "reopen verifies every active blob"
+    );
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn frames_committed_by_another_handle_are_folded_and_their_blobs_verified() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = FileEventStore::open(directory.path()).await.unwrap();
+    first
+        .put_blob(&tenant(), "old", b"old-bytes")
+        .await
+        .unwrap();
+    let old = blob_object(directory.path(), b"old-bytes");
+    let second = FileEventStore::open(directory.path()).await.unwrap();
+    second
+        .append(
+            &stream("a"),
+            Expected::NoStream,
+            &[event("item.created", 1)],
+            &meta("second-writer", &json!({})),
+        )
+        .await
+        .unwrap();
+    second
+        .put_blob(&tenant(), "fresh", b"fresh-bytes")
+        .await
+        .unwrap();
+    // `first` verified this object when it bound it. Folding frames it has not seen yet does not
+    // re-read the objects the frames it already folded bind.
+    fs::write(&old, b"tampered!").unwrap();
+    assert_eq!(first.stream_version(&stream("a")).await.unwrap(), Some(1));
+    fs::write(&old, b"old-bytes").unwrap();
+    assert_eq!(
+        first.get_blob(&tenant(), "fresh").await.unwrap(),
+        Some(b"fresh-bytes".to_vec())
+    );
+    second
+        .put_blob(&tenant(), "later", b"later-bytes")
+        .await
+        .unwrap();
+    let object = blob_object(directory.path(), b"later-bytes");
+    fs::write(&object, b"tampered!!!").unwrap();
+    // The frame that binds the damaged blob is new to `first`, so its first observation verifies it.
+    assert!(matches!(
+        first.stream_version(&stream("a")).await,
+        Err(EventLogError::Backend(message)) if message.contains("integrity")
+    ));
+    fs::write(&object, b"later-bytes").unwrap();
+    assert_eq!(
+        first.get_blob(&tenant(), "later").await.unwrap(),
+        Some(b"later-bytes".to_vec())
+    );
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_longer_fork_of_the_same_store_is_refused_by_an_open_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let fork = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    for name in ["manifest.json", "events.jsonl"] {
+        fs::copy(directory.path().join(name), fork.path().join(name)).unwrap();
+    }
+    store.put_blob(&tenant(), "digest", b"left").await.unwrap();
+    // Same store identity, same epoch, a first frame of identical length with different content,
+    // and one frame more: the fork's second frame starts exactly where the handle's history ended.
+    let other = FileEventStore::open(fork.path()).await.unwrap();
+    other.put_blob(&tenant(), "digest", b"right").await.unwrap();
+    other.put_blob(&tenant(), "second", b"more").await.unwrap();
+    drop(other);
+    for name in ["events.jsonl", "manifest.json"] {
+        fs::copy(fork.path().join(name), directory.path().join(name)).unwrap();
+    }
+    for entry in fs::read_dir(fork.path().join("blobs")).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(
+            entry.path(),
+            directory.path().join("blobs").join(entry.file_name()),
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        store.stream_version(&stream("a")).await,
+        Err(EventLogError::Backend(message)) if message.contains("diverged")
+    ));
+    assert!(matches!(
+        store.get_blob(&tenant(), "second").await,
+        Err(EventLogError::Backend(message)) if message.contains("diverged")
+    ));
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_blob_removed_after_open_refuses_reads_without_changing_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    store
+        .put_blob(&tenant(), "digest", b"original")
+        .await
+        .unwrap();
+    let object = blob_object(directory.path(), b"original");
+    let manifest = fs::read(directory.path().join("manifest.json")).unwrap();
+    fs::remove_file(&object).unwrap();
+    // The object was verified at open; work that does not read it does not miss the file.
+    assert_eq!(store.stream_version(&stream("a")).await.unwrap(), None);
+    assert!(store.get_blob(&tenant(), "digest").await.is_err());
+    assert_eq!(
+        fs::read(directory.path().join("manifest.json")).unwrap(),
+        manifest,
+        "a refused read commits nothing"
+    );
+    // The binding is still history: restored bytes serve again, different bytes are still refused.
+    fs::write(&object, b"original").unwrap();
+    assert_eq!(
+        store.get_blob(&tenant(), "digest").await.unwrap(),
+        Some(b"original".to_vec())
+    );
+    assert!(matches!(
+        store.put_blob(&tenant(), "digest", b"different").await,
+        Err(EventLogError::Invalid(_))
+    ));
 }

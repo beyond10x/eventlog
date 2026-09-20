@@ -115,11 +115,26 @@ impl State {
     pub fn replay(transactions: &[Value]) -> Result<Self, EventLogError> {
         let mut state = Self::default();
         for transaction in transactions {
-            for op in serde_json::from_value::<Vec<Op>>(transaction.clone()).map_err(backend)? {
-                state.apply(op)?;
-            }
+            state.fold(transaction)?;
         }
         Ok(state)
+    }
+    /// Apply one committed transaction and return the blob bindings it created, so a handle that
+    /// folds frames it has not seen before can verify exactly the objects they bind.
+    pub fn fold(&mut self, transaction: &Value) -> Result<Vec<(TenantId, String)>, EventLogError> {
+        let mut bound = Vec::new();
+        for op in serde_json::from_value::<Vec<Op>>(transaction.clone()).map_err(backend)? {
+            if let Op::Blob {
+                tenant,
+                digest,
+                object: Some(_),
+            } = &op
+            {
+                bound.push((tenant.clone(), digest.clone()));
+            }
+            self.apply(op)?;
+        }
+        Ok(bound)
     }
     pub fn head(&self, stream: &StreamId) -> u64 {
         self.events
