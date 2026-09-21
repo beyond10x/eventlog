@@ -102,7 +102,21 @@ caller, which is the same rule a read on the write path follows.
 
 Blob bytes live separately in `blobs/`; journal entries contain a tenant/digest binding, object
 identity and content hash. Bytes and their directory entry are synchronized before the binding
-commits. Reusing a binding for different bytes refuses. Open and reopen verify every active content hash;
+commits. Reusing a binding for different bytes refuses.
+
+**Where the barrier is for a grouped write.** A blob written on its own takes a transaction of its
+own, so it takes its own barrier: object bytes synchronized, directory entry synchronized, then the
+commit sequence `append.json` → frame → manifest → directory. `append_group_with_blobs` writes the
+blobs inside the group's transaction instead, so a batch of any size takes **the group's one
+barrier and none besides**: every object is written and synchronized, the object directory is
+synchronized **once for the whole batch**, and the bindings are pending operations in the single
+frame the group commits. The barrier is therefore in exactly the same place it was — before the
+manifest that publishes the frame — and what changed is how many frames the same work costs. The
+durability promise is unchanged in both directions: nothing of the batch is observable before that
+manifest, and a crash before it leaves object files no committed frame names, which the next
+committed transaction and the complete opener dispose of as unreferenced. A deduplicated group
+retry binds nothing, because the original commit already bound it. Refusing one blob of a batch
+refuses the whole group and publishes neither. Open and reopen verify every active content hash;
 afterwards a read verifies the bytes it reads, and the first sight of a frame another writer
 committed verifies the objects that frame binds, so damaged bytes are refused whether they are
 read or newly bound. Deletion and tenant erasure remove unreferenced objects from the active directory.
@@ -155,4 +169,10 @@ every time; `tests/consistent_capture.rs` checks that a capture reusing a view s
 another writer committed, that a committed frame damaged in place afterwards refuses through the
 strict reader without changing a file, that damaged content still refuses the next capture, that a
 writers' lock that is no longer a regular file refuses one, and that a reserved recovery entry
-appearing after a capture — including one that cannot be followed — refuses the next. These are process-death tests, not simulated drive power failure.
+appearing after a capture — including one that cannot be followed — refuses the next. A grouped-blob
+unit test kills a subprocess at every boundary the joined write has, including the one between
+synchronized object files and the unpublished frame that binds them, and requires the group and
+every blob of it to be present together or absent together, the unreferenced objects of an
+interrupted batch to be gone, and the retry to deduplicate; a second counts the barriers a batch
+takes against the barriers the same work takes one blob per transaction, and a third checks that
+both paths bind the same digests to the same bytes. These are process-death tests, not simulated drive power failure.

@@ -298,6 +298,10 @@ impl Journal {
         fs::remove_file(self.root.join("append.json"))
             .and_then(|()| File::open(&self.root)?.sync_all())
             .map_err(|_| EventLogError::UnknownCommit)?;
+        #[cfg(test)]
+        crate::cost::charge(&self.root, |cost| {
+            cost.durability_barriers += 1;
+        });
         self.manifest = next;
         self.transactions.push(transaction);
         self.content.absorb(&line);
@@ -396,6 +400,10 @@ impl Journal {
         checkpoint("privacy-prepared");
         self.manifest = recover_privacy(&self.root, &self.manifest)
             .map_err(|_| EventLogError::UnknownCommit)?;
+        #[cfg(test)]
+        crate::cost::charge(&self.root, |cost| {
+            cost.durability_barriers += 1;
+        });
         self.transactions = transactions;
         self.content = Content::of(&bytes);
         Ok(())

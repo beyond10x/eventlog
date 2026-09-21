@@ -27,6 +27,15 @@ pub(crate) struct Cost {
     pub prefix_bytes_hashed: u64,
     /// Blob objects read and hashed against the hash the committed history recorded for them.
     pub blobs_hashed: u64,
+    /// Durability barriers published against this root: one per committed journal frame, and one
+    /// per privacy epoch. This is the unit a write is charged in, not the `fsync` count — a
+    /// barrier is the commit sequence `append.json` → frame → manifest → directory, and what a
+    /// batched writer removes is the sequence, not the individual synchronizations inside it.
+    pub durability_barriers: u64,
+    /// Object files and object-directory entries synchronized. Counted beside the barriers
+    /// because a batch that took one barrier and still synchronized its directory once per blob
+    /// would read as fixed against a metric that only counted commits.
+    pub object_syncs: u64,
 }
 
 impl std::ops::Sub for Cost {
@@ -38,6 +47,8 @@ impl std::ops::Sub for Cost {
             frames_folded: self.frames_folded - earlier.frames_folded,
             prefix_bytes_hashed: self.prefix_bytes_hashed - earlier.prefix_bytes_hashed,
             blobs_hashed: self.blobs_hashed - earlier.blobs_hashed,
+            durability_barriers: self.durability_barriers - earlier.durability_barriers,
+            object_syncs: self.object_syncs - earlier.object_syncs,
         }
     }
 }

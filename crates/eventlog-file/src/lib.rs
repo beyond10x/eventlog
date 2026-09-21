@@ -202,6 +202,100 @@ impl FileEventStore {
         }
         Ok(result)
     }
+    /// Commit an append group together with the blobs it binds, under the group's one barrier.
+    ///
+    /// The blobs are written, synchronized and bound inside the group's own transaction, so a
+    /// batch of any size costs the frame the group already commits and no barrier besides. A
+    /// caller that instead calls [`EventStore::put_blob`] once per blob pays one barrier per
+    /// blob, which is what this exists to remove; the bindings and the bytes are the same either
+    /// way. A deduplicated retry binds nothing, because the original commit already bound it.
+    ///
+    /// # Errors
+    /// Refuses whatever the group and each blob refuse on their own paths, and publishes nothing
+    /// — not the group and not a blob — when either refuses.
+    pub async fn append_group_with_blobs(
+        &self,
+        group: &AppendGroup,
+        blobs: &[(String, Vec<u8>)],
+    ) -> Result<AppendGroupResult, EventLogError> {
+        self.group(group, Arc::new(NoGuard), blobs).await
+    }
+    async fn group(
+        &self,
+        group: &AppendGroup,
+        guard: Arc<dyn Guard>,
+        blobs: &[(String, Vec<u8>)],
+    ) -> Result<AppendGroupResult, EventLogError> {
+        let digest = group.fingerprint()?;
+        let group = group.clone();
+        let blobs = blobs.to_vec();
+        self.freeze().await;
+        self.transaction(move |tx| {
+            Box::pin(async move {
+                if let Some((old, ranges)) = tx
+                    .state
+                    .groups
+                    .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
+                {
+                    if old != &digest {
+                        return Err(EventLogError::IdempotencyMismatch {
+                            key: group.meta.idempotency_key.clone(),
+                        });
+                    }
+                    return Ok(AppendGroupResult {
+                        appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
+                        deduplicated: true,
+                    });
+                }
+                guard
+                    .check(&mut projection::View {
+                        admission: true,
+                        selected: None,
+                        tx,
+                        tenant: &group.tenant,
+                    })
+                    .await?;
+                tx.bind_blobs(&group.tenant, &blobs).await?;
+                #[cfg(test)]
+                if !blobs.is_empty() {
+                    journal::checkpoint("group-blobs-written");
+                }
+                let mut appends = Vec::new();
+                let mut ranges = Vec::new();
+                #[cfg(test)]
+                let mut member = 0;
+                for entry in &group.appends {
+                    let result = tx
+                        .append(&entry.stream, entry.expected, &entry.events, &group.meta)
+                        .await?;
+                    #[cfg(test)]
+                    {
+                        member += 1;
+                        journal::checkpoint(&format!("group-member-{member}"));
+                    }
+                    ranges.push(GroupRange {
+                        stream: entry.stream.clone(),
+                        first_version: result.first_version,
+                        last_version: result.last_version,
+                    });
+                    appends.push(result);
+                }
+                tx.record(Op::Group {
+                    tenant: group.tenant,
+                    key: group.meta.idempotency_key,
+                    digest,
+                    ranges,
+                })?;
+                #[cfg(test)]
+                journal::checkpoint("group-bookkeeping");
+                Ok(AppendGroupResult {
+                    appends,
+                    deduplicated: false,
+                })
+            })
+        })
+        .await
+    }
     async fn freeze(&self) {
         self.runtime.lock().await.frozen = true;
     }
@@ -436,6 +530,91 @@ impl Transaction {
         }
         Ok(Some(bytes))
     }
+    /// Write, synchronize and bind every blob of one batch inside this transaction.
+    ///
+    /// The batch takes **no barrier of its own**. Each object file is written and synchronized,
+    /// the object directory is synchronized once for the whole batch, and the bindings are
+    /// recorded as pending operations — so what publishes them is the single frame this
+    /// transaction commits, in the ordering [`Journal::append`] already enforces: every object is
+    /// durable, and its directory entry is durable, before the manifest that names the frame
+    /// binding it. A crash anywhere before that manifest leaves object files no committed frame
+    /// references, and [`Transaction::clean_blobs`] and the complete opener dispose of them.
+    ///
+    /// That is the whole difference from a blob per transaction: the barrier count is the number
+    /// of frames, and one group is one frame however many blobs it binds.
+    async fn bind_blobs(
+        &mut self,
+        tenant: &TenantId,
+        blobs: &[(String, Vec<u8>)],
+    ) -> Result<(), EventLogError> {
+        let directory = self.root.join("blobs");
+        let mut fresh: Vec<(Blob, String)> = Vec::new();
+        let mut objects: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for (digest, bytes) in blobs {
+            validate_field("blob digest", digest)?;
+            // A digest repeated inside one batch binds once, and disagrees with itself exactly as
+            // it would disagree with a binding the committed history already carries.
+            if let Some((earlier, _)) = fresh.iter().find(|(_, name)| name == digest) {
+                if earlier.hash != hash(bytes) {
+                    return Err(EventLogError::Invalid(
+                        "blob digest already names different content".into(),
+                    ));
+                }
+                continue;
+            }
+            if let Some(old) = self.blob(tenant, digest)? {
+                if &old != bytes {
+                    return Err(EventLogError::Invalid(
+                        "blob digest already names different content".into(),
+                    ));
+                }
+                continue;
+            }
+            let blob = Blob {
+                id: new_event_id(),
+                hash: hash(bytes),
+            };
+            objects.push((directory.join(&blob.id), bytes.clone()));
+            fresh.push((blob, digest.clone()));
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(&directory).map_err(backend)?;
+        self::directory(&directory)?;
+        let count = objects.len();
+        blocking(move || {
+            use std::io::Write;
+            for (path, bytes) in &objects {
+                let mut file = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(backend)?;
+                file.write_all(bytes)
+                    .and_then(|()| file.sync_all())
+                    .map_err(backend)?;
+            }
+            fs::File::open(directory)
+                .and_then(|f| f.sync_all())
+                .map_err(backend)
+        })
+        .await?;
+        #[cfg(test)]
+        cost::charge(&self.root, |cost| {
+            cost.object_syncs += count as u64 + 1;
+        });
+        #[cfg(not(test))]
+        let _ = count;
+        for (blob, digest) in fresh {
+            self.record(Op::Blob {
+                tenant: tenant.clone(),
+                digest,
+                object: Some(blob),
+            })?;
+        }
+        Ok(())
+    }
     fn clean_blobs(&self) -> Result<(), EventLogError> {
         let directory = self.root.join("blobs");
         if !directory.exists() {
@@ -615,71 +794,7 @@ impl AtomicEventStore for FileEventStore {
         group: &'a AppendGroup,
         guard: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
-        Box::pin(async move {
-            let digest = group.fingerprint()?;
-            let group = group.clone();
-            self.freeze().await;
-            self.transaction(move |tx| {
-                Box::pin(async move {
-                    if let Some((old, ranges)) = tx
-                        .state
-                        .groups
-                        .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
-                    {
-                        if old != &digest {
-                            return Err(EventLogError::IdempotencyMismatch {
-                                key: group.meta.idempotency_key.clone(),
-                            });
-                        }
-                        return Ok(AppendGroupResult {
-                            appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
-                            deduplicated: true,
-                        });
-                    }
-                    guard
-                        .check(&mut projection::View {
-                            admission: true,
-                            selected: None,
-                            tx,
-                            tenant: &group.tenant,
-                        })
-                        .await?;
-                    let mut appends = Vec::new();
-                    let mut ranges = Vec::new();
-                    #[cfg(test)]
-                    let mut member = 0;
-                    for entry in &group.appends {
-                        let result = tx
-                            .append(&entry.stream, entry.expected, &entry.events, &group.meta)
-                            .await?;
-                        #[cfg(test)]
-                        {
-                            member += 1;
-                            journal::checkpoint(&format!("group-member-{member}"));
-                        }
-                        ranges.push(GroupRange {
-                            stream: entry.stream.clone(),
-                            first_version: result.first_version,
-                            last_version: result.last_version,
-                        });
-                        appends.push(result);
-                    }
-                    tx.record(Op::Group {
-                        tenant: group.tenant,
-                        key: group.meta.idempotency_key,
-                        digest,
-                        ranges,
-                    })?;
-                    #[cfg(test)]
-                    journal::checkpoint("group-bookkeeping");
-                    Ok(AppendGroupResult {
-                        appends,
-                        deduplicated: false,
-                    })
-                })
-            })
-            .await
-        })
+        Box::pin(self.group(group, guard, &[]))
     }
 }
 
@@ -954,45 +1069,7 @@ impl EventStore for FileEventStore {
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         let (tenant, digest, bytes) = (tenant.clone(), digest.to_owned(), bytes.to_vec());
         Box::pin(self.transaction(move |tx| {
-            Box::pin(async move {
-                validate_field("blob digest", &digest)?;
-                if let Some(old) = tx.blob(&tenant, &digest)? {
-                    if old != bytes {
-                        return Err(EventLogError::Invalid(
-                            "blob digest already names different content".into(),
-                        ));
-                    }
-                    return Ok(());
-                }
-                let blob = Blob {
-                    id: new_event_id(),
-                    hash: hash(&bytes),
-                };
-                let directory = tx.root.join("blobs");
-                fs::create_dir_all(&directory).map_err(backend)?;
-                self::directory(&directory)?;
-                let path = directory.join(&blob.id);
-                blocking(move || {
-                    use std::io::Write;
-                    let mut file = fs::OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(path)
-                        .map_err(backend)?;
-                    file.write_all(&bytes)
-                        .and_then(|()| file.sync_all())
-                        .map_err(backend)?;
-                    fs::File::open(directory)
-                        .and_then(|f| f.sync_all())
-                        .map_err(backend)
-                })
-                .await?;
-                tx.record(Op::Blob {
-                    tenant,
-                    digest,
-                    object: Some(blob),
-                })
-            })
+            Box::pin(async move { tx.bind_blobs(&tenant, &[(digest, bytes)]).await })
         }))
     }
     fn get_blob<'a>(
@@ -1418,6 +1495,350 @@ mod native_group_crash {
                 assert_eq!(again.events, original.events, "{point}");
                 assert!(again.deduplicated, "{point}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod grouped_blob_barrier {
+    use super::*;
+    use eventlog_conformance::{event, meta};
+    use eventlog_core::{CaptureLimits, ConsistentTenantCapture, StreamAppend};
+    use std::process::Command;
+
+    fn tenant() -> TenantId {
+        TenantId::new("grouped-blob").unwrap()
+    }
+
+    fn limits() -> CaptureLimits {
+        CaptureLimits {
+            max_events: 64,
+            max_blobs: 64,
+            max_projection_rows: 64,
+            max_payload_bytes: 65_536,
+        }
+    }
+
+    fn stream(id: &str) -> StreamId {
+        StreamId::new(tenant(), "item", id).unwrap()
+    }
+
+    /// `count` blobs whose digests and contents are fixed, so two stores written by two paths
+    /// bind the same names to the same bytes.
+    fn blobs(count: usize) -> Vec<(String, Vec<u8>)> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("d{index:04}"),
+                    format!("bytes-{index}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    fn group(key: &str, count: usize) -> AppendGroup {
+        AppendGroup {
+            tenant: tenant(),
+            meta: meta(key, &serde_json::json!({})),
+            appends: (0..count)
+                .map(|index| StreamAppend {
+                    stream: stream(&format!("s{index}")),
+                    expected: Expected::Any,
+                    events: vec![event("item.changed", 1)],
+                })
+                .collect(),
+        }
+    }
+
+    /// The acceptance statement: N blobs written inside one append group cost the group's one
+    /// durability barrier, not one per blob.
+    ///
+    /// The comparison is against the same store doing the same work the way a caller has to do it
+    /// today — `put_blob` per blob and then the group — because an absolute barrier count means
+    /// nothing without the count it replaces.
+    #[tokio::test]
+    async fn blobs_inside_one_group_take_the_groups_single_barrier() {
+        for count in [1_usize, 8, 32] {
+            let separate = tempfile::tempdir().unwrap();
+            let store = FileEventStore::open(separate.path()).await.unwrap();
+            let before = cost::of(separate.path());
+            for (digest, bytes) in blobs(count) {
+                store.put_blob(&tenant(), &digest, &bytes).await.unwrap();
+            }
+            store.append_group(&group("separate", count)).await.unwrap();
+            let apart = cost::of(separate.path()) - before;
+
+            let together = tempfile::tempdir().unwrap();
+            let store = FileEventStore::open(together.path()).await.unwrap();
+            let before = cost::of(together.path());
+            store
+                .append_group_with_blobs(&group("together", count), &blobs(count))
+                .await
+                .unwrap();
+            let joined = cost::of(together.path()) - before;
+
+            println!("BARRIERS count={count} apart={apart:?} joined={joined:?}");
+            assert_eq!(
+                apart.durability_barriers,
+                count as u64 + 1,
+                "the cost this story exists to remove: one barrier per blob plus the group's"
+            );
+            assert_eq!(
+                joined.durability_barriers, 1,
+                "{count} blobs inside one group take the group's one barrier"
+            );
+            assert_eq!(
+                apart.object_syncs,
+                2 * count as u64,
+                "a blob per transaction synchronizes the object directory once per blob"
+            );
+            assert_eq!(
+                joined.object_syncs,
+                count as u64 + 1,
+                "the batch synchronizes each object once and their directory once for all of them"
+            );
+        }
+    }
+
+    /// Byte identity: a store written one blob per transaction and a store written through the
+    /// group bind the same digests to the same bytes and bind nothing else.
+    ///
+    /// The comparison is the provider's own complete-content observation — every currently bound
+    /// blob, once, in bytewise digest order, orphans included — because a per-digest read only
+    /// proves that what was asked for is there, and the claim the migration rests on is that the
+    /// faster path writes the same content and no other.
+    #[tokio::test]
+    async fn both_paths_bind_the_same_digests_to_the_same_bytes() {
+        let count = 8;
+        let apart = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(apart.path()).await.unwrap();
+        store.stream_identity(&tenant()).await.unwrap();
+        for (digest, bytes) in blobs(count) {
+            store.put_blob(&tenant(), &digest, &bytes).await.unwrap();
+        }
+        store.append_group(&group("identity", count)).await.unwrap();
+        let one = store
+            .capture_tenant(&tenant(), &[], limits())
+            .await
+            .unwrap()
+            .blobs;
+
+        let joined = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(joined.path()).await.unwrap();
+        store.stream_identity(&tenant()).await.unwrap();
+        store
+            .append_group_with_blobs(&group("identity", count), &blobs(count))
+            .await
+            .unwrap();
+        let two = store
+            .capture_tenant(&tenant(), &[], limits())
+            .await
+            .unwrap()
+            .blobs;
+
+        assert_eq!(
+            one, two,
+            "the same digests name the same bytes on both paths, and no others are bound"
+        );
+        assert_eq!(
+            one.len(),
+            count,
+            "the fixture only means something when every blob is bound: {one:?}"
+        );
+        for (digest, bytes) in blobs(count) {
+            assert_eq!(
+                store.get_blob(&tenant(), &digest).await.unwrap(),
+                Some(bytes),
+                "{digest} reads back as itself through the ordinary port too"
+            );
+        }
+    }
+
+    /// The refusals `put_blob` makes are the refusals the batch makes, and a refused batch
+    /// publishes nothing at all — not the group, and not the blobs that were valid.
+    #[tokio::test]
+    async fn a_refused_blob_refuses_the_whole_group() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(root.path()).await.unwrap();
+        store.put_blob(&tenant(), "d0000", b"first").await.unwrap();
+
+        let conflict = store
+            .append_group_with_blobs(
+                &group("conflict", 2),
+                &[
+                    ("d0000".to_owned(), b"second".to_vec()),
+                    ("d0001".to_owned(), b"fresh".to_vec()),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(conflict, EventLogError::Invalid(ref message)
+                if message.contains("already names different content")),
+            "conflicting bytes under a bound digest refuse as they do on the single path: {conflict:?}"
+        );
+        assert_eq!(
+            store.get_blob(&tenant(), "d0000").await.unwrap(),
+            Some(b"first".to_vec()),
+            "the bound blob is untouched"
+        );
+        assert_eq!(
+            store.get_blob(&tenant(), "d0001").await.unwrap(),
+            None,
+            "a refused batch binds none of its blobs"
+        );
+        assert_eq!(
+            store.stream_version(&stream("s0")).await.unwrap(),
+            None,
+            "a refused batch appends none of its group"
+        );
+
+        let invalid = store
+            .append_group_with_blobs(&group("invalid", 1), &[(String::new(), b"x".to_vec())])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(invalid, EventLogError::Invalid(_)),
+            "an invalid digest refuses as it does on the single path: {invalid:?}"
+        );
+    }
+
+    /// The workload a wall-clock profiler attaches to, in the shape `child` already uses: an
+    /// ordinary case that does nothing until the environment names a workload, so the suite gains
+    /// no ignored lane and `strace -c -w` still has one process doing one thing.
+    ///
+    /// `EVENTLOG_FILE_BLOB_MEASURE` is `apart` (a transaction per blob, then the group) or
+    /// `joined` (the blobs inside the group); `EVENTLOG_FILE_BLOB_MEASURE_COUNT` is how many.
+    /// Measure with `-w`: `fsync` waits on the device and burns no CPU, so bare `strace -c`
+    /// reports it as free and is the wrong instrument for this question.
+    #[tokio::test]
+    async fn measure() {
+        let Ok(path) = std::env::var("EVENTLOG_FILE_BLOB_MEASURE") else {
+            return;
+        };
+        let count: usize = std::env::var("EVENTLOG_FILE_BLOB_MEASURE_COUNT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64);
+        let root = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(root.path()).await.unwrap();
+        match path.as_str() {
+            "apart" => {
+                for (digest, bytes) in blobs(count) {
+                    store.put_blob(&tenant(), &digest, &bytes).await.unwrap();
+                }
+                store.append_group(&group("measure", 1)).await.unwrap();
+            }
+            "joined" => {
+                store
+                    .append_group_with_blobs(&group("measure", 1), &blobs(count))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("unknown workload {other}"),
+        }
+        for (digest, bytes) in blobs(count) {
+            assert_eq!(
+                store.get_blob(&tenant(), &digest).await.unwrap(),
+                Some(bytes),
+                "the measured workload actually bound its blobs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn child() {
+        let Ok(root) = std::env::var("EVENTLOG_FILE_BLOB_GROUP_CHILD_ROOT") else {
+            return;
+        };
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append_group_with_blobs(&group("crash", 3), &blobs(4))
+            .await
+            .unwrap();
+    }
+
+    /// Crash consistency for the joined path, at every boundary the joined path has.
+    ///
+    /// `group-blobs-written` is the boundary this story adds and the one a timing assertion can
+    /// never reach: the object files are on disk and synchronized, and the frame that binds them
+    /// is not published. Nothing of the group may be observable there — not an event, and not a
+    /// blob — and the unreferenced objects must not survive as bound content.
+    #[tokio::test]
+    async fn every_grouped_blob_boundary_recovers_one_complete_outcome() {
+        for (point, committed) in [
+            ("group-blobs-written", false),
+            ("group-member-1", false),
+            ("group-bookkeeping", false),
+            ("group-precommit", false),
+            ("append-prepared", false),
+            ("append-torn", false),
+            ("append-synced", false),
+            ("append-committed", true),
+            ("group-postcommit", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let prepared = FileEventStore::open(root.path()).await.unwrap();
+            drop(prepared);
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "grouped_blob_barrier::child", "--nocapture"])
+                .env("EVENTLOG_FILE_BLOB_GROUP_CHILD_ROOT", root.path())
+                .env("EVENTLOG_FILE_CRASH_AT", point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{point}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let store = FileEventStore::open(root.path()).await.unwrap();
+            let events = store.read_feed(&tenant(), 0, 10).await.unwrap().events;
+            assert_eq!(
+                events.len(),
+                if committed { 3 } else { 0 },
+                "{point}: the group is all present or all absent"
+            );
+            for (digest, bytes) in blobs(4) {
+                assert_eq!(
+                    store.get_blob(&tenant(), &digest).await.unwrap(),
+                    committed.then_some(bytes),
+                    "{point}: a blob is durable exactly when the group that binds it is"
+                );
+            }
+            // An interrupted batch leaves object files no committed frame names. They are not
+            // content: the store disposes of them rather than serving them.
+            let objects = fs::read_dir(root.path().join("blobs")).map_or(0, Iterator::count);
+            assert_eq!(
+                objects,
+                if committed { 4 } else { 0 },
+                "{point}: unreferenced objects from an interrupted batch are disposed of"
+            );
+
+            let retry = store
+                .append_group_with_blobs(&group("crash", 3), &blobs(4))
+                .await
+                .unwrap_or_else(|error| panic!("{point}: retry refused after reopen: {error}"));
+            assert_eq!(retry.deduplicated, committed, "{point}");
+            assert_eq!(retry.appends.len(), 3, "{point}");
+            for (digest, bytes) in blobs(4) {
+                assert_eq!(
+                    store.get_blob(&tenant(), &digest).await.unwrap(),
+                    Some(bytes),
+                    "{point}: the retry binds every blob"
+                );
+            }
+            assert_eq!(
+                store
+                    .read_feed(&tenant(), 0, 10)
+                    .await
+                    .unwrap()
+                    .events
+                    .len(),
+                3,
+                "{point}: no duplicate or missing group member"
+            );
         }
     }
 }
