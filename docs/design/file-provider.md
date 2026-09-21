@@ -17,7 +17,10 @@ missing committed bytes and damaged committed frames refuse without altering the
 
 `writer.lock` is permanent and outside the disposable cache. Each operation opens its own lock
 file description, takes an exclusive process lock, establishes the committed history it will work
-against, and retains that lock through callbacks and commit. Never unlink the lock file while a process
+against, and retains that lock through callbacks and commit. A resumed handle that cannot establish
+its history under that lock is the one exception: every fall-through in `Journal::resume` drops its
+lock description and `Journal::open_existing` takes a fresh one, which re-reads and re-validates
+everything before the operation proceeds. Never unlink the lock file while a process
 can use the directory. All writers serialize, including absent streams and reverse-order groups.
 Callbacks access blobs and projections through their transaction context. Re-entering the outer
 store from a callback is unsupported, as with the SQL providers.
