@@ -474,6 +474,30 @@ mod native_group_crash {
         TenantId::new("native-crash").unwrap()
     }
 
+    /// Read the feed until it has delivered `expected` events, or give up saying so.
+    ///
+    /// The commit watermark is cluster-wide: a feed reader stops before
+    /// `pg_snapshot_xmin(pg_current_snapshot())`, and a transaction open anywhere in the same
+    /// instance — including a sibling case in this same lane — holds that back. Nothing is
+    /// skipped and nothing is lost; the events are committed and simply not yet visible to a
+    /// feed. Asking once is therefore asking whether this suite happened to be idle, which is a
+    /// question about the machine and not about the group. `eventlog_conformance::drain_at_least`
+    /// applies the same bounded retry to the catch-up runner for this reason, and the reason is in
+    /// `AGENTS.md` under *The watermark couples feed latency across owners*.
+    async fn feed_at_least(
+        store: &PostgresEventStore,
+        expected: usize,
+    ) -> Vec<eventlog_core::RecordedEvent> {
+        for _ in 0..200 {
+            let events = store.read_feed(&tenant(), 0, 10).await.unwrap().events;
+            if events.len() >= expected {
+                return events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the feed never delivered {expected} events");
+    }
+
     fn stream(id: &str) -> StreamId {
         StreamId::new(tenant(), "item", id).unwrap()
     }
@@ -548,7 +572,7 @@ mod native_group_crash {
             );
 
             let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
-            let before = store.read_feed(&tenant(), 0, 10).await.unwrap().events;
+            let before = feed_at_least(&store, usize::from(committed) * 3).await;
             assert_eq!(before.len(), if committed { 3 } else { 0 }, "{point}");
             for (id, count) in [("a", 2), ("z", 1)] {
                 assert_eq!(
@@ -595,7 +619,7 @@ mod native_group_crash {
                 assert_eq!(received[0].version, 1, "{point}: fresh retry");
             }
             assert_eq!(
-                store.read_feed(&tenant(), 0, 10).await.unwrap().events,
+                feed_at_least(&store, received.len()).await,
                 received,
                 "{point}: no duplicate or missing group member"
             );
