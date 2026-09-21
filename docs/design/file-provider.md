@@ -116,12 +116,29 @@ durability promise is unchanged in both directions: nothing of the batch is obse
 manifest, and a crash before it leaves object files no committed frame names, which the refusing
 transaction itself, the next committed transaction and the complete opener dispose of as
 unreferenced. A deduplicated group retry binds nothing, because the original commit already bound
-it — and that is checked rather than assumed: a group's identity is its tenant, members and command
-meta and deliberately not its batch, so before a retry is answered `Ok` every digest of the batch it
-carries is verified to be bound already, to exactly these bytes. A batch naming bytes the history
-does not carry is not the request that committed and refuses with `IdempotencyMismatch`; a batch
-naming different bytes under a bound digest refuses as `Invalid` exactly as it would on a fresh
-commit. Refusing one blob of a batch refuses the whole group and publishes neither.
+it — and that is checked rather than assumed. A group's identity is its tenant, members and command
+meta and deliberately not its batch, so the batch the commit carried is **recorded in the group's
+own committed operation**, and a retry's batch is compared against that record.
+
+**Against the record, never against what is bound now.** A digest the commit recorded still counts
+as recorded after `delete_blob`, an erasure or a retention sweep has removed the binding: deleting
+a blob is its own act and does not make a committed group belong to somebody else's request. A
+retry after one deduplicates. Deciding this on live blob state instead turns an ordinary deletion
+into `IdempotencyMismatch`, and the only recovery from that is a new idempotency key — which
+appends every member of the group a second time into an append-only log.
+
+So: a retry whose batch is the recorded set deduplicates; a retry whose batch is some other set is
+not that request and refuses with `IdempotencyMismatch`; a retry carrying **no** batch is the
+ordinary group retry, asks nothing about blobs and deduplicates as it always did. A digest that is
+still bound is additionally held to its bytes, and differing bytes refuse as `Invalid` exactly as
+they would on a fresh commit — the key is not in question there, the content is. Refusing one blob
+of a batch refuses the whole group and publishes neither.
+
+**A retry that carries a batch runs admission first.** The batch is part of what such a retry is
+asking about, so the guard runs before anything is said about it; otherwise replaying a key one
+once committed would report whether a digest is bound, and whether bytes match, with no guard ever
+called. A retry carrying no batch does not repeat admission, which is the port's own contract and
+what the shared conformance exercise asserts by counting guard calls.
 
 **Who disposes of an object no frame references.** A blob written on its own could not be refused
 after it was written — its transaction had nothing after it. A batch written inside a group can:
@@ -134,8 +151,18 @@ transaction and the complete opener remain the disposers for objects a crash lea
 guard, and it is on the `AtomicEventStore` port rather than on this provider because the caller it
 exists for — a migration importing many boundaries at once — holds a trait object. Admission runs
 before a byte of the batch is written, so a refused guard publishes neither the group nor a blob.
-Providers that have not implemented the single-barrier form inherit a default that writes each blob
-on its own path first: correct, and as slow as it is today. Open and reopen verify every active content hash;
+
+**A provider that cannot make that guarantee refuses instead of weakening it.** The port's default
+implementation writes nothing, commits nothing and refuses with `eventlog_core::UNAVAILABLE`; only
+this provider overrides it. An earlier default wrote each blob on its own path first and then ran
+admission, which meant a refused guard had already published the whole batch on the two SQL
+providers — and a caller holding a trait object cannot tell which provider it has, so the method
+would have meant one thing here and the opposite there. A blob row is a binding, not scratch:
+nothing reference-counts it, nothing sweeps it, and content-addressed storage has no way to take a
+published blob back. A caller that wants the slow path still has `put_blob` in a loop followed by
+`append_group_guarded`; what it cannot have is that sequence under a name promising the batch was
+not published. The shared conformance exercise runs both halves of this against all three
+providers. Open and reopen verify every active content hash;
 afterwards a read verifies the bytes it reads, and the first sight of a frame another writer
 committed verifies the objects that frame binds, so damaged bytes are refused whether they are
 read or newly bound. Deletion and tenant erasure remove unreferenced objects from the active directory.

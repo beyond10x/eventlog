@@ -38,7 +38,7 @@ pub use projection::{
 
 mod atomic_group;
 pub use atomic_group::{
-    AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend,
+    AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend, UNAVAILABLE,
 };
 
 use std::{future::Future, pin::Pin, sync::Arc};

@@ -252,23 +252,36 @@ impl FileEventStore {
         self.freeze().await;
         self.transaction(move |tx| {
             Box::pin(async move {
-                if let Some((old, ranges)) = tx
+                let committed = tx
                     .state
                     .groups
                     .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
-                {
-                    if old != &digest {
+                    .cloned();
+                if let Some((old, ranges, bound)) = committed {
+                    if old != digest {
                         return Err(EventLogError::IdempotencyMismatch {
                             key: group.meta.idempotency_key.clone(),
                         });
                     }
-                    // The group's fingerprint hashes the tenant, the members and the command meta,
-                    // and deliberately not the batch — moving it would move every provider's
-                    // digests. So the batch is checked against the history instead of against the
-                    // key: a deduplicating `Ok` says the batch is durable, and it may only be
-                    // returned when the committed frame really does bind every digest of it to
-                    // these bytes. A retry holding anything else is not this request.
-                    tx.verify_bound(&group.tenant, &blobs, &group.meta.idempotency_key)?;
+                    // A retry carrying a batch is answering for that batch, so admission runs
+                    // before anything is said about it. Without this a caller could replay a key
+                    // it once committed and read back whether a digest is bound and whether bytes
+                    // match, with the guard never called. A retry carrying no batch keeps the
+                    // port's contract exactly — "retries return the original result without
+                    // repeating admission or projections"
+                    // (`eventlog-core/src/atomic_group.rs`), which
+                    // `eventlog-conformance/src/atomic_group.rs:153` asserts by counting calls.
+                    if !blobs.is_empty() {
+                        guard
+                            .check(&mut projection::View {
+                                admission: true,
+                                selected: None,
+                                tx,
+                                tenant: &group.tenant,
+                            })
+                            .await?;
+                    }
+                    tx.verify_batch(&group.tenant, &blobs, &bound, &group.meta.idempotency_key)?;
                     return Ok(AppendGroupResult {
                         appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
                         deduplicated: true,
@@ -314,6 +327,7 @@ impl FileEventStore {
                     key: group.meta.idempotency_key,
                     digest,
                     ranges,
+                    blobs: batch(&blobs),
                 })?;
                 #[cfg(test)]
                 journal::checkpoint("group-bookkeeping");
@@ -559,40 +573,65 @@ impl Transaction {
         }
         Ok(Some(bytes))
     }
-    /// Verify the committed history already binds every digest of a batch to exactly these bytes.
+    /// Hold a retry's batch to the batch the committed group actually carried.
     ///
     /// What a deduplicating return means. [`AppendGroup::fingerprint`] identifies a group by its
     /// tenant, members and command meta and not by the batch it carries, so a second call under a
     /// committed key is recognized as a retry however the batch differs — and answering it `Ok`
-    /// is a claim that the batch is durable which the key alone cannot support. This is that
-    /// claim, checked: a digest bound to these bytes is the retry the mechanism exists to serve,
-    /// a digest bound to different bytes is the same contradiction [`Transaction::bind_blobs`]
-    /// refuses on the fresh path, and a digest the history does not carry at all means this is
-    /// not the request that committed.
+    /// is a claim about the batch that the key alone cannot support. This is that claim, checked.
+    ///
+    /// **Identity is decided against what the commit recorded, never against what is bound now.**
+    /// The committed `Op::Group` names the digests its call carried; the retry's batch must be
+    /// that same set. Whether each blob still exists is a different question with a different
+    /// answer: [`EventStore::delete_blob`], an erasure or a retention sweep removes a binding
+    /// without making the committed group belong to somebody else's request, and a retry after
+    /// one still deduplicates. Deciding identity on live blob state instead turns an ordinary
+    /// deletion into `IdempotencyMismatch`, whose only recovery is a new key — which appends
+    /// every member of the group a second time into an append-only log.
+    ///
+    /// A digest that *is* still bound is additionally held to its bytes, which is the
+    /// contradiction [`Transaction::bind_blobs`] refuses on the fresh path. That refusal is
+    /// [`EventLogError::Invalid`] and not `IdempotencyMismatch`: the key is not in question, the
+    /// content is, and a caller must not be invited to retry under a new key.
     ///
     /// # Errors
-    /// [`EventLogError::Invalid`] for a digest bound to different content or an unusable digest,
-    /// and [`EventLogError::IdempotencyMismatch`] for a digest no committed frame binds.
-    fn verify_bound(
+    /// [`EventLogError::IdempotencyMismatch`] when the batch is not the set the commit recorded,
+    /// and [`EventLogError::Invalid`] for an unusable digest or a still-bound digest whose bytes
+    /// differ.
+    fn verify_batch(
         &self,
         tenant: &TenantId,
         blobs: &[(String, Vec<u8>)],
+        committed: &[String],
         key: &str,
     ) -> Result<(), EventLogError> {
-        for (digest, bytes) in blobs {
+        // A retry that carries no batch is asking nothing about blobs, and is answered exactly as
+        // it was before groups could carry them — which is what every caller of
+        // `append_group_guarded` is. Comparing an absent batch against a recorded one would
+        // refuse the ordinary retry of a group that happened to commit blobs, and would be the
+        // same defect as deciding identity on live blob state: a committed key reported as
+        // somebody else's request, recoverable only under a new key that appends every member a
+        // second time.
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        for (digest, _) in blobs {
             validate_field("blob digest", digest)?;
-            match self.blob(tenant, digest)? {
-                Some(bound) if &bound == bytes => {}
-                Some(_) => {
-                    return Err(EventLogError::Invalid(
-                        "blob digest already names different content".into(),
-                    ));
-                }
-                None => {
-                    return Err(EventLogError::IdempotencyMismatch {
-                        key: key.to_owned(),
-                    });
-                }
+        }
+        if batch(blobs) != committed {
+            return Err(EventLogError::IdempotencyMismatch {
+                key: key.to_owned(),
+            });
+        }
+        for (digest, bytes) in blobs {
+            // Only a digest the store still carries can be contradicted. One it no longer carries
+            // was deleted, and a deletion is not a different request.
+            if let Some(bound) = self.blob(tenant, digest)?
+                && &bound != bytes
+            {
+                return Err(EventLogError::Invalid(
+                    "blob digest already names different content".into(),
+                ));
             }
         }
         Ok(())
@@ -657,12 +696,9 @@ impl Transaction {
         // and those objects would read as live.
         let created: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let recorder = Arc::clone(&created);
+        let root = self.root.clone();
         let outcome = blocking(move || {
             use std::io::Write;
-            // Counted where the synchronizations happen, not derived from the batch size: a
-            // counter computed from `objects.len()` reads the same whether the objects were
-            // synchronized or not, which is the one thing it exists to say.
-            let mut synchronized = 0_u64;
             for (id, path, bytes) in &objects {
                 let mut file = fs::OpenOptions::new()
                     .create_new(true)
@@ -673,16 +709,10 @@ impl Transaction {
                     .lock()
                     .map_err(|_| backend("blob object recorder poisoned"))?
                     .push(id.clone());
-                file.write_all(bytes)
-                    .and_then(|()| file.sync_all())
-                    .map_err(backend)?;
-                synchronized += 1;
+                file.write_all(bytes).map_err(backend)?;
+                synchronize(&root, &file)?;
             }
-            fs::File::open(directory)
-                .and_then(|f| f.sync_all())
-                .map_err(backend)?;
-            synchronized += 1;
-            Ok::<_, EventLogError>(synchronized)
+            synchronize(&root, &fs::File::open(directory).map_err(backend)?)
         })
         .await;
         self.written.extend(
@@ -691,13 +721,7 @@ impl Transaction {
                 .map_err(|_| backend("blob object recorder poisoned"))?
                 .drain(..),
         );
-        let synchronized = outcome?;
-        #[cfg(test)]
-        cost::charge(&self.root, |cost| {
-            cost.object_syncs += synchronized;
-        });
-        #[cfg(not(test))]
-        let _ = synchronized;
+        outcome?;
         for (blob, digest) in fresh {
             self.record(Op::Blob {
                 tenant: tenant.clone(),
@@ -907,6 +931,39 @@ fn validate_object(id: &str) -> Result<(), EventLogError> {
         return Err(backend("invalid blob object name"));
     }
     Ok(())
+}
+
+/// Synchronize one object or object directory, and charge that synchronization.
+///
+/// **The count is produced by the synchronization, not written beside it.** A counter incremented
+/// next to an `fsync` measures the code's intention: delete the `fsync`, leave the increment, and
+/// every assertion about the count still passes while nothing is durable — which is exactly what
+/// two independently written mutations did to the previous shape of this counter, both surviving
+/// a green suite. Here the number the charge adds is the value `sync_all` returned on success, so
+/// there is no increment left to strand: removing the call removes the charge with it, and a
+/// count that did not move is a synchronization that did not happen.
+fn synchronize(root: &Path, file: &fs::File) -> Result<(), EventLogError> {
+    let synchronized = file.sync_all().map(|()| 1_u64).map_err(backend)?;
+    #[cfg(test)]
+    cost::charge(root, |cost| {
+        cost.object_syncs += synchronized;
+    });
+    #[cfg(not(test))]
+    let _ = (root, synchronized);
+    Ok(())
+}
+
+/// The digest set of one batch: sorted, without repeats, and independent of the order or the
+/// repetition a caller happened to hand in.
+///
+/// Both the record and the comparison go through this, so a retry that names the same digests in
+/// another order — or names one of them twice, which [`Transaction::bind_blobs`] collapses on the
+/// fresh path — is the same request rather than a different one.
+fn batch(blobs: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut digests: Vec<String> = blobs.iter().map(|(digest, _)| digest.clone()).collect();
+    digests.sort();
+    digests.dedup();
+    digests
 }
 
 fn directory(path: &Path) -> Result<(), EventLogError> {
@@ -1643,11 +1700,26 @@ mod native_group_crash {
 /// **What the crash cases here can and cannot prove.** They are process-death cases: the child
 /// calls `std::process::exit(73)` at a named checkpoint, which does not drop the page cache, so a
 /// write the operating system has accepted but not yet put on the device still survives the death
-/// and is still read back by the parent. Nothing here can therefore detect a **dropped** `fsync` —
-/// remove one and every case stays green. What they do prove is barrier **placement** and binding:
+/// and is still read back by the parent. What they do prove is barrier **placement** and binding:
 /// which writes have happened at a named point, what a reopen recovers from that state, and that
-/// the group and its blobs are present together or absent together. Barrier *presence* needs a
-/// power-loss harness, which this tree does not have.
+/// the group and its blobs are present together or absent together.
+///
+/// **Three claims this module makes are exercised by nothing in this tree. A reader meeting one
+/// of them should not read it as tested.**
+///
+/// 1. **Barrier presence.** A dropped `fsync` is invisible to a process-death case, because
+///    `exit(73)` leaves the page cache intact. What holds the synchronizations here is
+///    [`synchronize`], which charges the count from the synchronization's own success so a
+///    deleted `fsync` cannot leave its count behind — a structural guard, not an observation of
+///    durability. Observing durability needs a power-loss harness, which this tree does not have.
+/// 2. **Mid-batch failure.** [`Transaction::bind_blobs`] records each object it creates as it
+///    creates it so that a batch failing part way through still carries every file it made into
+///    [`Transaction::discard_written`]. There is no fault injection in this tree, so no case ever
+///    fails that loop part way through; the property is correct by construction and unobserved.
+/// 3. **Disposal masking a refusal.** [`FileEventStore::transaction`] reports a failure of the
+///    refusal-path disposal *over* the refusal that caused it, on the reasoning that a store that
+///    cannot delete a file is not writable. No case makes that disposal fail, so what a caller
+///    actually receives in that situation is unobserved.
 #[cfg(test)]
 mod grouped_blob_barrier {
     use super::*;
@@ -1849,6 +1921,42 @@ mod grouped_blob_barrier {
         assert!(
             matches!(invalid, EventLogError::Invalid(_)),
             "an invalid digest refuses as it does on the single path: {invalid:?}"
+        );
+    }
+
+    /// A group that carries no blobs writes the frame it wrote before the batch was recorded.
+    ///
+    /// Correction round 2 records a group's batch in its own committed operation, which is what
+    /// lets a retry be judged against what the commit carried instead of against what is bound
+    /// now. That is a change to a persisted shape, and the compatibility claim it rests on is
+    /// this one: the field is absent from the wire whenever it is empty, so every group that
+    /// carries no blobs — which is every caller of `append_group` and `append_group_guarded` —
+    /// still writes exactly the bytes it wrote before, and a reader that predates the field still
+    /// reads them. The other direction is `#[serde(default)]`: a group recorded before the field
+    /// existed folds to an empty batch and retries as it always did.
+    #[tokio::test]
+    async fn a_group_without_blobs_records_no_batch_at_all() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(root.path()).await.unwrap();
+        store.append_group(&group("plain", 2)).await.unwrap();
+        let history = fs::read_to_string(root.path().join("events.jsonl")).unwrap();
+        assert!(
+            history.contains(r#""operation":"group""#),
+            "the fixture only means something once a group is in the history: {history}"
+        );
+        assert!(
+            !history.contains(r#""blobs""#),
+            "a group that carries no blobs writes no batch field: {history}"
+        );
+
+        store
+            .append_group_with_blobs(&group("carrying", 1), &blobs(1))
+            .await
+            .unwrap();
+        let history = fs::read_to_string(root.path().join("events.jsonl")).unwrap();
+        assert!(
+            history.contains(r#""blobs":["d0000"]"#),
+            "and one that does records exactly the digests it carried: {history}"
         );
     }
 

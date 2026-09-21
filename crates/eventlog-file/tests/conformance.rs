@@ -32,6 +32,16 @@ async fn file_groups_contract() {
     eventlog_conformance::run_atomic_groups(&store).await;
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn file_guarded_group_blobs_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    assert!(
+        eventlog_conformance::run_guarded_group_blobs(&store).await,
+        "the file provider implements the guarded blob-bearing group; a refusal here means the \
+         override was lost, and the exercise's other branch would have passed it"
+    );
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn file_claims_contract() {
     let directory = tempfile::tempdir().unwrap();
     let store = FileEventStore::open(directory.path()).await.unwrap();

@@ -7,7 +7,7 @@
 //! backends was found by an exercise like this one and not by review.
 
 mod atomic_group;
-pub use atomic_group::run_atomic_groups;
+pub use atomic_group::{run_atomic_groups, run_guarded_group_blobs};
 
 mod consistent_capture;
 pub use consistent_capture::{

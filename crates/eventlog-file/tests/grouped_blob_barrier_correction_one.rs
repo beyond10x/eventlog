@@ -120,6 +120,16 @@ async fn a_guarded_group_whose_guard_refuses_binds_no_blob_and_appends_no_frame(
 /// provider's own complete blob content, so a blob bound under a different key or left out fails
 /// it. The guarded commit is then retried and must deduplicate, which is how this says the group
 /// really was committed and not merely written.
+///
+/// **WITHDRAWN IN CORRECTION ROUND 2: the retry below used a refusing guard**, on the assumption
+/// that a committed key deduplicates before admission runs again. Review pass 2 showed what that
+/// assumption buys an attacker — a caller replaying a key it once committed learned whether a
+/// digest was bound and whether bytes matched, with the guard never called — and the coordinator
+/// decided admission runs first for any retry that carries a batch. So the retry here uses an
+/// admitting guard, and the refusing one now proves the opposite property in
+/// `a_retry_carrying_a_batch_runs_admission_before_it_says_anything_about_it`. The port's
+/// "retries return the original result without repeating admission" is unchanged for a retry
+/// that carries no batch, which is every caller of `append_group_guarded`.
 #[tokio::test]
 async fn the_guarded_form_commits_what_the_unguarded_form_commits() {
     let unguarded_root = tempfile::tempdir().expect("temp root");
@@ -174,13 +184,70 @@ async fn the_guarded_form_commits_what_the_unguarded_form_commits() {
     );
 
     let retry = guarded
-        .append_group_guarded_with_blobs(&group("same", 3), Arc::new(Refuses), &blobs(0, 4))
+        .append_group_guarded_with_blobs(
+            &group("same", 3),
+            Arc::new(eventlog_core::NoGuard),
+            &blobs(0, 4),
+        )
         .await
-        .expect("a committed key deduplicates before admission runs again");
+        .expect("an admitted retry of a committed key deduplicates");
     assert!(
         retry.deduplicated,
         "the guarded commit really committed: its key is taken"
     );
+}
+
+/// A retry carrying a batch runs admission before it says anything about that batch.
+///
+/// Pass 2's F5, which it could not write a red case for because the case above asserted the
+/// opposite. The batch is part of what a retry is asking about, so a caller must not learn
+/// whether the store binds a digest — or whether its bytes match — by replaying a key it once
+/// committed with the guard switched off. Both answers the dedup path can give are checked here:
+/// the refusing guard gets its own refusal, not `IdempotencyMismatch` and not `Ok`.
+///
+/// The exemption is deliberate and is asserted too: a retry carrying **no** batch is the ordinary
+/// group retry, it asks nothing about blobs, and it keeps the port's "retries return the original
+/// result without repeating admission or projections" — which
+/// `eventlog-conformance/src/atomic_group.rs` asserts by counting guard calls across a retry.
+#[tokio::test]
+async fn a_retry_carrying_a_batch_runs_admission_before_it_says_anything_about_it() {
+    let root = tempfile::tempdir().expect("temp root");
+    let store = FileEventStore::open(root.path()).await.expect("opened");
+
+    store
+        .append_group_with_blobs(&group("probe", 2), &blobs(0, 2))
+        .await
+        .expect("the first commit");
+
+    // The batch the commit carried: a refusing guard must still refuse it, rather than the store
+    // answering `deduplicated` before admission ran.
+    let refused = store
+        .append_group_guarded_with_blobs(&group("probe", 2), Arc::new(Refuses), &blobs(0, 2))
+        .await
+        .expect_err("admission runs on a retry that carries a batch");
+    assert!(
+        matches!(refused, EventLogError::GuardRefused { ref code } if code == "correction_refused"),
+        "the refusal is the guard's own, reached before anything is said about the batch: \
+         {refused:?}"
+    );
+
+    // A batch the commit did not carry: the same refusal, so the refused caller cannot tell the
+    // two apart and learns nothing about what is bound.
+    let probing = store
+        .append_group_guarded_with_blobs(&group("probe", 2), Arc::new(Refuses), &blobs(7, 1))
+        .await
+        .expect_err("admission runs before the batch is compared at all");
+    assert!(
+        matches!(probing, EventLogError::GuardRefused { ref code } if code == "correction_refused"),
+        "a refused caller cannot distinguish a bound batch from an unbound one: {probing:?}"
+    );
+
+    // And the exemption: no batch, no admission, the original result.
+    let plain = store
+        .append_group_guarded(&group("probe", 2), Arc::new(Refuses))
+        .await
+        .expect("a retry carrying no batch does not repeat admission");
+    assert!(plain.deduplicated, "it is the original result");
 }
 
 /// A guard that refuses when it can already see a digest of the batch it is admitting.
@@ -356,5 +423,52 @@ async fn a_retrys_batch_is_held_to_the_content_the_commit_actually_bound() {
         fs::read_dir(root.path().join("blobs")).map_or(0, Iterator::count),
         1,
         "and neither refusal left an object behind"
+    );
+}
+
+/// A retry is the same request whatever order it names its batch in, and whatever it repeats.
+///
+/// Added in correction round 2, holding the claim the digest-set comparison makes. The fresh path
+/// collapses a repeated digest — `bind_blobs` binds it once — so a retry that repeats one must not
+/// be a different request either, and neither must a retry that lists the same digests in another
+/// order. Without the normalization the comparison is on the caller's incidental sequencing, and
+/// an importer that rebuilds its batch from a map gets `IdempotencyMismatch` on a retry, whose
+/// only recovery is a new key that appends every member a second time.
+#[tokio::test]
+async fn a_retrys_batch_is_a_set_not_a_sequence() {
+    let root = tempfile::tempdir().expect("temp root");
+    let store = FileEventStore::open(root.path()).await.expect("opened");
+
+    store
+        .append_group_with_blobs(&group("set", 2), &blobs(0, 3))
+        .await
+        .expect("the first commit");
+
+    let mut reversed = blobs(0, 3);
+    reversed.reverse();
+    assert!(
+        store
+            .append_group_with_blobs(&group("set", 2), &reversed)
+            .await
+            .expect("the same digests in another order is the same request")
+            .deduplicated,
+        "a batch is a set of digests, not the order the caller happened to hand them in"
+    );
+
+    let mut repeated = blobs(0, 3);
+    repeated.push(repeated[1].clone());
+    assert!(
+        store
+            .append_group_with_blobs(&group("set", 2), &repeated)
+            .await
+            .expect("a repeated digest is the same request")
+            .deduplicated,
+        "the fresh path binds a repeated digest once, so a retry may repeat one too"
+    );
+
+    assert_eq!(
+        fs::read_dir(root.path().join("blobs")).map_or(0, Iterator::count),
+        3,
+        "and neither retry wrote a second copy of anything"
     );
 }

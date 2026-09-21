@@ -37,6 +37,21 @@ pub(crate) enum Op {
         key: String,
         digest: String,
         ranges: Vec<GroupRange>,
+        /// The blob digests this group committed, sorted and without repeats.
+        ///
+        /// What makes a retry of a blob-bearing group *the same request*. The group's fingerprint
+        /// covers the tenant, the members and the command meta and deliberately not the batch, so
+        /// the batch has to be recorded to be compared; and it is compared against what this
+        /// record says the commit carried, never against which blobs happen to be bound now.
+        /// Whether a blob still exists is a separate question with a separate answer —
+        /// `delete_blob` is its own act and does not retroactively make a committed group belong
+        /// to a different request.
+        ///
+        /// Absent in a record written before groups could carry blobs, and absent from the wire
+        /// whenever it is empty, so every frame a group without blobs writes is byte-identical to
+        /// what it wrote before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blobs: Vec<String>,
     },
     Identity {
         tenant: TenantId,
@@ -89,7 +104,7 @@ pub(crate) struct State {
     pub events: BTreeMap<u64, RecordedEvent>,
     pub commands: BTreeMap<String, (String, GroupRange)>,
     pub claims: BTreeMap<String, (String, GroupRange)>,
-    pub groups: BTreeMap<String, (String, Vec<GroupRange>)>,
+    pub groups: BTreeMap<String, (String, Vec<GroupRange>, Vec<String>)>,
     pub identities: BTreeMap<String, String>,
     pub generations: BTreeMap<String, String>,
     pub projections: BTreeMap<String, Vec<String>>,
@@ -210,9 +225,10 @@ impl State {
                 key: id,
                 digest,
                 ranges,
+                blobs,
             } => {
                 self.groups
-                    .insert(key(&[tenant.as_str(), &id]), (digest, ranges));
+                    .insert(key(&[tenant.as_str(), &id]), (digest, ranges, blobs));
             }
             Op::Identity { tenant, id } => {
                 self.identities.insert(tenant.as_str().into(), id);
