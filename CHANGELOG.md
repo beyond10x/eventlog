@@ -7,6 +7,19 @@ under bare-version tags such as `0.1.0`.
 
 ### Added
 
+- `ConsistentTenantCapture::capture_tenant_deferred` returns one tenant's complete observation
+  while handing blob content out through a reader that reads and hashes it on the read that hands
+  it out, rather than reading every bound object before it returns. Every refusal, cap and
+  ordering is `capture_tenant`'s; what differs is when content is read, and therefore what an
+  observation costs a caller that never looks at one binding. File answers it from the committed
+  records, which already name each binding's object and the hash its content must have. The
+  default reads every object, as before, so every provider serves the same contract. Bindings are
+  still decided under the provider's consistency boundary; content read afterwards that is no
+  longer the content the observation bound is refused, never substituted. Measured on a 7,815-blob
+  157.0 MB authority, release build, this workstation: a full capture falls from 667/675/706/729 ms
+  to 61/61/103 ms (`crates/eventlog-file/tests/measure_capture.rs`,
+  `docs/design/file-provider.md`).
+
 - File and SQLite expose existing-only open paths for callers that already hold provider
   authority. They refuse absent or incomplete stores without creating a root, lock, database or
   owner tables; explicit creation and File journal recovery retain their prior behavior.

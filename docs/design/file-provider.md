@@ -95,8 +95,52 @@ resumed reader removes no staging name and synchronizes no directory, because an
 mutates a store has changed the thing it came to observe. Its cached view is a reader's view and
 a transaction cannot use it: it carries the fold and the committed-byte hash, not the frames a
 writer appends onto, and not the promise that every object the fold binds has been hashed. Bound
-content is read and hashed on every capture, because every capture hands those bytes to its
-caller, which is the same rule a read on the write path follows.
+content is read and hashed by the capture that hands those bytes to its caller, which is the same
+rule a read on the write path follows — see *When bound content is read* below for which capture
+that is.
+
+### When bound content is read
+
+`capture_tenant` reads and hashes every bound object before it returns. `capture_tenant_deferred`
+returns the same observation and reads none of them: which digests a tenant binds, in what order,
+and whether they cross the caller's caps are all decided from the committed records, which already
+name the object behind each digest and the hash its content must have. The content is read, and
+hashed, by `DeferredBlob::bytes` — on the read that hands it out. **The rule is unchanged: this
+crate hashes what it hands out.** What changed is that a caller which never asks for a binding's
+content never pays for it.
+
+Two consequences, both deliberate:
+
+- A deferred observation's *bindings* are decided under the writers' lock, exactly as before. Its
+  *content* is read afterwards, without that lock. A binding whose object a later writer removed
+  or replaced is therefore refused by `DeferredBlob::bytes` rather than returned — the recorded
+  hash decides every read, so the observation answers with the content it bound or with nothing.
+  It never substitutes.
+- Nothing is cached. A second ask is a second read, which is what keeps a deferred capture's cost
+  in memory the size of its digests rather than the size of the store's content.
+
+The caps are charged identically on both paths. The payload cap is charged in bytes, so the
+deferred path `stat`s each object for its length — which is also where the half of the
+complete-content check that does not need the content already lived: an admitted object name and a
+regular file.
+
+**The decision, 2026-09-22.** Measured on this workstation (i9-10900K, no SHA-NI; release build;
+7,815 blobs totalling 157.0 MB, the shape of the migrated ESS authority;
+`crates/eventlog-file/tests/measure_capture.rs`):
+
+| capture of the whole authority | wall |
+| --- | --- |
+| `capture_tenant` (reads and hashes every object) | 667 / 675 / 706 / 729 ms |
+| `capture_tenant_deferred` (reads none) | 61 / 61 / 103 ms |
+
+The same harness separates the two costs the read pays, and the answer is that both are real:
+7,815 blobs of 128 bytes each cost 284 ms — about 36 µs per object of open/read/decode — and 61
+blobs totalling the same 157.0 MB cost 596 ms, about 263 MB/s, which is software SHA-256 on this
+CPU. An authority's capture pays both, on every capture, whether or not its caller looks at one
+binding. Three alternatives were weighed and not taken: keeping the read (the cost above); a digest
+cache keyed by file identity, which would serve a blob damaged in place with its identity preserved
+unverified once; and hashing only where the CPU has SHA-NI, which changes nothing here. None of
+them is needed once the committed record is the source of the digest.
 
 ## Content and privacy
 

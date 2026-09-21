@@ -92,7 +92,7 @@ pub(crate) enum Op {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Blob {
     pub id: String,

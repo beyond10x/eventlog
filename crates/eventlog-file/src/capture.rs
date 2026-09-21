@@ -7,12 +7,17 @@
 //! the thing it came to observe, so capture uses the strict reader instead and holds the same
 //! runtime mutex and interprocess `writer.lock` that every writer holds.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use eventlog_core::{
-    BoxFuture, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CapturedBlob,
-    CapturedProjection, ConsistentTenantCapture, EventLogError, ProjectionCaptureRefusal,
-    ProjectionSpec, TenantCapture, TenantId, order_blobs, order_rows, validate_capture_request,
+    BoundBlobs, BoxFuture, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial,
+    CapturedBlob, CapturedProjection, ConsistentTenantCapture, DeferredBlob, DeferredTenantCapture,
+    EventLogError, ProjectionCaptureRefusal, ProjectionSpec, RecordedEvent, TenantCapture,
+    TenantId, order_blobs, order_deferred_blobs, order_rows, validate_capture_request,
     validate_captured_digest, validate_captured_order,
 };
 use tokio::sync::Mutex;
@@ -105,6 +110,28 @@ impl ConsistentTenantCapture for FileTenantCapture {
                 tenant,
                 projections,
                 limits,
+                observe,
+            )
+            .await
+        })
+    }
+
+    fn capture_tenant_deferred<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        projections: &'a [ProjectionSpec],
+        limits: CaptureLimits,
+    ) -> BoxFuture<'a, Result<DeferredTenantCapture, CaptureError>> {
+        Box::pin(async move {
+            let observation = &mut *self.observation.lock().await;
+            capture(
+                &self.root,
+                &mut observation.observed,
+                &mut observation.view,
+                tenant,
+                projections,
+                limits,
+                observe_deferred,
             )
             .await
         })
@@ -129,6 +156,28 @@ impl ConsistentTenantCapture for FileEventStore {
                 tenant,
                 projections,
                 limits,
+                observe,
+            )
+            .await
+        })
+    }
+
+    fn capture_tenant_deferred<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        projections: &'a [ProjectionSpec],
+        limits: CaptureLimits,
+    ) -> BoxFuture<'a, Result<DeferredTenantCapture, CaptureError>> {
+        Box::pin(async move {
+            let runtime = &mut *self.runtime.lock().await;
+            capture(
+                &self.root,
+                &mut runtime.observed,
+                &mut runtime.captured,
+                tenant,
+                projections,
+                limits,
+                observe_deferred,
             )
             .await
         })
@@ -145,14 +194,24 @@ async fn blocking<T: Send + 'static>(
     })?
 }
 
-async fn capture(
+/// How one tenant is observed inside a strict read, given the fold that read produced.
+///
+/// A function pointer and not a closure: the two observations differ only in what they do with
+/// the bindings, and everything around them — the lock, the resumed view, the divergence guard
+/// and the rule about which refusals may be answered ahead of it — is one body serving both.
+/// There is no second copy of that reasoning to keep in step with this one.
+type Observe<T> =
+    fn(&Path, &State, &TenantId, &[ProjectionSpec], CaptureLimits) -> Result<T, CaptureError>;
+
+async fn capture<T: Send + 'static>(
     root: &Path,
     observed: &mut Option<Manifest>,
     view: &mut Option<Observed>,
     tenant: &TenantId,
     projections: &[ProjectionSpec],
     limits: CaptureLimits,
-) -> Result<TenantCapture, CaptureError> {
+    observe: Observe<T>,
+) -> Result<T, CaptureError> {
     validate_capture_request(tenant, projections)?;
     let root = root.to_owned();
     let previous = observed.clone();
@@ -174,6 +233,7 @@ async fn capture(
             &owner,
             &requested,
             limits,
+            observe,
         )
     })
     .await?;
@@ -217,22 +277,15 @@ async fn capture(
 /// strictly more than [`journal::extends_observed`] can: that the committed prefix is byte for
 /// byte the history this handle verified, and that every frame past it chains from the head it
 /// observed to the manifest that commits them.
-fn observed_history(
+fn observed_history<T>(
     root: &Path,
     previous: Option<&Manifest>,
     reusable: Option<Observed>,
     tenant: &TenantId,
     projections: &[ProjectionSpec],
     limits: CaptureLimits,
-) -> Result<
-    (
-        Manifest,
-        bool,
-        Observed,
-        Result<TenantCapture, CaptureError>,
-    ),
-    CaptureError,
-> {
+    observe: Observe<T>,
+) -> Result<(Manifest, bool, Observed, Result<T, CaptureError>), CaptureError> {
     if let (Some(previous), Some(reusable)) = (previous, reusable)
         && let Some(resumed) = journal::resume_strict(root, previous, &reusable.content)
     {
@@ -295,13 +348,18 @@ fn observed_history(
     ))
 }
 
-fn observe(
-    root: &Path,
+/// Everything one tenant's observation decides before it reaches the bindings.
+///
+/// The precedence here is the design's, in its order — identity, then redaction, then projection
+/// availability, then the event cap — and it is one body rather than two so that the eager and
+/// deferred observations cannot answer a refusal in different orders. What follows it differs;
+/// this does not.
+fn observed_prefix(
     state: &State,
     tenant: &TenantId,
     projections: &[ProjectionSpec],
-    limits: CaptureLimits,
-) -> Result<TenantCapture, CaptureError> {
+    budget: &mut CaptureBudget,
+) -> Result<(String, Vec<RecordedEvent>, Vec<ProjectionSpec>), CaptureError> {
     // Identity first: a tenant nobody provisioned has no observation to refuse on other grounds,
     // and ordinary append does not provision one, so append-then-redaction reaches exactly here.
     let Some(identity) = state.identities.get(tenant.as_str()) else {
@@ -326,7 +384,6 @@ fn observe(
         admitted.push(*specification);
     }
 
-    let mut budget = CaptureBudget::new(limits);
     let mut events = Vec::new();
     for event in state
         .events
@@ -337,23 +394,16 @@ fn observe(
         events.push(event.clone());
     }
     validate_captured_order(tenant, &events)?;
+    Ok((identity.clone(), events, admitted))
+}
 
-    let mut blobs = Vec::new();
-    for ((_, digest), blob) in state
-        .blobs
-        .iter()
-        .filter(|((owner, _), _)| owner == tenant.as_str())
-    {
-        validate_captured_digest(digest)?;
-        let bytes = read_blob(root, blob)?;
-        budget.admit_blob(bytes.len() as u64)?;
-        blobs.push(CapturedBlob {
-            digest: digest.clone(),
-            bytes,
-        });
-    }
-    order_blobs(&mut blobs)?;
-
+/// The requested materializations, charged after the bindings exactly as the design orders them.
+fn observed_projections(
+    state: &State,
+    tenant: &TenantId,
+    admitted: Vec<ProjectionSpec>,
+    budget: &mut CaptureBudget,
+) -> Result<Vec<CapturedProjection>, CaptureError> {
     let mut captured = Vec::with_capacity(admitted.len());
     for specification in admitted {
         let mut rows = Vec::new();
@@ -371,14 +421,146 @@ fn observe(
             rows,
         });
     }
+    Ok(captured)
+}
 
+/// One tenant's bindings, by digest, as the committed history records them.
+fn bound<'a>(
+    state: &'a State,
+    tenant: &'a TenantId,
+) -> impl Iterator<Item = (&'a String, &'a Blob)> {
+    state
+        .blobs
+        .iter()
+        .filter(|((owner, _), _)| owner == tenant.as_str())
+        .map(|((_, digest), blob)| (digest, blob))
+}
+
+fn observe(
+    root: &Path,
+    state: &State,
+    tenant: &TenantId,
+    projections: &[ProjectionSpec],
+    limits: CaptureLimits,
+) -> Result<TenantCapture, CaptureError> {
+    let mut budget = CaptureBudget::new(limits);
+    let (identity, events, admitted) = observed_prefix(state, tenant, projections, &mut budget)?;
+
+    let mut blobs = Vec::new();
+    for (digest, blob) in bound(state, tenant) {
+        validate_captured_digest(digest)?;
+        let bytes = read_blob(root, blob)?;
+        budget.admit_blob(bytes.len() as u64)?;
+        blobs.push(CapturedBlob {
+            digest: digest.clone(),
+            bytes,
+        });
+    }
+    order_blobs(&mut blobs)?;
+
+    let captured = observed_projections(state, tenant, admitted, &mut budget)?;
     Ok(TenantCapture {
         tenant: tenant.clone(),
-        stream_identity: identity.clone(),
+        stream_identity: identity,
         events,
         blobs,
         projections: captured,
     })
+}
+
+/// The same observation, deciding every binding from the committed history and reading none.
+///
+/// This is where the authority's content stops being read on every capture. The committed record
+/// already names the object behind each digest and the hash that object's content must have —
+/// `put_blob` and `bind_blobs` wrote both — so *which* digests this tenant binds, and in what
+/// order, and whether they cross the caller's caps, are all answerable without opening one of
+/// them. What is not answerable without opening one is whether its content is still that content,
+/// and that question is asked where it can be answered: in [`BoundObjects::read`], on the read
+/// that hands the content out.
+fn observe_deferred(
+    root: &Path,
+    state: &State,
+    tenant: &TenantId,
+    projections: &[ProjectionSpec],
+    limits: CaptureLimits,
+) -> Result<DeferredTenantCapture, CaptureError> {
+    let mut budget = CaptureBudget::new(limits);
+    let (identity, events, admitted) = observed_prefix(state, tenant, projections, &mut budget)?;
+
+    let mut digests = Vec::new();
+    let mut objects = BTreeMap::new();
+    for (digest, blob) in bound(state, tenant) {
+        validate_captured_digest(digest)?;
+        budget.admit_blob(bound_length(root, blob)?)?;
+        digests.push(digest.clone());
+        objects.insert(digest.clone(), blob.clone());
+    }
+    let source: Arc<dyn BoundBlobs> = Arc::new(BoundObjects {
+        root: root.to_owned(),
+        objects,
+    });
+    let mut blobs: Vec<DeferredBlob> = digests
+        .into_iter()
+        .map(|digest| DeferredBlob::deferred(digest, Arc::clone(&source)))
+        .collect();
+    order_deferred_blobs(&mut blobs)?;
+
+    let captured = observed_projections(state, tenant, admitted, &mut budget)?;
+    Ok(DeferredTenantCapture {
+        tenant: tenant.clone(),
+        stream_identity: identity,
+        events,
+        blobs,
+        projections: captured,
+    })
+}
+
+/// The bindings one deferred observation made, and where their content lives.
+///
+/// What this holds is the size of the observation's *digests*, not of its content: one object id
+/// and one recorded hash per binding. That is the whole reason the reads can be moved — a handle
+/// that instead held the bytes to avoid re-reading them would hold the store.
+///
+/// It is read without the writers' lock, because the observation that made it has long since let
+/// go. That is a real difference from the eager capture and it is bounded in one direction only:
+/// the recorded hash decides every read, so a binding whose object a later writer replaced or
+/// removed is refused. The content this answers with is the content the observation bound, or
+/// there is no answer.
+#[derive(Debug)]
+struct BoundObjects {
+    root: PathBuf,
+    objects: BTreeMap<String, Blob>,
+}
+
+impl BoundBlobs for BoundObjects {
+    fn read(&self, digest: &str) -> Result<Vec<u8>, CaptureError> {
+        let Some(blob) = self.objects.get(digest) else {
+            return Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob,
+            });
+        };
+        read_blob(&self.root, blob)
+    }
+}
+
+/// How many bytes one binding's object holds, without reading or hashing any of them.
+///
+/// A deferred capture answers the caller's caps exactly as an eager one does, and the payload cap
+/// is charged in bytes, so the bytes have to be counted. `stat` counts them — and it is also
+/// where the half of the complete-content check that does not need the content already lives: an
+/// admitted object name and a regular file. The other half is the hash, and it is charged where
+/// the content is read.
+fn bound_length(root: &Path, blob: &Blob) -> Result<u64, CaptureError> {
+    let corrupt = || CaptureError::Corrupt {
+        material: CaptureMaterial::Blob,
+    };
+    crate::validate_object(&blob.id).map_err(|_| corrupt())?;
+    let metadata =
+        std::fs::symlink_metadata(root.join("blobs").join(&blob.id)).map_err(|_| corrupt())?;
+    if !metadata.is_file() {
+        return Err(corrupt());
+    }
+    Ok(metadata.len())
 }
 
 fn admit_projection(
@@ -649,6 +831,99 @@ mod tests {
             ten.blobs_hashed,
             10 * one.blobs_hashed,
             "the bytes a capture hands out are hashed on every capture: {ten:?} against {one:?}"
+        );
+    }
+
+    /// A deferred capture says which digests are bound without opening one object to find out.
+    ///
+    /// The acceptance statement of this unit, and it is asserted as *work* rather than as wall
+    /// clock, because wall clock cannot tell a fast read from no read: a machine with the whole
+    /// store in page cache reads 7,815 objects in well under the budget a timing assertion would
+    /// have to allow, and would go on passing after somebody put the reads back. `blobs_hashed`
+    /// is charged inside the read that hashes, by that read, so it moves if and only if an object
+    /// was opened and digested.
+    ///
+    /// The other half is the half that matters: the reads are *moved*, not removed. Asking one
+    /// binding for its content costs exactly one, asking for all of them costs exactly what the
+    /// capture used to cost, and what comes back is what the eager capture would have handed over
+    /// — same digests, same bytes, same everything else. A capture that answered cheaply by
+    /// answering with less would pass the first assertion and fail these.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_capture_reads_no_blob_object_until_its_bytes_are_asked_for() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("deferred-capture-owner").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.stream_identity(&tenant).await.unwrap();
+        for index in 0..8_i64 {
+            store
+                .append(
+                    &StreamId::new(tenant.clone(), "item", format!("s{index}")).unwrap(),
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", index)],
+                    &eventlog_conformance::meta(&format!("m{index}"), &json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .put_blob(
+                    &tenant,
+                    &format!("d{index}"),
+                    format!("bytes-{index}").as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let before = crate::cost::of(root);
+        let deferred = store
+            .capture_tenant_deferred(&tenant, &[], limits())
+            .await
+            .unwrap();
+        let taking = crate::cost::of(root) - before;
+        assert_eq!(
+            deferred.blobs.len(),
+            8,
+            "a deferred capture names every bound blob: {:?}",
+            deferred.blobs.len()
+        );
+        assert_eq!(
+            deferred
+                .blobs
+                .iter()
+                .map(|blob| blob.digest.clone())
+                .collect::<Vec<_>>(),
+            (0..8).map(|index| format!("d{index}")).collect::<Vec<_>>(),
+            "the digests are the committed records', in the order every capture returns"
+        );
+        assert_eq!(
+            taking.blobs_hashed, 0,
+            "a deferred capture opened and digested blob objects to say which digests are bound: {taking:?}"
+        );
+
+        let asking = crate::cost::of(root);
+        assert_eq!(
+            deferred.blobs[3].bytes().unwrap(),
+            b"bytes-3".to_vec(),
+            "the binding hands out the content it names"
+        );
+        let asked = crate::cost::of(root) - asking;
+        assert_eq!(
+            asked.blobs_hashed, 1,
+            "one binding asked for its content cost one object read, hashed on the way out: {asked:?}"
+        );
+
+        let loading = crate::cost::of(root);
+        let loaded = deferred.load().unwrap();
+        let whole = crate::cost::of(root) - loading;
+        assert_eq!(
+            whole.blobs_hashed, 8,
+            "asking for every binding's content costs exactly what the capture used to cost: {whole:?}"
+        );
+        assert_eq!(
+            loaded,
+            store.capture_tenant(&tenant, &[], limits()).await.unwrap(),
+            "a deferred capture read in full is the capture the caller would have been handed"
         );
     }
 

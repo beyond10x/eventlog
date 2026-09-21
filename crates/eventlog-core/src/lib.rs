@@ -19,10 +19,11 @@ mod inline_admin;
 mod projection;
 
 pub use capture::{
-    CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CaptureRequestRefusal,
-    CaptureResource, CapturedBlob, CapturedProjection, ConsistentTenantCapture,
-    ProjectionCaptureRefusal, TenantCapture, order_blobs, order_rows, validate_capture_request,
-    validate_captured_digest, validate_captured_event, validate_captured_order,
+    BoundBlobs, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CaptureRequestRefusal,
+    CaptureResource, CapturedBlob, CapturedProjection, ConsistentTenantCapture, DeferredBlob,
+    DeferredTenantCapture, ProjectionCaptureRefusal, TenantCapture, order_blobs,
+    order_deferred_blobs, order_rows, validate_capture_request, validate_captured_digest,
+    validate_captured_event, validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 

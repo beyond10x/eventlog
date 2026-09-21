@@ -14,6 +14,9 @@ pub use consistent_capture::{
     CAPTURE_LEDGER, CAPTURE_SIDECAR, CaptureLedger, run_consistent_capture,
 };
 
+mod deferred_capture;
+pub use deferred_capture::run_deferred_blob_bytes;
+
 mod inline_admin;
 pub use inline_admin::{
     ADMIN_LEDGER, ADMIN_SIDECAR, ADMIN_SPARE, AdminProjector, CoordinatedProjector, SpareProjector,

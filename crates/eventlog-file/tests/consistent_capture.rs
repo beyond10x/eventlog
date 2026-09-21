@@ -95,6 +95,35 @@ async fn file_consistent_capture_contract() {
     eventlog_conformance::run_consistent_capture(&store, concrete.as_ref()).await;
 }
 
+/// The deferred read's contract, with this store's own way of damaging an object supplied to it.
+///
+/// A blob object is a file under `blobs/`, named by an object id the committed history assigns,
+/// so the damage finds its file by the content the exercise bound rather than by guessing that
+/// id. It writes different bytes of the same length in place: a change that leaves the directory
+/// entry, the file size and the modification granularity able to look the same is exactly the
+/// change a reader that trusted anything but the hash would miss.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_deferred_blob_bytes_contract() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path().to_owned();
+    let concrete = Arc::new(FileEventStore::open(&root).await.expect("opened store"));
+    let store: Arc<dyn EventStore> = concrete.clone();
+    let damage = move |_: &TenantId, _: &str, content: &[u8]| {
+        let mut replaced = false;
+        for entry in fs::read_dir(root.join("blobs")).expect("object directory") {
+            let path = entry.expect("object entry").path();
+            if fs::read(&path).expect("object bytes") == content {
+                let mut other = content.to_vec();
+                other[0] ^= 0xff;
+                fs::write(&path, &other).expect("damaged object");
+                replaced = true;
+            }
+        }
+        assert!(replaced, "the exercise's content is stored under blobs/");
+    };
+    eventlog_conformance::run_deferred_blob_bytes(&store, concrete.as_ref(), &damage).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_only_handle_inspects_a_store_nobody_opened_for_writing() {
     let directory = tempfile::tempdir().expect("temporary directory");

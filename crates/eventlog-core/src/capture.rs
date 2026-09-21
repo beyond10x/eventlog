@@ -10,7 +10,10 @@
 //! stored identity, no format version. The envelope a fact is recorded in remains [`RecordedEvent`]
 //! and the projection vocabulary remains [`ProjectionSpec`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde_json::Value;
 
@@ -50,6 +53,136 @@ pub struct TenantCapture {
 pub struct CapturedBlob {
     pub digest: String,
     pub bytes: Vec<u8>,
+}
+
+/// The bytes behind one bound digest, read from the provider when a caller asks for them.
+///
+/// This exists so that an observation can be complete about *what* is bound without reading the
+/// content of every binding to say so. A provider that hands one of these out makes the same
+/// promise it made when it handed the bytes over by value: what comes back is the content the
+/// observation bound, checked against what the observation recorded for it — or nothing at all.
+/// The check moves to the read; it does not go away.
+pub trait BoundBlobs: Send + Sync + std::fmt::Debug {
+    /// Read the bytes bound to `digest` in the observation this reader came from.
+    ///
+    /// # Errors
+    /// Returns [`CaptureError::Corrupt`] when this reader does not name that digest, when the
+    /// stored object is gone or is not the shape the provider writes, or when its content no
+    /// longer hashes to what the observation recorded — and [`CaptureError::Store`] for an
+    /// operational failure.
+    fn read(&self, digest: &str) -> Result<Vec<u8>, CaptureError>;
+}
+
+/// One bound blob of a [`DeferredTenantCapture`]: the digest now, the bytes when asked for.
+#[derive(Clone, Debug)]
+pub struct DeferredBlob {
+    pub digest: String,
+    source: DeferredSource,
+}
+
+#[derive(Clone, Debug)]
+enum DeferredSource {
+    /// The provider read the content already, so the value carries it.
+    Held(Vec<u8>),
+    /// The provider will read the content, and check it, when it is asked for.
+    Read(Arc<dyn BoundBlobs>),
+}
+
+impl DeferredBlob {
+    /// One binding whose content the provider has already read and checked.
+    #[must_use]
+    pub fn held(digest: String, bytes: Vec<u8>) -> Self {
+        Self {
+            digest,
+            source: DeferredSource::Held(bytes),
+        }
+    }
+
+    /// One binding whose content is read, and checked, by [`Self::bytes`].
+    #[must_use]
+    pub fn deferred(digest: String, source: Arc<dyn BoundBlobs>) -> Self {
+        Self {
+            digest,
+            source: DeferredSource::Read(source),
+        }
+    }
+
+    /// The content this binding names, hashed on the way out.
+    ///
+    /// **Nothing is cached.** A second ask is a second read, which is what keeps a capture's cost
+    /// in memory the size of its digests rather than the size of its content — the whole point of
+    /// not reading them at capture. A caller that wants them all at once has [`
+    /// DeferredTenantCapture::load`], which is exactly the value it would have been handed before.
+    ///
+    /// # Errors
+    /// Returns [`CaptureError::Corrupt`] when the stored content is gone or is no longer the
+    /// content the observation bound, and [`CaptureError::Store`] for an operational failure.
+    pub fn bytes(&self) -> Result<Vec<u8>, CaptureError> {
+        match &self.source {
+            DeferredSource::Held(bytes) => Ok(bytes.clone()),
+            DeferredSource::Read(source) => source.read(&self.digest),
+        }
+    }
+}
+
+/// One tenant's observation, handing blob content out through a reader rather than by value.
+///
+/// Everything [`TenantCapture`] promises about history, bindings, caps and ordering is promised
+/// here, and promised at the same instant: which digests this tenant binds is decided under the
+/// provider's own consistency boundary, exactly as before. What is no longer decided there is the
+/// *content* behind a binding — that is read afterwards, without the boundary, so a binding whose
+/// object a later writer removed or replaced is refused by [`DeferredBlob::bytes`] rather than
+/// returned. The observation never substitutes: it answers the content it bound, or it refuses.
+#[derive(Clone, Debug)]
+pub struct DeferredTenantCapture {
+    pub tenant: TenantId,
+    /// The identity the provider already stored. Capture never mints one.
+    pub stream_identity: String,
+    /// Every event for this tenant, once, in ascending `global_seq`.
+    pub events: Vec<RecordedEvent>,
+    /// Every currently bound blob, once, in bytewise digest order, orphans included.
+    pub blobs: Vec<DeferredBlob>,
+    /// One entry per requested projection, in the request's order.
+    pub projections: Vec<CapturedProjection>,
+}
+
+impl DeferredTenantCapture {
+    /// Read every binding's content and become the value [`TenantCapture`] would have been.
+    ///
+    /// # Errors
+    /// Whatever [`DeferredBlob::bytes`] returns for the first binding that cannot be read.
+    pub fn load(self) -> Result<TenantCapture, CaptureError> {
+        let mut blobs = Vec::with_capacity(self.blobs.len());
+        for blob in &self.blobs {
+            blobs.push(CapturedBlob {
+                digest: blob.digest.clone(),
+                bytes: blob.bytes()?,
+            });
+        }
+        Ok(TenantCapture {
+            tenant: self.tenant,
+            stream_identity: self.stream_identity,
+            events: self.events,
+            blobs,
+            projections: self.projections,
+        })
+    }
+}
+
+impl From<TenantCapture> for DeferredTenantCapture {
+    fn from(value: TenantCapture) -> Self {
+        Self {
+            tenant: value.tenant,
+            stream_identity: value.stream_identity,
+            events: value.events,
+            blobs: value
+                .blobs
+                .into_iter()
+                .map(|blob| DeferredBlob::held(blob.digest, blob.bytes))
+                .collect(),
+            projections: value.projections,
+        }
+    }
 }
 
 /// One requested projection's rows, in bytewise key order.
@@ -158,6 +291,34 @@ pub trait ConsistentTenantCapture: Send + Sync + 'static {
         projections: &'a [ProjectionSpec],
         limits: CaptureLimits,
     ) -> BoxFuture<'a, Result<TenantCapture, CaptureError>>;
+
+    /// The same observation, handing blob content out through a reader rather than by value.
+    ///
+    /// Every refusal, every cap and every ordering is [`Self::capture_tenant`]'s. What differs is
+    /// *when* the content behind a binding is read, and therefore what an observation costs a
+    /// caller that never looks at one: a provider whose committed records already name what each
+    /// binding's content must hash to can answer this without opening an object at all.
+    ///
+    /// The default answers it from [`Self::capture_tenant`], which reads every object, so a
+    /// provider with no cheaper source of the digests neither gains nor loses anything and every
+    /// caller sees one contract. That is deliberate: this is not a capability to select on, it is
+    /// the same capture with the reads moved to the reader.
+    ///
+    /// # Errors
+    /// Exactly what [`Self::capture_tenant`] returns, except that stored content which fails its
+    /// integrity check is refused by [`DeferredBlob::bytes`] rather than here.
+    fn capture_tenant_deferred<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        projections: &'a [ProjectionSpec],
+        limits: CaptureLimits,
+    ) -> BoxFuture<'a, Result<DeferredTenantCapture, CaptureError>> {
+        Box::pin(async move {
+            Ok(DeferredTenantCapture::from(
+                self.capture_tenant(tenant, projections, limits).await?,
+            ))
+        })
+    }
 }
 
 /// Check a capture request before any provider touches a connection or a lock.
@@ -406,10 +567,26 @@ pub fn validate_captured_digest(digest: &str) -> Result<(), CaptureError> {
 /// # Errors
 /// Returns [`CaptureError::Corrupt`] when one digest is bound twice in one tenant.
 pub fn order_blobs(blobs: &mut [CapturedBlob]) -> Result<(), CaptureError> {
-    blobs.sort_by(|left, right| left.digest.as_bytes().cmp(right.digest.as_bytes()));
+    order_by_digest(blobs, |blob| blob.digest.as_str())
+}
+
+/// [`order_blobs`] for a [`DeferredTenantCapture`]'s bindings, which is the same rule.
+///
+/// # Errors
+/// Returns [`CaptureError::Corrupt`] when one digest is bound twice in one tenant.
+pub fn order_deferred_blobs(blobs: &mut [DeferredBlob]) -> Result<(), CaptureError> {
+    order_by_digest(blobs, |blob| blob.digest.as_str())
+}
+
+/// The one ordering rule both capture shapes follow, written once so they cannot drift apart.
+fn order_by_digest<T>(
+    blobs: &mut [T],
+    digest: impl Fn(&T) -> &str + Copy,
+) -> Result<(), CaptureError> {
+    blobs.sort_by(|left, right| digest(left).as_bytes().cmp(digest(right).as_bytes()));
     if blobs
         .windows(2)
-        .any(|pair| pair[0].digest == pair[1].digest)
+        .any(|pair| digest(&pair[0]) == digest(&pair[1]))
     {
         return Err(CaptureError::Corrupt {
             material: CaptureMaterial::Blob,
@@ -449,6 +626,84 @@ mod tests {
             max_projection_rows: value,
             max_payload_bytes: value,
         }
+    }
+
+    /// One provider that has nothing cheaper than `capture_tenant`, which is the default's case.
+    struct Recorded(TenantCapture);
+
+    impl ConsistentTenantCapture for Recorded {
+        fn capture_tenant<'a>(
+            &'a self,
+            _: &'a TenantId,
+            _: &'a [ProjectionSpec],
+            _: CaptureLimits,
+        ) -> BoxFuture<'a, Result<TenantCapture, CaptureError>> {
+            Box::pin(std::future::ready(Ok(self.0.clone())))
+        }
+    }
+
+    /// Drive a future that cannot await anything, in a crate with no runtime to await it on.
+    ///
+    /// `Pending` is not a case to handle, it is the assertion: the default body awaits exactly one
+    /// thing, and the stub above answers it without yielding. A default that acquired something to
+    /// wait on would stop here rather than pass.
+    fn ready<T>(mut future: BoxFuture<'_, T>) -> T {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("the default deferred capture awaited a store"),
+        }
+    }
+
+    /// The default deferred capture is the eager one with its content already in hand.
+    ///
+    /// Every provider that has no cheaper source for its digests serves this body, and nothing
+    /// else runs it: `run_deferred_blob_bytes` is called by the one provider that overrides it,
+    /// so a green suite over the others would have said nothing about this at all. What it must
+    /// not do is reinterpret the value it was handed — the order is the order `capture_tenant`
+    /// decided, which is why the fixture's bindings are deliberately not in digest order.
+    #[test]
+    fn the_default_deferred_capture_is_the_eager_one_with_its_content_in_hand() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let eager = TenantCapture {
+            tenant: tenant.clone(),
+            stream_identity: "identity-1".to_owned(),
+            events: vec![recorded(1, 1, "one")],
+            blobs: vec![
+                CapturedBlob {
+                    digest: "second".to_owned(),
+                    bytes: b"two".to_vec(),
+                },
+                CapturedBlob {
+                    digest: "first".to_owned(),
+                    bytes: b"one".to_vec(),
+                },
+            ],
+            projections: Vec::new(),
+        };
+        let provider = Recorded(eager.clone());
+
+        let deferred = ready(provider.capture_tenant_deferred(&tenant, &[], limits(64)))
+            .expect("the default answers whatever capture_tenant answered");
+        assert_eq!(
+            deferred
+                .blobs
+                .iter()
+                .map(|blob| blob.digest.clone())
+                .collect::<Vec<_>>(),
+            vec!["second".to_owned(), "first".to_owned()],
+            "the default re-ordered bindings its provider had already ordered"
+        );
+        assert_eq!(
+            deferred.blobs[0].bytes().unwrap(),
+            b"two".to_vec(),
+            "a binding the provider already read hands out the content it was given"
+        );
+        assert_eq!(
+            deferred.load().unwrap(),
+            eager,
+            "the default read in full is the value capture_tenant returned"
+        );
     }
 
     fn recorded(global_seq: u64, version: u64, stream_id: &str) -> RecordedEvent {
