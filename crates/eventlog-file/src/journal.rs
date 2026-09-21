@@ -221,6 +221,10 @@ impl Journal {
             .read_to_end(&mut committed)
             .map_err(backend)?;
         let transactions = decode(&committed, &manifest)?;
+        #[cfg(test)]
+        crate::cost::charge(root, |cost| {
+            cost.frames_chained += transactions.len() as u64;
+        });
         if events.metadata().map_err(backend)?.len() > manifest.length {
             return Err(corrupt());
         }
@@ -332,61 +336,8 @@ impl Journal {
             .open(lock_path)
             .map_err(backend)?;
         lock.lock().map_err(backend)?;
-        if root.join("append.json").exists() || root.join("privacy.json").exists() {
+        let Some((manifest, fresh, content)) = resumed_committed(root, observed, content)? else {
             return Ok(None);
-        }
-        let manifest_path = root.join("manifest.json");
-        if !manifest_path.exists() {
-            return Ok(None);
-        }
-        let manifest: Manifest =
-            serde_json::from_slice(&read(&manifest_path)?).map_err(|_| corrupt())?;
-        if manifest.format != FORMAT {
-            return Err(corrupt());
-        }
-        if manifest.store != observed.store
-            || manifest.epoch != observed.epoch
-            || manifest.sequence < observed.sequence
-            || manifest.length < observed.length
-        {
-            return Ok(None);
-        }
-        let events_path = root.join("events.jsonl");
-        regular(&events_path)?;
-        if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
-            return Ok(None);
-        }
-        // The committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
-        // rechaining it, and the only way a handle can tell that what it verified is still there.
-        let mut events = File::open(&events_path).map_err(backend)?;
-        let mut observed_content = Content::empty();
-        let mut remaining = observed.length;
-        let mut buffer = vec![0_u8; 64 * 1024];
-        while remaining > 0 {
-            let want = usize::try_from(remaining.min(buffer.len() as u64)).map_err(backend)?;
-            let read = events.read(&mut buffer[..want]).map_err(backend)?;
-            if read == 0 {
-                return Ok(None);
-            }
-            observed_content.absorb(&buffer[..read]);
-            remaining -= read as u64;
-        }
-        if observed_content.digest() != content.digest() {
-            return Ok(None);
-        }
-        // Past the prefix: an unchanged head reads nothing more.
-        let fresh = if manifest == *observed {
-            Vec::new()
-        } else {
-            let mut tail = Vec::new();
-            events.read_to_end(&mut tail).map_err(backend)?;
-            match decode_chain(&tail, &manifest, observed.sequence, &observed.digest) {
-                Ok(fresh) => {
-                    observed_content.absorb(&tail);
-                    fresh
-                }
-                Err(_) => return Ok(None),
-            }
         };
         if sweep_unselected(root)? {
             sync_dir(root)?;
@@ -395,7 +346,7 @@ impl Journal {
             lock,
             manifest,
             fresh,
-            content: observed_content,
+            content,
         }))
     }
 
@@ -433,6 +384,95 @@ impl Journal {
         self.content = Content::of(&bytes);
         Ok(())
     }
+}
+
+/// Decide, with the writers' lock already held, whether the committed history is still the one
+/// behind `observed` — and what it gained since.
+///
+/// One walk, used by the writer's [`Journal::resume`] and by the reader's [`resume_strict`]: a
+/// second copy of it would be a second chance to compare the wrong thing. It reads and decides and
+/// nothing else. The sweep of unselected staging names belongs to the caller, because a writer
+/// owes it and a reader owes none: a capture that removed a file would have changed the thing it
+/// came to observe.
+///
+/// `None` hands the decision to the caller's complete opener: a pending recovery intent, a missing
+/// manifest, a manifest that is not on the observed store and epoch or is shorter, a file whose
+/// length is not the committed length, a committed prefix that is not the bytes this handle
+/// verified, or a tail that does not chain.
+fn resumed_committed(
+    root: &Path,
+    observed: &Manifest,
+    content: &Content,
+) -> Result<Option<(Manifest, Vec<Value>, Content)>, EventLogError> {
+    // A reserved intent name is present when its directory entry exists, even when following that
+    // entry reaches nothing. `Path::exists` follows links and reports a dangling one as absent, so
+    // it is not the question being asked here; and an entry that cannot be inspected at all is a
+    // doubt, which the complete opener resolves.
+    if pending_intent_exists(root).unwrap_or(true) {
+        return Ok(None);
+    }
+    let manifest_path = root.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&read(&manifest_path)?).map_err(|_| corrupt())?;
+    if manifest.format != FORMAT {
+        return Err(corrupt());
+    }
+    if manifest.store != observed.store
+        || manifest.epoch != observed.epoch
+        || manifest.sequence < observed.sequence
+        || manifest.length < observed.length
+    {
+        return Ok(None);
+    }
+    let events_path = root.join("events.jsonl");
+    regular(&events_path)?;
+    if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
+        return Ok(None);
+    }
+    // The committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
+    // rechaining it, and the only way a handle can tell that what it verified is still there.
+    let mut events = File::open(&events_path).map_err(backend)?;
+    let mut observed_content = Content::empty();
+    let mut remaining = observed.length;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buffer.len() as u64)).map_err(backend)?;
+        let read = events.read(&mut buffer[..want]).map_err(backend)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        observed_content.absorb(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.prefix_bytes_hashed += observed.length;
+    });
+    if observed_content.digest() != content.digest() {
+        return Ok(None);
+    }
+    // Past the prefix: an unchanged head reads nothing more.
+    let fresh = if manifest == *observed {
+        Vec::new()
+    } else {
+        let mut tail = Vec::new();
+        events.read_to_end(&mut tail).map_err(backend)?;
+        match decode_chain(&tail, &manifest, observed.sequence, &observed.digest) {
+            Ok(fresh) => {
+                observed_content.absorb(&tail);
+                fresh
+            }
+            Err(_) => return Ok(None),
+        }
+    };
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.frames_chained += fresh.len() as u64;
+    });
+    Ok(Some((manifest, fresh, observed_content)))
 }
 
 /// Whether the committed history still contains the exact prefix a handle observed.
@@ -484,6 +524,58 @@ impl Resumed {
     }
 }
 
+/// Committed history a reader resumed onto, with the writers' lock held for as long as it lives.
+///
+/// The reader's counterpart to [`Resumed`]. It carries no root and has no `into_journal`: there is
+/// no method here that could write, so there is none to forget to guard.
+pub(crate) struct StrictResumed {
+    lock: File,
+    pub manifest: Manifest,
+    pub fresh: Vec<Value>,
+    content: Content,
+}
+
+impl StrictResumed {
+    /// Release the lock and keep what it protected: the committed head, the frames past the head
+    /// the handle observed, and the hash of the committed bytes this resume validated.
+    pub(crate) fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
+        drop(self.lock);
+        (self.manifest, self.fresh, self.content)
+    }
+}
+
+/// Resume onto committed history without the authority to change any of it.
+///
+/// The read-only sibling of [`Journal::resume`], sharing its walk and adding nothing to it. Two
+/// differences, both of them the difference between a writer and a reader: this removes no
+/// staging name and synchronizes no directory, and it answers `None` rather than an error for
+/// everything it cannot decide, because every refusal belongs to [`open_strict`], which reaches
+/// them with the evidence left exactly where it was found.
+pub(crate) fn resume_strict(
+    root: &Path,
+    observed: &Manifest,
+    content: &Content,
+) -> Option<StrictResumed> {
+    let lock_path = root.join("writer.lock");
+    regular(&lock_path).ok()?;
+    // No create, no truncate: this opens the writers' own lock, it does not establish one.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    lock.lock().ok()?;
+    let (manifest, fresh, content) = resumed_committed(root, observed, content).ok()??;
+    Some(StrictResumed {
+        lock,
+        manifest,
+        fresh,
+        content,
+    })
+}
+
 /// One committed history, read without the authority to change it.
 ///
 /// The interprocess lock is held for as long as this value lives, exactly as an ordinary writer
@@ -496,6 +588,13 @@ pub(crate) struct Strict {
 }
 
 impl Strict {
+    /// Release the lock and keep what it protected: the committed head, the verified frames, and
+    /// the hash of the committed bytes those frames were decoded from.
+    pub(crate) fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
+        drop(self.lock);
+        (self.manifest, self.transactions, self.content)
+    }
+
     /// Turn a fully validated strict observation into a writer without reopening or recovering it.
     pub(crate) fn into_journal(self, root: &Path) -> Journal {
         Journal {
@@ -581,6 +680,10 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
         return Err(damaged());
     }
     let transactions = decode(&committed, &manifest).map_err(|_| damaged())?;
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.frames_chained += transactions.len() as u64;
+    });
     let content = Content::of(&committed);
     Ok(Strict {
         lock,

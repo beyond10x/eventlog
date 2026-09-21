@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Repository-local Eventlog. JSONL transactions are authoritative; snapshots are disposable.
 mod capture;
+#[cfg(test)]
+mod cost;
 mod inline_admin;
 mod journal;
 mod projection;
@@ -42,6 +44,11 @@ struct Runtime {
     /// frame in it has been chained and every object its fold binds has been hashed, so a later
     /// transaction may reuse it and pay only for what the file gained since.
     verified: Option<Verified>,
+    /// The same history as a *reader* verified it. A separate slot, and a separate type that a
+    /// transaction cannot accept, because a capture makes the weaker promise: see
+    /// [`capture::Observed`]. Keeping it here rather than in `verified` also means a read never
+    /// costs a writer the view its open paid for.
+    captured: Option<capture::Observed>,
 }
 /// One handle's verified view of the committed history, carrying the head it was folded from.
 ///
@@ -420,6 +427,10 @@ impl Transaction {
             return Err(backend("blob is not a regular file"));
         }
         let bytes = fs::read(path).map_err(backend)?;
+        #[cfg(test)]
+        cost::charge(&self.root, |cost| {
+            cost.blobs_hashed += 1;
+        });
         if hash(&bytes) != blob.hash {
             return Err(backend("referenced blob integrity check failed"));
         }

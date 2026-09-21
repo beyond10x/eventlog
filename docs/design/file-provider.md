@@ -79,6 +79,25 @@ to the complete reread, which refuses a history that does not extend the observe
 before. So an operation costs one raw pass over the committed bytes plus what the file gained
 since the handle last looked: no frame is decoded twice and no object is read twice.
 
+A consistent tenant capture reuses the same verified history, under the same rules and one
+restriction. A handle that has already observed the committed head re-reads and hashes the
+committed bytes behind it, folds only the frames past it, and answers the per-handle divergence
+guard from that comparison rather than by re-encoding the observed prefix: what the comparison
+establishes — the committed prefix is byte for byte the history this handle verified, and the
+frames past it chain from the head it observed — is strictly more than the guard asks. Everything
+the strict reader refuses before it decodes, the resumed reader reaches too, by handing the
+decision back to it: a writers' lock that is not a regular file or cannot be held, a reserved
+`append.json` or `privacy.json` entry — present whenever the directory entry is, even when
+following it reaches nothing — a manifest on another store or epoch, a file whose length is not
+the committed length, a committed prefix that is no longer the bytes the handle verified, or a
+tail that does not chain. The restriction is the one that separates a reader from a writer: the
+resumed reader removes no staging name and synchronizes no directory, because an inspector that
+mutates a store has changed the thing it came to observe. Its cached view is a reader's view and
+a transaction cannot use it: it carries the fold and the committed-byte hash, not the frames a
+writer appends onto, and not the promise that every object the fold binds has been hashed. Bound
+content is read and hashed on every capture, because every capture hands those bytes to its
+caller, which is the same rule a read on the write path follows.
+
 ## Content and privacy
 
 Blob bytes live separately in `blobs/`; journal entries contain a tenant/digest binding, object
@@ -129,4 +148,11 @@ committed are folded and the objects they bind verified, that a longer fork of t
 still refused, that a bound object removed after open refuses its read without changing state, and
 that a committed frame damaged in place after open refuses the next append without altering the
 history. A separate suite checks the same damage against an open handle's reads, its appends and a
-history whose observed prefix was rewritten under a genuine tail. These are process-death tests, not simulated drive power failure.
+history whose observed prefix was rewritten under a genuine tail. A capture unit test counts the
+frames a handle decodes, re-encodes and folds and the objects it hashes, and requires ten captures
+with no write between them to verify the committed history once and the content they hand out
+every time; `tests/consistent_capture.rs` checks that a capture reusing a view still folds what
+another writer committed, that a committed frame damaged in place afterwards refuses through the
+strict reader without changing a file, that damaged content still refuses the next capture, that a
+writers' lock that is no longer a regular file refuses one, and that a reserved recovery entry
+appearing after a capture — including one that cannot be followed — refuses the next. These are process-death tests, not simulated drive power failure.

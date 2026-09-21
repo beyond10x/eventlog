@@ -24,6 +24,36 @@ use crate::{
     state::{Blob, State},
 };
 
+/// The committed history one handle has verified, as a *reader* verified it.
+///
+/// Deliberately not [`crate::Verified`]. That is a writer's view: it carries the frames a
+/// transaction appends onto, and the promise that every object its fold binds has been hashed. A
+/// reader makes neither promise — it hashes the content it hands out and nothing else, because a
+/// capture has no business refusing over another tenant's object — and it needs neither the
+/// frames nor the promise. Two types rather than a flag on one: a transaction cannot pick this
+/// up, and that is enforced by the compiler rather than by a line somebody has to keep right.
+pub(crate) struct Observed {
+    /// The head these bytes were committed under, and the head this view is good for.
+    manifest: Manifest,
+    /// The fold of the whole committed history.
+    state: State,
+    /// The hash of the committed bytes the fold was built from. A resumed reader re-reads exactly
+    /// those bytes and refuses to reuse the view when they are not them, so a committed frame
+    /// damaged in place after a capture is never served from memory.
+    content: journal::Content,
+}
+
+/// What one handle has observed: the committed head it last accepted, and — when it still has
+/// one — the verified view behind that head, so the next capture pays for what changed.
+///
+/// The two travel together under one lock because they are one fact. The view is used only while
+/// its own manifest is still the observed head, so any path that moves the head retires it.
+#[derive(Default)]
+struct Observation {
+    observed: Option<Manifest>,
+    view: Option<Observed>,
+}
+
 /// A read-only entry to an existing store.
 ///
 /// Opening this handle and capturing through it both use the strict path, so an inspector never
@@ -31,7 +61,7 @@ use crate::{
 /// and nothing else: there is no method here that could write, so there is none to forget to guard.
 pub struct FileTenantCapture {
     root: PathBuf,
-    observed: Mutex<Option<Manifest>>,
+    observation: Mutex<Observation>,
 }
 
 impl FileTenantCapture {
@@ -46,9 +76,15 @@ impl FileTenantCapture {
         let probe = root.clone();
         let manifest =
             blocking(move || journal::open_strict(&probe).map(|strict| strict.manifest)).await?;
+        // No view yet: building one here would mean folding the history at open, which is work
+        // this handle may never be asked for and a refusal this entry point does not own. The
+        // first capture builds it from the strict read it does anyway.
         Ok(Self {
             root,
-            observed: Mutex::new(Some(manifest)),
+            observation: Mutex::new(Observation {
+                observed: Some(manifest),
+                view: None,
+            }),
         })
     }
 }
@@ -61,8 +97,16 @@ impl ConsistentTenantCapture for FileTenantCapture {
         limits: CaptureLimits,
     ) -> BoxFuture<'a, Result<TenantCapture, CaptureError>> {
         Box::pin(async move {
-            let mut observed = self.observed.lock().await;
-            capture(&self.root, &mut observed, tenant, projections, limits).await
+            let observation = &mut *self.observation.lock().await;
+            capture(
+                &self.root,
+                &mut observation.observed,
+                &mut observation.view,
+                tenant,
+                projections,
+                limits,
+            )
+            .await
         })
     }
 }
@@ -76,11 +120,12 @@ impl ConsistentTenantCapture for FileEventStore {
     ) -> BoxFuture<'a, Result<TenantCapture, CaptureError>> {
         Box::pin(async move {
             // The same runtime mutex every ordinary operation takes, then the same interprocess
-            // lock, then the same strict read: one implementation serves both entry points.
-            let mut runtime = self.runtime.lock().await;
+            // lock, then the same read: one implementation serves both entry points.
+            let runtime = &mut *self.runtime.lock().await;
             capture(
                 &self.root,
                 &mut runtime.observed,
+                &mut runtime.captured,
                 tenant,
                 projections,
                 limits,
@@ -103,6 +148,7 @@ async fn blocking<T: Send + 'static>(
 async fn capture(
     root: &Path,
     observed: &mut Option<Manifest>,
+    view: &mut Option<Observed>,
     tenant: &TenantId,
     projections: &[ProjectionSpec],
     limits: CaptureLimits,
@@ -110,21 +156,25 @@ async fn capture(
     validate_capture_request(tenant, projections)?;
     let root = root.to_owned();
     let previous = observed.clone();
+    // Taken, not borrowed, and filtered against the head this handle actually holds: a capture
+    // that refuses leaves no view behind, so the next one reads everything again rather than
+    // trusting a view assembled beside a refusal; and any entry point that moved the observed head
+    // past what this view folded has already retired it by moving it. The rule and the reason are
+    // `FileEventStore::transaction`'s.
+    let reusable = view
+        .take()
+        .filter(|view| Some(&view.manifest) == previous.as_ref());
     let owner = tenant.clone();
     let requested = projections.to_vec();
-    let (manifest, extended, outcome) = blocking(move || {
-        let strict = journal::open_strict(&root)?;
-        let extended = match &previous {
-            Some(previous) => {
-                journal::extends_observed(&strict.manifest, &strict.transactions, previous)?
-            }
-            None => true,
-        };
-        let state = State::replay(&strict.transactions).map_err(|_| CaptureError::Corrupt {
-            material: CaptureMaterial::Journal,
-        })?;
-        let outcome = observe(&root, &state, &owner, &requested, limits);
-        Ok((strict.manifest.clone(), extended, outcome))
+    let (manifest, extended, verified, outcome) = blocking(move || {
+        observed_history(
+            &root,
+            previous.as_ref(),
+            reusable,
+            &owner,
+            &requested,
+            limits,
+        )
     })
     .await?;
     // The design names exactly two refusals that may be answered from validated state ahead of the
@@ -148,7 +198,99 @@ async fn capture(
     }
     let value = outcome?;
     *observed = Some(manifest);
+    *view = Some(verified);
     Ok(value)
+}
+
+/// Read the committed history under the writers' lock and observe one tenant in it.
+///
+/// With a verified view of `previous` in hand, [`journal::resume_strict`] compares
+/// `manifest.json` with it and re-hashes the committed bytes behind it: an unchanged head costs
+/// the lock, that comparison and one raw pass over those bytes, and a longer history costs the
+/// same pass plus the frames past the observed length, chained from the observed digest and
+/// folded onto the state the handle already had. Anything else — no view, a pending recovery
+/// intent, a new epoch, a shorter or unchained file, or a committed prefix that is no longer the
+/// bytes this handle verified — falls to [`journal::open_strict`], which rereads and rechains
+/// everything and refuses exactly as it always has.
+///
+/// The resumed path answers the divergence guard without asking it. `resume_strict` establishes
+/// strictly more than [`journal::extends_observed`] can: that the committed prefix is byte for
+/// byte the history this handle verified, and that every frame past it chains from the head it
+/// observed to the manifest that commits them.
+fn observed_history(
+    root: &Path,
+    previous: Option<&Manifest>,
+    reusable: Option<Observed>,
+    tenant: &TenantId,
+    projections: &[ProjectionSpec],
+    limits: CaptureLimits,
+) -> Result<
+    (
+        Manifest,
+        bool,
+        Observed,
+        Result<TenantCapture, CaptureError>,
+    ),
+    CaptureError,
+> {
+    if let (Some(previous), Some(reusable)) = (previous, reusable)
+        && let Some(resumed) = journal::resume_strict(root, previous, &reusable.content)
+    {
+        let mut state = reusable.state;
+        #[cfg(test)]
+        crate::cost::charge(root, |cost| {
+            cost.frames_folded += resumed.fresh.len() as u64;
+        });
+        for transaction in &resumed.fresh {
+            state.fold(transaction).map_err(|_| CaptureError::Corrupt {
+                material: CaptureMaterial::Journal,
+            })?;
+        }
+        // The lock is held for the whole observation, exactly as the strict reader holds it: the
+        // blob objects below are read under it, not after it.
+        let outcome = observe(root, &state, tenant, projections, limits);
+        let (manifest, _, content) = resumed.into_parts();
+        return Ok((
+            manifest.clone(),
+            true,
+            Observed {
+                manifest,
+                state,
+                content,
+            },
+            outcome,
+        ));
+    }
+    let strict = journal::open_strict(root)?;
+    let extended = match previous {
+        Some(previous) => {
+            #[cfg(test)]
+            crate::cost::charge(root, |cost| {
+                cost.frames_reencoded += previous.sequence;
+            });
+            journal::extends_observed(&strict.manifest, &strict.transactions, previous)?
+        }
+        None => true,
+    };
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.frames_folded += strict.transactions.len() as u64;
+    });
+    let state = State::replay(&strict.transactions).map_err(|_| CaptureError::Corrupt {
+        material: CaptureMaterial::Journal,
+    })?;
+    let outcome = observe(root, &state, tenant, projections, limits);
+    let (manifest, _, content) = strict.into_parts();
+    Ok((
+        manifest.clone(),
+        extended,
+        Observed {
+            manifest,
+            state,
+            content,
+        },
+        outcome,
+    ))
 }
 
 fn observe(
@@ -284,6 +426,10 @@ fn read_blob(root: &Path, blob: &Blob) -> Result<Vec<u8>, CaptureError> {
         return Err(corrupt());
     }
     let bytes = std::fs::read(&path).map_err(|_| corrupt())?;
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.blobs_hashed += 1;
+    });
     if journal::hash(&bytes) != blob.hash {
         return Err(corrupt());
     }
@@ -348,6 +494,82 @@ mod tests {
         probe
             .try_lock()
             .expect("the lock is free once the reader is finished with it");
+    }
+
+    /// Repeated captures on one handle verify the committed history once, not once per capture.
+    ///
+    /// No damage a case can do to the store tells a resumed reader from a strict one: both read
+    /// the same bytes of `events.jsonl`. What separates them is work, so work is what this
+    /// asserts — the frames decoded and chained, the frames re-encoded to answer the divergence
+    /// guard, and the transactions folded into state. With no write between the captures, the
+    /// first pays all of it and the nine after it pay none.
+    ///
+    /// The blob line is the boundary, and it is asserted rather than left implied: a capture hands
+    /// the bytes to its caller, and bytes handed to a caller are hashed when they are read — the
+    /// rule `Transaction::blob` follows for every read on the write path. Serving them from a
+    /// cache instead would be a design change, not a refactor, and it would be unbounded in the
+    /// size of the store's content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_captures_on_one_handle_verify_the_committed_history_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("capture-cost-owner").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.stream_identity(&tenant).await.unwrap();
+        for index in 0..8_i64 {
+            store
+                .append(
+                    &StreamId::new(tenant.clone(), "item", format!("s{index}")).unwrap(),
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", index)],
+                    &eventlog_conformance::meta(&format!("m{index}"), &json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .put_blob(
+                    &tenant,
+                    &format!("d{index}"),
+                    format!("bytes-{index}").as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let before = crate::cost::of(root);
+        let first = store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        let one = crate::cost::of(root) - before;
+        for round in 0..9 {
+            assert_eq!(
+                store.capture_tenant(&tenant, &[], limits()).await.unwrap(),
+                first,
+                "round {round}: a reused view serves the observation the strict read built"
+            );
+        }
+        let ten = crate::cost::of(root) - before;
+        println!("COST one={one:?} ten={ten:?}");
+
+        assert!(
+            one.frames_chained >= 17 && one.frames_folded >= 17 && one.blobs_hashed >= 8,
+            "the fixture only means something with a history worth not reverifying: {one:?}"
+        );
+        assert_eq!(
+            ten.frames_chained, one.frames_chained,
+            "nine further captures decoded and chained committed frames again: {ten:?} against {one:?}"
+        );
+        assert_eq!(
+            ten.frames_reencoded, one.frames_reencoded,
+            "nine further captures re-encoded the observed prefix again: {ten:?} against {one:?}"
+        );
+        assert_eq!(
+            ten.frames_folded, one.frames_folded,
+            "nine further captures folded committed history again: {ten:?} against {one:?}"
+        );
+        assert_eq!(
+            ten.blobs_hashed,
+            10 * one.blobs_hashed,
+            "the bytes a capture hands out are hashed on every capture: {ten:?} against {one:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

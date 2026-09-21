@@ -18,8 +18,8 @@ use std::{
 use std::os::unix::fs::symlink;
 
 use eventlog_core::{
-    CaptureError, CaptureLimits, ConsistentTenantCapture, EventLogError, EventStore, Expected,
-    NewEvent, ProjectionSpec, StreamId, TenantId,
+    CaptureError, CaptureLimits, CaptureMaterial, ConsistentTenantCapture, EventLogError,
+    EventStore, Expected, NewEvent, ProjectionSpec, StreamId, TenantId,
 };
 use eventlog_file::{FileEventStore, FileTenantCapture};
 use serde_json::json;
@@ -577,4 +577,255 @@ async fn every_key_an_existing_writer_admits_round_trips_including_an_embedded_n
         expected,
         "exact decoded bytes, in bytewise order, with no key grammar invented"
     );
+}
+
+/// The bound object one capture handed out, found by its bytes.
+fn blob_object(root: &Path, bytes: &[u8]) -> PathBuf {
+    fs::read_dir(root.join("blobs"))
+        .expect("blob directory")
+        .map(|entry| entry.expect("readable entry").path())
+        .find(|path| fs::read(path).expect("readable object") == bytes)
+        .expect("bound blob object")
+}
+
+/// A capture that reuses what the handle verified still folds what another writer committed.
+///
+/// The resumed path answers the divergence guard without asking it, so this is the case that says
+/// the answer is the committed history and not the one the handle happened to have: a handle that
+/// reused its view and skipped the frames past it would serve a store the file has left behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_folds_what_another_writer_committed_since_the_view_was_built() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let tenant = populated(directory.path()).await;
+    let handle = FileTenantCapture::open(directory.path())
+        .await
+        .expect("opened read-only");
+    let first = handle
+        .capture_tenant(&tenant, &[], limits())
+        .await
+        .expect("complete observation");
+    assert_eq!((first.events.len(), first.blobs.len()), (1, 1));
+
+    let writer = FileEventStore::open(directory.path())
+        .await
+        .expect("opened store");
+    writer
+        .append(
+            &StreamId::new(tenant.clone(), "item", "two").expect("valid stream"),
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 2)],
+            &eventlog_conformance::meta("two", &json!({})),
+        )
+        .await
+        .expect("appended");
+    writer
+        .put_blob(&tenant, "later", b"later-bytes")
+        .await
+        .expect("bound content");
+
+    let second = handle
+        .capture_tenant(&tenant, &[], limits())
+        .await
+        .expect("complete observation");
+    assert_eq!(
+        second.events.len(),
+        2,
+        "a capture that reuses a view without folding the frames past it serves a history the \
+         file has already left behind"
+    );
+    assert!(
+        second
+            .blobs
+            .iter()
+            .any(|blob| blob.bytes == b"later-bytes".to_vec()),
+        "content another writer bound after the view was built is part of the next observation"
+    );
+    // And the handle that folded those frames is still the one deciding: a third capture with no
+    // write between reads the same thing again.
+    assert_eq!(
+        handle
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation"),
+        second
+    );
+}
+
+/// A committed frame damaged in place after a capture is refused, not served from the view.
+///
+/// The damage keeps the file's exact length, so nothing about the manifest disagrees with it: the
+/// only way a handle can tell is by re-reading the committed bytes behind the head it observed and
+/// hashing them against what it verified. Without that pass the handle would keep serving an
+/// observation of bytes that are no longer on the disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_committed_frame_damaged_after_a_capture_refuses_through_the_strict_opener() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let tenant = populated(directory.path()).await;
+    let handle = FileTenantCapture::open(directory.path())
+        .await
+        .expect("opened read-only");
+    handle
+        .capture_tenant(&tenant, &[], limits())
+        .await
+        .expect("complete observation");
+
+    let events = directory.path().join("events.jsonl");
+    let mut bytes = fs::read(&events).expect("committed history");
+    let length = bytes.len();
+    let at = bytes
+        .windows(b"item.received".len())
+        .position(|window| window == b"item.received")
+        .expect("a committed frame to damage");
+    bytes[at] = b'j';
+    assert_eq!(bytes.len(), length, "the damage keeps the committed length");
+    fs::write(&events, &bytes).expect("damaged history");
+
+    let before = inventory(directory.path());
+    for round in 0..2 {
+        assert_eq!(
+            handle.capture_tenant(&tenant, &[], limits()).await,
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Journal
+            }),
+            "round {round}: a handle does not serve committed bytes it can no longer validate"
+        );
+        assert_eq!(
+            inventory(directory.path()),
+            before,
+            "round {round}: a refusal changed a file"
+        );
+    }
+}
+
+/// Content damaged after a capture refuses the next one, even though the handle has read it.
+///
+/// A capture hands the bytes to its caller, and bytes handed to a caller are hashed when they are
+/// read — the rule `Transaction::blob` follows for every read on the write path. Reusing a
+/// verified view is about the committed history; it is not permission to serve content from a
+/// handle's memory of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn content_damaged_after_a_capture_still_refuses_the_next_one() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let tenant = populated(directory.path()).await;
+    let handle = FileTenantCapture::open(directory.path())
+        .await
+        .expect("opened read-only");
+    assert_eq!(
+        handle
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation")
+            .blobs[0]
+            .bytes,
+        b"bound-bytes".to_vec()
+    );
+
+    let object = blob_object(directory.path(), b"bound-bytes");
+    fs::write(&object, b"tampered!!!").expect("damaged object");
+    assert_eq!(
+        handle.capture_tenant(&tenant, &[], limits()).await,
+        Err(CaptureError::Corrupt {
+            material: CaptureMaterial::Blob
+        }),
+        "a capture verifies the content it hands out, on every capture"
+    );
+    assert_eq!(
+        fs::read(&object).expect("readable object"),
+        b"tampered!!!".to_vec(),
+        "refusal preserves evidence"
+    );
+}
+
+/// Every refusal the strict opener makes before it decodes is one the resumed reader reaches too.
+///
+/// The writers' lock is the first of them and the only one this reader checks by hand rather than
+/// by falling through: a lock that is no longer a regular file is `open_strict`'s refusal, and a
+/// fast path that opened it anyway would be reading a store the strict opener would not.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_lock_that_is_no_longer_a_regular_file_refuses_a_capture() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let elsewhere = tempfile::tempdir().expect("temporary directory");
+    let tenant = populated(directory.path()).await;
+    let handle = FileTenantCapture::open(directory.path())
+        .await
+        .expect("opened read-only");
+    handle
+        .capture_tenant(&tenant, &[], limits())
+        .await
+        .expect("complete observation");
+
+    let displaced = elsewhere.path().join("writer.lock");
+    fs::write(&displaced, b"").expect("displaced lock");
+    let entry = directory.path().join("writer.lock");
+    fs::remove_file(&entry).expect("removed lock");
+    symlink(&displaced, &entry).expect("lock entry that is not a regular file");
+
+    assert_eq!(
+        handle.capture_tenant(&tenant, &[], limits()).await,
+        Err(CaptureError::Corrupt {
+            material: CaptureMaterial::Journal
+        }),
+        "a resumed reader took a lock the strict opener refuses to take"
+    );
+}
+
+/// A reserved pending-intent entry that appears *after* a handle has a view still refuses.
+///
+/// `a_dangling_pending_intent_entry_refuses_strict_open_and_capture` does not reach this: the
+/// handle it uses has never captured, so it has no view to resume from and the strict opener
+/// answers. The resumed reader asks the same question of the same directory entries, and asks it
+/// with `symlink_metadata` — `Path::exists` follows the link and reports a dangling one as absent,
+/// which would read straight past somebody else's recovery authority.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_intent_that_appears_after_a_capture_refuses_the_next_one() {
+    for (intent, dangling) in [
+        ("append.json", true),
+        ("privacy.json", true),
+        ("append.json", false),
+        ("privacy.json", false),
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let tenant = populated(directory.path()).await;
+        let handle = FileTenantCapture::open(directory.path())
+            .await
+            .expect("opened read-only");
+        handle
+            .capture_tenant(&tenant, &[], limits())
+            .await
+            .expect("complete observation");
+
+        // A dangling entry is deliberately outside `inventory`, which reads file bytes and
+        // therefore cannot describe one; the existing strict-open case checks it the same way.
+        let entry = directory.path().join(intent);
+        let target = directory.path().join(format!("missing-{intent}-target"));
+        if dangling {
+            symlink(&target, &entry).expect("dangling pending-intent entry");
+        } else {
+            fs::write(&entry, b"{\"pending\":true}").expect("pending intent");
+        }
+        let before = (!dangling).then(|| inventory(directory.path()));
+        assert_eq!(
+            handle.capture_tenant(&tenant, &[], limits()).await,
+            Err(CaptureError::RecoveryRequired),
+            "{intent} (dangling: {dangling}): a handle with a view read past a reserved entry"
+        );
+        if dangling {
+            assert!(
+                fs::symlink_metadata(&entry)
+                    .expect("intent entry remains")
+                    .file_type()
+                    .is_symlink(),
+                "{intent}: the refusal changed the pending entry"
+            );
+            assert!(!target.exists(), "{intent}: the refusal created the target");
+        } else {
+            assert_eq!(
+                Some(inventory(directory.path())),
+                before,
+                "{intent}: a refusal changed a file"
+            );
+        }
+    }
 }

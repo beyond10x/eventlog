@@ -33,6 +33,17 @@ under bare-version tags such as `0.1.0`.
   A resumed operation also removes the staging names no durable intent selected. The divergence,
   blob-integrity and disposal refusals are unchanged.
 
+- File reuses that verified history for reads as well. A capture on a handle that already observed
+  the committed head re-reads and hashes the committed bytes behind it, folds only the frames the
+  file gained since, and decodes, rechains and refolds nothing else; anything it cannot decide that
+  way falls back to the strict reader, which refuses exactly as before. The reader changes nothing
+  it observes: unlike a resumed transaction it removes no staging name and synchronizes no
+  directory, and a reserved recovery entry — including one that cannot be followed — still refuses.
+  Content is read and hashed on every capture, because every capture hands those bytes to its
+  caller. Measured on a 3,273,126-byte committed history with 1,113 content objects totalling
+  11,384,593 bytes, twenty captures of one tenant on one handle: a repeated capture costs 57 ms
+  where it cost 140 ms, and returns the identical observation.
+
 ### Fixed
 
 - Inline rebuild validates complete stored event history before applying projectors. SQL capture
