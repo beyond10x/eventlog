@@ -75,6 +75,10 @@ struct Transaction {
     root: PathBuf,
     privacy: bool,
     permit: AdmissionPermit,
+    /// Object files this transaction created, by object id, whether or not it goes on to commit
+    /// them. A transaction that refuses has already applied its own `Op::Blob`s to `state`, so
+    /// `clean_blobs` would read those objects as live; this is the list that says otherwise.
+    written: Vec<String>,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -150,7 +154,18 @@ impl FileEventStore {
         let permit = self.permit.clone();
         let mut tx =
             blocking(move || enter(&path, observed.as_ref(), verified, inline, permit)).await?;
-        let result = work(&mut tx).await?;
+        let outcome = work(&mut tx).await;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(refusal) => {
+                // A refusal after the batch is on disk leaves objects no frame will ever
+                // reference. Dispose of them here rather than leaving them for whatever writes to
+                // this store next; a disposal that itself fails is reported over the refusal,
+                // because it means the store is not writable.
+                blocking(move || tx.discard_written()).await?;
+                return Err(refusal);
+            }
+        };
         let (manifest, transactions, state, cacheable, content) = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
@@ -208,11 +223,16 @@ impl FileEventStore {
     /// batch of any size costs the frame the group already commits and no barrier besides. A
     /// caller that instead calls [`EventStore::put_blob`] once per blob pays one barrier per
     /// blob, which is what this exists to remove; the bindings and the bytes are the same either
-    /// way. A deduplicated retry binds nothing, because the original commit already bound it.
+    /// way. A deduplicated retry binds nothing, because the original commit already bound it —
+    /// and [`Transaction::verify_bound`] checks that rather than assuming it, because the group's
+    /// identity does not cover the batch.
+    ///
+    /// [`AtomicEventStore::append_group_guarded_with_blobs`] is this under an admission guard.
     ///
     /// # Errors
     /// Refuses whatever the group and each blob refuse on their own paths, and publishes nothing
-    /// — not the group and not a blob — when either refuses.
+    /// — not the group and not a blob — when either refuses. Refuses a retry under a committed
+    /// key whose batch the committed history does not already carry.
     pub async fn append_group_with_blobs(
         &self,
         group: &AppendGroup,
@@ -242,6 +262,13 @@ impl FileEventStore {
                             key: group.meta.idempotency_key.clone(),
                         });
                     }
+                    // The group's fingerprint hashes the tenant, the members and the command meta,
+                    // and deliberately not the batch — moving it would move every provider's
+                    // digests. So the batch is checked against the history instead of against the
+                    // key: a deduplicating `Ok` says the batch is durable, and it may only be
+                    // returned when the committed frame really does bind every digest of it to
+                    // these bytes. A retry holding anything else is not this request.
+                    tx.verify_bound(&group.tenant, &blobs, &group.meta.idempotency_key)?;
                     return Ok(AppendGroupResult {
                         appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
                         deduplicated: true,
@@ -255,6 +282,8 @@ impl FileEventStore {
                         tenant: &group.tenant,
                     })
                     .await?;
+                #[cfg(test)]
+                journal::checkpoint("group-admitted");
                 tx.bind_blobs(&group.tenant, &blobs).await?;
                 #[cfg(test)]
                 if !blobs.is_empty() {
@@ -530,6 +559,44 @@ impl Transaction {
         }
         Ok(Some(bytes))
     }
+    /// Verify the committed history already binds every digest of a batch to exactly these bytes.
+    ///
+    /// What a deduplicating return means. [`AppendGroup::fingerprint`] identifies a group by its
+    /// tenant, members and command meta and not by the batch it carries, so a second call under a
+    /// committed key is recognized as a retry however the batch differs — and answering it `Ok`
+    /// is a claim that the batch is durable which the key alone cannot support. This is that
+    /// claim, checked: a digest bound to these bytes is the retry the mechanism exists to serve,
+    /// a digest bound to different bytes is the same contradiction [`Transaction::bind_blobs`]
+    /// refuses on the fresh path, and a digest the history does not carry at all means this is
+    /// not the request that committed.
+    ///
+    /// # Errors
+    /// [`EventLogError::Invalid`] for a digest bound to different content or an unusable digest,
+    /// and [`EventLogError::IdempotencyMismatch`] for a digest no committed frame binds.
+    fn verify_bound(
+        &self,
+        tenant: &TenantId,
+        blobs: &[(String, Vec<u8>)],
+        key: &str,
+    ) -> Result<(), EventLogError> {
+        for (digest, bytes) in blobs {
+            validate_field("blob digest", digest)?;
+            match self.blob(tenant, digest)? {
+                Some(bound) if &bound == bytes => {}
+                Some(_) => {
+                    return Err(EventLogError::Invalid(
+                        "blob digest already names different content".into(),
+                    ));
+                }
+                None => {
+                    return Err(EventLogError::IdempotencyMismatch {
+                        key: key.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
     /// Write, synchronize and bind every blob of one batch inside this transaction.
     ///
     /// The batch takes **no barrier of its own**. Each object file is written and synchronized,
@@ -549,7 +616,7 @@ impl Transaction {
     ) -> Result<(), EventLogError> {
         let directory = self.root.join("blobs");
         let mut fresh: Vec<(Blob, String)> = Vec::new();
-        let mut objects: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let mut objects: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
         for (digest, bytes) in blobs {
             validate_field("blob digest", digest)?;
             // A digest repeated inside one batch binds once, and disagrees with itself exactly as
@@ -574,7 +641,7 @@ impl Transaction {
                 id: new_event_id(),
                 hash: hash(bytes),
             };
-            objects.push((directory.join(&blob.id), bytes.clone()));
+            objects.push((blob.id.clone(), directory.join(&blob.id), bytes.clone()));
             fresh.push((blob, digest.clone()));
         }
         if fresh.is_empty() {
@@ -582,30 +649,55 @@ impl Transaction {
         }
         fs::create_dir_all(&directory).map_err(backend)?;
         self::directory(&directory)?;
-        let count = objects.len();
-        blocking(move || {
+        // Every object this call creates, recorded as it is created rather than before or after
+        // the loop, so the disposal list is exactly what exists: a batch that fails halfway
+        // leaves the objects it did create on the list, and an object the loop never created is
+        // never on it. Disposal has to go by object identity and not by what `state` references,
+        // because a transaction that refuses has already applied its own `Op::Blob`s to `state`
+        // and those objects would read as live.
+        let created: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = Arc::clone(&created);
+        let outcome = blocking(move || {
             use std::io::Write;
-            for (path, bytes) in &objects {
+            // Counted where the synchronizations happen, not derived from the batch size: a
+            // counter computed from `objects.len()` reads the same whether the objects were
+            // synchronized or not, which is the one thing it exists to say.
+            let mut synchronized = 0_u64;
+            for (id, path, bytes) in &objects {
                 let mut file = fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(path)
                     .map_err(backend)?;
+                recorder
+                    .lock()
+                    .map_err(|_| backend("blob object recorder poisoned"))?
+                    .push(id.clone());
                 file.write_all(bytes)
                     .and_then(|()| file.sync_all())
                     .map_err(backend)?;
+                synchronized += 1;
             }
             fs::File::open(directory)
                 .and_then(|f| f.sync_all())
-                .map_err(backend)
+                .map_err(backend)?;
+            synchronized += 1;
+            Ok::<_, EventLogError>(synchronized)
         })
-        .await?;
+        .await;
+        self.written.extend(
+            created
+                .lock()
+                .map_err(|_| backend("blob object recorder poisoned"))?
+                .drain(..),
+        );
+        let synchronized = outcome?;
         #[cfg(test)]
         cost::charge(&self.root, |cost| {
-            cost.object_syncs += count as u64 + 1;
+            cost.object_syncs += synchronized;
         });
         #[cfg(not(test))]
-        let _ = count;
+        let _ = synchronized;
         for (blob, digest) in fresh {
             self.record(Op::Blob {
                 tenant: tenant.clone(),
@@ -614,6 +706,40 @@ impl Transaction {
             })?;
         }
         Ok(())
+    }
+    /// Remove the object files this transaction wrote, for a transaction that will not commit.
+    ///
+    /// The refusal path needs its own disposer. Before this provider bound blobs inside a group,
+    /// an object was written in a transaction with nothing after it, so nothing could refuse
+    /// between the write and the commit; now a member append, an inline projector or an
+    /// optimistic-concurrency conflict can all refuse after the batch is on disk. The two
+    /// disposers the design names — the next committed transaction and the complete opener — both
+    /// still apply and both run later, so without this a refused batch of N objects is N files
+    /// occupying the store until something else writes to it.
+    ///
+    /// Driven by object identity rather than by `state`, because a refused transaction's `state`
+    /// already carries the rolled-back bindings and would report these very objects as live.
+    fn discard_written(&self) -> Result<(), EventLogError> {
+        if self.written.is_empty() {
+            return Ok(());
+        }
+        let directory = self.root.join("blobs");
+        if !directory.exists() {
+            return Ok(());
+        }
+        self::directory(&directory)?;
+        for object in &self.written {
+            validate_object(object)?;
+            let path = directory.join(object);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(backend(error)),
+            }
+        }
+        fs::File::open(directory)
+            .and_then(|f| f.sync_all())
+            .map_err(backend)
     }
     fn clean_blobs(&self) -> Result<(), EventLogError> {
         let directory = self.root.join("blobs");
@@ -730,6 +856,7 @@ fn enter(
             root: root.to_owned(),
             privacy: false,
             permit,
+            written: Vec::new(),
         };
         // Only the objects the new frames bind are new to this handle; the rest it already hashed.
         for (tenant, digest) in &bound {
@@ -757,6 +884,7 @@ fn enter(
         root: root.to_owned(),
         privacy: false,
         permit,
+        written: Vec::new(),
     };
     tx.clear_snapshots()?;
     tx.clean_blobs()?;
@@ -795,6 +923,16 @@ impl AtomicEventStore for FileEventStore {
         guard: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(self.group(group, guard, &[]))
+    }
+    /// The batch takes the group's one barrier rather than one each, and the guard runs before a
+    /// byte of it is written, so a refused guard publishes neither the group nor a blob.
+    fn append_group_guarded_with_blobs<'a>(
+        &'a self,
+        group: &'a AppendGroup,
+        guard: Arc<dyn Guard>,
+        blobs: &'a [(String, Vec<u8>)],
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        Box::pin(self.group(group, guard, blobs))
     }
 }
 
@@ -1188,6 +1326,7 @@ impl EventStore for FileEventStore {
                 root: self.root.clone(),
                 privacy: false,
                 permit: self.permit.clone(),
+                written: Vec::new(),
             };
             tx.register(projector.as_ref())?;
             let manifest = blocking(move || {
@@ -1499,6 +1638,16 @@ mod native_group_crash {
     }
 }
 
+/// Cases for `story:grouped-blob-writes-take-one-durability-barrier`.
+///
+/// **What the crash cases here can and cannot prove.** They are process-death cases: the child
+/// calls `std::process::exit(73)` at a named checkpoint, which does not drop the page cache, so a
+/// write the operating system has accepted but not yet put on the device still survives the death
+/// and is still read back by the parent. Nothing here can therefore detect a **dropped** `fsync` —
+/// remove one and every case stays green. What they do prove is barrier **placement** and binding:
+/// which writes have happened at a named point, what a reopen recovers from that state, and that
+/// the group and its blobs are present together or absent together. Barrier *presence* needs a
+/// power-loss harness, which this tree does not have.
 #[cfg(test)]
 mod grouped_blob_barrier {
     use super::*;
@@ -1707,8 +1856,10 @@ mod grouped_blob_barrier {
     /// ordinary case that does nothing until the environment names a workload, so the suite gains
     /// no ignored lane and `strace -c -w` still has one process doing one thing.
     ///
-    /// `EVENTLOG_FILE_BLOB_MEASURE` is `apart` (a transaction per blob, then the group) or
-    /// `joined` (the blobs inside the group); `EVENTLOG_FILE_BLOB_MEASURE_COUNT` is how many.
+    /// `EVENTLOG_FILE_BLOB_MEASURE` is `apart` (a transaction per blob, then the group),
+    /// `joined` (the blobs inside the group) or `guarded` (the blobs inside a guarded group, the
+    /// shape an importer commits in); `EVENTLOG_FILE_BLOB_MEASURE_COUNT` is how many blobs and
+    /// `EVENTLOG_FILE_BLOB_MEASURE_MEMBERS` how many streams the group appends to.
     /// Measure with `-w`: `fsync` waits on the device and burns no CPU, so bare `strace -c`
     /// reports it as free and is the wrong instrument for this question.
     #[tokio::test]
@@ -1720,6 +1871,10 @@ mod grouped_blob_barrier {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(64);
+        let members: usize = std::env::var("EVENTLOG_FILE_BLOB_MEASURE_MEMBERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
         let root = tempfile::tempdir().unwrap();
         let store = FileEventStore::open(root.path()).await.unwrap();
         match path.as_str() {
@@ -1727,11 +1882,24 @@ mod grouped_blob_barrier {
                 for (digest, bytes) in blobs(count) {
                     store.put_blob(&tenant(), &digest, &bytes).await.unwrap();
                 }
-                store.append_group(&group("measure", 1)).await.unwrap();
+                store
+                    .append_group_guarded(&group("measure", members), Arc::new(NoGuard))
+                    .await
+                    .unwrap();
             }
             "joined" => {
                 store
-                    .append_group_with_blobs(&group("measure", 1), &blobs(count))
+                    .append_group_with_blobs(&group("measure", members), &blobs(count))
+                    .await
+                    .unwrap();
+            }
+            "guarded" => {
+                store
+                    .append_group_guarded_with_blobs(
+                        &group("measure", members),
+                        Arc::new(NoGuard),
+                        &blobs(count),
+                    )
                     .await
                     .unwrap();
             }
@@ -1760,13 +1928,16 @@ mod grouped_blob_barrier {
 
     /// Crash consistency for the joined path, at every boundary the joined path has.
     ///
-    /// `group-blobs-written` is the boundary this story adds and the one a timing assertion can
-    /// never reach: the object files are on disk and synchronized, and the frame that binds them
-    /// is not published. Nothing of the group may be observable there — not an event, and not a
-    /// blob — and the unreferenced objects must not survive as bound content.
+    /// `group-blobs-written` is the boundary this story adds: the object files are on disk and
+    /// synchronized, and the frame that binds them is not published. Nothing of the group may be
+    /// observable there — not an event, and not a blob — and the unreferenced objects must not
+    /// survive as bound content. `group-admitted` is its pair, above the same write, and the two
+    /// together are what hold each checkpoint to the state it names; see the module's note on
+    /// what a process-death case can and cannot prove.
     #[tokio::test]
     async fn every_grouped_blob_boundary_recovers_one_complete_outcome() {
         for (point, committed) in [
+            ("group-admitted", false),
             ("group-blobs-written", false),
             ("group-member-1", false),
             ("group-bookkeeping", false),
@@ -1791,6 +1962,21 @@ mod grouped_blob_barrier {
                 Some(73),
                 "{point}: {}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+
+            // Where each checkpoint is, stated as the state on disk at it rather than as the line
+            // it sits on. `group-admitted` is above `bind_blobs` and `group-blobs-written` is
+            // below it, so the batch's objects are absent at the first and written and
+            // synchronized at the second. Without this pair either checkpoint may be moved to the
+            // other side of the write it names and every other assertion here stays green. Read
+            // before the store is reopened, because opening is what disposes of unreferenced
+            // objects.
+            let written = fs::read_dir(root.path().join("blobs")).map_or(0, Iterator::count);
+            assert_eq!(
+                written,
+                if point == "group-admitted" { 0 } else { 4 },
+                "{point}: the batch's objects are on disk from group-blobs-written onwards, \
+                 and not before it"
             );
 
             let store = FileEventStore::open(root.path()).await.unwrap();

@@ -32,9 +32,13 @@ pub(crate) struct Cost {
     /// barrier is the commit sequence `append.json` → frame → manifest → directory, and what a
     /// batched writer removes is the sequence, not the individual synchronizations inside it.
     pub durability_barriers: u64,
-    /// Object files and object-directory entries synchronized. Counted beside the barriers
+    /// Object files and object-directory entries synchronized, charged one per `sync_all` that
+    /// actually ran and not derived from the size of the batch. Counted beside the barriers
     /// because a batch that took one barrier and still synchronized its directory once per blob
-    /// would read as fixed against a metric that only counted commits.
+    /// would read as fixed against a metric that only counted commits — and counted at the call
+    /// so that dropping a synchronization moves it, which a count computed from the batch would
+    /// not. It is the number of object-level synchronizations, not the process's `fsync` total:
+    /// the commit sequence's own synchronizations are charged as `durability_barriers`.
     pub object_syncs: u64,
 }
 

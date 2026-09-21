@@ -111,4 +111,36 @@ pub trait AtomicEventStore: EventStore {
         group: &'a AppendGroup,
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>>;
+
+    /// Commit a guarded group together with the blobs it binds, under the group's own barrier.
+    ///
+    /// This is [`AtomicEventStore::append_group_guarded`] and [`EventStore::put_blob`] in one
+    /// transaction, for the caller that has both a guard and a batch of blobs — a migration
+    /// importing many boundaries at once is the case it exists for, and the reason it is on the
+    /// port rather than on one provider is that such a caller holds a trait object and cannot
+    /// name a provider's inherent method.
+    ///
+    /// The default writes each blob on its own path first, so a provider that has not implemented
+    /// the single-barrier form stays correct and merely stays as slow as it is today. Publishing
+    /// nothing when the group refuses is the override's obligation; the default may leave
+    /// content-addressed orphan blobs, which are non-authority and bind nothing.
+    ///
+    /// Admission runs before any blob the override binds, so a refused guard publishes no byte of
+    /// the batch.
+    ///
+    /// # Errors
+    /// Whatever the group and each blob refuse on their own paths.
+    fn append_group_guarded_with_blobs<'a>(
+        &'a self,
+        group: &'a AppendGroup,
+        admission: Arc<dyn Guard>,
+        blobs: &'a [(String, Vec<u8>)],
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        Box::pin(async move {
+            for (digest, bytes) in blobs {
+                self.put_blob(&group.tenant, digest, bytes).await?;
+            }
+            self.append_group_guarded(group, admission).await
+        })
+    }
 }

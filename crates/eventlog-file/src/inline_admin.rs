@@ -144,6 +144,7 @@ impl InlineProjectionAdmin for crate::FileEventStore {
                 root: self.root.clone(),
                 privacy: false,
                 permit: self.permit.clone(),
+                written: Vec::new(),
             };
             for specification in projector.projections() {
                 transaction.record(Op::ClearRows {

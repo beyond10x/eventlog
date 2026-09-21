@@ -113,10 +113,29 @@ synchronized **once for the whole batch**, and the bindings are pending operatio
 frame the group commits. The barrier is therefore in exactly the same place it was — before the
 manifest that publishes the frame — and what changed is how many frames the same work costs. The
 durability promise is unchanged in both directions: nothing of the batch is observable before that
-manifest, and a crash before it leaves object files no committed frame names, which the next
-committed transaction and the complete opener dispose of as unreferenced. A deduplicated group
-retry binds nothing, because the original commit already bound it. Refusing one blob of a batch
-refuses the whole group and publishes neither. Open and reopen verify every active content hash;
+manifest, and a crash before it leaves object files no committed frame names, which the refusing
+transaction itself, the next committed transaction and the complete opener dispose of as
+unreferenced. A deduplicated group retry binds nothing, because the original commit already bound
+it — and that is checked rather than assumed: a group's identity is its tenant, members and command
+meta and deliberately not its batch, so before a retry is answered `Ok` every digest of the batch it
+carries is verified to be bound already, to exactly these bytes. A batch naming bytes the history
+does not carry is not the request that committed and refuses with `IdempotencyMismatch`; a batch
+naming different bytes under a bound digest refuses as `Invalid` exactly as it would on a fresh
+commit. Refusing one blob of a batch refuses the whole group and publishes neither.
+
+**Who disposes of an object no frame references.** A blob written on its own could not be refused
+after it was written — its transaction had nothing after it. A batch written inside a group can:
+a member append, an inline projector or an admission guard may all refuse after the objects are
+on disk. So the refusing transaction disposes of the objects it wrote before it returns, by object
+identity rather than by what its rolled-back in-memory state references. The next committed
+transaction and the complete opener remain the disposers for objects a crash leaves behind.
+
+**The guarded form.** `append_group_guarded_with_blobs` is the same commit under an admission
+guard, and it is on the `AtomicEventStore` port rather than on this provider because the caller it
+exists for — a migration importing many boundaries at once — holds a trait object. Admission runs
+before a byte of the batch is written, so a refused guard publishes neither the group nor a blob.
+Providers that have not implemented the single-barrier form inherit a default that writes each blob
+on its own path first: correct, and as slow as it is today. Open and reopen verify every active content hash;
 afterwards a read verifies the bytes it reads, and the first sight of a frame another writer
 committed verifies the objects that frame binds, so damaged bytes are refused whether they are
 read or newly bound. Deletion and tenant erasure remove unreferenced objects from the active directory.
