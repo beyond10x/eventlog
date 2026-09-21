@@ -25,7 +25,15 @@ pub(crate) struct Cost {
     pub frames_folded: u64,
     /// Bytes of an already verified committed prefix re-read and hashed without decoding it.
     pub prefix_bytes_hashed: u64,
-    /// Blob objects read and hashed against the hash the committed history recorded for them.
+    /// Blob objects read, hashed against the hash the committed history recorded for them, and
+    /// found to be that content.
+    ///
+    /// Charged by the comparison rather than beside it (`crate::verified`), which is the same rule
+    /// `object_syncs` below states and for the same reason: a charge written between the read and
+    /// the comparison measures *read*, so deleting the comparison leaves every assertion about
+    /// this number green while nothing is verified. A mismatch therefore adds nothing — as a
+    /// failed `sync_all` adds no `object_syncs` — and that difference is what
+    /// `capture::tests::a_binding_whose_content_is_not_the_record_charges_no_hashing` measures.
     pub blobs_hashed: u64,
     /// Durability barriers published against this root: one per committed journal frame, and one
     /// per privacy epoch. This is the unit a write is charged in, not the `fsync` count — a

@@ -535,9 +535,7 @@ struct BoundObjects {
 impl BoundBlobs for BoundObjects {
     fn read(&self, digest: &str) -> Result<Vec<u8>, CaptureError> {
         let Some(blob) = self.objects.get(digest) else {
-            return Err(CaptureError::Corrupt {
-                material: CaptureMaterial::Blob,
-            });
+            return Err(corrupt());
         };
         read_blob(&self.root, blob)
     }
@@ -550,13 +548,16 @@ impl BoundBlobs for BoundObjects {
 /// where the half of the complete-content check that does not need the content already lives: an
 /// admitted object name and a regular file. The other half is the hash, and it is charged where
 /// the content is read.
+///
+/// The same split [`read_blob`] makes, for the same reason and through the same [`material`]: a
+/// `stat` that fails because the process may not traverse `blobs/` is not the store telling
+/// anybody its material is damaged. This one runs inside the strict read, where such a failure is
+/// far less likely — but "less likely" is not a taxonomy, and two sites answering one question
+/// two ways is how the answer drifts.
 fn bound_length(root: &Path, blob: &Blob) -> Result<u64, CaptureError> {
-    let corrupt = || CaptureError::Corrupt {
-        material: CaptureMaterial::Blob,
-    };
     crate::validate_object(&blob.id).map_err(|_| corrupt())?;
-    let metadata =
-        std::fs::symlink_metadata(root.join("blobs").join(&blob.id)).map_err(|_| corrupt())?;
+    let metadata = std::fs::symlink_metadata(root.join("blobs").join(&blob.id))
+        .map_err(|error| material(&error))?;
     if !metadata.is_file() {
         return Err(corrupt());
     }
@@ -593,30 +594,63 @@ fn admit_projection(
     Ok(())
 }
 
+/// The refusal one bound object is, and the only refusal any of them is.
+fn corrupt() -> CaptureError {
+    CaptureError::Corrupt {
+        material: CaptureMaterial::Blob,
+    }
+}
+
+/// Which refusal one filesystem error about a bound object is.
+///
+/// **`NotFound` is the only kind that says anything about the stored material**: the object the
+/// committed record names is not there, which is the "the stored object is gone" half of
+/// [`BoundBlobs::read`]'s contract. Everything else the operating system reports — a permission
+/// change, an exhausted descriptor table, an `EIO` from the device — is a fact about this attempt
+/// and not about the store. Answering those with [`CaptureError::Corrupt`] tells a consumer that
+/// stored material failed its integrity check, and `CaptureMaterial`'s own documentation says the
+/// variant is the whole diagnostic, so there is nothing else for that consumer to read: it cannot
+/// tell a store it must stop trusting from one it should simply retry.
+///
+/// **This only became reachable when the read moved.** The eager capture read every object inside
+/// the strict read, under the writers' lock, microseconds after the `stat` that admitted it — a
+/// window in which essentially nothing but real damage happens. A [`DeferredBlob`] is read
+/// whenever its holder gets round to it, outside every boundary this provider owns, which is
+/// exactly where `EACCES`, `EMFILE` and `EIO` land. The read was moved and the taxonomy had to
+/// follow it.
+///
+/// One function, because it is one rule: every filesystem error on the capture path comes through
+/// here, so there is no second site at which to apply it differently.
+fn material(error: &std::io::Error) -> CaptureError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return corrupt();
+    }
+    CaptureError::Store(EventLogError::Backend(format!(
+        "bound object could not be read: {:?}",
+        error.kind()
+    )))
+}
+
 /// The existing complete-content check: admitted object name, regular file, exact stored hash.
 ///
 /// `clean_blobs` and `clear_snapshots` are not called. Unbound objects and stale caches belong to
 /// whoever owns the write path; a reader that tidies them is a writer with better manners.
+///
+/// The three refusals are three different facts and [`material`] keeps them apart: a name no
+/// writer here would have produced and a kind this provider does not write are the store's, a
+/// content hash that disagrees with the record is the store's, and anything else the filesystem
+/// says about the attempt is the attempt's.
 fn read_blob(root: &Path, blob: &Blob) -> Result<Vec<u8>, CaptureError> {
-    let corrupt = || CaptureError::Corrupt {
-        material: CaptureMaterial::Blob,
-    };
     crate::validate_object(&blob.id).map_err(|_| corrupt())?;
     let path = root.join("blobs").join(&blob.id);
     if !std::fs::symlink_metadata(&path)
-        .map_err(|_| corrupt())?
+        .map_err(|error| material(&error))?
         .is_file()
     {
         return Err(corrupt());
     }
-    let bytes = std::fs::read(&path).map_err(|_| corrupt())?;
-    #[cfg(test)]
-    crate::cost::charge(root, |cost| {
-        cost.blobs_hashed += 1;
-    });
-    if journal::hash(&bytes) != blob.hash {
-        return Err(corrupt());
-    }
+    let bytes = std::fs::read(&path).map_err(|error| material(&error))?;
+    crate::verified(root, &bytes, &blob.hash).ok_or_else(corrupt)?;
     Ok(bytes)
 }
 
@@ -840,14 +874,101 @@ mod tests {
     /// clock, because wall clock cannot tell a fast read from no read: a machine with the whole
     /// store in page cache reads 7,815 objects in well under the budget a timing assertion would
     /// have to allow, and would go on passing after somebody put the reads back. `blobs_hashed`
-    /// is charged inside the read that hashes, by that read, so it moves if and only if an object
-    /// was opened and digested.
+    /// is the value the hash comparison produced, so it moves if and only if an object was opened
+    /// and digested and found to be what the committed record says — which is what
+    /// `a_binding_whose_content_is_not_the_record_charges_no_hashing` holds it to, because this
+    /// case alone cannot tell "digested" from "read".
     ///
     /// The other half is the half that matters: the reads are *moved*, not removed. Asking one
     /// binding for its content costs exactly one, asking for all of them costs exactly what the
     /// capture used to cost, and what comes back is what the eager capture would have handed over
     /// — same digests, same bytes, same everything else. A capture that answered cheaply by
     /// answering with less would pass the first assertion and fail these.
+    /// A read that found the wrong content charged no hashing, because the count *is* the check.
+    ///
+    /// What the sibling case above cannot see. Its three `blobs_hashed` assertions all read
+    /// undamaged objects, so they cannot tell a charge produced by the hash comparison from one
+    /// written beside it between the `read` and the comparison — and that is not a hypothetical:
+    /// the charge was written beside it, and deleting the comparison left all three green while
+    /// nothing was verified at all. `crate::synchronize` states the rule this crate already
+    /// learned once, for `object_syncs`: *the count is produced by the synchronization, not
+    /// written beside it.*
+    ///
+    /// A damaged object is the one input that separates the two. It is read — the object is a
+    /// regular file of the admitted name and exactly the length the observation charged, so
+    /// everything before the comparison succeeds — and it fails the comparison. A counter that
+    /// measures reading moves; a counter that measures verifying does not. The undamaged control
+    /// in the same case is what stops a permanently stuck counter from passing the first half.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_binding_whose_content_is_not_the_record_charges_no_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("charge-on-verify-owner").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.stream_identity(&tenant).await.unwrap();
+        for (digest, bytes) in [
+            ("intact", b"intact-content"),
+            ("damaged", b"damage-content"),
+        ] {
+            store.put_blob(&tenant, digest, bytes).await.unwrap();
+        }
+        let observed = store
+            .capture_tenant_deferred(&tenant, &[], limits())
+            .await
+            .unwrap();
+
+        // Same length, different bytes, written under the object's own name: the name is still
+        // admitted, the entry is still a regular file and `bound_length` still agrees, so the
+        // read reaches the comparison and nothing before it can refuse.
+        let mut replaced = false;
+        for entry in std::fs::read_dir(root.join("blobs")).unwrap() {
+            let path = entry.unwrap().path();
+            let mut bytes = std::fs::read(&path).unwrap();
+            if bytes == b"damage-content" {
+                bytes[0] ^= 0xff;
+                std::fs::write(&path, &bytes).unwrap();
+                replaced = true;
+            }
+        }
+        assert!(replaced, "the fixture's content is stored under blobs/");
+
+        let binding = |digest: &str| {
+            observed
+                .blobs
+                .iter()
+                .find(|blob| blob.digest == digest)
+                .expect("the binding is in the observation")
+        };
+
+        let before = crate::cost::of(root);
+        assert_eq!(
+            binding("damaged").bytes(),
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            }),
+            "the damaged object is refused, which is the precondition for what follows"
+        );
+        let damaged = crate::cost::of(root) - before;
+        assert_eq!(
+            damaged.blobs_hashed, 0,
+            "an object read and found not to be the content the record names was charged as \
+             hashing: the count is measuring the read rather than the comparison: {damaged:?}"
+        );
+
+        let control = crate::cost::of(root);
+        assert_eq!(
+            binding("intact").bytes().unwrap(),
+            b"intact-content".to_vec(),
+            "the untouched binding still hands out its content"
+        );
+        let verified = crate::cost::of(root) - control;
+        assert_eq!(
+            verified.blobs_hashed, 1,
+            "a counter that never moves would pass the assertion above for the wrong reason: \
+             {verified:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_deferred_capture_reads_no_blob_object_until_its_bytes_are_asked_for() {
         let directory = tempfile::tempdir().unwrap();

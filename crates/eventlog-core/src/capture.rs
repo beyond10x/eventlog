@@ -883,6 +883,40 @@ mod tests {
         }
     }
 
+    /// `order_deferred_blobs` orders and de-duplicates, which nothing else here can observe.
+    ///
+    /// The sibling case below passes `order_blobs` an out-of-order pair, so deleting the `sort_by`
+    /// inside the rule both share goes red. Nothing passed `order_deferred_blobs` anything: the
+    /// one provider that calls it takes its bindings from a `BTreeMap`, which already yields
+    /// bytewise order, so the call could be replaced by `Ok(())` and the whole suite would stay
+    /// green. The entry point is new even though the no-op is not, and this is the input that
+    /// makes the call load-bearing.
+    #[test]
+    fn a_deferred_captures_bindings_are_ordered_and_never_repeat_a_coordinate() {
+        let mut blobs = vec![
+            DeferredBlob::held("b".to_owned(), vec![2]),
+            DeferredBlob::held("A".to_owned(), vec![1]),
+        ];
+        order_deferred_blobs(&mut blobs).unwrap();
+        assert_eq!(
+            blobs
+                .iter()
+                .map(|blob| blob.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "b"],
+            "bytewise, not a locale's idea of order"
+        );
+        assert_eq!(
+            order_deferred_blobs(&mut [
+                DeferredBlob::held("same".to_owned(), Vec::new()),
+                DeferredBlob::held("same".to_owned(), Vec::new()),
+            ]),
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            })
+        );
+    }
+
     #[test]
     fn captured_content_is_ordered_bytewise_and_never_repeats_a_coordinate() {
         let mut blobs = vec![

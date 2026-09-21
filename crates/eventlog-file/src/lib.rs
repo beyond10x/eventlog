@@ -564,13 +564,8 @@ impl Transaction {
             return Err(backend("blob is not a regular file"));
         }
         let bytes = fs::read(path).map_err(backend)?;
-        #[cfg(test)]
-        cost::charge(&self.root, |cost| {
-            cost.blobs_hashed += 1;
-        });
-        if hash(&bytes) != blob.hash {
-            return Err(backend("referenced blob integrity check failed"));
-        }
+        verified(&self.root, &bytes, &blob.hash)
+            .ok_or_else(|| backend("referenced blob integrity check failed"))?;
         Ok(Some(bytes))
     }
     /// Hold a retry's batch to the batch the committed group actually carried.
@@ -951,6 +946,34 @@ fn synchronize(root: &Path, file: &fs::File) -> Result<(), EventLogError> {
     #[cfg(not(test))]
     let _ = (root, synchronized);
     Ok(())
+}
+
+/// Hash one object's content against the hash the committed history recorded, and charge that.
+///
+/// **The count is produced by the comparison, not written beside it** — [`synchronize`]'s rule,
+/// reached here the same way it was reached there, and after the same defect. The charge used to
+/// sit between the `read` and the comparison, so what it measured was *read*: delete the
+/// comparison and every `blobs_hashed` assertion in this crate stayed green while nothing was
+/// being verified at all. Here the number charged is the value the comparison produced, so a
+/// comparison that is not made charges nothing and a comparison that is deleted takes its charge
+/// with it.
+///
+/// `blobs_hashed` therefore counts objects read, hashed **and found to be the content the record
+/// names**, exactly as `object_syncs` counts synchronizations that succeeded. A mismatch is not a
+/// hashing this store got any value from.
+///
+/// `None` is the mismatch, named by the caller rather than here: this is reached from a read that
+/// refuses with [`EventLogError`] and from one that refuses with `CaptureError::Corrupt`, and
+/// neither vocabulary belongs to the comparison.
+fn verified(root: &Path, bytes: &[u8], recorded: &str) -> Option<()> {
+    let hashed = (hash(bytes) == recorded).then_some(1_u64)?;
+    #[cfg(test)]
+    cost::charge(root, |cost| {
+        cost.blobs_hashed += hashed;
+    });
+    #[cfg(not(test))]
+    let _ = (root, hashed);
+    Some(())
 }
 
 /// The digest set of one batch: sorted, without repeats, and independent of the order or the
