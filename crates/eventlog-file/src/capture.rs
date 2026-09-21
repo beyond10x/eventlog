@@ -246,10 +246,12 @@ fn observed_history(
                 material: CaptureMaterial::Journal,
             })?;
         }
-        // The lock is held for the whole observation, exactly as the strict reader holds it: the
-        // blob objects below are read under it, not after it.
-        let outcome = observe(root, &state, tenant, projections, limits);
-        let (manifest, _, content) = resumed.into_parts();
+        // The observation runs inside the value that owns the lock, exactly as the strict reader
+        // below does it: the blob objects it reads are read under the lock, and the lock is
+        // released by `read_under_lock` returning, not by a statement anybody has to keep above
+        // this one.
+        let (outcome, manifest, _, content) =
+            resumed.read_under_lock(|| observe(root, &state, tenant, projections, limits));
         return Ok((
             manifest.clone(),
             true,
@@ -279,8 +281,8 @@ fn observed_history(
     let state = State::replay(&strict.transactions).map_err(|_| CaptureError::Corrupt {
         material: CaptureMaterial::Journal,
     })?;
-    let outcome = observe(root, &state, tenant, projections, limits);
-    let (manifest, _, content) = strict.into_parts();
+    let (outcome, manifest, _, content) =
+        strict.read_under_lock(|| observe(root, &state, tenant, projections, limits));
     Ok((
         manifest.clone(),
         extended,
@@ -494,6 +496,84 @@ mod tests {
         probe
             .try_lock()
             .expect("the lock is free once the reader is finished with it");
+    }
+
+    /// Both readers that hand content back read it *inside* the lock, not beside it.
+    ///
+    /// `the_strict_reader_holds_the_writer_lock_for_its_whole_life` settles that the value holds
+    /// the lock; it cannot see when its caller lets go. Releasing the lock one statement before
+    /// `observe()` reads the blob objects it hands out left every case in this crate green
+    /// (review 2, finding A3): the rule this module states was carried by statement order and by
+    /// nothing else. `read_under_lock` takes the read as an argument of the value that owns the
+    /// lock, so there is no order left to get wrong, and this case measures the lock from inside
+    /// that read. `flock` conflicts between open file descriptions, so a second handle in this
+    /// same process settles it with no timing between threads in it.
+    ///
+    /// The question is asked over a window rather than at an instant, and that is not a
+    /// concession to timing. `Command::spawn` anywhere in this binary forks a child that carries
+    /// every open descriptor until it execs, and an inherited descriptor keeps a released
+    /// `flock` alive — measured here at around 700 spun `try_lock` calls, and the cause of the
+    /// pre-existing flake in the sibling case above. A single probe therefore answers about
+    /// somebody else's fork as readily as about this reader. Over a window it cannot: a lock the
+    /// reader holds is held for the whole of it, and a transient that outlasts the whole of it is
+    /// not something a fork can produce. The error is one-sided — a lost race reads as held,
+    /// never as released — so this case cannot go red on a store that is correct.
+    #[test]
+    fn both_readers_read_the_content_they_hand_out_under_the_writers_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        {
+            let mut journal = journal::Journal::open(root).expect("initialized store");
+            journal
+                .append(json!({"value": "committed"}))
+                .expect("committed frame");
+        }
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("writer.lock"))
+            .expect("existing writer lock");
+        // Two orders of magnitude over the longest inherited-descriptor window measured.
+        let window = std::time::Duration::from_millis(100);
+        let free_within = |window: std::time::Duration| {
+            let until = std::time::Instant::now() + window;
+            while std::time::Instant::now() < until {
+                if probe.try_lock().is_ok() {
+                    probe.unlock().expect("released the probe");
+                    return true;
+                }
+            }
+            false
+        };
+
+        assert!(
+            free_within(window),
+            "the control: nothing holds the writers' lock before a reader exists"
+        );
+
+        let strict = journal::open_strict(root).expect("strict read");
+        let (free_during_read, manifest, _, content) =
+            strict.read_under_lock(|| free_within(window));
+        assert!(
+            !free_during_read,
+            "the strict reader read the content it hands out with the writers' lock released"
+        );
+        assert!(
+            free_within(window),
+            "the strict reader kept the writers' lock after it was finished with it"
+        );
+
+        let resumed =
+            journal::resume_strict(root, &manifest, &content).expect("resumed onto the same head");
+        let (free_during_read, _, _, _) = resumed.read_under_lock(|| free_within(window));
+        assert!(
+            !free_during_read,
+            "the resumed reader read the content it hands out with the writers' lock released"
+        );
+        assert!(
+            free_within(window),
+            "the resumed reader kept the writers' lock after it was finished with it"
+        );
     }
 
     /// Repeated captures on one handle verify the committed history once, not once per capture.

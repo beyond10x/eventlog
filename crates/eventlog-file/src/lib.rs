@@ -603,7 +603,7 @@ fn validate_object(id: &str) -> Result<(), EventLogError> {
 }
 
 fn directory(path: &Path) -> Result<(), EventLogError> {
-    if !fs::symlink_metadata(path).map_err(backend)?.is_dir() {
+    if !journal::physical_directory(path).map_err(backend)? {
         return Err(backend("store directory is not a physical directory"));
     }
     Ok(())

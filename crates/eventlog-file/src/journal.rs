@@ -116,6 +116,22 @@ fn regular(path: &Path) -> Result<(), EventLogError> {
     }
     Ok(())
 }
+/// Whether `path` is a directory in this filesystem, rather than a link to one.
+///
+/// Every entry point onto a store root asks this and asks it *first*: a symlink in a path
+/// component is followed by every check after it, so a root that is not a physical directory is
+/// refused here or nowhere. One predicate and five callers, because five hand-written copies is
+/// how they came to disagree — [`resume_strict`] shipped without one and read a store the other
+/// four refuse.
+///
+/// The refusals stay different on purpose and belong to the callers: `corrupt()` for the two
+/// writer paths, [`open_strict`]'s own string for the reader a consumer reads errors from,
+/// `crate::directory`'s own message, and `None` for [`resume_strict`], which hands the decision
+/// to `open_strict`. `symlink_metadata` does not follow a final-component link, which is the
+/// whole question.
+pub(crate) fn physical_directory(path: &Path) -> Result<bool, std::io::Error> {
+    Ok(fs::symlink_metadata(path)?.is_dir())
+}
 fn read(path: &Path) -> Result<Vec<u8>, EventLogError> {
     regular(path)?;
     fs::read(path).map_err(backend)
@@ -151,7 +167,7 @@ impl Journal {
         if create {
             fs::create_dir_all(root).map_err(backend)?;
         }
-        if !fs::symlink_metadata(root).map_err(backend)?.is_dir() {
+        if !physical_directory(root).map_err(backend)? {
             return Err(corrupt());
         }
         let lock_path = root.join("writer.lock");
@@ -323,7 +339,7 @@ impl Journal {
         observed: &Manifest,
         content: &Content,
     ) -> Result<Option<Resumed>, EventLogError> {
-        if !fs::symlink_metadata(root).map_err(backend)?.is_dir() {
+        if !physical_directory(root).map_err(backend)? {
             return Err(corrupt());
         }
         let lock_path = root.join("writer.lock");
@@ -529,18 +545,34 @@ impl Resumed {
 /// The reader's counterpart to [`Resumed`]. It carries no root and has no `into_journal`: there is
 /// no method here that could write, so there is none to forget to guard.
 pub(crate) struct StrictResumed {
-    lock: File,
+    // Kept open for the whole life of this value and released by its own drop: nothing reads it,
+    // and there is deliberately no statement that releases it early. `Journal` holds the writers'
+    // lock the same way and for the same reason.
+    _lock: File,
     pub manifest: Manifest,
     pub fresh: Vec<Value>,
     content: Content,
 }
 
 impl StrictResumed {
-    /// Release the lock and keep what it protected: the committed head, the frames past the head
-    /// the handle observed, and the hash of the committed bytes this resume validated.
-    pub(crate) fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
-        drop(self.lock);
-        (self.manifest, self.fresh, self.content)
+    /// Run `read` with the lock still held, then release it and keep what it protected: the
+    /// committed head, the frames past the head the handle observed, and the hash of the
+    /// committed bytes this resume validated.
+    ///
+    /// The read is an argument rather than the caller's next statement on purpose. The rule is
+    /// that the bytes a reader hands out are read under the writers' lock, and while the caller
+    /// wrote "observe, then take the parts" that rule was two statements in one order and
+    /// nothing else: swapping them read the content unlocked and left every case in this crate
+    /// green (review 2, finding A3). Here the lock is `self`'s and `self` is alive until this
+    /// function returns, so releasing it before the read is not something a caller can write.
+    pub(crate) fn read_under_lock<T>(
+        self,
+        read: impl FnOnce() -> T,
+    ) -> (T, Manifest, Vec<Value>, Content) {
+        // No `drop` and no order to keep: `self` owns the lock until this function returns,
+        // so `read` cannot run after it is released.
+        let value = read();
+        (value, self.manifest, self.fresh, self.content)
     }
 }
 
@@ -556,6 +588,13 @@ pub(crate) fn resume_strict(
     observed: &Manifest,
     content: &Content,
 ) -> Option<StrictResumed> {
+    // The member of this class that was missing, and an absence no mutation of present code
+    // could reach: every check below follows a link in a path component, so a root that is not a
+    // physical directory has to be refused before any of them. `None`, so `open_strict` makes
+    // the refusal with the evidence where it was found, exactly as the rest of this function does.
+    if !physical_directory(root).ok()? {
+        return None;
+    }
     let lock_path = root.join("writer.lock");
     regular(&lock_path).ok()?;
     // No create, no truncate: this opens the writers' own lock, it does not establish one.
@@ -569,7 +608,7 @@ pub(crate) fn resume_strict(
     lock.lock().ok()?;
     let (manifest, fresh, content) = resumed_committed(root, observed, content).ok()??;
     Some(StrictResumed {
-        lock,
+        _lock: lock,
         manifest,
         fresh,
         content,
@@ -588,11 +627,20 @@ pub(crate) struct Strict {
 }
 
 impl Strict {
-    /// Release the lock and keep what it protected: the committed head, the verified frames, and
-    /// the hash of the committed bytes those frames were decoded from.
-    pub(crate) fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
-        drop(self.lock);
-        (self.manifest, self.transactions, self.content)
+    /// Run `read` with the lock still held, then release it and keep what it protected: the
+    /// committed head, the verified frames, and the hash of the committed bytes those frames
+    /// were decoded from.
+    ///
+    /// The reader's half of the same rule [`StrictResumed::read_under_lock`] states, on the path
+    /// that rereads everything. Both paths hand blob objects to a caller and both read them here.
+    pub(crate) fn read_under_lock<T>(
+        self,
+        read: impl FnOnce() -> T,
+    ) -> (T, Manifest, Vec<Value>, Content) {
+        // No `drop` and no order to keep: `self` owns the lock until this function returns,
+        // so `read` cannot run after it is released.
+        let value = read();
+        (value, self.manifest, self.transactions, self.content)
     }
 
     /// Turn a fully validated strict observation into a writer without reopening or recovering it.
@@ -626,10 +674,7 @@ fn damaged() -> CaptureError {
 /// rather than an invitation to make one; a pending durable intent is somebody else's recovery;
 /// and damage is refused with the evidence left exactly where it was found.
 pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
-    if !fs::symlink_metadata(root)
-        .map_err(|_| unavailable("file store root is not present"))?
-        .is_dir()
-    {
+    if !physical_directory(root).map_err(|_| unavailable("file store root is not present"))? {
         return Err(unavailable("file store root is not a physical directory"));
     }
     let lock_path = root.join("writer.lock");
@@ -1233,5 +1278,140 @@ mod tests {
                 assert_eq!(fs::read_dir(path).unwrap().count(), 0, "{point}");
             }
         }
+    }
+    /// One shape of damage, every entry point onto a store root, and each one's own refusal.
+    ///
+    /// A symlink in a path component is followed by every check after it, so a root that is not a
+    /// physical directory is refused at the root or nowhere. That makes the rule a class with one
+    /// member per entry point, and `resume_strict` shipped as the member that was *absent* — an
+    /// omission no mutation of code that is present can reach, which is why both independent
+    /// reviews had to find it by hand. The five now share one predicate,
+    /// [`physical_directory`], and keep the five different refusals they already owed: the two
+    /// writer paths answer `corrupt()`, the strict opener answers the exact string a consumer
+    /// reads, the store directory answers its own message, and the resumed reader answers `None`
+    /// so that [`open_strict`] makes the refusal with the evidence where it was found.
+    ///
+    /// A sixth entry point that hand-writes the check instead of calling the predicate is caught
+    /// by `every_root_directory_decision_goes_through_one_predicate`; a sixth that omits it
+    /// entirely is caught by neither, and adding a row here is what that costs.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_not_a_physical_directory_is_refused_at_every_entry_point() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let link = directory.path().join("link");
+        let (observed, content) = {
+            let mut journal = Journal::open(&real).expect("writable store");
+            journal
+                .append(json!({"value": "committed"}))
+                .expect("committed frame");
+            (journal.manifest.clone(), journal.content.clone())
+        };
+
+        // The control: every entry point reads the same store happily by its real name.
+        assert_eq!(Journal::open_existing(&real).err(), None);
+        assert!(
+            Journal::resume(&real, &observed, &content)
+                .expect("readable")
+                .is_some()
+        );
+        assert!(open_strict(&real).is_ok());
+        assert!(resume_strict(&real, &observed, &content).is_some());
+        assert_eq!(crate::directory(&real).err(), None);
+
+        std::os::unix::fs::symlink(&real, &link).expect("a link where the root was");
+        assert!(
+            link.is_dir(),
+            "the fixture only means something if every later check follows the link"
+        );
+
+        assert_eq!(
+            Journal::open(&link).err(),
+            Some(corrupt()),
+            "the ordinary opener minted commit authority through a link"
+        );
+        assert_eq!(
+            Journal::open_existing(&link).err(),
+            Some(corrupt()),
+            "the provisioned opener read a root that is not a physical directory"
+        );
+        assert_eq!(
+            Journal::resume(&link, &observed, &content).err(),
+            Some(corrupt()),
+            "the writer resumed onto a root that is not a physical directory"
+        );
+        assert_eq!(
+            open_strict(&link).err().map(|error| format!("{error:?}")),
+            Some(format!(
+                "{:?}",
+                unavailable("file store root is not a physical directory")
+            )),
+            "the strict opener changed the refusal a consumer reads"
+        );
+        assert!(
+            resume_strict(&link, &observed, &content).is_none(),
+            "the resumed reader served a root the strict opener refuses by name"
+        );
+        assert_eq!(
+            crate::directory(&link).err(),
+            Some(backend("store directory is not a physical directory")),
+            "the store directory check read a link as a directory"
+        );
+    }
+
+    /// The root-is-a-physical-directory decision has exactly one implementation.
+    ///
+    /// The defect this round answers was an *omission*, and an omission is not machine-checkable
+    /// from here. A second copy of the decision is, and a second copy is how the five entry
+    /// points diverged in the first place: the crate already refuses one for the resume walk and
+    /// for `extends_observed`, for the same stated reason — a second copy is a second chance to
+    /// compare the wrong thing.
+    ///
+    /// The needles are assembled at run time so that this case is not a hit on itself.
+    #[test]
+    fn every_root_directory_decision_goes_through_one_predicate() {
+        let asked = concat!("symlink_", "metadata");
+        let decided = concat!(".is_", "dir()");
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut written_by_hand = Vec::new();
+        for entry in fs::read_dir(&source_root).expect("readable source directory") {
+            let file = entry.expect("readable entry").path();
+            if file.extension().is_none_or(|kind| kind != "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&file).expect("readable source file");
+            let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Sources carry multi-byte characters, so every window start is moved forward to a
+            // character boundary rather than sliced blind.
+            let window = |text: &str, from: usize, to: usize| {
+                let start = (from..=to)
+                    .find(|index| text.is_char_boundary(*index))
+                    .unwrap_or(to);
+                text[start..to].to_owned()
+            };
+            for (at, _) in collapsed.match_indices(decided) {
+                let context = &window(&collapsed, at.saturating_sub(200), at);
+                // A question that follows links is a different question; this one does not.
+                if !context.contains(asked) {
+                    continue;
+                }
+                if context.contains("fn physical_directory(") {
+                    continue;
+                }
+                written_by_hand.push(format!(
+                    "{}: ...{}{decided}",
+                    file.file_name()
+                        .unwrap_or(file.as_os_str())
+                        .to_string_lossy(),
+                    window(context, context.len().saturating_sub(70), context.len())
+                ));
+            }
+        }
+        assert!(
+            written_by_hand.is_empty(),
+            "the root-directory decision is written by hand outside physical_directory, which is \
+             how the five entry points came to disagree:\n  {}",
+            written_by_hand.join("\n  ")
+        );
     }
 }
