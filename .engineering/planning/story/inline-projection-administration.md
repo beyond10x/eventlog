@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:inline-projection-administration
 kind: story
-status: draft
+status: implemented
 title: Attach existing inline projections and rebuild them atomically
 relations:
 - serves: vision:O2
@@ -18,6 +18,12 @@ scope:
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
 - confidence: cited
+  path: crates/eventlog-file/src/capture.rs
+- confidence: inferred
+  path: crates/eventlog-file/src/inline_admin.rs
+- confidence: cited
+  path: crates/eventlog-file/src/journal.rs
+- confidence: cited
   path: crates/eventlog-file/src/lib.rs
 - confidence: inferred
   path: crates/eventlog-file/tests/inline_admin.rs
@@ -26,6 +32,10 @@ scope:
 - confidence: inferred
   path: crates/eventlog-postgres/src/atomic_group.rs
 - confidence: cited
+  path: crates/eventlog-postgres/src/capture.rs
+- confidence: inferred
+  path: crates/eventlog-postgres/src/inline_admin.rs
+- confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
 - confidence: cited
   path: crates/eventlog-postgres/src/schema.rs
@@ -33,6 +43,10 @@ scope:
   path: crates/eventlog-postgres/tests/inline_admin.rs
 - confidence: inferred
   path: crates/eventlog-sqlite/src/atomic_group.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/src/capture.rs
+- confidence: inferred
+  path: crates/eventlog-sqlite/src/inline_admin.rs
 - confidence: cited
   path: crates/eventlog-sqlite/src/lib.rs
 - confidence: inferred
@@ -43,7 +57,7 @@ scope:
   path: ess/inline-admin/domains/inline-admin.yaml
 - confidence: cited
   path: ess/inline-admin/system.yaml
-revision: 3
+revision: 20
 ---
 ## Outcome
 
@@ -171,3 +185,100 @@ the owner remains draft. Provider source, all native qualification, full product
 consumer seam adoption are not supplied by this review. The root coordinator carries the selected
 structural attachment and registered-name rebuild seam into the ER consumer contract separately.
 
+## Qualified dependency pins and source admission
+
+SQL8746a693 and completed native captured016adb0c1f8177657c64d00e9e7bdff80bd1d5b are now
+verified and integrated. Capture both source passes closed; final actual provider gates/common
+verification pass. This clears both declared implementation dependencies. The two accepted admin
+design passes remain closed; no additional design examination or operator confirmation is required.
+ER24d31cf1 docs/design/eventlog-recorded-indexes-v0.1.md:296–385 already adopts structural
+attachment and actual-registered-projector-name rebuild, satisfying the consumer seam condition.
+
+Complete implementation follows local-evidence:ess-evolution/waves/0008-eventlog-inline-admin/implementation-brief.md.
+The full accepted provider design, all three providers, native edge/cancellation/rollback tests,
+finite decisive controls, both actual gates and PostgreSQL/TLS remain required. Worker owns only
+source/tests in its isolated tree; root retains canonical planning/design/changelog, source
+submission, two permitted source examinations and integration. Worker closes after that complete
+contract, not a smaller proof tranche. No ER adapter, real cutover or publication is included.
+
+Fresh AEP wave computation selects this one draft, no collisions/unassessed items. Source may be
+prepared while S5 holds the sole heavy token; no worker Cargo starts until explicit token grant.
+The new accepted capture source exposes reusable strict/shape/decoding helpers, so their exact
+provider module paths are now included for bounded reuse and crate visibility only.
+
+## Completed implementation and source examination
+
+The complete administration source/check assignment is closed at local bot commit
+43ceaa09ceec610e25891815e33e03e8df92ee28, treeb07a692ecabcaa0a2cde306543b3837ae67f5a52,
+on accepted captured016adb0. Both actual provider gates exit0; PostgreSQL17.6/TLS244passed,
+0failed/skipped/missing. All four prescribed compile-valid controls fail101 and restored targets
+pass0. Root verified every one of20final Rust source hashes against the producer report.
+Exact receipt: local-evidence:ess-evolution/waves/0008-eventlog-inline-admin/implementation/implementation-result.md.
+
+First whole-source examination is active in a separate exact managed checkout, maximum2 passes.
+This story stays active pending source examination, corrections if demonstrated, and local
+integration with common checks. No new SQL/capture/design review, adapter, cutover or publication.
+
+## Supplied administration examination and bounded correction
+
+# M1 supplied-review correction, existing administration contract
+
+2026-09-18T21:49Z. User reports completed review; root found source-review-1-claude/report.md and raw logs. Reviewer used claude-opus-4-8 (report provenance), not the earlier requested Sonnet. Root did not invoke that reviewer. Report is NEEDS-CHANGE, not approval. Original independent pass1 is now supplied; interruption record remains immutable. No review budget reset or equivalent denied examination is dispatched.
+
+Approved requirement: M1 native administration, docs/design/inline-projection-administration.md:123–126, requires the same stored event/envelope/numeric validation as native capture. Existing author suites passed while independent SQLite corruption regression fails101. This is a demonstrated introduced defect, not a new prerequisite. Root confirms validate_captured_order includes validate_captured_event and can reuse the existing contract without inventing a new validation mechanism.
+
+Owner: one gpt-5.6-sol/high implementor under the recorded Opus quota fallback, root integration/planning/cleanup. Reuse managed ess-evolution-inline-admin-implementation-20260916 at43ceaa09, no new worktree. Planning authority is separate from its stale draft snapshot; root records against the existing active story in capture-implementation tree. No planning writes, commits, publication, new review, CLI reviewer invocation, broad audit or other assignments by worker.
+
+Write scope: crates/eventlog-{file,sqlite,postgres}/src/inline_admin.rs and their existing inline_admin tests plus the supplied sqlite tests/inline_admin_review_one.rs; dedicated regression fixtures in those test paths only. Inspect all three existing rebuild paths to close the same invariant class. Preserve generic redacted-event behavior, shadow publication atomicity, blob checks, cursor and unrelated tenant state, all existing timeouts and APIs. Use existing complete-set capture validation before invoking projector/publishing. Do not duplicate per-row validation if the set validator already supplies it. No schema/format/core API changes.
+
+Acceptance and finite stopping condition: preserve supplied failing case before production edit; minimal source correction; regression refusal on malformed envelope and stream-order state with prior rows/cursor unchanged; existing affected provider suites, format/strict checks and original full actual-PostgreSQL gates remain required. Never call missing PostgreSQL fixtures passing. Source-only initially: disk is below retained20GiB floor, so no Cargo/build/process fixture until root grants capacity. This is a temporary stage of the same contract, not a new review/diagnostic. If capacity cannot be supplied, return source/test patch and precise unexecuted checks and close without claiming verification. Once checks pass, return source/check manifests and cleanup custody then STOP. Root carries correction through existing final acceptance/integration; no automatic extension.
+
+Evidence/scratch: this wave's f1-correction-20260918/; owner lease ess-evolution-admin-f1-sol-20260918; target remains the assigned worktree target, scratch below evidence directory. No shared target mutation or cache cleanup by worker. Read current AGENTS.md/worktree skill and aep-drive0.9.3 implementor charter; tool dispatch is collaboration with explicit brief, not a native plugin role. Root alone manages storage. No heavy allocation now.
+
+## Coordinator capture completeness correction
+
+# Same provider validation defect at capture's first page
+
+Approved requirement blocked: M1 complete native tenant capture; accepted docs/design/consistent-tenant-capture.md:106–108 requires numeric/event-position validation and explicitly prohibits silently filtering malformed rows. While confirming the supplied rebuild finding, worker and root found the SQL capture readers initialize pagination to0 and query only greater positions. Preflight counts enforce caps, not completeness or positive positions. A malformed last event at0 is omitted while earlier version1 remains a valid-looking prefix. This is introduced in this initiative's native capture path, not an unchanged inherited unknown or incidental enhancement.
+
+Existing evidence is insufficient: the supplied review exercises array payload validation, and prior capture suites do not establish that an invalid position excluded by SELECT ever reaches the validator. Existing production schema has no positive-position CHECK. Root reuses the existing correction fixtures, adding capture refusal assertions for0 and-1 and executing them before production changes. No new engine, generic infrastructure, domain, story or review budget.
+
+Root-owned finite deliverable, separate from the frozen worker correction: change only SQLite/PostgreSQL capture read_events initial cursor to unfiltered optional cursor, preserving ordinary pagination thereafter; existing event decoder/order validator then refuses malformed rows. Tighten the existing correction tests to require both capture and rebuild refusal while prior projection rows/cursors remain unchanged. No File capture change unless an actual equivalent defect is established; its existing committed-state replay validation remains.
+
+Stopping condition: captured red/green for both real SQL providers and the unchanged whole provider gate/production proof on the final composed vector. Root fast-forwarded the existing author branch from43ceaa09 to accepted6d5e249 while preserving worker dirty source/test patch and preimages. Original administrative source paths and test bases are unchanged in that ancestry. Run whole gates only after this composition, avoiding duplicate author/full-integration runs. Review pass1 remains the supplied NEEDS-CHANGE; original final pass budget remains, no third or replacement unit.
+
+## Supplied review correction acceptance
+
+# Coordinator correction checkpoint
+
+2026-09-18T22:12Z. Local candidate daf6b814b94ec34fd0db57cd35c64b3be86677ae is composed on6d5e249. Original supplied review F1 is corrected by validating complete stored history before all native rebuild callbacks. A demonstrated same-contract numeric omission in native SQL capture is corrected alongside rebuild: zero/negative stored positions are read and refused rather than filtered away. Both strengthened capture assertions failed before correction; original reviewer case and final focused provider cases pass.
+
+All eight source hashes in final-source.sha256 match the gated bytes. Full repository gate and production proof exited0 on actual PostgreSQL17.6/TLS. Production report conformance_valid=true, passed255, failed0, skipped0, missing_required_cases=[]. Common signed check and verification exit0; common-receipt.json binds the local commit. Raw logs and worker closure are in report.md and logs/. No deployment capacity claim or gate waiver.
+
+Original second/final administration review is running under ../source-review-2-brief.md through the operator-requested Claude model. This is not an accepted provider milestone: final verdict and remaining original provider native stages are still due before qualified M2 integration. Worker assignment is closed and own lease released. Root owns integration, planning, existing author cache and disposable fixture teardown.
+
+## Final review authentication stop
+
+# Final review authentication failure
+
+2026-09-18T22:13Z. The explicitly requested Claude CLI model claude-sonnet-5 exited1 before any model execution. Raw result.json reports terminal_reason=api_error, api_error_status=401, input/output tokens0, empty modelUsage and no permission denials. No source review or verdict was produced, so this is not a completed second pass. Session04606538-1f12-4b47-8dcf-306547411ed1.
+
+Verbatim result: "Failed to authenticate. API Error: 401 API key is invalid."
+
+stderr reports a configured API auth source takes precedence over claude.ai login. Root did not inspect credentials, change authentication, retry, substitute a model or bypass permissions. Timo's instruction to quote a login refusal and stop applies. Required input: repair this machine's Claude CLI authentication, then resume the same pending final review. No approval or gate waiver requested.
+
+Corrected candidate daf6b814b94ec34fd0db57cd35c64b3be86677ae remains committed, with full actual-provider gate/production/common checks green. Original supplied pass1 report and its fixed outcome remain recorded. Reviewer tree unchanged and root lease released. The prior detached head209ac320 remains in Git; current reviewer checkout atdaf6b814 is retained for resumption. No new worktree or review budget reset.
+
+## Final acceptance and local integration
+
+# Administration accepted and integrated
+
+2026-09-18T22:36Z. The original final independent source review returned ACCEPT at daf6b814b94ec34fd0db57cd35c64b3be86677ae. Requested reviewer claude-sonnet-5, session95491016-e4fd-4540-a947-ac42e4f6d799, CLI exit0. Report: ../source-review-2-claude/report.md; raw reviewer events and result: ../source-review-2-claude/login-session/events.jsonl. It confirmed F1 fixed and no new blocking defect. It performed source examination, not independent test execution; root relies on the retained final actual-provider gate and production proof for execution.
+
+Coordinator fast-forwarded the existing clean local integration branch integrate/ess-evolution-eventlog-20260915 fromd016adb0 to this commit; no new tree, commit or merge conflict. All eight corrected source hashes matched the gated manifest in the integration checkout, and the signed common receipt independently verified there. The full candidate's original gate/production outputs remain valid because integration did not change source. No redundant gate rerun.
+
+Administration outcome I/V/G=yes/yes/yes. The original two source examinations are CLOSED; no third review or expansion from nonblocking observations. This closes B-ADMIN-REVIEW, including the temporary auth issue, without altering the original interruption evidence. No publication, release, deployment or store cutover.
+
+Whole M1 provider qualification and M2 runtime integration still retain the previously recorded native group failure stages. Existing journal process-death tests prove generic File journal durability, and public adapter wrappers prove uncertainty handling; neither is relabelled as all missing provider-private group boundaries. These are existing storage acceptance obligations, not new review projects. Next complete outcome is qualified ER adapter integration under its existing contract, using this now-accepted administration source.
+
+Both source checkouts are clean. All source, review and gate evidence retained. Completed correction target and disposable PostgreSQL/private fixture material were already retired; this integration created no build output. Coordinator releases review/integration leases after recording acceptance; canonical planning remains separately governed in capture-implementation.

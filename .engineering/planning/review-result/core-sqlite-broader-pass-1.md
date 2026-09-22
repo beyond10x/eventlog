@@ -25,8 +25,8 @@ Only crates/eventlog-sqlite/tests/input_validation_review.rs was added. All thre
 
 Command: TMPDIR="$PWD/target/review-scratch" CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p eventlog-sqlite --test input_validation_review --locked
 Exit: 101. Verbatim first-run output:
-   Compiling eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
     Finished `test` profile [unoptimized] target(s) in 0.69s
      Running tests/input_validation_review.rs (target/debug/deps/input_validation_review-914d5ffd7d995a3b)
 
@@ -68,12 +68,12 @@ error: test failed, to rerun pass `-p eventlog-sqlite --test input_validation_re
 Command: TMPDIR="$PWD/target/review-scratch" EVENTLOG_TEST_POSTGRES_URL=postgres://postgres@127.0.0.1:32876/postgres CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --workspace --locked --no-fail-fast
 Exit: 101. Baseline 78 from implementor handoff; after additions 81 executed: original 78 passed, new 3 failed. Verbatim runner output:
    Compiling ring v0.17.14
-   Compiling eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
    Compiling rustls v0.23.43
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
     Finished `test` profile [unoptimized] target(s) in 2.63s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
 

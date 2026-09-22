@@ -10,7 +10,7 @@ revision: 1
 ---
 ## Frozen implementation
 
-Candidate 9bb72d903243b7bb54341771cb4953f3418f54b4, clean throughout measurement. Baseline 20e00c1eeab5d67bd5f749bbbd871b1fbfe7f796 with original runtime source verified unchanged. Compiler rustc 1.98.1 (48a229cea 2026-09-01). Raw evidence root: /home/timo/.cache/eventlog-complete-20260909.
+Candidate 9bb72d903243b7bb54341771cb4953f3418f54b4, clean throughout measurement. Baseline 20e00c1eeab5d67bd5f749bbbd871b1fbfe7f796 with original runtime source verified unchanged. Compiler rustc 1.98.1 (48a229cea 2026-09-01). Raw evidence root: ~/.cache/eventlog-complete-20260909.
 
 Required production gate exited 0: 98 passed, 0 failed, 0 skipped, missing_required_cases=[]. Formatting and clippy exited 0. Frozen receipts are evidence/frozen-production.json and evidence/frozen-gate.log. The fresh-fixture repeat also passed the same 98 cases; evidence/fresh-production.json and evidence/fresh-gate.log. All three ESS roots validated before source freeze.
 

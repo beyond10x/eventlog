@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:consistent-tenant-capture
 kind: story
-status: active
+status: implemented
 title: Capture complete tenant history, content and projections consistently
 owner: Astra
 refs:
@@ -56,7 +56,7 @@ scope:
   path: ess/capture/domains/capture.yaml
 - confidence: cited
   path: ess/capture/system.yaml
-revision: 6
+revision: 10
 ---
 ## Outcome
 
@@ -166,3 +166,51 @@ capture. Worker owns only source/tests and roster; root owns planning/design/mod
 Exact commands, write paths and stopping condition are recorded in the coordinator's capture
 implementation brief. Required provider checks, causal controls and independent source examination
 remain mandatory. No real store cutover, publication or release.
+
+## First source examination correction contract
+
+First source examination is closed on 5b4d4f83. Corrected reviewer execution reports211passed,
+3failed,0ignored; fmt and strict Clippy pass. The initial four SQL prefix failures were fixture
+faults and are retained separately. SQL8746 remains accepted and integrated.
+
+M1 capture corruption and truthful-cap requirements block acceptance: non-TEXT SQLite keyset
+coordinates can repeat, and both SQL preflights trust corrupt stored blob lengths as a cap proof.
+Correction covers these classes with bounded actual-length observation and incremental reads,
+plus the existing File handle-guard precedence clause. Preserve immutable reviewer cases and all
+legal stored keys. Clarify Dirty's current unreachability under redaction precedence; do not expand
+PostgreSQL support or relax schema admission based on an untested version hypothesis.
+
+Deliver source and regression fixes, actual red/restored-green evidence and both native gates with
+real PostgreSQL/TLS. Stop after this complete bounded correction; no inline administration or new
+design review. Root freezes, records and uses the one remaining source examination2of2.
+Evidence: local-evidence:ess-evolution/waves/0011-provider-capture/source-review-1/report.md and
+source-correction-1-brief.md. No broader provider completion or real-store cutover is inferred.
+
+## Final source examination and correction
+
+Final SOURCE2of2 at d15672f4f3497ad839c1fcff9536664d49aea513 is closed. Immutable original
+review-result:consistent-tenant-capture-source-pass-2 records four actual assertion failures across
+three classes;106 other affected cases pass and final reviewer Clippy/fmt pass. Raw evidence is
+local-evidence:ess-evolution/waves/0011-provider-capture/source-review-2/.
+
+Although ordinary kit writers do not construct these stored states, the accepted capture contract
+requires their refusal: strict pending-intent entry handling, exact physical-shape admission and
+complete malformed owned-coordinate detection. Root accepts the bounded correction of those
+classes under this owner. The original report remains unchanged. Both source reviews are now
+closed; no third review or SQL review is scheduled. Final corrected gates/common verification and
+local integration remain required; administration still requires qualified capture.
+
+## Final acceptance and local integration
+
+Complete native capture is implemented, verified and integrated locally at
+ d016adb0c1f8177657c64d00e9e7bdff80bd1d5b, treef1298d1a3b9f9c0947eff4eadcf7f0c4a8f871f8.
+Both design and source review budgets are closed. Final three reported corruption/shape/path
+classes are fixed, immutable reviewer assertions retained and actual causal reds/restored greens
+recorded. Both required repository gates pass; production proof ran PostgreSQL17.6/TLS with
+224passed,0failed/skipped/missing. Signed common receipt is verified, final hashes match source
+submission and clean fast-forwarded canonical source integration.
+
+Exact receipt: local-evidence:ess-evolution/waves/0011-provider-capture/source-correction-2/integration.md.
+This closes capture and releases the existing administration dependency. It does not close all
+provider acceptance, ER adapter/migration acceptance, any real cutover, or authorize publication.
+No third review was commissioned and no denied SQL work was retried.
