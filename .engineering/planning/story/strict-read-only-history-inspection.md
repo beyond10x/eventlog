@@ -7,31 +7,31 @@ title: Inspect File and SQLite history without changing source storage
 scope:
 - confidence: cited
   path: Cargo.lock
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-conformance/src/inspection.rs
 - confidence: cited
   path: crates/eventlog-conformance/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-core/src/inspection.rs
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-file/src/inspection.rs
 - confidence: cited
   path: crates/eventlog-file/src/journal.rs
 - confidence: cited
   path: crates/eventlog-file/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-file/tests/strict_inspection.rs
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
 - confidence: cited
   path: crates/eventlog-sqlite/Cargo.toml
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-sqlite/src/inspection.rs
 - confidence: cited
   path: crates/eventlog-sqlite/src/lib.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-sqlite/tests/strict_inspection.rs
 - confidence: inferred
   path: docs/design/strict-history-inspection.md
@@ -39,7 +39,7 @@ scope:
   path: ess/inspection/domains/inspection.yaml
 - confidence: inferred
   path: ess/inspection/system.yaml
-revision: 8
+revision: 15
 ---
 ## Outcome
 
@@ -139,3 +139,25 @@ Runtime agreement remains unexecuted until the existing-writer/subprocess,
 registry exhaustion/no-open preservation and concurrent-inspector cases pass.
 This resource limitation is documented publicly; callers requiring additional
 distinct sources use another process.
+
+## Implementation handback
+
+The stable source handback is recorded in
+.engineering/reviews/strict-inspection-implementation.md. It quotes the
+four-package lane from 76 to 94 passing cases, 18 new required names, formatter/
+strict package clippy and changed production-example compilation. This is not
+the full integration or PostgreSQL production gate.
+
+All inferred modules/tests now exist: core/conformance/file/sqlite inspection
+modules and file/sqlite strict_inspection tests. Existing changed source is the
+File journal strict entry, crate exports and production-proof required roster.
+Approved dependency extension is Linux-only nix fs plus Cargo.lock.
+
+Named cases cover source preservation, complete history including absent tenant
+identity, limits, corruption/recovery/redaction, native contention and exact
+SQLite schema. The SQLite lock/resource cases exercise writer-before and reader-
+before inspection, subprocess contention after refusal, concurrent inspection and
+descriptor exhaustion. Default WAL is explicitly refused unchanged; successful
+fixtures use rollback mode prepared before bytes are frozen.
+
+Independent review and full required backend/source CI remain pending.
