@@ -62,7 +62,6 @@ surfaces:
     documents:
       include:
       - README.md
-      - website/docs/**/*.md
     navigation:
       group: Services
       label: Eventlog
