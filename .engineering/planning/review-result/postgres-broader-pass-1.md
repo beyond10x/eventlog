@@ -34,7 +34,7 @@ First local-case raw output:
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `test` profile [unoptimized] target(s) in 5.82s
      Running tests/conformance.rs (target/debug/deps/conformance-ffc713f485ccb72b)
 
@@ -56,7 +56,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out;
 error: test failed, to rerun pass `-p eventlog-postgres --test conformance`
 
 First hosted-case raw output:
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `test` profile [unoptimized] target(s) in 1.40s
      Running tests/conformance.rs (target/debug/deps/conformance-ffc713f485ccb72b)
 
@@ -79,7 +79,7 @@ error: test failed, to rerun pass `-p eventlog-postgres --test conformance`
 ## Suite after the new cases
 Command: cargo test -p eventlog-postgres --test conformance --locked -- --nocapture --test-threads=1
 Exit101. Executed29→31, from the prior implementor production-proof summary29 to this runner's31. The29 existing cases still pass; the two new cases fail. TLS/application-role fixtures configured, no skips.
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `test` profile [unoptimized] target(s) in 1.48s
      Running tests/conformance.rs (target/debug/deps/conformance-ffc713f485ccb72b)
 

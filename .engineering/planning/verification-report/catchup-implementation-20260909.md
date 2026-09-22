@@ -40,7 +40,7 @@ Environment: CARGO_BUILD_JOBS=4, CARGO_PROFILE_DEV_DEBUG=0, CARGO_PROFILE_TEST_D
 No planning files, sibling source, or pool internals edited. No release or publication performed by this worker. Coordinator owns artifact evidence/lifecycle, publication, later review, container shutdown, and worktree cleanup. No files written outside assigned worktree. Scratch backups *.fixed.rs and implementation.patch preserve the exact tested change. Worker lease released at handoff.
 
 ## Red output (verbatim)
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `test` profile [unoptimized] target(s) in 1.30s
      Running tests/conformance.rs (target/debug/deps/conformance-ffc713f485ccb72b)
 
@@ -75,7 +75,7 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 26 filtered out;
 error: test failed, to rerun pass `-p eventlog-postgres --test conformance`
 
 ## Green gate output (verbatim)
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `dev` profile [unoptimized] target(s) in 0.63s
      Running `target/debug/examples/gate --production-proof`
 gate: cargo run --locked -p eventlog-postgres --example production-proof
@@ -84,7 +84,7 @@ gate: cargo run --locked -p eventlog-postgres --example production-proof
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `dev` profile [unoptimized] target(s) in 1.46s
      Running `target/debug/examples/production-proof`
 
@@ -260,12 +260,12 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
    Compiling fallible-iterator v0.3.0
    Compiling fallible-streaming-iterator v0.1.9
    Compiling fastrand v2.5.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
    Compiling tempfile v3.27.0
    Compiling rusqlite v0.37.0
-   Compiling eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-sqlite)
-   Compiling eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
-   Compiling eventlog-core v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
+   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
     Finished `test` profile [unoptimized] target(s) in 3.74s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
      Running unittests src/lib.rs (target/debug/deps/eventlog_core-6e06060c4a60d048)
@@ -402,19 +402,19 @@ gate: cargo clippy --workspace --all-targets --locked -- -D warnings
     Checking clap v4.6.6
     Checking hashlink v0.10.0
     Checking fallible-iterator v0.3.0
-    Checking eventlog-core v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
+    Checking eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
     Checking postgres-types v0.2.14
     Checking linux-raw-sys v0.12.1
     Checking fallible-streaming-iterator v0.1.9
     Checking rustix v1.1.4
     Checking rusqlite v0.37.0
     Checking tokio-postgres v0.7.18
-    Checking eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
+    Checking eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
     Checking fastrand v2.5.0
     Checking tempfile v3.27.0
-    Checking eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-sqlite)
+    Checking eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-sqlite)
     Checking tokio-postgres-rustls v0.14.0
-    Checking eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+    Checking eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
     Finished `dev` profile [unoptimized] target(s) in 7.57s
 gate: green
 

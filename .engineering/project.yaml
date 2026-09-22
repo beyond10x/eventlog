@@ -1,12 +1,1 @@
-version: aep.project/1
-
-# Written by `protocol reverse init`. It points; it does not duplicate — a rule restated
-# here would be a second copy with no way to say which one is in force. Principles and
-# profiles of this project's own go under `principles/` and `profiles/` beside this file.
-protocol: adp/1
-profile: development.critical
-protocols: git+https://github.com/beyond10x/aep.git#52ca1ec48da9c744e2e551eab64f7cbad6ab7c3c
-
-summary: >-
-  Release Eventlog 0.1.0 under Apache-2.0 with stable coded guard refusals and backend rollback
-  parity.
+{"version":"aep.project/2","protocol":"adp/1","profile":"development.critical","summary":"Release Eventlog 0.1.0 under Apache-2.0 with stable coded guard refusals and backend rollback parity.","protocols":"git+https://github.com/beyond10x/aep.git#52ca1ec48da9c744e2e551eab64f7cbad6ab7c3c","store":{"eventlog":{"path":"state","projection":"planning"}},"planning_scope":"eventlog","planning_tenant":"planning","planning_identity":"01a0cab3-612c-7252-86da-0beca2e7e4d1"}

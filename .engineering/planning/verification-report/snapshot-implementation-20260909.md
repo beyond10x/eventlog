@@ -17,7 +17,7 @@ needs-coordinator: no
 
 1. Acceptance: on both supported adapters, a snapshot derived before completed redaction cannot restore its contribution, and current-history snapshots still work.
 
-Commit d25e5675e299119af905e0c2df9a8c862934e08a; author and committer both b10x-bot[bot] <316511680+b10x-bot[bot]@users.noreply.github.com>. Coordinator publishes the branch. Tree wt-f0ba183ee985, /home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985. No AEP writes or other units' source changes. Assigned inferred surfaces were confirmed: PostgreSQL admission, hosted permissions, test teardown and production roster all require the new metadata table; a new ESS metadata home was validated before implementation.
+Commit d25e5675e299119af905e0c2df9a8c862934e08a; author and committer both b10x-bot[bot] <316511680+b10x-bot[bot]@users.noreply.github.com>. Coordinator publishes the branch. Tree wt-f0ba183ee985, ~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985. No AEP writes or other units' source changes. Assigned inferred surfaces were confirmed: PostgreSQL admission, hosted permissions, test teardown and production roster all require the new metadata table; a new ESS metadata home was validated before implementation.
 
 2. Shape: 11 files changed, 1116 insertions(+), 63 deletions(-). Core API and Repository; both adapters; PostgreSQL schema admission; shared conformance, SQLite repository and PostgreSQL conformance tests; production required-case roster; two ESS files. Snapshot/Loaded/Outcome layouts and existing physical snapshot columns remain unchanged. This is deliberately a storage contract change: legacy unproven saves return Invalid. Additive generation metadata certifies only checked saves. Automatic cache errors remain best effort after append; explicit snapshots retry one stale generation.
 
@@ -88,9 +88,9 @@ The appended outputs are, in order: original baseline red; SQLite mutation; Post
    Compiling fastrand v2.5.0
    Compiling once_cell v1.21.4
    Compiling tempfile v3.27.0
-   Compiling eventlog-core v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
-   Compiling eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
+   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
     Finished `test` profile [unoptimized] target(s) in 5.94s
      Running tests/repository.rs (target/debug/deps/repository-3e79b32af72754d0)
 
@@ -114,9 +114,9 @@ failures:
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
 
 error: test failed, to rerun pass `-p eventlog-sqlite --test repository`
-   Compiling eventlog-core v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
-   Compiling eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
+   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
     Finished `test` profile [unoptimized] target(s) in 1.34s
      Running tests/repository.rs (target/debug/deps/repository-3e79b32af72754d0)
 
@@ -143,7 +143,7 @@ error: test failed, to rerun pass `-p eventlog-sqlite --test repository`
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
     Finished `test` profile [unoptimized] target(s) in 2.12s
      Running tests/conformance.rs (target/debug/deps/conformance-ffc713f485ccb72b)
 
@@ -165,9 +165,9 @@ failures:
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.22s
 
 error: test failed, to rerun pass `-p eventlog-postgres --test conformance`
-   Compiling eventlog-core v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
-   Compiling eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
+   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
+   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
     Finished `dev` profile [unoptimized] target(s) in 1.26s
      Running `target/debug/examples/gate --production-proof`
 gate: cargo run --locked -p eventlog-postgres --example production-proof
@@ -176,7 +176,7 @@ gate: cargo run --locked -p eventlog-postgres --example production-proof
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
     Finished `dev` profile [unoptimized] target(s) in 1.58s
      Running `target/debug/examples/production-proof`
 
@@ -352,11 +352,11 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-   Compiling eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
    Compiling tempfile v3.27.0
-   Compiling eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
-   Compiling eventlog-conformance v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
-   Compiling eventlog-core v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-conformance)
+   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-core)
     Finished `test` profile [unoptimized] target(s) in 3.45s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
      Running unittests src/lib.rs (target/debug/deps/eventlog_core-6e06060c4a60d048)
@@ -393,11 +393,11 @@ retained_projection_after_successful_erasure=None
 gate: cargo fmt --all --check
 gate: cargo clippy --workspace --all-targets --locked -- -D warnings
     Checking ring v0.17.14
-    Checking eventlog-sqlite v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
+    Checking eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-sqlite)
     Checking rustls-webpki v0.103.15
     Checking rustls v0.23.43
     Checking tokio-rustls v0.26.5
     Checking tokio-postgres-rustls v0.14.0
-    Checking eventlog-postgres v0.1.0-dev.1 (/home/timo/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
+    Checking eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-f0ba183ee985/crates/eventlog-postgres)
     Finished `dev` profile [unoptimized] target(s) in 1.77s
 gate: green
