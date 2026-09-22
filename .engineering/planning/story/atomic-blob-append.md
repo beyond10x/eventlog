@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:atomic-blob-append
 kind: story
-status: active
+status: implemented
 title: Commit blob bindings and ordered event appends atomically
 scope:
 - confidence: cited
@@ -39,7 +39,7 @@ scope:
   path: docs/design/atomic-blob-append.md
 - confidence: cited
   path: ess/atomic-content/domains/atomic-content.yaml
-revision: 27
+revision: 29
 ---
 # Atomic blob binding and event append
 
@@ -172,3 +172,27 @@ module and test paths are now cited from those committed files. Source admission
 still requires the final integration production gate and exact-source CI with
 comparative and restart receipts. This paragraph does not claim those pending
 checks or authorize a deployment capacity.
+
+## Published admission
+
+Source 4ee3dc23f0d02a5726a0e41d097477791f09efe2 reached main through PR11
+after every required check passed:
+https://github.com/beyond10x/eventlog/pull/11
+
+Persistence run35688825492, job106621273031, reports success at that exact
+source for verified-TLS fixture setup, required production conformance/lint,
+comparative envelope and restart replay, and preservation of proof output:
+https://github.com/beyond10x/eventlog/actions/runs/35688825492
+
+Artifact10677362562 is the unexpired persistence-proof archive, 62079079 bytes,
+bound to that source and run. The coordinator inspected the bot API's job-step
+results and artifact metadata; it did not download or independently parse the
+archive. Local full production execution and its explicit184/0/0 count are
+recorded separately. No deployment capacity is inferred beyond the CI laboratory
+envelope.
+
+The independent source unit is merged and its wanted commits are remotely
+recoverable. Its managed tree was finished and removed after exact reviewed-id
+GC; reproducible build output was cleaned after all owned processes finished.
+Reports and raw private evidence remain retained. EKR can now adopt this exact
+source SHA with all three dependency selectors and its lockfile together.
