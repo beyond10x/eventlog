@@ -15,7 +15,7 @@ types:
     fields:
       - name: digest
         type: String
-      - name: byte_len
+      - name: byte_count
         type: Integer
       - name: content_sha256
         type: String

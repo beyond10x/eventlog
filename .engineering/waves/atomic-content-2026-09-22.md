@@ -46,3 +46,9 @@ The whole gate and mandatory production, comparative and restart proof are
 required before published main adoption. An exact verified main SHA suffices;
 this dependency unit does not need a tag or release. Source implementation is
 unexecuted at opening, and its opening is not project completion.
+
+The implementor found that the inspected fingerprint spells its length field
+byte_count while the coordinator's ESS projection used byte_len. The coordinator
+verified the report against the specification and corrected both active copies
+to byte_count before implementation. ESS validation passes. The future executable
+fingerprint case must bind that declaration; agreement remains unexecuted here.
