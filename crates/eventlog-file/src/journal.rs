@@ -1,5 +1,5 @@
 //! Durable JSONL framing. The manifest is the commit point, never a best-effort cache.
-use eventlog_core::{EventLogError, new_event_id};
+use eventlog_core::{EventLogError, InspectionError, new_event_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -66,6 +66,100 @@ pub(crate) struct Journal {
     _lock: File,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
+}
+
+/// Retains the native lock while the caller folds and examines this observation.
+pub(crate) struct InspectedJournal {
+    _lock: File,
+    pub transactions: Vec<Value>,
+}
+
+/// Source bytes count the manifest and journal, the only files decoded here.
+pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal, InspectionError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(inspection_io)?;
+    if !root_metadata.is_dir() {
+        return Err(InspectionError::UnsupportedSource);
+    }
+    let lock = inspection_file(&root.join("writer.lock"))?;
+    lock.try_lock().map_err(|_| InspectionError::SourceBusy)?;
+    for name in ["append.json", "privacy.json"] {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(_) => return Err(InspectionError::RecoveryRequired),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(inspection_io(error)),
+        }
+    }
+    let manifest_file = inspection_file(&root.join("manifest.json"))?;
+    let events_file = inspection_file(&root.join("events.jsonl"))?;
+    let manifest_len = manifest_file.metadata().map_err(inspection_io)?.len();
+    let events_len = events_file.metadata().map_err(inspection_io)?.len();
+    if manifest_len
+        .checked_add(events_len)
+        .ok_or(InspectionError::LimitExceeded)?
+        > source_bytes
+    {
+        return Err(InspectionError::LimitExceeded);
+    }
+    let manifest: Manifest = serde_json::from_slice(&inspection_read(manifest_file, manifest_len)?)
+        .map_err(|_| InspectionError::CorruptSource)?;
+    if manifest.format != FORMAT {
+        return Err(InspectionError::UnsupportedSource);
+    }
+    if manifest.store.is_empty() || manifest.length != events_len {
+        return Err(InspectionError::CorruptSource);
+    }
+    let transactions = decode(&inspection_read(events_file, events_len)?, &manifest)
+        .map_err(|_| InspectionError::CorruptSource)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let after = fs::symlink_metadata(root).map_err(|_| InspectionError::SourceChanged)?;
+        let after_lock = fs::symlink_metadata(root.join("writer.lock"))
+            .map_err(|_| InspectionError::SourceChanged)?;
+        let locked = lock.metadata().map_err(inspection_io)?;
+        if (after.dev(), after.ino()) != (root_metadata.dev(), root_metadata.ino())
+            || (after_lock.dev(), after_lock.ino()) != (locked.dev(), locked.ino())
+        {
+            return Err(InspectionError::SourceChanged);
+        }
+    }
+    Ok(InspectedJournal {
+        _lock: lock,
+        transactions,
+    })
+}
+
+fn inspection_io(error: std::io::Error) -> InspectionError {
+    let kind = error.kind();
+    // This boundary consumes the original diagnostic; retained paths never enter errors.
+    drop(error);
+    if kind == std::io::ErrorKind::NotFound {
+        InspectionError::MissingSource
+    } else {
+        InspectionError::SourceBusy
+    }
+}
+
+fn inspection_file(path: &Path) -> Result<File, InspectionError> {
+    if !fs::symlink_metadata(path).map_err(inspection_io)?.is_file() {
+        return Err(InspectionError::UnsupportedSource);
+    }
+    File::open(path).map_err(inspection_io)
+}
+
+fn inspection_read(file: File, length: u64) -> Result<Vec<u8>, InspectionError> {
+    let mut bytes = Vec::new();
+    file.take(
+        length
+            .checked_add(1)
+            .ok_or(InspectionError::LimitExceeded)?,
+    )
+    .read_to_end(&mut bytes)
+    .map_err(inspection_io)?;
+    if u64::try_from(bytes.len()).map_err(|_| InspectionError::LimitExceeded)? != length {
+        return Err(InspectionError::SourceChanged);
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn backend(error: impl std::fmt::Display) -> EventLogError {

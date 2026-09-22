@@ -34,6 +34,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let started = time::OffsetDateTime::now_utc();
     let elapsed = Instant::now();
+    // The nested workspace build can replace this executable as feature sets
+    // unify. Capture the running artifact before Cargo unlinks its old inode.
+    let binary = std::fs::read(std::env::current_exe()?)?;
     let output = Command::new("cargo")
         .args(["test", "--workspace", "--locked", "--", "--nocapture"])
         .env("EVENTLOG_REQUIRE_POSTGRES", "1")
@@ -70,6 +73,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let required = [
+        "file_inspection_body_fields_and_zero_schema_are_preserved",
+        "adversary_file_duplicate_event_identity_is_corruption",
+        "adversary_file_unknown_recorded_envelope_field_is_not_discarded",
+        "adversary_file_empty_identity_refuses_and_zero_result_caps_allow_absence",
+        "adversary_file_inadmissible_recorded_envelope_is_corruption",
+        "adversary_sqlite_inadmissible_recorded_envelope_is_corruption",
+        "adversary_sqlite_empty_identity_and_exact_source_cap",
+        "adversary_sqlite_success_preserves_preexisting_reader_lock",
+        "adversary_sqlite_public_descriptor_bound_keeps_prior_writer_lock",
+        "file_inspection_history_preserves_source",
+        "file_inspection_missing_sources_never_create",
+        "file_inspection_recovery_and_corruption_preserve_source",
+        "file_inspection_native_lock_is_nonblocking",
+        "file_inspection_identity_redaction_and_unknown_format",
+        "file_inspection_concurrent_append_is_one_observation",
+        "sqlite_inspection_history_preserves_source",
+        "sqlite_inspection_missing_sources_never_create",
+        "sqlite_inspection_wal_and_journal_refusals_preserve_source",
+        "sqlite_inspection_native_writer_refuses_without_changes",
+        "sqlite_inspection_identity_corruption_schema_and_uri",
+        "inspection::linux::tests::inspection_ofd_blocks_native_writers_in_process",
+        "inspection::linux::tests::inspection_ofd_blocks_native_writer_process",
+        "inspection::linux::tests::inspection_ofd_detects_replaced_source",
+        "inspection::linux::tests::inspection_refusal_preserves_existing_process_writer_lock",
+        "inspection::linux::tests::inspection_refusal_preserves_existing_process_reader_lock",
+        "inspection::linux::tests::inspection_concurrent_call_cannot_unlock_another_observation",
+        "inspection::linux::tests::inspection_descriptor_exhaustion_never_opens_or_closes_source",
         "file_storage_contract",
         "file_groups_contract",
         "file_claims_contract",
@@ -166,7 +196,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .output()?;
-    let binary = std::fs::read(std::env::current_exe()?)?;
     let server = tokio::runtime::Runtime::new()?.block_on(async {
         let configuration: tokio_postgres::Config =
             std::env::var("EVENTLOG_TEST_POSTGRES_URL")?.parse()?;

@@ -102,3 +102,18 @@ concurrent inspector cases are required before this claim is accepted.
 Free space at dispatch preparation:   25G
 
 Toolchain: rustc 1.98.1 (48a229cea 2026-09-01)
+
+## Reviewed source and local gate
+
+The implementation, independent adversary, correction re-review and coordinator
+integration receipts are retained under .engineering/reviews/strict-inspection-*.
+The coordinator fixed all original findings without changing the adversary cases
+and demonstrated the shared body validator mutation against both providers.
+The full production gate now passes with a dedicated native PostgreSQL fixture,
+verified TLS and the hosted application role. A subsequent independent review
+also covers the proof runner's executable-identity timing correction.
+
+The story stays active until the exact remote candidate passes required common,
+production, comparative and restart checks and is published on main. Atomic blob
+publication is prepared as the next source unit in a separate checkout. Its
+planning activation is included here; no atomic implementation is claimed.

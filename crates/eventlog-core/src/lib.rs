@@ -12,7 +12,9 @@
 
 mod admission;
 mod aggregate;
+mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
+pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
 mod projection;
 
 pub use aggregate::{Aggregate, Applied, DomainEvent, Loaded, Outcome, Repository, SnapshotPolicy};

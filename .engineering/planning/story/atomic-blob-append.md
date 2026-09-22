@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:atomic-blob-append
 kind: story
-status: draft
+status: active
 title: Commit blob bindings and ordered event appends atomically
 scope:
 - confidence: inferred
@@ -37,7 +37,7 @@ scope:
   path: crates/eventlog-sqlite/src/lib.rs
 - confidence: inferred
   path: crates/eventlog-sqlite/tests/atomic_blob.rs
-revision: 17
+revision: 19
 ---
 # Atomic blob binding and event append
 

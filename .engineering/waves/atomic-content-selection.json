@@ -1,0 +1,82 @@
+{
+  "waves": [
+    {
+      "wave": 1,
+      "artifacts": [
+        {
+          "id": "story:atomic-blob-append",
+          "inferred": true,
+          "scope": [
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-conformance/src/atomic_blob.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-conformance/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-core/src/atomic_blob.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-core/src/atomic_group.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-core/src/lib.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/journal.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/lib.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/state.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-file/tests/atomic_blob.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-postgres/examples/production-proof.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-postgres/src/atomic_group.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-postgres/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-postgres/tests/atomic_blob.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-sqlite/src/atomic_group.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-sqlite/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-sqlite/tests/atomic_blob.rs"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "collisions": [],
+  "unassessed": [],
+  "cycles": []
+}

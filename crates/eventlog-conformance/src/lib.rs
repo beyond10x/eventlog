@@ -7,7 +7,9 @@
 //! backends was found by an exercise like this one and not by review.
 
 mod atomic_group;
+mod inspection;
 pub use atomic_group::run_atomic_groups;
+pub use inspection::{INSPECTION_LIMITS, prepare_inspection_history, run_history_inspection};
 
 use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, NewEvent, Snapshot, StreamId, TenantId,

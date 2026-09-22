@@ -12,6 +12,8 @@
 //! `spawn_blocking` by hand, and forgetting one wrap panicked a worker at startup.
 
 mod atomic_group;
+mod inspection;
+pub use inspection::SqliteHistoryInspector;
 
 use std::{
     collections::BTreeSet,

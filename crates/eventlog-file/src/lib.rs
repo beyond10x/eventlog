@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Repository-local Eventlog. JSONL transactions are authoritative; snapshots are disposable.
+mod inspection;
 mod journal;
+pub use inspection::FileHistoryInspector;
 mod projection;
 mod state;
 

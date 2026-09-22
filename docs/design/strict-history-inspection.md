@@ -2,8 +2,10 @@
 
 This additive capability serves O2 and O6: inspect the durable decision record
 without altering the evidence. The RFC 0020 storage schema and the existing
-provider encodings remain unchanged. Runtime claims below are unexecuted until
-the strict-inspection cases and repository proof run.
+provider encodings remain unchanged. The strict-inspection cases and local
+production gate are recorded in
+[integration evidence](../../.engineering/reviews/strict-inspection-integration.md).
+Required remote comparative/restart proof and source publication remain separate.
 
 ## API and result
 
@@ -20,6 +22,13 @@ global sequence are legal; per-stream versions retain the provider's ordering.
 An absent identity is not minted, and an empty history without an identity says
 only that no tenant evidence was recorded. Legacy event history without an
 identity directory entry is supported.
+
+Returned envelopes must satisfy the kit's existing field, opaque-identity,
+causation-depth and object-body admission rules; event identities must be unique
+within the inspected history. File inspection refuses unknown event-envelope
+keys before the ordinary state fold can discard them. Application data remains
+an arbitrary JSON object, and schema version zero remains supported. These
+inspection checks neither alter the stored bytes nor relax ordinary append rules.
 
 `InspectionLimits` contains `source_bytes`, `events` and `envelope_bytes`, each
 a nonnegative finite integer. Zero is a real cap. Source admission bounds input
@@ -61,8 +70,9 @@ transaction and connection drop. SQLite's native POSIX write locks must conflict
 with this guard even in the same process; ordinary shared read locks remain
 compatible. This freezes native writers across rollback-mode admission and
 prevents a check-then-open switch to WAL. A normal flock is insufficient.
-Other platforms receive `UnsupportedSource`. Runtime lock compatibility remains
-unexecuted until same-process and separate-process writer cases establish it.
+Other platforms receive `UnsupportedSource`. The cases
+`inspection_ofd_blocks_native_writers_in_process` and
+`inspection_ofd_blocks_native_writer_process` establish lock compatibility.
 
 Closing an independently opened database descriptor can release an existing
 same-process SQLite connection's POSIX locks, even when inspection refused.
@@ -77,8 +87,9 @@ code, fork, unbounded descriptor retention or connection callback is introduced.
 This bounded resource cost is part of the public inspection contract. Callers
 needing more distinct sources must use another process. A writer already open
 before inspection, and a separate-process contention probe after refusal, must
-establish that refusal preserves the existing writer's lock; runtime agreement
-is unexecuted until that regression runs green.
+establish that refusal preserves the existing writer's lock. The executed cases
+`inspection_refusal_preserves_existing_process_writer_lock` and
+`adversary_sqlite_public_descriptor_bound_keeps_prior_writer_lock` bind this claim.
 
 SQLite uses READ_ONLY without CREATE and one deferred native read transaction.
 Admit the exact supported published schema before selecting event/identity rows;
