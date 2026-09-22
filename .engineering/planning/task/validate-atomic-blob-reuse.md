@@ -2,14 +2,14 @@
 format: aep.planning-md/1
 id: task:validate-atomic-blob-reuse
 kind: task
-status: active
+status: implemented
 title: Validate SQLite blob integrity before fresh atomic reuse
 relations:
 - derived_from: story:atomic-blob-append
 - derived_from: story:sql-blob-read-integrity
 - serves: vision:O2
 - decomposes: story:atomic-blob-append
-revision: 4
+revision: 6
 ---
 ## Reproduced defect
 
@@ -74,3 +74,20 @@ Full workspace and required real-backend CI remain pending.
 
 Publication of the candidate branch is needed to trigger required CI. That
 candidate is not integrated or selected by the consumer until those checks pass.
+
+## Completed source qualification
+
+The repaired source and all required regression roster entries merged in PR #15:
+https://github.com/beyond10x/eventlog/pull/15
+Its exact-head required persistence workflow passed:
+https://github.com/beyond10x/eventlog/actions/runs/35720472752
+
+That workflow supplied the disposable verified-TLS PostgreSQL fixture and passed
+the required backend conformance/formatter/linter lane, comparative envelope and
+restart replay lane. The local fixture-free full-gate refusal remains retained
+and is not counted as passing PostgreSQL evidence. Independent SQLite review,
+the original probe, validator mutation and complete local strict Clippy evidence
+also remain retained. The consumer's full gate and direct old-to-repaired seed
+compatibility proof passed separately; they do not replace provider CI.
+
+No storage migration, operator data repair or tagged release was performed.
