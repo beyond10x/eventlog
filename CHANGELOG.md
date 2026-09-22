@@ -5,6 +5,14 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- SQLite validates an existing blob's stored length, integrity hash and edition
+  before a fresh atomic append group reuses it. A corrupt binding refuses the
+  complete transaction, including tentative blobs, events and receipts. Retries
+  of an already committed group still return its retained result without reading
+  or restoring subsequently corrupted or erased blob content.
+
 ## 0.3.0 — 2026-09-22
 
 ### Added

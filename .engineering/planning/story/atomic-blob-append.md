@@ -24,6 +24,8 @@ scope:
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
 - confidence: cited
+  path: crates/eventlog-postgres/examples/production-proof/required.rs
+- confidence: cited
   path: crates/eventlog-postgres/src/atomic_group.rs
 - confidence: cited
   path: crates/eventlog-postgres/tests/adversary_atomic_blob.rs
@@ -36,10 +38,12 @@ scope:
 - confidence: cited
   path: crates/eventlog-sqlite/tests/atomic_blob.rs
 - confidence: cited
+  path: crates/eventlog-sqlite/tests/atomic_blob_integrity_review.rs
+- confidence: cited
   path: docs/design/atomic-blob-append.md
 - confidence: cited
   path: ess/atomic-content/domains/atomic-content.yaml
-revision: 29
+revision: 31
 ---
 # Atomic blob binding and event append
 

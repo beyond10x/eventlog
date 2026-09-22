@@ -7,6 +7,14 @@ macro_rules! cases {
 }
 pub fn required_cases() -> Vec<RequiredCase> {
     let mut required = Vec::new();
+    required.extend(
+        cases!("eventlog-sqlite", "test", "atomic_blob_integrity_review";
+            "corrupt_reuse_precedes_byte_conflict_and_all_guard_modes",
+            "malformed_sqlite_storage_classes_refuse_without_partial_publication",
+            "retained_receipt_wins_before_corrupt_row_decode_after_head_advance",
+            "foreign_corruption_and_guard_refusal_preserve_healthy_reuse",
+        ),
+    );
     required.extend(cases!("eventlog-file", "test", "conformance";
         "file_storage_contract",
         "file_groups_contract",
@@ -283,6 +291,14 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "sqlite_atomic_blob_content_contract",
         "sqlite_atomic_blob_independent_writers_keep_only_complete_winner",
         "sqlite_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
+        "sqlite_atomic_blob_reuse_refuses_hash_mismatch_and_rolls_back",
+        "sqlite_atomic_blob_reuse_refuses_malformed_hash_and_rolls_back",
+        "sqlite_atomic_blob_reuse_refuses_missing_hash_and_rolls_back",
+        "sqlite_atomic_blob_reuse_refuses_length_mismatch_and_rolls_back",
+        "sqlite_atomic_blob_reuse_refuses_negative_length_and_rolls_back",
+        "sqlite_atomic_blob_reuse_refuses_unknown_edition_and_rolls_back",
+        "sqlite_atomic_blob_integrity_preserves_healthy_reuse_and_byte_conflicts",
+        "sqlite_atomic_blob_receipt_retry_precedes_integrity_and_never_restores_erasure",
     ));
     required.extend(cases!("eventlog-sqlite", "test", "strict_inspection";
         "sqlite_inspection_history_preserves_source",
