@@ -9,7 +9,7 @@ relations:
 - derived_from: story:sql-blob-read-integrity
 - serves: vision:O2
 - decomposes: story:atomic-blob-append
-revision: 3
+revision: 4
 ---
 ## Reproduced defect
 
@@ -42,7 +42,7 @@ later existing binding is invalid.
 Retain the original failing probe unchanged and execute it against the repaired
 candidate. Add provider regressions and require them in production proof.
 Demonstrate mutation sensitivity. Run targeted checks, the repository gate and
-independent review, followed by required real-backend CI before publication.
+independent review, followed by required real-backend CI before integration.
 
 ## Scope
 
@@ -61,3 +61,16 @@ No automatic legacy trust migration, repair of corrupt stored bytes, data erasur
 new provider API or changed guard/receipt ordering. No operator store access.
 This task is a prerequisite for the consumer's planned blob-backed writer,
 not a claim that the consumer currently publishes blob-backed state.
+
+## Independent review
+
+The independent report is retained verbatim in
+review-result:sqlite-atomic-integrity-review. It returns no new finding, with
+its exact source identities, executed checks, fixture correction and limitations.
+The added regression target is
+crates/eventlog-sqlite/tests/atomic_blob_integrity_review.rs. The coordinator
+includes its cases in the existing production-proof roster after review.
+Full workspace and required real-backend CI remain pending.
+
+Publication of the candidate branch is needed to trigger required CI. That
+candidate is not integrated or selected by the consumer until those checks pass.

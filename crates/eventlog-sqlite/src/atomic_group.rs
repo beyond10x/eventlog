@@ -3,7 +3,7 @@ use super::{
     AppendResult, Arc, BoxFuture, Connection, EventLogError, Guard, Inner, NoGuard,
     SqliteEventStore, SqliteProjections, backend, begin_immediate, drive,
     ensure_callback_integrity, finish_transaction, params, poisoned, run_blocking, select_versions,
-    to_i64,
+    to_i64, validate_stored_blob,
 };
 use eventlog_core::{
     AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
@@ -161,15 +161,16 @@ impl Inner {
             });
         }
         for blob in blobs {
-            let prior: Option<Vec<u8>> = connection
+            let prior = connection
                 .query_row(
-                    &format!("SELECT bytes FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
+                    &format!("SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
                     params![group.tenant.as_str(), blob.digest],
-                    |row| row.get(0),
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)),
                 )
                 .optional()
                 .map_err(backend)?;
-            if let Some(bytes) = prior {
+            if let Some((bytes, count, hash, version)) = prior {
+                let bytes = validate_stored_blob(bytes, count, hash, version)?;
                 if bytes != blob.bytes {
                     return Err(EventLogError::Invalid(
                         "blob digest already names different content".into(),

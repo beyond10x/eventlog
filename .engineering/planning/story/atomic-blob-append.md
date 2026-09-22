@@ -38,10 +38,12 @@ scope:
 - confidence: cited
   path: crates/eventlog-sqlite/tests/atomic_blob.rs
 - confidence: cited
+  path: crates/eventlog-sqlite/tests/atomic_blob_integrity_review.rs
+- confidence: cited
   path: docs/design/atomic-blob-append.md
 - confidence: cited
   path: ess/atomic-content/domains/atomic-content.yaml
-revision: 30
+revision: 31
 ---
 # Atomic blob binding and event append
 

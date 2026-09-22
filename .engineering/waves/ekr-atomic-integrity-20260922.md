@@ -25,6 +25,19 @@ published base. New journal bytes and artifact bodies are scanned separately;
 no inherited history or private policy is rewritten. Publication must still
 pass the enrolled Gates policy.
 
-No implementation, correction or release success is claimed by this opening
-record. Populated legacy blob migration and the consumer's live stores remain
-outside this source repair.
+The implementor froze the three assigned files and released its lease. Its retained
+implementation-report.md records the original regressions, mutation failure,
+restored source hashes and passing scoped checks. Independent review now owns
+lease codex-ekr-atomic-integrity-review and the same sequential build directory;
+the coordinator did not compile there until review handback. The reviewer added
+only crates/eventlog-sqlite/tests/atomic_blob_integrity_review.rs and released its
+lease. Its verbatim no-new-findings report is retained in
+.engineering/reviews/sqlite-atomic-integrity-review.md. The coordinator then
+included every added case in the production-proof roster.
+
+The local full gate executed but stopped in the PostgreSQL library tests because
+EVENTLOG_TEST_POSTGRES_URL is absent. Both required-fixture failures and the
+command's own exit status remain retained; no local full-gate success is claimed.
+The required CI supplies the real PostgreSQL/TLS fixture and must pass before
+integration. Populated legacy blob migration and the consumer's live stores
+remain outside this repair.
