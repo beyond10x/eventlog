@@ -5,6 +5,8 @@ kind: story
 status: active
 title: Inspect File and SQLite history without changing source storage
 scope:
+- confidence: cited
+  path: Cargo.lock
 - confidence: inferred
   path: crates/eventlog-conformance/src/inspection.rs
 - confidence: cited
@@ -23,6 +25,8 @@ scope:
   path: crates/eventlog-file/tests/strict_inspection.rs
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/Cargo.toml
 - confidence: inferred
   path: crates/eventlog-sqlite/src/inspection.rs
 - confidence: cited
@@ -35,7 +39,7 @@ scope:
   path: ess/inspection/domains/inspection.yaml
 - confidence: inferred
   path: ess/inspection/system.yaml
-revision: 5
+revision: 7
 ---
 ## Outcome
 
@@ -92,3 +96,26 @@ Derived 2026-09-22 by story-scoper. Every entry distinguishes inspected source f
 Run focused provider/common cases, then bash scripts/gate.sh and the repository's mandatory real PostgreSQL TLS/hosted-role production proof, comparative and restart checks. Add exact new provider test names to the published-main production roster, removing none. Keep exact commands, source identity, test counts and mutation receipts. A green shared privacy check alone is not repository correctness.
 
 No store cutover, history conversion, schema migration, object-byte relocation, blob reclamation, upstream dependency-family upgrade, PostgreSQL inspection or unrelated evolution integration is authorized by this story. Source bytes and identities remain available to the consumer's later verification; missing operation payloads or validation evidence remain a consumer migration refusal.
+
+## Linux SQLite admission correction before implementation
+
+The implementor's primitive measurement reports that READ_ONLY plus URI
+readonly_shm=1 on an ordinary cleanly closed WAL-mode store can leave a newly
+created WAL file even when opening fails. Keep the raw primitive evidence in the
+unit report. A pathname/header preflight also races a native writer changing
+journal mode; do not implement check-then-open as the no-write guarantee.
+
+The coordinator approved a target-specific nix 0.30.1 dependency with its fs
+feature and the lockfile update. Acquire a nonblocking Linux OFD shared lock over
+the database before inspecting its header or sidecars and retain it through
+connection drop. SQLite POSIX write locks must conflict even in the same process;
+normal flock is insufficient. Unsupported platforms refuse. No repository unsafe
+code, immutable-mode bypass or unrelated dependency-family upgrade is authorized.
+Source path/inode checks must refuse detected replacement. The consistency claim
+covers native cooperating SQLite writers, not arbitrary filesystem interference.
+
+The updated design records this contract. Same-process and separate-process
+writer tests, plus unchanged bytes/entries on success/refusal/drop, remain
+required. Cleanly closed default WAL-mode sources may be named unsupported;
+a separately prepared and frozen rollback-mode published-schema fixture must
+establish useful success. Inspection never prepares or checkpoints its source.

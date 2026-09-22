@@ -39,6 +39,13 @@ independent reviewer loads aep-drive:adversary. The inspected scope came from
 aep-drive:story-scoper. These dispatch mechanics are explicit deviations from the
 host-specific skill examples.
 
+During implementation the coordinator also owns bounded design/AEP corrections
+in this checkout under its own lease, while the worker edits only Rust source and
+tests. This is a disjoint-file exception to the sequential handoff above; neither
+actor writes the other's files. The first lock-contract body update was written
+after handoff before reacquiring the coordinator lease; the lease was immediately
+restored. Subsequent coordinator writes use that lease.
+
 Authorized commits are the opening, reviewed implementation and corrections,
 closing evidence, and integration into main after required checks. No tag or
 version bump is needed for a verified immutable Git dependency. The consumer
@@ -74,6 +81,14 @@ Independent review may write tests only. Integration runs every gate step with
 its own exit status, plus the existing mandatory production, comparative and
 restart proof. Required CI and published main provenance must be verified before
 consumer adoption. Stage at opening: source implementation unstarted.
+
+Implementation is active. A measured READ_ONLY/readonly_shm primitive left a WAL
+file on an opening failure; ordinary opening is therefore not reused. The design
+now selects a Linux OFD shared source lock before admission through connection
+drop, with a bounded target-specific nix dependency. Native same-process and
+separate-process writer interleavings must prove the boundary. Default WAL-mode
+inspection may refuse explicitly; the frozen rollback-mode fixture must prove
+usable success. No source repair or checkpoint is permitted in inspection.
 
 Free space at dispatch preparation:   25G
 

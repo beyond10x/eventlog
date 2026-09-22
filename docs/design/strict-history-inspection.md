@@ -54,6 +54,16 @@ initialize, truncate, collect blobs or remove staging entries. Prefer a read-onl
 lock descriptor where the supported native primitive permits it; regardless of
 descriptor mode, no file bytes or entries may change.
 
+SQLite support is initially Linux-only. Before reading the header or checking
+sidecars, acquire a nonblocking Linux open-file-description shared lock covering
+the database through the safe `nix` fs API. Hold it through the deferred read
+transaction and connection drop. SQLite's native POSIX write locks must conflict
+with this guard even in the same process; ordinary shared read locks remain
+compatible. This freezes native writers across rollback-mode admission and
+prevents a check-then-open switch to WAL. A normal flock is insufficient.
+Other platforms receive `UnsupportedSource`. Runtime lock compatibility remains
+unexecuted until same-process and separate-process writer cases establish it.
+
 SQLite uses READ_ONLY without CREATE and one deferred native read transaction.
 Admit the exact supported published schema before selecting event/identity rows;
 do not run DDL, pragmas that change journal mode, `BEGIN IMMEDIATE`, checkpoint,
@@ -73,6 +83,11 @@ native boundary alone does not hold the complete observation. Preservation tests
 without another writer distinguish inspector writes from writer activity in the
 separate concurrency tests. Persistent bytes and directory entries are preserved;
 filesystem access timestamps are outside this promise.
+
+The lock contract covers cooperating native SQLite writers. It does not grant
+control over arbitrary filesystem replacement by another actor. Check source
+path/inode identity at the observation boundary and refuse detected replacement
+as `SourceChanged`; never describe an advisory lock as a filesystem freeze.
 
 ## Scope and evidence
 
