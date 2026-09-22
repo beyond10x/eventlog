@@ -24,11 +24,11 @@ Install Git and Rust 1.91 or newer. From a checkout of tag `0.3.0`:
 ```bash
 cargo test --locked -p eventlog-file
 cargo test --locked -p eventlog-sqlite
-bash scripts/gate.sh
 ```
 
-The full gate runs tests, formatting and Clippy. PostgreSQL reports a skip without its explicit
-disposable fixture. [Quickstart](website/docs/quickstart.md) · [Production proof](website/docs/operations.md#validate-a-deployment).
+The full `bash scripts/gate.sh` gate runs tests, formatting and Clippy. Its PostgreSQL cases need
+an explicit disposable fixture; some refuse a missing URL while others report a skip.
+[Quickstart](website/docs/quickstart.md) · [Production proof](website/docs/operations.md#validate-a-deployment).
 
 ## Public input validation
 

@@ -14,6 +14,7 @@ export default {
   presets: [['classic', {
     docs: {path: 'docs', routeBasePath: '/', sidebarPath: './sidebars.js'},
     blog: false,
+    theme: {customCss: './src/css/custom.css'},
   }]],
   plugins: [docsSystemPlugin],
   themeConfig: {
