@@ -3,6 +3,5 @@
 /website/build/
 /website/.docusaurus/
 .engineering/.aep-planning-writer*.lock
-.engineering/state/writer.lock
 .engineering/migrations/*/recovery/
 .engineering/migrations/*/stage/
