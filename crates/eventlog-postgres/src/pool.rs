@@ -1,7 +1,7 @@
 //! Bounded leases. A cancelled transaction never returns its connection to the idle list.
-use eventlog_core::EventLogError;
+use eventlog_core::{BoxFuture, EventLogError};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
@@ -13,6 +13,61 @@ use tokio_postgres::{
     config::{Host, SslMode},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
+
+/// Host assertion about the transport created by a caller-owned authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostgresTransportAssurance {
+    /// Plaintext is confined by the host to an isolated loopback or Unix-socket fixture.
+    Isolated,
+    /// The host authenticates the remote server and refuses insecure/plaintext transport.
+    Verified,
+}
+
+/// One caller-created async client and its still-unpolled connection driver.
+pub struct AuthorizedConnection {
+    client: Client,
+    driver: BoxFuture<'static, Result<(), EventLogError>>,
+}
+
+impl AuthorizedConnection {
+    /// Transfers a custom-transport client and driver to the bounded provider pool.
+    ///
+    /// Driver error details are deliberately confined to the host boundary; the pool observes a
+    /// closed client and retires the lease without logging connection material.
+    pub fn new<F>(client: Client, driver: F) -> Self
+    where
+        F: std::future::Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+    {
+        Self {
+            client,
+            driver: Box::pin(async move {
+                driver.await.map_err(|_| {
+                    EventLogError::Backend(
+                        "caller-owned PostgreSQL connection driver failed".to_owned(),
+                    )
+                })
+            }),
+        }
+    }
+
+    fn into_parts(self) -> (Client, BoxFuture<'static, Result<(), EventLogError>>) {
+        (self.client, self.driver)
+    }
+}
+
+/// Host-owned authority that creates one independently driven connection per pool lease.
+pub trait PostgresConnectionAuthority: Send + Sync + 'static {
+    /// Transport assurance the host establishes for every returned connection.
+    fn assurance(&self) -> PostgresTransportAssurance;
+
+    /// Creates one client/driver pair under the supplied pool connection deadline.
+    ///
+    /// The pool independently enforces the same deadline and owns the returned driver.
+    fn connect(
+        &self,
+        timeout: Duration,
+    ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>>;
+}
 
 /// Limits are per process. A host must also admit the sum across its replicas.
 #[derive(Clone, Debug)]
@@ -67,11 +122,22 @@ impl PoolOptions {
 /// Host-owned connection settings. Debug output deliberately excludes connection material.
 #[derive(Clone)]
 pub struct PostgresConfig {
-    pub(crate) connection: Config,
-    pub(crate) tls: Option<rustls::ClientConfig>,
+    source: ConnectionSource,
     pub(crate) schema: String,
     pub(crate) prefix: String,
     pub(crate) production: bool,
+}
+
+#[derive(Clone)]
+enum ConnectionSource {
+    BuiltIn(Box<BuiltInConnection>),
+    CallerOwned(Arc<dyn PostgresConnectionAuthority>),
+}
+
+#[derive(Clone)]
+struct BuiltInConnection {
+    connection: Config,
+    tls: Option<rustls::ClientConfig>,
 }
 impl PostgresConfig {
     /// Admit plaintext only for an explicitly isolated loopback or Unix-socket test database.
@@ -104,8 +170,10 @@ impl PostgresConfig {
         super::validate_prefix(prefix)?;
         connection.ssl_mode(SslMode::Disable);
         Ok(Self {
-            connection,
-            tls: None,
+            source: ConnectionSource::BuiltIn(Box::new(BuiltInConnection {
+                connection,
+                tls: None,
+            })),
             schema: "public".into(),
             prefix: prefix.into(),
             production: false,
@@ -135,11 +203,35 @@ impl PostgresConfig {
             .with_root_certificates(roots)
             .with_no_client_auth();
         Ok(Self {
-            connection,
-            tls: Some(tls),
+            source: ConnectionSource::BuiltIn(Box::new(BuiltInConnection {
+                connection,
+                tls: Some(tls),
+            })),
             schema: schema.into(),
             prefix: prefix.into(),
             production: true,
+        })
+    }
+    /// Uses a host-owned custom connection authority without taking credentials or TLS policy.
+    ///
+    /// The authority creates one async client plus owned driver per bounded pool connection.
+    /// `Verified` authorities remain eligible for hosted admission; `Isolated` authorities remain
+    /// confined to local/migration constructors.
+    ///
+    /// # Errors
+    /// Refuses an invalid schema or owner prefix.
+    pub fn caller_owned(
+        schema: &str,
+        prefix: &str,
+        authority: Arc<dyn PostgresConnectionAuthority>,
+    ) -> Result<Self, EventLogError> {
+        super::validate_prefix(prefix)?;
+        eventlog_core::validate_identifier("owner schema", schema)?;
+        Ok(Self {
+            production: authority.assurance() == PostgresTransportAssurance::Verified,
+            source: ConnectionSource::CallerOwned(authority),
+            schema: schema.into(),
+            prefix: prefix.into(),
         })
     }
     /// Select an existing test-owned schema without changing the transport admission.
@@ -193,6 +285,8 @@ pub(crate) struct Pool {
     driver_pause: Mutex<Option<RecyclePause>>,
     #[cfg(test)]
     connect_attempts: AtomicUsize,
+    #[cfg(test)]
+    fail_shutdown: AtomicBool,
 }
 
 #[derive(Default)]
@@ -251,6 +345,8 @@ impl Pool {
             driver_pause: Mutex::new(None),
             #[cfg(test)]
             connect_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_shutdown: AtomicBool::new(false),
         }))
     }
     pub(crate) async fn acquire(self: &Arc<Self>) -> Result<Lease, EventLogError> {
@@ -337,59 +433,44 @@ impl Pool {
         #[cfg(test)]
         self.connect_attempts.fetch_add(1, Ordering::AcqRel);
         let work = async {
-            let mut config = self.config.connection.clone();
-            config.connect_timeout(self.options.connect_timeout);
-            let client = if let Some(tls) = &self.config.tls {
-                let (client, connection) = config
-                    .connect(MakeRustlsConnect::new(tls.clone()))
-                    .await
-                    .map_err(super::backend)?;
-                #[cfg(test)]
-                let pause = self.driver_pause.lock().unwrap().take();
-                let driver = tokio::spawn(async move {
-                    #[cfg(not(test))]
-                    let _ = connection.await;
-                    #[cfg(test)]
-                    {
-                        let mut connection = connection;
-                        let _ = (&mut connection).await;
-                        if let Some(pause) = pause {
-                            tokio::task::block_in_place(|| {
-                                pause.reached.wait();
-                                pause.resume.wait();
-                            });
-                        }
+            let authorized = match &self.config.source {
+                ConnectionSource::BuiltIn(built_in) => {
+                    let BuiltInConnection { connection, tls } = built_in.as_ref();
+                    let mut config = connection.clone();
+                    config.connect_timeout(self.options.connect_timeout);
+                    if let Some(tls) = tls {
+                        let (client, driver) = config
+                            .connect(MakeRustlsConnect::new(tls.clone()))
+                            .await
+                            .map_err(super::backend)?;
+                        AuthorizedConnection::new(client, driver)
+                    } else {
+                        let (client, driver) =
+                            config.connect(NoTls).await.map_err(super::backend)?;
+                        AuthorizedConnection::new(client, driver)
                     }
-                });
-                Connection {
-                    client,
-                    driver: Some(driver),
                 }
-            } else {
-                let (client, connection) = config.connect(NoTls).await.map_err(super::backend)?;
-                #[cfg(test)]
-                let pause = self.driver_pause.lock().unwrap().take();
-                let driver = tokio::spawn(async move {
-                    #[cfg(not(test))]
-                    let _ = connection.await;
-                    #[cfg(test)]
-                    {
-                        let mut connection = connection;
-                        let _ = (&mut connection).await;
-                        if let Some(pause) = pause {
-                            tokio::task::block_in_place(|| {
-                                pause.reached.wait();
-                                pause.resume.wait();
-                            });
-                        }
-                    }
-                });
-                Connection {
-                    client,
-                    driver: Some(driver),
+                ConnectionSource::CallerOwned(authority) => {
+                    authority.connect(self.options.connect_timeout).await?
                 }
             };
-            Ok(client)
+            let (client, connection) = authorized.into_parts();
+            #[cfg(test)]
+            let pause = self.driver_pause.lock().unwrap().take();
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+                #[cfg(test)]
+                if let Some(pause) = pause {
+                    tokio::task::block_in_place(|| {
+                        pause.reached.wait();
+                        pause.resume.wait();
+                    });
+                }
+            });
+            Ok(Connection {
+                client,
+                driver: Some(driver),
+            })
         };
         tokio::time::timeout(self.options.connect_timeout, work)
             .await
@@ -461,7 +542,19 @@ impl Pool {
         .await
         .map_err(|_| EventLogError::Deadline {
             operation: "shutdown",
-        })?
+        })??;
+        #[cfg(test)]
+        if self.fail_shutdown.swap(false, Ordering::AcqRel) {
+            return Err(EventLogError::Backend(
+                "injected temporary-pool shutdown failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_shutdown(&self) {
+        self.fail_shutdown.store(true, Ordering::Release);
     }
 }
 
@@ -575,6 +668,215 @@ mod tests {
         pin::Pin,
         task::{Context, Poll, Waker},
     };
+
+    struct TestAuthority {
+        url: Option<String>,
+        assurance: PostgresTransportAssurance,
+        fail_driver: bool,
+        calls: AtomicUsize,
+        timeouts: Mutex<Vec<Duration>>,
+    }
+
+    impl PostgresConnectionAuthority for TestAuthority {
+        fn assurance(&self) -> PostgresTransportAssurance {
+            self.assurance
+        }
+
+        fn connect(
+            &self,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.timeouts.lock().unwrap().push(timeout);
+            Box::pin(async move {
+                let Some(url) = &self.url else {
+                    return std::future::pending().await;
+                };
+                let (client, driver) = tokio_postgres::connect(url, NoTls)
+                    .await
+                    .map_err(super::super::backend)?;
+                if self.fail_driver {
+                    drop(driver);
+                    Ok(AuthorizedConnection {
+                        client,
+                        driver: Box::pin(async {
+                            Err(EventLogError::Backend(
+                                "injected caller driver failure".to_owned(),
+                            ))
+                        }),
+                    })
+                } else {
+                    Ok(AuthorizedConnection::new(client, driver))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_owned_authority_is_bounded_and_reused() {
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(
+                std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none(),
+                "required caller-owned PostgreSQL proof cannot skip an absent database URL"
+            );
+            eprintln!("skipped: caller-owned authority needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let authority = Arc::new(TestAuthority {
+            url: Some(url),
+            assurance: PostgresTransportAssurance::Isolated,
+            fail_driver: false,
+            calls: AtomicUsize::new(0),
+            timeouts: Mutex::new(Vec::new()),
+        });
+        let options = PoolOptions {
+            max_connections: 1,
+            connect_timeout: Duration::from_secs(3),
+            ..PoolOptions::default()
+        };
+        let pool = Pool::new(
+            PostgresConfig::caller_owned("public", "caller_authority", authority.clone()).unwrap(),
+            options.clone(),
+        )
+        .unwrap();
+        {
+            let mut first = pool.acquire().await.unwrap();
+            let value: i32 = first.query_one("SELECT 1", &[]).await.unwrap().get(0);
+            assert_eq!(value, 1);
+            first.settled();
+        }
+        {
+            let mut reused = pool.acquire().await.unwrap();
+            let value: i32 = reused.query_one("SELECT 2", &[]).await.unwrap().get(0);
+            assert_eq!(value, 2);
+            reused.settled();
+        }
+        assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *authority.timeouts.lock().unwrap(),
+            vec![options.connect_timeout]
+        );
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_owned_connection_timeout_releases_pool_capacity() {
+        let authority = Arc::new(TestAuthority {
+            url: None,
+            assurance: PostgresTransportAssurance::Verified,
+            fail_driver: false,
+            calls: AtomicUsize::new(0),
+            timeouts: Mutex::new(Vec::new()),
+        });
+        let options = PoolOptions {
+            max_connections: 1,
+            connect_timeout: Duration::from_millis(20),
+            shutdown_timeout: Duration::from_secs(1),
+            ..PoolOptions::default()
+        };
+        let config =
+            PostgresConfig::caller_owned("hosted", "caller_timeout", authority.clone()).unwrap();
+        assert!(config.production);
+        let pool = Pool::new(config, options.clone()).unwrap();
+        assert!(matches!(
+            pool.acquire().await,
+            Err(EventLogError::Deadline {
+                operation: "connection"
+            })
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(pool.status().checked_out, 0);
+        assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *authority.timeouts.lock().unwrap(),
+            vec![options.connect_timeout]
+        );
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_owned_authority_cannot_escape_connection_or_waiter_bounds() {
+        let authority = Arc::new(TestAuthority {
+            url: None,
+            assurance: PostgresTransportAssurance::Verified,
+            fail_driver: false,
+            calls: AtomicUsize::new(0),
+            timeouts: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::new(
+            PostgresConfig::caller_owned("hosted", "caller_bounds", authority.clone()).unwrap(),
+            PoolOptions {
+                max_connections: 1,
+                max_waiters: 1,
+                connect_timeout: Duration::from_secs(5),
+                shutdown_timeout: Duration::from_secs(1),
+                ..PoolOptions::default()
+            },
+        )
+        .unwrap();
+        let first_pool = pool.clone();
+        let first = tokio::spawn(async move { first_pool.acquire().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while authority.calls.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first authority call");
+        let second_pool = pool.clone();
+        let second = tokio::spawn(async move { second_pool.acquire().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.status().waiting != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one bounded waiter");
+        assert!(matches!(
+            pool.acquire().await,
+            Err(EventLogError::Overloaded)
+        ));
+        assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+        tokio::task::yield_now().await;
+        assert_eq!(pool.status().checked_out, 0);
+        assert_eq!(pool.status().waiting, 0);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_owned_driver_failure_does_not_escape_capacity_accounting() {
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none());
+            eprintln!("skipped: caller-owned driver failure needs PostgreSQL");
+            return;
+        };
+        let authority = Arc::new(TestAuthority {
+            url: Some(url),
+            assurance: PostgresTransportAssurance::Isolated,
+            fail_driver: true,
+            calls: AtomicUsize::new(0),
+            timeouts: Mutex::new(Vec::new()),
+        });
+        let pool = Pool::new(
+            PostgresConfig::caller_owned("public", "caller_driver", authority).unwrap(),
+            PoolOptions::default(),
+        )
+        .unwrap();
+        assert!(pool.acquire().await.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(pool.status().checked_out, 0);
+        pool.shutdown().await.unwrap();
+    }
 
     fn fixture(connections: usize, waiters: usize) -> Option<Arc<Pool>> {
         let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL")

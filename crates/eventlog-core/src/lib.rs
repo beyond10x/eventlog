@@ -14,10 +14,26 @@ mod admission;
 mod aggregate;
 mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
+mod blob_integrity;
+mod capture;
+mod inline_admin;
 pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
 mod projection;
 
+pub use capture::{
+    BoundBlobs, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CaptureRequestRefusal,
+    CaptureResource, CapturedBlob, CapturedProjection, ConsistentTenantCapture, DeferredBlob,
+    DeferredTenantCapture, ProjectionCaptureRefusal, TenantCapture, order_blobs,
+    order_deferred_blobs, order_rows, validate_capture_request, validate_captured_digest,
+    validate_captured_event, validate_captured_order,
+};
+pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
+
 pub use aggregate::{Aggregate, Applied, DomainEvent, Loaded, Outcome, Repository, SnapshotPolicy};
+pub use blob_integrity::{
+    BlobMigrationReport, LegacyBlobMigration, blob_integrity_sha256, validate_legacy_blob_count,
+    validate_stored_blob,
+};
 pub use projection::{
     CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, NoGuard, ProjectionSpec,
     ProjectionStore, Projector, indexed_value, validate_identifier,
@@ -27,7 +43,7 @@ mod atomic_blob;
 pub use atomic_blob::{AtomicBlobEventStore, BlobAppendGroup, BlobWrite};
 mod atomic_group;
 pub use atomic_group::{
-    AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend,
+    AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend, UNAVAILABLE,
 };
 
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -650,6 +666,13 @@ pub enum EventLogError {
     Deadline { operation: &'static str },
     #[error("commit outcome unknown; reconnect and resolve the same command identity")]
     UnknownCommit,
+    #[error("blob migration commit outcome unknown; reinspect the owner schema")]
+    BlobMigrationCommitUnknown,
+    #[error("blob migration completed, but temporary pool cleanup failed: {cleanup}")]
+    BlobMigrationCompleted {
+        report: BlobMigrationReport,
+        cleanup: Box<EventLogError>,
+    },
 
     #[error("stream is at version {actual}, not {expected}")]
     Conflict { expected: u64, actual: u64 },
@@ -979,8 +1002,14 @@ pub trait EventStore: Send + Sync + 'static {
     /// upload is a record nobody can erase. An event names the digest; the bytes are erasable on
     /// their own, and erasing them leaves the fact that a file arrived intact.
     ///
+    /// Within one tenant, the digest binds to one byte sequence until explicit deletion or
+    /// tenant erasure. Identical retries succeed; different bytes are refused without changing
+    /// the existing binding. Another tenant may bind the same opaque digest independently.
+    /// Concurrent differing writers establish exactly one binding and only one succeeds.
+    ///
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] when the digest is unusable.
+    /// Returns [`EventLogError::Invalid`] when the digest is unusable or already binds different
+    /// bytes in this tenant.
     fn put_blob<'a>(
         &'a self,
         tenant: &'a TenantId,

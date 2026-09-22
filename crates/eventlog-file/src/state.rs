@@ -37,6 +37,21 @@ pub(crate) enum Op {
         key: String,
         digest: String,
         ranges: Vec<GroupRange>,
+        /// The blob digests this group committed, sorted and without repeats.
+        ///
+        /// What makes a retry of a blob-bearing group *the same request*. The group's fingerprint
+        /// covers the tenant, the members and the command meta and deliberately not the batch, so
+        /// the batch has to be recorded to be compared; and it is compared against what this
+        /// record says the commit carried, never against which blobs happen to be bound now.
+        /// Whether a blob still exists is a separate question with a separate answer —
+        /// `delete_blob` is its own act and does not retroactively make a committed group belong
+        /// to a different request.
+        ///
+        /// Absent in a record written before groups could carry blobs, and absent from the wire
+        /// whenever it is empty, so every frame a group without blobs writes is byte-identical to
+        /// what it wrote before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blobs: Vec<String>,
     },
     Identity {
         tenant: TenantId,
@@ -77,7 +92,7 @@ pub(crate) enum Op {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Blob {
     pub id: String,
@@ -89,7 +104,7 @@ pub(crate) struct State {
     pub events: BTreeMap<u64, RecordedEvent>,
     pub commands: BTreeMap<String, (String, GroupRange)>,
     pub claims: BTreeMap<String, (String, GroupRange)>,
-    pub groups: BTreeMap<String, (String, Vec<GroupRange>)>,
+    pub groups: BTreeMap<String, (String, Vec<GroupRange>, Vec<String>)>,
     pub identities: BTreeMap<String, String>,
     pub generations: BTreeMap<String, String>,
     pub projections: BTreeMap<String, Vec<String>>,
@@ -115,11 +130,26 @@ impl State {
     pub fn replay(transactions: &[Value]) -> Result<Self, EventLogError> {
         let mut state = Self::default();
         for transaction in transactions {
-            for op in serde_json::from_value::<Vec<Op>>(transaction.clone()).map_err(backend)? {
-                state.apply(op)?;
-            }
+            state.fold(transaction)?;
         }
         Ok(state)
+    }
+    /// Apply one committed transaction and return the blob bindings it created, so a handle that
+    /// folds frames it has not seen before can verify exactly the objects they bind.
+    pub fn fold(&mut self, transaction: &Value) -> Result<Vec<(TenantId, String)>, EventLogError> {
+        let mut bound = Vec::new();
+        for op in serde_json::from_value::<Vec<Op>>(transaction.clone()).map_err(backend)? {
+            if let Op::Blob {
+                tenant,
+                digest,
+                object: Some(_),
+            } = &op
+            {
+                bound.push((tenant.clone(), digest.clone()));
+            }
+            self.apply(op)?;
+        }
+        Ok(bound)
     }
     pub fn head(&self, stream: &StreamId) -> u64 {
         self.events
@@ -195,9 +225,10 @@ impl State {
                 key: id,
                 digest,
                 ranges,
+                blobs,
             } => {
                 self.groups
-                    .insert(key(&[tenant.as_str(), &id]), (digest, ranges));
+                    .insert(key(&[tenant.as_str(), &id]), (digest, ranges, blobs));
             }
             Op::Identity { tenant, id } => {
                 self.identities.insert(tenant.as_str().into(), id);

@@ -1,5 +1,5 @@
 //! Durable JSONL framing. The manifest is the commit point, never a best-effort cache.
-use eventlog_core::{EventLogError, InspectionError, new_event_id};
+use eventlog_core::{CaptureError, CaptureMaterial, EventLogError, InspectionError, new_event_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -73,6 +73,34 @@ pub(crate) struct Journal {
     _lock: File,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
+    content: Content,
+}
+
+/// A running SHA-256 over the committed bytes of `events.jsonl`, to the committed length.
+///
+/// A handle that resumes onto a head it already chained trusts committed bytes it is not decoding
+/// again. This carries what those bytes were when it verified them, so [`Journal::resume`] can
+/// re-read exactly them and hand a history whose committed prefix is no longer the one this handle
+/// verified to the complete opener, which refuses it. Without it, damage inside the committed
+/// prefix is invisible to every later transaction, including the one that appends onto it.
+#[derive(Clone)]
+pub(crate) struct Content(Sha256);
+
+impl Content {
+    fn empty() -> Self {
+        Self(Sha256::new())
+    }
+    fn of(bytes: &[u8]) -> Self {
+        let mut content = Self::empty();
+        content.absorb(bytes);
+        content
+    }
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    fn digest(&self) -> String {
+        format!("{:x}", self.0.clone().finalize())
+    }
 }
 
 /// Retains the native lock while the caller folds and examines this observation.
@@ -83,10 +111,12 @@ pub(crate) struct InspectedJournal {
 
 /// Source bytes count the manifest and journal, the only files decoded here.
 pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal, InspectionError> {
-    let root_metadata = fs::symlink_metadata(root).map_err(inspection_io)?;
-    if !root_metadata.is_dir() {
+    // The one predicate, not a second copy of the decision: an inspection that read a link as a
+    // store is the same defect the write paths already refuse.
+    if !physical_directory(root).map_err(inspection_io)? {
         return Err(InspectionError::UnsupportedSource);
     }
+    let root_metadata = fs::symlink_metadata(root).map_err(inspection_io)?;
     let lock = inspection_file(&root.join("writer.lock"))?;
     lock.try_lock().map_err(|_| InspectionError::SourceBusy)?;
     for name in ["append.json", "privacy.json"] {
@@ -189,6 +219,22 @@ fn regular(path: &Path) -> Result<(), EventLogError> {
     }
     Ok(())
 }
+/// Whether `path` is a directory in this filesystem, rather than a link to one.
+///
+/// Every entry point onto a store root asks this and asks it *first*: a symlink in a path
+/// component is followed by every check after it, so a root that is not a physical directory is
+/// refused here or nowhere. One predicate and five callers, because five hand-written copies is
+/// how they came to disagree — [`resume_strict`] shipped without one and read a store the other
+/// four refuse.
+///
+/// The refusals stay different on purpose and belong to the callers: `corrupt()` for the two
+/// writer paths, [`open_strict`]'s own string for the reader a consumer reads errors from,
+/// `crate::directory`'s own message, and `None` for [`resume_strict`], which hands the decision
+/// to `open_strict`. `symlink_metadata` does not follow a final-component link, which is the
+/// whole question.
+pub(crate) fn physical_directory(path: &Path) -> Result<bool, std::io::Error> {
+    Ok(fs::symlink_metadata(path)?.is_dir())
+}
 fn read(path: &Path) -> Result<Vec<u8>, EventLogError> {
     regular(path)?;
     fs::read(path).map_err(backend)
@@ -212,24 +258,38 @@ fn atomic_json(root: &Path, name: &str, value: &impl Serialize) -> Result<(), Ev
 
 impl Journal {
     pub fn open(root: &Path) -> Result<Self, EventLogError> {
-        fs::create_dir_all(root).map_err(backend)?;
-        if !fs::symlink_metadata(root).map_err(backend)?.is_dir() {
+        Self::open_with_creation(root, true)
+    }
+
+    /// Open a provisioned journal without minting any missing authority.
+    pub fn open_existing(root: &Path) -> Result<Self, EventLogError> {
+        Self::open_with_creation(root, false)
+    }
+
+    fn open_with_creation(root: &Path, create: bool) -> Result<Self, EventLogError> {
+        if create {
+            fs::create_dir_all(root).map_err(backend)?;
+        }
+        if !physical_directory(root).map_err(backend)? {
             return Err(corrupt());
         }
         let lock_path = root.join("writer.lock");
-        if fs::symlink_metadata(&lock_path).is_ok() {
+        if !create || fs::symlink_metadata(&lock_path).is_ok() {
             regular(&lock_path)?;
         }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
             .open(lock_path)
             .map_err(backend)?;
         lock.lock().map_err(backend)?;
         let manifest_path = root.join("manifest.json");
         if !manifest_path.exists() {
+            if !create {
+                return Err(corrupt());
+            }
             // Never interpret an existing history without its commit authority as a new store.
             if root.join("events.jsonl").exists() || root.join("privacy.json").exists() {
                 return Err(corrupt());
@@ -280,29 +340,22 @@ impl Journal {
             .read_to_end(&mut committed)
             .map_err(backend)?;
         let transactions = decode(&committed, &manifest)?;
+        #[cfg(test)]
+        crate::cost::charge(root, |cost| {
+            cost.frames_chained += transactions.len() as u64;
+        });
         if events.metadata().map_err(backend)?.len() > manifest.length {
             return Err(corrupt());
         }
-        // These files were never selected by a durable intent. They may contain sensitive bytes.
-        for entry in fs::read_dir(root).map_err(backend)? {
-            let entry = entry.map_err(backend)?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name == "privacy.next"
-                || name.strip_prefix(".write-").is_some_and(|id| {
-                    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
-                })
-            {
-                regular(&entry.path())?;
-                fs::remove_file(entry.path()).map_err(backend)?;
-            }
-        }
+        let content = Content::of(&committed);
+        sweep_unselected(root)?;
         sync_dir(root)?;
         Ok(Self {
             root: root.to_owned(),
             _lock: lock,
             manifest,
             transactions,
+            content,
         })
     }
 
@@ -348,34 +401,76 @@ impl Journal {
         fs::remove_file(self.root.join("append.json"))
             .and_then(|()| File::open(&self.root)?.sync_all())
             .map_err(|_| EventLogError::UnknownCommit)?;
+        #[cfg(test)]
+        crate::cost::charge(&self.root, |cost| {
+            cost.durability_barriers += 1;
+        });
         self.manifest = next;
         self.transactions.push(transaction);
+        self.content.absorb(&line);
         Ok(())
     }
 
+    /// The hash of the committed bytes this journal decoded, for a test that resumes onto them.
+    #[cfg(test)]
+    pub fn content(&self) -> Content {
+        self.content.clone()
+    }
+
     pub fn extends(&self, observed: &Manifest) -> Result<bool, EventLogError> {
-        if observed.store != self.manifest.store
-            || observed.epoch != self.manifest.epoch
-            || observed.sequence > self.manifest.sequence
-        {
-            return Ok(false);
+        extends_observed(&self.manifest, &self.transactions, observed)
+    }
+
+    /// Release the lock and keep what it protected: the manifest, the verified frames, and the
+    /// hash of the committed bytes those frames were decoded from.
+    pub fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
+        (self.manifest, self.transactions, self.content)
+    }
+
+    /// Take the lock and decide from `manifest.json` whether the committed history is exactly
+    /// `observed` or extends it, reading and verifying only the frames past `observed.length`,
+    /// chained from `observed.digest` to the new manifest digest.
+    ///
+    /// The committed bytes behind `observed` are re-read and hashed against `content` before any
+    /// of them is trusted, so a frame damaged in place after this handle verified it is never
+    /// served, folded onto, or appended after: it is handed to the complete opener, which refuses
+    /// it before the caller can write.
+    ///
+    /// `None` hands the decision to the complete opener: a pending recovery intent, a missing
+    /// manifest, a manifest that is not on the observed store and epoch or is shorter, a file
+    /// whose length is not the committed length, a committed prefix that is not the bytes this
+    /// handle verified, or a tail that does not chain. That path rereads and re-verifies
+    /// everything and refuses with the same errors it always has.
+    pub fn resume(
+        root: &Path,
+        observed: &Manifest,
+        content: &Content,
+    ) -> Result<Option<Resumed>, EventLogError> {
+        if !physical_directory(root).map_err(backend)? {
+            return Err(corrupt());
         }
-        let mut previous = ZERO.to_owned();
-        for (index, transaction) in self
-            .transactions
-            .iter()
-            .take(usize::try_from(observed.sequence).map_err(backend)?)
-            .enumerate()
-        {
-            previous = encode(
-                &self.manifest,
-                index as u64 + 1,
-                &previous,
-                transaction.clone(),
-            )?
-            .1;
+        let lock_path = root.join("writer.lock");
+        regular(&lock_path)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(backend)?;
+        lock.lock().map_err(backend)?;
+        let Some((manifest, fresh, content)) = resumed_committed(root, observed, content)? else {
+            return Ok(None);
+        };
+        if sweep_unselected(root)? {
+            sync_dir(root)?;
         }
-        Ok(previous == observed.digest)
+        Ok(Some(Resumed {
+            lock,
+            manifest,
+            fresh,
+            content,
+        }))
     }
 
     /// Privacy is the only rewrite path. The caller supplies history with only erased data removed.
@@ -408,9 +503,390 @@ impl Journal {
         checkpoint("privacy-prepared");
         self.manifest = recover_privacy(&self.root, &self.manifest)
             .map_err(|_| EventLogError::UnknownCommit)?;
+        #[cfg(test)]
+        crate::cost::charge(&self.root, |cost| {
+            cost.durability_barriers += 1;
+        });
         self.transactions = transactions;
+        self.content = Content::of(&bytes);
         Ok(())
     }
+}
+
+/// Decide, with the writers' lock already held, whether the committed history is still the one
+/// behind `observed` — and what it gained since.
+///
+/// One walk, used by the writer's [`Journal::resume`] and by the reader's [`resume_strict`]: a
+/// second copy of it would be a second chance to compare the wrong thing. It reads and decides and
+/// nothing else. The sweep of unselected staging names belongs to the caller, because a writer
+/// owes it and a reader owes none: a capture that removed a file would have changed the thing it
+/// came to observe.
+///
+/// `None` hands the decision to the caller's complete opener: a pending recovery intent, a missing
+/// manifest, a manifest that is not on the observed store and epoch or is shorter, a file whose
+/// length is not the committed length, a committed prefix that is not the bytes this handle
+/// verified, or a tail that does not chain.
+fn resumed_committed(
+    root: &Path,
+    observed: &Manifest,
+    content: &Content,
+) -> Result<Option<(Manifest, Vec<Value>, Content)>, EventLogError> {
+    // A reserved intent name is present when its directory entry exists, even when following that
+    // entry reaches nothing. `Path::exists` follows links and reports a dangling one as absent, so
+    // it is not the question being asked here; and an entry that cannot be inspected at all is a
+    // doubt, which the complete opener resolves.
+    if pending_intent_exists(root).unwrap_or(true) {
+        return Ok(None);
+    }
+    let manifest_path = root.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&read(&manifest_path)?).map_err(|_| corrupt())?;
+    if manifest.format != FORMAT {
+        return Err(corrupt());
+    }
+    if manifest.store != observed.store
+        || manifest.epoch != observed.epoch
+        || manifest.sequence < observed.sequence
+        || manifest.length < observed.length
+    {
+        return Ok(None);
+    }
+    let events_path = root.join("events.jsonl");
+    regular(&events_path)?;
+    if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
+        return Ok(None);
+    }
+    // The committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
+    // rechaining it, and the only way a handle can tell that what it verified is still there.
+    let mut events = File::open(&events_path).map_err(backend)?;
+    let mut observed_content = Content::empty();
+    let mut remaining = observed.length;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buffer.len() as u64)).map_err(backend)?;
+        let read = events.read(&mut buffer[..want]).map_err(backend)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        observed_content.absorb(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.prefix_bytes_hashed += observed.length;
+    });
+    if observed_content.digest() != content.digest() {
+        return Ok(None);
+    }
+    // Past the prefix: an unchanged head reads nothing more.
+    let fresh = if manifest == *observed {
+        Vec::new()
+    } else {
+        let mut tail = Vec::new();
+        events.read_to_end(&mut tail).map_err(backend)?;
+        match decode_chain(&tail, &manifest, observed.sequence, &observed.digest) {
+            Ok(fresh) => {
+                observed_content.absorb(&tail);
+                fresh
+            }
+            Err(_) => return Ok(None),
+        }
+    };
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.frames_chained += fresh.len() as u64;
+    });
+    Ok(Some((manifest, fresh, observed_content)))
+}
+
+/// Whether the committed history still contains the exact prefix a handle observed.
+///
+/// One implementation, used by the ordinary opener's per-handle guard and by the strict reader's:
+/// a second copy of this walk is a second chance to compare the wrong thing.
+pub(crate) fn extends_observed(
+    manifest: &Manifest,
+    transactions: &[Value],
+    observed: &Manifest,
+) -> Result<bool, EventLogError> {
+    if observed.store != manifest.store
+        || observed.epoch != manifest.epoch
+        || observed.sequence > manifest.sequence
+    {
+        return Ok(false);
+    }
+    let mut previous = ZERO.to_owned();
+    for (index, transaction) in transactions
+        .iter()
+        .take(usize::try_from(observed.sequence).map_err(backend)?)
+        .enumerate()
+    {
+        previous = encode(manifest, index as u64 + 1, &previous, transaction.clone())?.1;
+    }
+    Ok(previous == observed.digest)
+}
+
+/// The lock, the committed manifest, the frames a handle has not verified yet, and the hash of
+/// the committed bytes this resume re-read and validated.
+pub(crate) struct Resumed {
+    lock: File,
+    pub manifest: Manifest,
+    pub fresh: Vec<Value>,
+    content: Content,
+}
+
+impl Resumed {
+    /// Assemble the writer from the handle's verified frames followed by the fresh ones.
+    pub fn into_journal(self, root: &Path, mut transactions: Vec<Value>) -> Journal {
+        transactions.extend(self.fresh);
+        Journal {
+            root: root.to_owned(),
+            _lock: self.lock,
+            manifest: self.manifest,
+            transactions,
+            content: self.content,
+        }
+    }
+}
+
+/// Committed history a reader resumed onto, with the writers' lock held for as long as it lives.
+///
+/// The reader's counterpart to [`Resumed`]. It carries no root and has no `into_journal`: there is
+/// no method here that could write, so there is none to forget to guard.
+pub(crate) struct StrictResumed {
+    // Kept open for the whole life of this value and released by its own drop: nothing reads it,
+    // and there is deliberately no statement that releases it early. `Journal` holds the writers'
+    // lock the same way and for the same reason.
+    _lock: File,
+    pub manifest: Manifest,
+    pub fresh: Vec<Value>,
+    content: Content,
+}
+
+impl StrictResumed {
+    /// Run `read` with the lock still held, then release it and keep what it protected: the
+    /// committed head, the frames past the head the handle observed, and the hash of the
+    /// committed bytes this resume validated.
+    ///
+    /// The read is an argument rather than the caller's next statement on purpose. The rule is
+    /// that the bytes a reader hands out are read under the writers' lock, and while the caller
+    /// wrote "observe, then take the parts" that rule was two statements in one order and
+    /// nothing else: swapping them read the content unlocked and left every case in this crate
+    /// green (review 2, finding A3). Here the lock is `self`'s and `self` is alive until this
+    /// function returns, so releasing it before the read is not something a caller can write.
+    pub(crate) fn read_under_lock<T>(
+        self,
+        read: impl FnOnce() -> T,
+    ) -> (T, Manifest, Vec<Value>, Content) {
+        // No `drop` and no order to keep: `self` owns the lock until this function returns,
+        // so `read` cannot run after it is released.
+        let value = read();
+        (value, self.manifest, self.fresh, self.content)
+    }
+}
+
+/// Resume onto committed history without the authority to change any of it.
+///
+/// The read-only sibling of [`Journal::resume`], sharing its walk and adding nothing to it. Two
+/// differences, both of them the difference between a writer and a reader: this removes no
+/// staging name and synchronizes no directory, and it answers `None` rather than an error for
+/// everything it cannot decide, because every refusal belongs to [`open_strict`], which reaches
+/// them with the evidence left exactly where it was found.
+pub(crate) fn resume_strict(
+    root: &Path,
+    observed: &Manifest,
+    content: &Content,
+) -> Option<StrictResumed> {
+    // The member of this class that was missing, and an absence no mutation of present code
+    // could reach: every check below follows a link in a path component, so a root that is not a
+    // physical directory has to be refused before any of them. `None`, so `open_strict` makes
+    // the refusal with the evidence where it was found, exactly as the rest of this function does.
+    if !physical_directory(root).ok()? {
+        return None;
+    }
+    let lock_path = root.join("writer.lock");
+    regular(&lock_path).ok()?;
+    // No create, no truncate: this opens the writers' own lock, it does not establish one.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    lock.lock().ok()?;
+    let (manifest, fresh, content) = resumed_committed(root, observed, content).ok()??;
+    Some(StrictResumed {
+        _lock: lock,
+        manifest,
+        fresh,
+        content,
+    })
+}
+
+/// One committed history, read without the authority to change it.
+///
+/// The interprocess lock is held for as long as this value lives, exactly as an ordinary writer
+/// holds it, so an observation cannot straddle somebody else's commit.
+pub(crate) struct Strict {
+    lock: File,
+    pub manifest: Manifest,
+    pub transactions: Vec<Value>,
+    content: Content,
+}
+
+impl Strict {
+    /// Run `read` with the lock still held, then release it and keep what it protected: the
+    /// committed head, the verified frames, and the hash of the committed bytes those frames
+    /// were decoded from.
+    ///
+    /// The reader's half of the same rule [`StrictResumed::read_under_lock`] states, on the path
+    /// that rereads everything. Both paths hand blob objects to a caller and both read them here.
+    pub(crate) fn read_under_lock<T>(
+        self,
+        read: impl FnOnce() -> T,
+    ) -> (T, Manifest, Vec<Value>, Content) {
+        // No `drop` and no order to keep: `self` owns the lock until this function returns,
+        // so `read` cannot run after it is released.
+        let value = read();
+        (value, self.manifest, self.transactions, self.content)
+    }
+
+    /// Turn a fully validated strict observation into a writer without reopening or recovering it.
+    pub(crate) fn into_journal(self, root: &Path) -> Journal {
+        Journal {
+            root: root.to_owned(),
+            _lock: self.lock,
+            manifest: self.manifest,
+            transactions: self.transactions,
+            content: self.content,
+        }
+    }
+}
+
+fn unavailable(reason: &str) -> CaptureError {
+    CaptureError::Store(EventLogError::Backend(reason.to_owned()))
+}
+
+fn damaged() -> CaptureError {
+    CaptureError::Corrupt {
+        material: CaptureMaterial::Journal,
+    }
+}
+
+/// Open an existing store for reading only.
+///
+/// [`Journal::open`] is the wrong entry point for an inspector, and not by a little: it creates a
+/// store where there is none, runs append and privacy recovery, truncates a torn frame, deletes
+/// unselected staging files and rewrites `manifest.json` — all before the caller's read closure is
+/// ever invoked. This path does none of it. A missing root, lock or manifest is a storage refusal
+/// rather than an invitation to make one; a pending durable intent is somebody else's recovery;
+/// and damage is refused with the evidence left exactly where it was found.
+pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
+    if !physical_directory(root).map_err(|_| unavailable("file store root is not present"))? {
+        return Err(unavailable("file store root is not a physical directory"));
+    }
+    let lock_path = root.join("writer.lock");
+    if !fs::symlink_metadata(&lock_path)
+        .map_err(|_| unavailable("file store writer lock is not present"))?
+        .is_file()
+    {
+        return Err(damaged());
+    }
+    // No create, no truncate: this opens the writers' own lock, it does not establish one.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|_| unavailable("file store writer lock cannot be opened"))?;
+    lock.lock()
+        .map_err(|_| unavailable("file store writer lock cannot be held"))?;
+    // A pending intent is the authority of an ordinary opener. Reading past one would either
+    // repair history without permission or hand back bytes an erasure has already claimed.
+    if pending_intent_exists(root)? {
+        return Err(CaptureError::RecoveryRequired);
+    }
+    let manifest_path = root.join("manifest.json");
+    if !fs::symlink_metadata(&manifest_path)
+        .map_err(|_| unavailable("file store manifest is not present"))?
+        .is_file()
+    {
+        return Err(damaged());
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| damaged())?)
+            .map_err(|_| damaged())?;
+    if manifest.format != FORMAT {
+        return Err(damaged());
+    }
+    let events_path = root.join("events.jsonl");
+    if !fs::symlink_metadata(&events_path)
+        .map_err(|_| damaged())?
+        .is_file()
+    {
+        return Err(damaged());
+    }
+    let committed = fs::read(&events_path).map_err(|_| damaged())?;
+    // Surplus bytes are as much a refusal as missing ones: neither is history this manifest commits.
+    if committed.len() as u64 != manifest.length {
+        return Err(damaged());
+    }
+    let transactions = decode(&committed, &manifest).map_err(|_| damaged())?;
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.frames_chained += transactions.len() as u64;
+    });
+    let content = Content::of(&committed);
+    Ok(Strict {
+        lock,
+        manifest,
+        transactions,
+        content,
+    })
+}
+
+/// Observe reserved intent names as directory entries, without following or changing them.
+///
+/// `Path::exists` follows links and treats every metadata error as absence. A strict reader may
+/// read past only an actually absent name: a dangling link is still recovery authority, while an
+/// inability to inspect either name is an operational refusal.
+fn pending_intent_exists(root: &Path) -> Result<bool, CaptureError> {
+    for name in ["append.json", "privacy.json"] {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unavailable("file store pending intent cannot be inspected")),
+        }
+    }
+    Ok(false)
+}
+
+/// Remove reserved names that no durable intent ever selected, reporting whether any was there.
+///
+/// A complete open has always done this; a resumed handle does it too, because the files may hold
+/// sensitive bytes and a handle that stays open across a failed rename is otherwise the one path
+/// that never sweeps them. The caller syncs the directory when something was actually removed.
+fn sweep_unselected(root: &Path) -> Result<bool, EventLogError> {
+    let mut swept = false;
+    for entry in fs::read_dir(root).map_err(backend)? {
+        let entry = entry.map_err(backend)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "privacy.next"
+            || name.strip_prefix(".write-").is_some_and(|id| {
+                id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            })
+        {
+            regular(&entry.path())?;
+            fs::remove_file(entry.path()).map_err(backend)?;
+            swept = true;
+        }
+    }
+    Ok(swept)
 }
 
 fn recover_append(root: &Path, current: &Manifest) -> Result<(), EventLogError> {
@@ -469,18 +945,31 @@ fn encode(
     Ok((bytes, frame.digest))
 }
 fn decode(bytes: &[u8], manifest: &Manifest) -> Result<Vec<Value>, EventLogError> {
-    if bytes.len() as u64 != manifest.length || (!bytes.is_empty() && bytes.last() != Some(&b'\n'))
-    {
+    if bytes.len() as u64 != manifest.length {
         return Err(corrupt());
     }
-    let mut previous = ZERO.to_owned();
+    decode_chain(bytes, manifest, 0, ZERO)
+}
+/// Verify the frames `sequence + 1..=manifest.sequence`, chained from `previous` to the manifest
+/// digest. The complete history starts at zero; a resumed handle starts at its observed head.
+fn decode_chain(
+    bytes: &[u8],
+    manifest: &Manifest,
+    mut sequence: u64,
+    previous: &str,
+) -> Result<Vec<Value>, EventLogError> {
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(corrupt());
+    }
+    let mut previous = previous.to_owned();
     let mut transactions = Vec::new();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let mut frame: Frame = serde_json::from_slice(line).map_err(|_| corrupt())?;
+        sequence = sequence.checked_add(1).ok_or_else(corrupt)?;
         if frame.format != FORMAT
             || frame.store != manifest.store
             || frame.epoch != manifest.epoch
-            || frame.sequence != transactions.len() as u64 + 1
+            || frame.sequence != sequence
             || frame.previous != previous
         {
             return Err(corrupt());
@@ -492,7 +981,7 @@ fn decode(bytes: &[u8], manifest: &Manifest) -> Result<Vec<Value>, EventLogError
         previous = digest;
         transactions.push(frame.transaction);
     }
-    if transactions.len() as u64 != manifest.sequence || previous != manifest.digest {
+    if sequence != manifest.sequence || previous != manifest.digest {
         return Err(corrupt());
     }
     Ok(transactions)
@@ -543,11 +1032,12 @@ mod tests {
             return;
         };
         if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB").is_some() {
-            use eventlog_core::AtomicBlobEventStore;
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let store = crate::FileEventStore::open(&root).await.unwrap();
                 let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
-                let result = store.append_group_with_blobs(&request).await;
+                let result =
+                    eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+                        .await;
                 if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
                     assert_eq!(result, Err(EventLogError::UnknownCommit));
                 } else {
@@ -598,7 +1088,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn atomic_blob_crash_boundaries_recover_only_complete_publication() {
-        use eventlog_core::{AtomicBlobEventStore, EventStore};
+        use eventlog_core::EventStore;
         for point in [
             "blob-staged",
             "append-prepared",
@@ -644,7 +1134,10 @@ mod tests {
                 usize::from(committed),
                 "unbound crash staging reclaimed at {point}"
             );
-            let resolved = store.append_group_with_blobs(&request).await.unwrap();
+            let resolved =
+                eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+                    .await
+                    .unwrap();
             assert_eq!(resolved.deduplicated, committed);
             if committed {
                 assert_eq!(resolved.appends[0].events, events);
@@ -660,7 +1153,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn atomic_blob_postcommit_cleanup_failure_keeps_committed_content() {
-        use eventlog_core::{AtomicBlobEventStore, EventStore};
+        use eventlog_core::EventStore;
         let root = tempfile::tempdir().unwrap();
         drop(crate::FileEventStore::open(root.path()).await.unwrap());
         let output = Command::new(std::env::current_exe().unwrap())
@@ -696,7 +1189,9 @@ mod tests {
                 .unwrap(),
             Some(request.blobs[0].bytes.clone())
         );
-        let result = store.append_group_with_blobs(&request).await.unwrap();
+        let result = eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+            .await
+            .unwrap();
         assert!(result.deduplicated);
         assert_eq!(result.appends[0].events, events);
     }
@@ -807,6 +1302,145 @@ mod tests {
     }
 
     #[test]
+    fn resume_reads_only_frames_past_the_observed_head() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 1})).unwrap();
+        let observed = journal.manifest.clone();
+        let observed_content = journal.content();
+        drop(journal);
+        let same = Journal::resume(root.path(), &observed, &observed_content)
+            .unwrap()
+            .unwrap();
+        assert!(same.fresh.is_empty());
+        assert_eq!(same.manifest, observed);
+        drop(same);
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 2})).unwrap();
+        journal.append(json!({"value": 3})).unwrap();
+        let head = journal.manifest.clone();
+        let head_content = journal.content();
+        drop(journal);
+        let extended = Journal::resume(root.path(), &observed, &observed_content)
+            .unwrap()
+            .unwrap();
+        assert_eq!(extended.fresh, [json!({"value": 2}), json!({"value": 3})]);
+        let journal = extended.into_journal(root.path(), vec![json!({"value": 1})]);
+        assert_eq!(journal.manifest, head);
+        assert_eq!(journal.transactions.len(), 3);
+        drop(journal);
+        // Shorter than observed: the complete opener decides.
+        let bytes = fs::read(root.path().join("events.jsonl")).unwrap();
+        fs::write(
+            root.path().join("events.jsonl"),
+            &bytes[..usize::try_from(observed.length).unwrap()],
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&observed).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
+        // The observed prefix left exactly as this handle verified it, and one more frame that
+        // does not chain from the observed digest: the prefix hash passes and the chain check is
+        // what refuses.
+        let mut unchained = head.clone();
+        let (line, digest) = encode(&unchained, 4, ZERO, json!({"value": 11})).unwrap();
+        let mut rebuilt = bytes.clone();
+        rebuilt.extend(line);
+        unchained.sequence = 4;
+        unchained.length = rebuilt.len() as u64;
+        unchained.digest = digest;
+        fs::write(root.path().join("events.jsonl"), &rebuilt).unwrap();
+        fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&unchained).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
+        // A fork whose first three frames have the observed lengths and one frame more: the tail
+        // starts exactly at the observed offset and must fail to chain from the observed digest.
+        let mut fork = head.clone();
+        let mut previous = ZERO.to_owned();
+        let mut forked = Vec::new();
+        for (sequence, value) in [(1, 7), (2, 8), (3, 9), (4, 10)] {
+            let (line, digest) =
+                encode(&fork, sequence, &previous, json!({"value": value})).unwrap();
+            forked.extend(line);
+            previous = digest;
+        }
+        fork.sequence = 4;
+        fork.length = forked.len() as u64;
+        fork.digest = previous;
+        fs::write(root.path().join("events.jsonl"), &forked).unwrap();
+        fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&fork).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
+        // A privacy epoch: the complete opener decides, while the new head resumes as itself.
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.privacy(vec![json!({"value": "erased"})]).unwrap();
+        let sanitized = journal.manifest.clone();
+        let sanitized_content = journal.content();
+        drop(journal);
+        assert!(
+            Journal::resume(root.path(), &fork, &Content::of(&forked))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            Journal::resume(root.path(), &sanitized, &sanitized_content)
+                .unwrap()
+                .unwrap()
+                .manifest,
+            sanitized
+        );
+    }
+
+    #[test]
+    fn a_resumed_handle_sweeps_unselected_staging_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 1})).unwrap();
+        let observed = journal.manifest.clone();
+        let content = journal.content();
+        drop(journal);
+        // Neither name was ever selected by a durable intent, and both may hold sensitive bytes.
+        let staging = root.path().join(format!(".write-{}", new_event_id()));
+        fs::write(&staging, b"unselected").unwrap();
+        let replacement = root.path().join("privacy.next");
+        fs::write(&replacement, b"unselected").unwrap();
+        let resumed = Journal::resume(root.path(), &observed, &content)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.manifest, observed);
+        drop(resumed);
+        assert!(
+            !staging.exists(),
+            "a resumed handle removes .write-<uuid> staging files, as a complete open does"
+        );
+        assert!(
+            !replacement.exists(),
+            "a resumed handle removes privacy.next, as a complete open does"
+        );
+    }
+
+    #[test]
     fn mixed_recovery_intents_refuse_before_changing_authority() {
         let root = tempfile::tempdir().unwrap();
         drop(Journal::open(root.path()).unwrap());
@@ -884,5 +1518,140 @@ mod tests {
                 assert_eq!(fs::read_dir(path).unwrap().count(), 0, "{point}");
             }
         }
+    }
+    /// One shape of damage, every entry point onto a store root, and each one's own refusal.
+    ///
+    /// A symlink in a path component is followed by every check after it, so a root that is not a
+    /// physical directory is refused at the root or nowhere. That makes the rule a class with one
+    /// member per entry point, and `resume_strict` shipped as the member that was *absent* — an
+    /// omission no mutation of code that is present can reach, which is why both independent
+    /// reviews had to find it by hand. The five now share one predicate,
+    /// [`physical_directory`], and keep the five different refusals they already owed: the two
+    /// writer paths answer `corrupt()`, the strict opener answers the exact string a consumer
+    /// reads, the store directory answers its own message, and the resumed reader answers `None`
+    /// so that [`open_strict`] makes the refusal with the evidence where it was found.
+    ///
+    /// A sixth entry point that hand-writes the check instead of calling the predicate is caught
+    /// by `every_root_directory_decision_goes_through_one_predicate`; a sixth that omits it
+    /// entirely is caught by neither, and adding a row here is what that costs.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_not_a_physical_directory_is_refused_at_every_entry_point() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let link = directory.path().join("link");
+        let (observed, content) = {
+            let mut journal = Journal::open(&real).expect("writable store");
+            journal
+                .append(json!({"value": "committed"}))
+                .expect("committed frame");
+            (journal.manifest.clone(), journal.content.clone())
+        };
+
+        // The control: every entry point reads the same store happily by its real name.
+        assert_eq!(Journal::open_existing(&real).err(), None);
+        assert!(
+            Journal::resume(&real, &observed, &content)
+                .expect("readable")
+                .is_some()
+        );
+        assert!(open_strict(&real).is_ok());
+        assert!(resume_strict(&real, &observed, &content).is_some());
+        assert_eq!(crate::directory(&real).err(), None);
+
+        std::os::unix::fs::symlink(&real, &link).expect("a link where the root was");
+        assert!(
+            link.is_dir(),
+            "the fixture only means something if every later check follows the link"
+        );
+
+        assert_eq!(
+            Journal::open(&link).err(),
+            Some(corrupt()),
+            "the ordinary opener minted commit authority through a link"
+        );
+        assert_eq!(
+            Journal::open_existing(&link).err(),
+            Some(corrupt()),
+            "the provisioned opener read a root that is not a physical directory"
+        );
+        assert_eq!(
+            Journal::resume(&link, &observed, &content).err(),
+            Some(corrupt()),
+            "the writer resumed onto a root that is not a physical directory"
+        );
+        assert_eq!(
+            open_strict(&link).err().map(|error| format!("{error:?}")),
+            Some(format!(
+                "{:?}",
+                unavailable("file store root is not a physical directory")
+            )),
+            "the strict opener changed the refusal a consumer reads"
+        );
+        assert!(
+            resume_strict(&link, &observed, &content).is_none(),
+            "the resumed reader served a root the strict opener refuses by name"
+        );
+        assert_eq!(
+            crate::directory(&link).err(),
+            Some(backend("store directory is not a physical directory")),
+            "the store directory check read a link as a directory"
+        );
+    }
+
+    /// The root-is-a-physical-directory decision has exactly one implementation.
+    ///
+    /// The defect this round answers was an *omission*, and an omission is not machine-checkable
+    /// from here. A second copy of the decision is, and a second copy is how the five entry
+    /// points diverged in the first place: the crate already refuses one for the resume walk and
+    /// for `extends_observed`, for the same stated reason — a second copy is a second chance to
+    /// compare the wrong thing.
+    ///
+    /// The needles are assembled at run time so that this case is not a hit on itself.
+    #[test]
+    fn every_root_directory_decision_goes_through_one_predicate() {
+        let asked = concat!("symlink_", "metadata");
+        let decided = concat!(".is_", "dir()");
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut written_by_hand = Vec::new();
+        for entry in fs::read_dir(&source_root).expect("readable source directory") {
+            let file = entry.expect("readable entry").path();
+            if file.extension().is_none_or(|kind| kind != "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&file).expect("readable source file");
+            let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Sources carry multi-byte characters, so every window start is moved forward to a
+            // character boundary rather than sliced blind.
+            let window = |text: &str, from: usize, to: usize| {
+                let start = (from..=to)
+                    .find(|index| text.is_char_boundary(*index))
+                    .unwrap_or(to);
+                text[start..to].to_owned()
+            };
+            for (at, _) in collapsed.match_indices(decided) {
+                let context = &window(&collapsed, at.saturating_sub(200), at);
+                // A question that follows links is a different question; this one does not.
+                if !context.contains(asked) {
+                    continue;
+                }
+                if context.contains("fn physical_directory(") {
+                    continue;
+                }
+                written_by_hand.push(format!(
+                    "{}: ...{}{decided}",
+                    file.file_name()
+                        .unwrap_or(file.as_os_str())
+                        .to_string_lossy(),
+                    window(context, context.len().saturating_sub(70), context.len())
+                ));
+            }
+        }
+        assert!(
+            written_by_hand.is_empty(),
+            "the root-directory decision is written by hand outside physical_directory, which is \
+             how the five entry points came to disagree:\n  {}",
+            written_by_hand.join("\n  ")
+        );
     }
 }

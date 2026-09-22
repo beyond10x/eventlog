@@ -1,8 +1,8 @@
 //! Independent expectations for ordered groups; both real SQL providers run these assertions.
 use crate::{event, meta};
 use eventlog_core::{
-    AppendGroup, AtomicEventStore, BoxFuture, EventLogError, Expected, Guard, ProjectionSpec,
-    ProjectionStore, Projector, RecordedEvent, StreamAppend, StreamId, TenantId,
+    AppendGroup, AtomicEventStore, BoxFuture, EventLogError, Expected, Guard, NoGuard,
+    ProjectionSpec, ProjectionStore, Projector, RecordedEvent, StreamAppend, StreamId, TenantId,
 };
 use serde_json::json;
 use std::sync::{
@@ -377,4 +377,223 @@ pub async fn run_atomic_groups(store: &dyn AtomicEventStore) {
         fresh.appends[0].events[0].event_id,
         result.appends[0].events[0].event_id
     );
+}
+
+/// No digest of `digests` is readable from `store`.
+async fn assert_unpublished(
+    store: &dyn AtomicEventStore,
+    tenant: &TenantId,
+    digests: &[(String, Vec<u8>)],
+) {
+    for (digest, _) in digests {
+        assert_eq!(
+            store.get_blob(tenant, digest).await.unwrap(),
+            None,
+            "{digest}: a refused guarded group publishes no blob of its batch"
+        );
+    }
+}
+
+/// A guard that refuses every command it is asked about, and counts what it was asked.
+struct RefusingAdmission {
+    calls: Arc<AtomicUsize>,
+}
+impl Guard for RefusingAdmission {
+    fn check<'a>(
+        &'a self,
+        _store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(EventLogError::GuardRefused {
+                code: "conformance_refused".into(),
+            })
+        })
+    }
+}
+
+/// `AtomicEventStore::append_group_guarded_with_blobs`, on every provider.
+///
+/// The method is on the port because the caller it exists for holds a trait object and cannot
+/// name the provider underneath it. That caller can only rely on what the port promises, so the
+/// promise has to hold on all three providers — and the two defects this exercise exists to
+/// prevent both went green at every gate step of two earlier rounds precisely because the method
+/// had three implementations and no cross-provider exercise.
+///
+/// **There are two contracts here and the provider says which one applies.** A provider that has
+/// not implemented the single-barrier form refuses with [`eventlog_core::UNAVAILABLE`], writes
+/// nothing and commits nothing; a provider that has implemented it publishes nothing when the
+/// guard refuses, and deduplicates a retry against the batch the commit recorded rather than
+/// against whichever blobs happen to be bound at the time. This exercise asks the store which one
+/// it is, by the only means a caller has — calling the method — and then holds it to that
+/// contract. Both answers are contracts; neither is an excuse.
+///
+/// **Returns which contract it exercised, and the caller asserts the one it expects.** Without
+/// that this exercise would pass a provider that quietly lost its implementation: the refusal
+/// branch is a valid contract, so "it refused everything" is indistinguishable from "it has no
+/// override any more" unless somebody who knows the provider says which it should be.
+///
+/// # Panics
+/// Asserts the refusing contract — nothing written, nothing committed, the same refusal every
+/// time — or the implementing one: a refused guard publishes no blob and appends no member, an
+/// admitted commit binds its whole batch, a retry carrying the recorded batch deduplicates, a
+/// retry carrying another batch refuses without publishing, and a retry after one of the group's
+/// blobs was deleted still deduplicates.
+#[must_use]
+pub async fn run_guarded_group_blobs(store: &dyn AtomicEventStore) -> bool {
+    let tenant = TenantId::new("guarded-group-blobs").unwrap();
+    let member = |key: &str, index: usize| StreamAppend {
+        stream: StreamId::new(tenant.clone(), "item", format!("{key}-{index}")).unwrap(),
+        expected: Expected::Any,
+        events: vec![event("item.changed", 1)],
+    };
+    let group = |key: &str, count: usize| AppendGroup {
+        tenant: tenant.clone(),
+        meta: meta(key, &json!({})),
+        appends: (0..count).map(|index| member(key, index)).collect(),
+    };
+    let batch = |first: usize, count: usize| {
+        (first..first + count)
+            .map(|index| {
+                (
+                    format!("g{index:04}"),
+                    format!("guarded-{index}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Which contract applies. A provider that implements the method commits this probe; one that
+    // does not refuses it, and must have published nothing while refusing.
+    let probe = store
+        .append_group_guarded_with_blobs(&group("probe", 1), Arc::new(NoGuard), &batch(0, 1))
+        .await;
+    let implemented = match probe {
+        Ok(result) => {
+            assert!(!result.deduplicated, "the probe is the first commit");
+            true
+        }
+        Err(EventLogError::Invalid(ref message)) if message == eventlog_core::UNAVAILABLE => false,
+        Err(other) => panic!("neither contract: {other:?}"),
+    };
+
+    if !implemented {
+        assert_unpublished(store, &tenant, &batch(0, 1)).await;
+        assert_eq!(
+            store
+                .stream_version(&member("probe", 0).stream)
+                .await
+                .unwrap(),
+            None,
+            "a provider that refuses the method commits no member of the group either"
+        );
+        // The refusal is the whole contract for this provider, and it does not depend on the
+        // guard: nothing is written, so there is nothing for a guard to protect.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let again = store
+            .append_group_guarded_with_blobs(
+                &group("probe", 1),
+                Arc::new(RefusingAdmission {
+                    calls: calls.clone(),
+                }),
+                &batch(0, 1),
+            )
+            .await
+            .expect_err("the refusal is stable");
+        assert!(
+            matches!(again, EventLogError::Invalid(ref message)
+                if message == eventlog_core::UNAVAILABLE),
+            "the same refusal every time: {again:?}"
+        );
+        assert_unpublished(store, &tenant, &batch(0, 1)).await;
+        return false;
+    }
+
+    // A refused guard publishes neither the group nor a blob.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let refused = store
+        .append_group_guarded_with_blobs(
+            &group("refused", 2),
+            Arc::new(RefusingAdmission {
+                calls: calls.clone(),
+            }),
+            &batch(10, 3),
+        )
+        .await
+        .expect_err("the guard refuses");
+    assert!(
+        matches!(refused, EventLogError::GuardRefused { ref code } if code == "conformance_refused"),
+        "the refusal is the guard's own: {refused:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "admission ran exactly once"
+    );
+    assert_unpublished(store, &tenant, &batch(10, 3)).await;
+    for index in 0..2 {
+        assert_eq!(
+            store
+                .stream_version(&member("refused", index).stream)
+                .await
+                .unwrap(),
+            None,
+            "a refused guard appends no member of the group"
+        );
+    }
+
+    // An admitted commit binds every digest of its batch.
+    let committed = store
+        .append_group_guarded_with_blobs(&group("bound", 2), Arc::new(NoGuard), &batch(20, 2))
+        .await
+        .unwrap();
+    assert!(!committed.deduplicated, "the first commit is not a retry");
+    for (digest, bytes) in batch(20, 2) {
+        assert_eq!(
+            store.get_blob(&tenant, &digest).await.unwrap(),
+            Some(bytes),
+            "{digest}: an admitted guarded group binds every digest of its batch"
+        );
+    }
+
+    // A retry carrying the batch the commit recorded deduplicates.
+    let retry = store
+        .append_group_guarded_with_blobs(&group("bound", 2), Arc::new(NoGuard), &batch(20, 2))
+        .await
+        .unwrap();
+    assert!(retry.deduplicated, "the same request twice is one request");
+
+    // A retry carrying a batch the commit did not is not that request, and publishes nothing.
+    let other = store
+        .append_group_guarded_with_blobs(&group("bound", 2), Arc::new(NoGuard), &batch(30, 1))
+        .await
+        .expect_err("a batch the commit never carried is a different request");
+    assert!(
+        matches!(other, EventLogError::IdempotencyMismatch { ref key } if key == "bound"),
+        "the refusal names the key: {other:?}"
+    );
+    assert_unpublished(store, &tenant, &batch(30, 1)).await;
+
+    // Deduplication is decided by what the commit recorded, not by what is bound now. Deleting a
+    // blob the group bound is its own act: it must not turn every later retry of a committed
+    // group into `IdempotencyMismatch`, whose only recovery is a new key — and a new key over the
+    // same members appends every one of them a second time into an append-only log.
+    store.delete_blob(&tenant, "g0020").await.unwrap();
+    assert_eq!(
+        store.get_blob(&tenant, "g0020").await.unwrap(),
+        None,
+        "the fixture only means something once the blob really is gone"
+    );
+    let after_deletion = store
+        .append_group_guarded_with_blobs(&group("bound", 2), Arc::new(NoGuard), &batch(20, 2))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "a committed group is still itself after one of its blobs was deleted: {error:?}"
+            )
+        });
+    assert!(
+        after_deletion.deduplicated,
+        "the same key, the same members and the same batch is the same request"
+    );
+    true
 }

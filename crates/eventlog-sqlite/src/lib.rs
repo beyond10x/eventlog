@@ -12,23 +12,29 @@
 //! `spawn_blocking` by hand, and forgetting one wrap panicked a worker at startup.
 
 mod atomic_group;
+mod capture;
+mod inline_admin;
 mod inspection;
 pub use inspection::SqliteHistoryInspector;
 
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Wake, Waker},
 };
 
 use eventlog_core::{
-    AppendResult, BoxFuture, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError,
-    EventStore, Expected, FeedPage, Guard, MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec,
-    ProjectionStore, Projector, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice,
-    TenantId, bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
-    validate_field,
+    AppendResult, BlobMigrationReport, BoxFuture, CatchUpProgress, Claim, ClaimedCommand,
+    CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
+    MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
+    Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, blob_integrity_sha256,
+    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
+    validate_field, validate_legacy_blob_count, validate_stored_blob,
 };
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, TransactionBehavior, params};
 use serde_json::Value;
 
 /// Every envelope column, in the order [`read_event`] expects them.
@@ -65,12 +71,44 @@ impl SqliteEventStore {
     /// Returns [`EventLogError::Invalid`] for an unusable prefix and [`EventLogError::Backend`]
     /// when the database cannot be opened or its tables cannot be created.
     pub async fn open(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+        Self::open_with_blob_migration(path, prefix, LegacyBlobMigration::RefusePopulated)
+            .await
+            .map(|(store, _)| store)
+    }
+
+    /// Open an already provisioned file-backed owner without creating a database or tables.
+    /// This path never performs a predecessor blob migration.
+    ///
+    /// # Errors
+    /// Refuses a missing database, missing or incompatible owner schema, and inaccessible storage.
+    pub async fn open_existing(path: &str, prefix: &str) -> Result<Self, EventLogError> {
         let path = path.to_owned();
         let prefix = prefix.to_owned();
-        let inner = run_blocking(move || Inner::open(&path, &prefix)).await?;
+        let inner = run_blocking(move || Inner::open_existing(&path, &prefix)).await?;
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Open or create the store with an explicit predecessor blob-import choice.
+    ///
+    /// # Errors
+    /// Refuses populated predecessor bindings unless `TrustObservedBytes` is selected, and refuses
+    /// malformed or foreign blob shapes before any persistent migration change.
+    pub async fn open_with_blob_migration(
+        path: &str,
+        prefix: &str,
+        migration: LegacyBlobMigration,
+    ) -> Result<(Self, BlobMigrationReport), EventLogError> {
+        let path = path.to_owned();
+        let prefix = prefix.to_owned();
+        let (inner, report) = run_blocking(move || Inner::open(&path, &prefix, migration)).await?;
+        Ok((
+            Self {
+                inner: Arc::new(inner),
+            },
+            report,
+        ))
     }
 
     /// An empty store that lives only as long as the process.
@@ -79,7 +117,7 @@ impl SqliteEventStore {
     /// Returns [`EventLogError::Backend`] when the database cannot be created.
     pub async fn in_memory(prefix: &str) -> Result<Self, EventLogError> {
         let prefix = prefix.to_owned();
-        let inner = run_blocking(move || Inner::in_memory(&prefix)).await?;
+        let (inner, _) = run_blocking(move || Inner::in_memory(&prefix)).await?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -105,38 +143,99 @@ where
 }
 
 impl Inner {
-    fn open(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+    fn open_existing(path: &str, prefix: &str) -> Result<Self, EventLogError> {
+        validate_prefix(prefix)?;
+        if path.is_empty() || path == ":memory:" {
+            return Err(EventLogError::Invalid(
+                "existing SQLite authority requires a file path".into(),
+            ));
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(backend)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(backend)?;
+        let inner = Self::new(connection, prefix);
+        inner.require_existing_schema()?;
+        Ok(inner)
+    }
+
+    fn open(
+        path: &str,
+        prefix: &str,
+        migration: LegacyBlobMigration,
+    ) -> Result<(Self, BlobMigrationReport), EventLogError> {
         let connection = Connection::open(path).map_err(backend)?;
-        Self::from_connection(connection, prefix)
+        Self::from_connection(connection, prefix, migration)
     }
 
-    fn in_memory(prefix: &str) -> Result<Self, EventLogError> {
+    fn in_memory(prefix: &str) -> Result<(Self, BlobMigrationReport), EventLogError> {
         let connection = Connection::open_in_memory().map_err(backend)?;
-        Self::from_connection(connection, prefix)
+        Self::from_connection(connection, prefix, LegacyBlobMigration::RefusePopulated)
     }
 
-    fn from_connection(connection: Connection, prefix: &str) -> Result<Self, EventLogError> {
+    fn from_connection(
+        connection: Connection,
+        prefix: &str,
+        migration: LegacyBlobMigration,
+    ) -> Result<(Self, BlobMigrationReport), EventLogError> {
         validate_prefix(prefix)?;
         connection
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(backend)?;
-        let store = Self {
+        let store = Self::new(connection, prefix);
+        let report = store.create_tables(migration)?;
+        Ok((store, report))
+    }
+
+    fn new(connection: Connection, prefix: &str) -> Self {
+        Self {
             connection: Mutex::new(connection),
             prefix: prefix.to_owned(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
             admission_permit: eventlog_core::AdmissionPermit::default(),
             registration: Mutex::new(false),
-        };
-        store.create_tables()?;
-        store
-            .connection
-            .lock()
-            .map_err(poisoned)?
-            .execute_batch(&atomic_group::ddl(prefix))
-            .map_err(backend)?;
-        store.connection.lock().map_err(poisoned)?.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {prefix}_scope_counters (coordinate TEXT PRIMARY KEY, held INTEGER NOT NULL CHECK(held>=0)); CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(projection_name TEXT PRIMARY KEY,indexed_fields TEXT NOT NULL)")).map_err(backend)?;
-        Ok(store)
+        }
+    }
+
+    fn require_existing_schema(&self) -> Result<(), EventLogError> {
+        let connection = self.connection.lock().map_err(poisoned)?;
+        self.refuse_foreign_tables(&connection)?;
+        for suffix in [
+            "events",
+            "commands",
+            "claims",
+            "identity",
+            "blobs",
+            "projection_cursors",
+            "snapshots",
+            "snapshot_generations",
+            "append_groups",
+            "scope_counters",
+            "projection_registry",
+        ] {
+            let name = format!("{}_{}", self.prefix, suffix);
+            let present: Option<String> = connection
+                .query_row(
+                    "SELECT type FROM sqlite_master WHERE name=?1 AND type='table'",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if present.is_none() {
+                return Err(EventLogError::Invalid(format!(
+                    "SQLite owner table {name} is absent"
+                )));
+            }
+        }
+        if sqlite_blob_shape(&connection, &self.prefix)? != SqliteBlobShape::Current {
+            return Err(EventLogError::Invalid(
+                "existing SQLite owner has an unupgraded blob schema".into(),
+            ));
+        }
+        self.validate_snapshot_generation_schema(&connection)
     }
 
     /// Refuse a table of ours that somebody else made.
@@ -175,8 +274,17 @@ impl Inner {
         )))
     }
 
-    fn create_tables(&self) -> Result<(), EventLogError> {
+    fn create_tables(
+        &self,
+        migration: LegacyBlobMigration,
+    ) -> Result<BlobMigrationReport, EventLogError> {
         let prefix = &self.prefix;
+        let blobs = sqlite_blob_table_body(&[
+            SQLITE_BLOB_PREDECESSOR_COLUMNS,
+            SQLITE_BLOB_HASH_COLUMN,
+            SQLITE_BLOB_EDITION_COLUMN,
+            SQLITE_BLOB_PRIMARY_KEY,
+        ]);
         let statements = format!(
             "CREATE TABLE IF NOT EXISTS {prefix}_events (
                  global_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,14 +337,7 @@ impl Inner {
                  tenant_id TEXT NOT NULL PRIMARY KEY,
                  stream_identity TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS {prefix}_blobs (
-                 tenant_id TEXT NOT NULL,
-                 digest TEXT NOT NULL,
-                 bytes BLOB NOT NULL,
-                 byte_count INTEGER NOT NULL,
-                 recorded_at TEXT NOT NULL,
-                 PRIMARY KEY (tenant_id, digest)
-             );
+             CREATE TABLE IF NOT EXISTS {prefix}_blobs ({blobs});
              CREATE TABLE IF NOT EXISTS {prefix}_projection_cursors (
                  projection TEXT NOT NULL,
                  tenant_id TEXT NOT NULL,
@@ -261,13 +362,143 @@ impl Inner {
                  generation TEXT NOT NULL,
                  cached_generation TEXT,
                  PRIMARY KEY (tenant_id, stream_type, stream_id)
-             );"
+             );
+             {}
+             CREATE TABLE IF NOT EXISTS {prefix}_scope_counters (
+                 coordinate TEXT PRIMARY KEY,
+                 held INTEGER NOT NULL CHECK(held>=0)
+             );
+             CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(
+                 projection_name TEXT PRIMARY KEY,
+                 indexed_fields TEXT NOT NULL
+             );",
+            atomic_group::ddl(prefix)
         );
-        let connection = self.connection.lock().map_err(poisoned)?;
+        let mut connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
-        connection.execute_batch(&statements).map_err(backend)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let blob_shape = sqlite_blob_shape(&transaction, prefix)?;
+        let mut report = BlobMigrationReport::default();
+        match blob_shape {
+            SqliteBlobShape::Missing => {
+                report.upgraded = true;
+            }
+            SqliteBlobShape::Current => {}
+            SqliteBlobShape::Legacy => {
+                let table = format!("{prefix}_blobs");
+                let rows: i64 = transaction
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(backend)?;
+                let rows = u64::try_from(rows).map_err(|_| {
+                    EventLogError::Backend("stored blob row count is invalid".into())
+                })?;
+                if rows != 0 && migration == LegacyBlobMigration::RefusePopulated {
+                    return Err(EventLogError::Invalid(format!(
+                        "populated predecessor blob table has {rows} rows; explicit TrustObservedBytes migration required"
+                    )));
+                }
+                transaction
+                    .execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {SQLITE_BLOB_HASH_COLUMN}"
+                    ))
+                    .map_err(backend)?;
+                let mut after: Option<(String, String)> = None;
+                loop {
+                    let read = |row: &Row<'_>| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    };
+                    let row = if let Some((tenant, digest)) = &after {
+                        transaction
+                            .query_row(
+                                &format!(
+                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+                             WHERE tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)
+                             ORDER BY tenant_id,digest LIMIT 1"
+                        ),
+                                params![tenant, digest],
+                                read,
+                            )
+                            .optional()
+                    } else {
+                        transaction
+                            .query_row(
+                                &format!(
+                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+                             ORDER BY tenant_id,digest LIMIT 1"
+                        ),
+                                [],
+                                read,
+                            )
+                            .optional()
+                    }
+                    .map_err(backend)?;
+                    let Some((tenant, digest, bytes, count, recorded_at)) = row else {
+                        break;
+                    };
+                    validate_field("stored blob tenant", &tenant).map_err(|_| {
+                        EventLogError::Backend("stored blob identity is invalid".into())
+                    })?;
+                    validate_field("stored blob digest", &digest).map_err(|_| {
+                        EventLogError::Backend("stored blob identity is invalid".into())
+                    })?;
+                    parse_time(&recorded_at)?;
+                    validate_legacy_blob_count(&bytes, count)?;
+                    let hash = blob_integrity_sha256(&bytes);
+                    transaction
+                        .execute(
+                            &format!(
+                                "UPDATE {table} SET integrity_sha256=?1
+                                 WHERE tenant_id=?2 AND digest=?3"
+                            ),
+                            params![hash, tenant, digest],
+                        )
+                        .map_err(backend)?;
+                    after = Some((tenant, digest));
+                }
+                transaction
+                    .execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {SQLITE_BLOB_EDITION_COLUMN}"
+                    ))
+                    .map_err(backend)?;
+                report = BlobMigrationReport {
+                    upgraded: true,
+                    trusted_legacy_rows: rows,
+                };
+            }
+        }
+        transaction.execute_batch(&statements).map_err(backend)?;
+        if sqlite_blob_shape(&transaction, prefix)? != SqliteBlobShape::Current {
+            return Err(EventLogError::Invalid(
+                "incompatible SQLite blob schema".into(),
+            ));
+        }
+        if report.upgraded {
+            validate_all_sqlite_blobs(&transaction, prefix)?;
+        }
+        self.validate_snapshot_generation_schema(&transaction)?;
+        transaction.commit().map_err(backend)?;
+        Ok(report)
+    }
+
+    fn validate_snapshot_generation_schema(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), EventLogError> {
         let mut query = connection
-            .prepare(&format!("PRAGMA table_info({prefix}_snapshot_generations)"))
+            .prepare(&format!(
+                "PRAGMA table_info({}_snapshot_generations)",
+                self.prefix
+            ))
             .map_err(backend)?;
         let columns = query
             .query_map([], |row| {
@@ -295,8 +526,458 @@ impl Inner {
                 "incompatible SQLite snapshot generation schema".into(),
             ));
         }
+        drop(query);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqliteBlobShape {
+    Missing,
+    Legacy,
+    Current,
+}
+
+/// The predecessor's five blob columns, which the integrity edition keeps untouched.
+const SQLITE_BLOB_PREDECESSOR_COLUMNS: &str = "tenant_id TEXT NOT NULL,
+                 digest TEXT NOT NULL,
+                 bytes BLOB NOT NULL,
+                 byte_count INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL";
+
+/// The nullable hash column an admitted predecessor is backfilled through.
+const SQLITE_BLOB_HASH_COLUMN: &str = "integrity_sha256 TEXT";
+
+/// The edition tag whose closed check refuses an old five-column `INSERT`.
+const SQLITE_BLOB_EDITION_COLUMN: &str = "integrity_v1 INTEGER NOT NULL DEFAULT 1
+                     CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)";
+
+/// The only key this table has.
+const SQLITE_BLOB_PRIMARY_KEY: &str = "PRIMARY KEY (tenant_id, digest)";
+
+/// One `CREATE TABLE` body, written the one way this kit writes it.
+///
+/// `create_tables` builds its own DDL through this function and admission builds what it expects
+/// through the same one, so the shape that is written and the shape that is recognised cannot
+/// drift apart.
+fn sqlite_blob_table_body(parts: &[&str]) -> String {
+    parts.join(",\n                 ")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqliteSchemaToken<'a> {
+    Bare(&'a str),
+    LeftParenthesis,
+    RightParenthesis,
+    Equals,
+    Other,
+}
+
+fn sqlite_schema_tokens(sql: &str) -> Vec<SqliteSchemaToken<'_>> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            byte if byte.is_ascii_whitespace() => position += 1,
+            b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                position += 2;
+                while bytes.get(position).is_some_and(|byte| *byte != b'\n') {
+                    position += 1;
+                }
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            b'/' if bytes.get(position + 1) == Some(&b'*') => {
+                position += 2;
+                while position + 1 < bytes.len()
+                    && (bytes[position] != b'*' || bytes[position + 1] != b'/')
+                {
+                    position += 1;
+                }
+                position = (position + 2).min(bytes.len());
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                position += 1;
+                while position < bytes.len() {
+                    if bytes[position] != quote {
+                        position += 1;
+                    } else if bytes.get(position + 1) == Some(&quote) {
+                        position += 2;
+                    } else {
+                        position += 1;
+                        break;
+                    }
+                }
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            b'[' => {
+                position += 1;
+                while bytes.get(position).is_some_and(|byte| *byte != b']') {
+                    position += 1;
+                }
+                position = (position + 1).min(bytes.len());
+                tokens.push(SqliteSchemaToken::Other);
+            }
+            b'(' => {
+                tokens.push(SqliteSchemaToken::LeftParenthesis);
+                position += 1;
+            }
+            b')' => {
+                tokens.push(SqliteSchemaToken::RightParenthesis);
+                position += 1;
+            }
+            b'=' => {
+                tokens.push(SqliteSchemaToken::Equals);
+                position += 1;
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                let start = position;
+                position += 1;
+                while bytes
+                    .get(position)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    position += 1;
+                }
+                tokens.push(SqliteSchemaToken::Bare(&sql[start..position]));
+            }
+            _ => {
+                tokens.push(SqliteSchemaToken::Other);
+                position += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn has_exact_sqlite_blob_integrity_check(sql: &str) -> bool {
+    const EXPECTED: [SqliteSchemaToken<'static>; 8] = [
+        SqliteSchemaToken::Bare("integrity_v1"),
+        SqliteSchemaToken::Equals,
+        SqliteSchemaToken::Bare("1"),
+        SqliteSchemaToken::Bare("AND"),
+        SqliteSchemaToken::Bare("integrity_sha256"),
+        SqliteSchemaToken::Bare("IS"),
+        SqliteSchemaToken::Bare("NOT"),
+        SqliteSchemaToken::Bare("NULL"),
+    ];
+    let tokens = sqlite_schema_tokens(sql);
+    let mut checks = 0;
+    let mut expected = false;
+    let mut position = 0;
+    while position + 1 < tokens.len() {
+        if tokens[position] != SqliteSchemaToken::Bare("CHECK")
+            || tokens[position + 1] != SqliteSchemaToken::LeftParenthesis
+        {
+            position += 1;
+            continue;
+        }
+        checks += 1;
+        let expression_start = position + 2;
+        let mut expression_end = expression_start;
+        let mut depth = 1_u32;
+        while expression_end < tokens.len() && depth != 0 {
+            match tokens[expression_end] {
+                SqliteSchemaToken::LeftParenthesis => depth += 1,
+                SqliteSchemaToken::RightParenthesis => depth -= 1,
+                _ => {}
+            }
+            expression_end += 1;
+        }
+        if depth != 0 {
+            return false;
+        }
+        expected = tokens[expression_start..expression_end - 1] == EXPECTED;
+        position = expression_end;
+    }
+    checks == 1 && expected
+}
+
+/// The tokens between a stored `CREATE TABLE` statement's outermost parentheses.
+///
+/// `None` when there is no balanced parenthesised body, or when any token follows the closing
+/// parenthesis — table options such as `WITHOUT ROWID` and `STRICT` arrive there.
+fn sqlite_table_body_tokens(sql: &str) -> Option<Vec<SqliteSchemaToken<'_>>> {
+    let tokens = sqlite_schema_tokens(sql);
+    let open = tokens
+        .iter()
+        .position(|token| *token == SqliteSchemaToken::LeftParenthesis)?;
+    let mut depth = 0_u32;
+    for (offset, token) in tokens[open..].iter().enumerate() {
+        match token {
+            SqliteSchemaToken::LeftParenthesis => depth += 1,
+            SqliteSchemaToken::RightParenthesis => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    if open + offset + 1 != tokens.len() {
+                        return None;
+                    }
+                    return Some(tokens[open + 1..open + offset].to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Recognise a stored blob table by its complete declared body.
+///
+/// `PRAGMA table_xinfo`, `PRAGMA index_list` and the check tokenizer each answer one question, and
+/// a clause they were not asked about is admitted by all three: a `COLLATE` on `digest` makes one
+/// opaque identity answer for another, a primary-key `ON CONFLICT` replaces the kit's own conflict
+/// resolution, a `REFERENCES ... ON DELETE CASCADE` lets a foreign row delete an admitted binding.
+/// Enumerating those three clauses would leave the next one, so this compares the whole body
+/// instead: every token of an admitted table is a token this kit itself wrote. `GENERATED`,
+/// `UNIQUE`, `AUTOINCREMENT`, a second `CHECK`, a different `DEFAULT` and every clause nobody has
+/// thought of yet are refused by the same equality, without naming any of them.
+fn recognized_sqlite_blob_shape(sql: &str) -> Option<SqliteBlobShape> {
+    let body = sqlite_table_body_tokens(sql)?;
+    let predecessor =
+        sqlite_blob_table_body(&[SQLITE_BLOB_PREDECESSOR_COLUMNS, SQLITE_BLOB_PRIMARY_KEY]);
+    if body == sqlite_schema_tokens(&predecessor) {
+        return Some(SqliteBlobShape::Legacy);
+    }
+    let created = sqlite_blob_table_body(&[
+        SQLITE_BLOB_PREDECESSOR_COLUMNS,
+        SQLITE_BLOB_HASH_COLUMN,
+        SQLITE_BLOB_EDITION_COLUMN,
+        SQLITE_BLOB_PRIMARY_KEY,
+    ]);
+    // `ALTER TABLE ... ADD COLUMN` rewrites the stored statement by inserting the added column
+    // after the last column definition, which leaves the key last again. The second ordering is
+    // accepted so that a table whose statement SQLite rewrote some other way is still the same
+    // table: identical columns in identical order, types, nullability, defaults, key and check.
+    let migrated = sqlite_blob_table_body(&[
+        SQLITE_BLOB_PREDECESSOR_COLUMNS,
+        SQLITE_BLOB_PRIMARY_KEY,
+        SQLITE_BLOB_HASH_COLUMN,
+        SQLITE_BLOB_EDITION_COLUMN,
+    ]);
+    if body == sqlite_schema_tokens(&created) || body == sqlite_schema_tokens(&migrated) {
+        return Some(SqliteBlobShape::Current);
+    }
+    None
+}
+
+fn sqlite_blob_shape(
+    connection: &Connection,
+    prefix: &str,
+) -> Result<SqliteBlobShape, EventLogError> {
+    let table = format!("{prefix}_blobs");
+    let relation = connection
+        .query_row(
+            "SELECT type,sql FROM sqlite_master WHERE name=?1 AND type IN ('table','view')",
+            params![table],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some((kind, sql)) = relation else {
+        return Ok(SqliteBlobShape::Missing);
+    };
+    let sql =
+        sql.ok_or_else(|| EventLogError::Invalid("incompatible SQLite blob schema".into()))?;
+    if kind != "table" {
+        return Err(EventLogError::Invalid(
+            "incompatible SQLite blob relation".into(),
+        ));
+    }
+    let hidden_objects: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE tbl_name=?1 AND type='trigger'",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if hidden_objects != 0 || sql.contains("WITHOUT ROWID") || sql.contains("STRICT") {
+        return Err(EventLogError::Invalid(
+            "unsupported SQLite blob trigger or table behavior".into(),
+        ));
+    }
+    let recognized = recognized_sqlite_blob_shape(&sql)
+        .ok_or_else(|| EventLogError::Invalid("unrecognized SQLite blob table semantics".into()))?;
+    let columns = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_xinfo({table})"))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    let legacy = vec![
+        ("tenant_id".into(), "TEXT".into(), true, None, 1, 0),
+        ("digest".into(), "TEXT".into(), true, None, 2, 0),
+        ("bytes".into(), "BLOB".into(), true, None, 0, 0),
+        ("byte_count".into(), "INTEGER".into(), true, None, 0, 0),
+        ("recorded_at".into(), "TEXT".into(), true, None, 0, 0),
+    ];
+    let mut current = legacy.clone();
+    current.extend([
+        ("integrity_sha256".into(), "TEXT".into(), false, None, 0, 0),
+        (
+            "integrity_v1".into(),
+            "INTEGER".into(),
+            true,
+            Some("1".into()),
+            0,
+            0,
+        ),
+    ]);
+    let shape = if columns == legacy {
+        SqliteBlobShape::Legacy
+    } else if columns == current && has_exact_sqlite_blob_integrity_check(&sql) {
+        SqliteBlobShape::Current
+    } else {
+        return Err(EventLogError::Invalid(
+            "incompatible SQLite blob schema".into(),
+        ));
+    };
+    if shape != recognized {
+        return Err(EventLogError::Invalid(
+            "incompatible SQLite blob schema".into(),
+        ));
+    }
+    let foreign_keys = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    if !foreign_keys.is_empty() {
+        return Err(EventLogError::Invalid(
+            "unsupported SQLite blob foreign key behavior".into(),
+        ));
+    }
+    let indexes = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    if indexes.len() != 1 || !indexes[0].1 || indexes[0].2 != "pk" || indexes[0].3 {
+        return Err(EventLogError::Invalid(
+            "incompatible SQLite blob indexes".into(),
+        ));
+    }
+    let index_columns = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_info({})", indexes[0].0))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    if index_columns != ["tenant_id", "digest"] {
+        return Err(EventLogError::Invalid(
+            "incompatible SQLite blob primary key".into(),
+        ));
+    }
+    // The key's collation decides which spellings of an opaque digest are one identity, and no
+    // column pragma reports it. The key index does.
+    let key_collations = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_xinfo({})", indexes[0].0))
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| row.get::<_, Option<String>>(4))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+    };
+    if key_collations
+        .iter()
+        .flatten()
+        .any(|collation| !collation.eq_ignore_ascii_case("BINARY"))
+    {
+        return Err(EventLogError::Invalid(
+            "unsupported SQLite blob key collation".into(),
+        ));
+    }
+    Ok(shape)
+}
+
+fn validate_all_sqlite_blobs(connection: &Connection, prefix: &str) -> Result<(), EventLogError> {
+    let table = format!("{prefix}_blobs");
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let read = |row: &Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        };
+        let row = if let Some((tenant, digest)) = &after {
+            connection
+                .query_row(
+                    &format!(
+                "SELECT tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1
+                 FROM {table} WHERE tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)
+                 ORDER BY tenant_id,digest LIMIT 1"
+            ),
+                    params![tenant, digest],
+                    read,
+                )
+                .optional()
+        } else {
+            connection
+                .query_row(
+                    &format!(
+                "SELECT tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1
+                 FROM {table} ORDER BY tenant_id,digest LIMIT 1"
+            ),
+                    [],
+                    read,
+                )
+                .optional()
+        }
+        .map_err(backend)?;
+        let Some((tenant, digest, bytes, count, recorded_at, hash, version)) = row else {
+            break;
+        };
+        validate_field("stored blob tenant", &tenant)
+            .map_err(|_| EventLogError::Backend("stored blob identity is invalid".into()))?;
+        validate_field("stored blob digest", &digest)
+            .map_err(|_| EventLogError::Backend("stored blob identity is invalid".into()))?;
+        parse_time(&recorded_at)?;
+        validate_stored_blob(bytes, count, hash, version)?;
+        after = Some((tenant, digest));
+    }
+    Ok(())
 }
 
 impl EventStore for SqliteEventStore {
@@ -614,8 +1295,17 @@ impl Inner {
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
-        let result =
-            self.append_in_transaction(connection, stream, expected, events, meta, admission, true);
+        let callback_failed = Arc::new(AtomicBool::new(false));
+        let result = self.append_in_transaction(
+            connection,
+            stream,
+            expected,
+            events,
+            meta,
+            admission,
+            true,
+            &callback_failed,
+        );
         finish_transaction(connection, result)
     }
 
@@ -635,6 +1325,7 @@ impl Inner {
         meta: &CommandMeta,
         admission: &dyn Guard,
         record_command: bool,
+        callback_failed: &Arc<AtomicBool>,
     ) -> Result<AppendResult, EventLogError> {
         let prefix = &self.prefix;
 
@@ -717,12 +1408,17 @@ impl Inner {
         {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
-                prefix,
+                blob_prefix: prefix,
+                projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
                 admission: Some((&self.admission_permit, stream.tenant())),
+                callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
-            drive(admission.check(&mut projections))?;
+            let result = drive(admission.check(&mut projections));
+            ensure_callback_integrity(callback_failed)?;
+            result?;
         }
 
         let now = OffsetDateTime::now_utc();
@@ -763,6 +1459,10 @@ impl Inner {
                 )
                 .map_err(backend)?;
             let global_seq = to_u64(connection.last_insert_rowid())?;
+            #[cfg(test)]
+            if !record_command && offset == 0 {
+                atomic_group::checkpoint("group-event-1");
+            }
             written.push(RecordedEvent {
                 global_seq,
                 tenant: stream.tenant().clone(),
@@ -813,13 +1513,18 @@ impl Inner {
         for projector in &projectors {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
-                prefix,
+                blob_prefix: prefix,
+                projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
                 admission: None,
+                callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             for recorded in &written {
-                drive(projector.apply(recorded, &mut projections))?;
+                let result = drive(projector.apply(recorded, &mut projections));
+                ensure_callback_integrity(callback_failed)?;
+                result?;
             }
         }
 
@@ -847,6 +1552,7 @@ impl Inner {
                 .map_err(backend)?;
         }
 
+        ensure_callback_integrity(callback_failed)?;
         Ok(AppendResult {
             first_version,
             last_version,
@@ -1393,12 +2099,17 @@ impl Inner {
     fn put_blob(&self, tenant: &TenantId, digest: &str, bytes: &[u8]) -> Result<(), EventLogError> {
         validate_field("digest", digest)?;
         let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
-        guard
+        let integrity_sha256 = blob_integrity_sha256(bytes);
+        let mut guard = self.connection.lock().map_err(poisoned)?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        transaction
             .execute(
                 &format!(
-                    "INSERT INTO {prefix}_blobs (tenant_id, digest, bytes, byte_count, recorded_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO {prefix}_blobs (tenant_id, digest, bytes, byte_count, recorded_at,
+                                                 integrity_sha256, integrity_v1)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
                      ON CONFLICT (tenant_id, digest) DO NOTHING"
                 ),
                 params![
@@ -1406,24 +2117,61 @@ impl Inner {
                     digest,
                     bytes,
                     to_i64(bytes.len() as u64)?,
-                    format_time(OffsetDateTime::now_utc())?
+                    format_time(OffsetDateTime::now_utc())?,
+                    integrity_sha256,
                 ],
             )
-            .map(|_| ())
-            .map_err(backend)
+            .map_err(backend)?;
+        let stored = transaction
+            .query_row(
+                &format!(
+                    "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs
+                     WHERE tenant_id = ?1 AND digest = ?2"
+                ),
+                params![tenant.as_str(), digest],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(backend)?;
+        let stored = validate_stored_blob(stored.0, stored.1, stored.2, stored.3)?;
+        if stored != bytes {
+            return Err(EventLogError::Invalid(
+                "blob digest already names different content".into(),
+            ));
+        }
+        transaction.commit().map_err(backend)
     }
 
     fn get_blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError> {
         let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
-        guard
+        let stored = guard
             .query_row(
-                &format!("SELECT bytes FROM {prefix}_blobs WHERE tenant_id = ?1 AND digest = ?2"),
+                &format!(
+                    "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs
+                     WHERE tenant_id = ?1 AND digest = ?2"
+                ),
                 params![tenant.as_str(), digest],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional()
-            .map_err(backend)
+            .map_err(backend)?;
+        stored
+            .map(|(bytes, count, hash, version)| validate_stored_blob(bytes, count, hash, version))
+            .transpose()
     }
 
     fn delete_blob(&self, tenant: &TenantId, digest: &str) -> Result<(), EventLogError> {
@@ -1444,24 +2192,16 @@ impl Inner {
         for spec in projector.projections() {
             spec.validate()?;
             let table = projection_table(prefix, spec.name);
-            let columns: String = joined(spec.indexed.len(), |position| {
-                format!(", idx_{position} TEXT")
-            });
+            let body = projection_table_body(spec.indexed.len());
             let indexes: String = joined(spec.indexed.len(), |position| {
+                let index = projection_index(&table, position);
                 format!(
-                    "CREATE INDEX IF NOT EXISTS {table}_idx_{position}
-                         ON {table} (tenant_id, idx_{position});"
+                    "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
                 )
             });
             guard
                 .execute_batch(&format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (
-                         tenant_id TEXT NOT NULL,
-                         row_key TEXT NOT NULL,
-                         body TEXT NOT NULL{columns},
-                         PRIMARY KEY (tenant_id, row_key)
-                     );
-                     {indexes}"
+                    "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
                 ))
                 .map_err(backend)?;
         }
@@ -1544,6 +2284,7 @@ impl Inner {
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
+        let callback_failed = Arc::new(AtomicBool::new(false));
         let result = (|| {
             let position:i64=connection.query_row(&format!("SELECT global_seq FROM {}_projection_cursors WHERE projection=?1 AND tenant_id=?2",self.prefix),params![projector.name(),tenant.as_str()],|row|row.get(0)).optional().map_err(backend)?.unwrap_or(0);
             let mut events = {
@@ -1570,7 +2311,7 @@ impl Inner {
                 next_position,
                 has_more,
             };
-            self.catch_up_in_transaction(connection, projector, tenant, &page)?;
+            self.catch_up_in_transaction(connection, projector, tenant, &page, &callback_failed)?;
             Ok(CatchUpProgress {
                 applied: page.events.len() as u64,
                 position: next_position,
@@ -1586,20 +2327,27 @@ impl Inner {
         projector: &dyn Projector,
         tenant: &TenantId,
         page: &FeedPage,
+        callback_failed: &Arc<AtomicBool>,
     ) -> Result<(), EventLogError> {
         let prefix = &self.prefix;
         {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
-                prefix,
+                blob_prefix: prefix,
+                projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant,
                 admission: None,
+                callback_failed: Arc::clone(callback_failed),
+                selected: None,
             };
             for recorded in &page.events {
-                drive(projector.apply(recorded, &mut projections))?;
+                let result = drive(projector.apply(recorded, &mut projections));
+                ensure_callback_integrity(callback_failed)?;
+                result?;
             }
         }
+        ensure_callback_integrity(callback_failed)?;
         connection
             .execute(
                 &format!(
@@ -1634,6 +2382,7 @@ impl Inner {
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
+        let callback_failed = Arc::new(AtomicBool::new(false));
         let result = (|| {
             for spec in projector.projections() {
                 let shadow = projection_table("eventlog_rebuild", spec.name);
@@ -1664,13 +2413,18 @@ impl Inner {
                 }
                 let mut projections = SqliteProjections {
                     connection: &mut *connection,
-                    prefix: "eventlog_rebuild",
+                    blob_prefix: &self.prefix,
+                    projection_prefix: "eventlog_rebuild",
                     inline: &self.inline_names,
                     tenant,
                     admission: None,
+                    callback_failed: Arc::clone(&callback_failed),
+                    selected: None,
                 };
                 for event in &events {
-                    drive(projector.apply(event, &mut projections))?;
+                    let result = drive(projector.apply(event, &mut projections));
+                    ensure_callback_integrity(&callback_failed)?;
+                    result?;
                     position = to_i64(event.global_seq)?;
                     applied += 1;
                 }
@@ -1694,6 +2448,7 @@ impl Inner {
                     .execute_batch(&format!("DROP TABLE {shadow}"))
                     .map_err(backend)?;
             }
+            ensure_callback_integrity(&callback_failed)?;
             connection.execute(&format!("INSERT INTO {}_projection_cursors(projection,tenant_id,global_seq,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(projection,tenant_id) DO UPDATE SET global_seq=excluded.global_seq,updated_at=excluded.updated_at",self.prefix),params![projector.name(),tenant.as_str(),position,format_time(OffsetDateTime::now_utc())?]).map_err(backend)?;
             Ok(applied)
         })();
@@ -1774,6 +2529,15 @@ fn begin_immediate(connection: &Connection) -> Result<(), EventLogError> {
     connection.execute_batch("BEGIN IMMEDIATE").map_err(backend)
 }
 
+fn ensure_callback_integrity(callback_failed: &Arc<AtomicBool>) -> Result<(), EventLogError> {
+    if callback_failed.load(Ordering::Acquire) {
+        return Err(EventLogError::Backend(
+            "transaction observed corrupt blob content".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Commit on success, roll back on failure — the two ends of [`begin_immediate`].
 fn finish_transaction<T>(
     connection: &Connection,
@@ -1832,10 +2596,13 @@ fn done<'a, T: Send + 'a>(value: T) -> BoxFuture<'a, T> {
 /// future must be `Send`, and a `Transaction` borrows the connection in a way that is not.
 struct SqliteProjections<'a> {
     connection: &'a mut Connection,
-    prefix: &'a str,
+    blob_prefix: &'a str,
+    projection_prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
     tenant: &'a TenantId,
     admission: Option<(&'a eventlog_core::AdmissionPermit, &'a TenantId)>,
+    callback_failed: Arc<AtomicBool>,
+    selected: Option<&'a [ProjectionSpec]>,
 }
 
 impl ProjectionStore for SqliteProjections<'_> {
@@ -1844,18 +2611,38 @@ impl ProjectionStore for SqliteProjections<'_> {
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
         Box::pin(async move {
-            validate_field("digest", digest)?;
-            self.connection
-                .query_row(
-                    &format!(
-                        "SELECT bytes FROM {}_blobs WHERE tenant_id=?1 AND digest=?2",
-                        self.prefix
-                    ),
-                    params![self.tenant.as_str(), digest],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(backend)
+            let result = (|| {
+                validate_field("digest", digest)?;
+                let stored = self
+                    .connection
+                    .query_row(
+                        &format!(
+                            "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {}_blobs
+                             WHERE tenant_id=?1 AND digest=?2",
+                            self.blob_prefix
+                        ),
+                        params![self.tenant.as_str(), digest],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(backend)?;
+                stored
+                    .map(|(bytes, count, hash, version)| {
+                        validate_stored_blob(bytes, count, hash, version)
+                    })
+                    .transpose()
+            })();
+            if matches!(result, Err(EventLogError::Backend(_))) {
+                self.callback_failed.store(true, Ordering::Release);
+            }
+            result
         })
     }
 
@@ -1917,6 +2704,18 @@ impl ProjectionStore for SqliteProjections<'_> {
 }
 
 impl SqliteProjections<'_> {
+    fn validate_target(&self, projection: &ProjectionSpec) -> Result<(), EventLogError> {
+        if self
+            .selected
+            .is_some_and(|selected| !selected.iter().any(|admitted| admitted == projection))
+        {
+            return Err(EventLogError::Invalid(
+                "projection is outside this rebuild's selected tables".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn reserve_now(
         &mut self,
         permit: &eventlog_core::AdmissionPermit,
@@ -1935,7 +2734,7 @@ impl SqliteProjections<'_> {
             .execute_batch("SAVEPOINT eventlog_reservation")
             .map_err(backend)?;
         let result = (|| {
-            let table = format!("{}_scope_counters", self.prefix);
+            let table = format!("{}_scope_counters", self.projection_prefix);
             let mut next = Vec::with_capacity(ordered.len());
             // BEGIN IMMEDIATE already serializes independent connections, including absent keys.
             for (coordinate, reservation) in &ordered {
@@ -1982,13 +2781,14 @@ impl SqliteProjections<'_> {
         key: &str,
         body: &Value,
     ) -> Result<(), EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
             ));
         }
         projection.validate()?;
-        let table = projection_table(self.prefix, projection.name);
+        let table = projection_table(self.projection_prefix, projection.name);
         let columns: String = joined(projection.indexed.len(), |position| {
             format!(", idx_{position}")
         });
@@ -2025,13 +2825,14 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<(), EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
             ));
         }
         projection.validate()?;
-        let table = projection_table(self.prefix, projection.name);
+        let table = projection_table(self.projection_prefix, projection.name);
         self.connection
             .execute(
                 &format!("DELETE FROM {table} WHERE tenant_id = ?1 AND row_key = ?2"),
@@ -2047,13 +2848,14 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
             ));
         }
         projection.validate()?;
-        let table = projection_table(self.prefix, projection.name);
+        let table = projection_table(self.projection_prefix, projection.name);
         let body: Option<String> = self
             .connection
             .query_row(
@@ -2077,6 +2879,7 @@ impl SqliteProjections<'_> {
         tenant: &TenantId,
         key: &str,
     ) -> Result<Option<Value>, EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
@@ -2104,6 +2907,7 @@ impl SqliteProjections<'_> {
         value: &str,
         limit: usize,
     ) -> Result<Vec<Value>, EventLogError> {
+        self.validate_target(projection)?;
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection context cannot cross tenant".into(),
@@ -2116,7 +2920,7 @@ impl SqliteProjections<'_> {
             ))
         })?;
         projection.validate()?;
-        let table = projection_table(self.prefix, projection.name);
+        let table = projection_table(self.projection_prefix, projection.name);
         let limit = bounded_limit(limit);
         let mut statement = self
             .connection
@@ -2159,6 +2963,25 @@ fn joined(count: usize, render: impl Fn(usize) -> String) -> String {
 
 fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
+}
+
+/// The one `CREATE TABLE` body every projection table in this kit is written with.
+///
+/// Capture admits an actual stored table by comparing its whole declared body against this, so the
+/// shape that is created and the shape that is recognised come from one place and cannot drift.
+/// A `COLLATE` on `row_key`, a second `CHECK`, a `REFERENCES ... ON DELETE CASCADE` or a clause
+/// nobody has thought of yet is refused by that equality without being named here.
+fn projection_table_body(indexed: usize) -> String {
+    let columns: String = joined(indexed, |position| format!(", idx_{position} TEXT"));
+    format!(
+        "tenant_id TEXT NOT NULL, row_key TEXT NOT NULL, body TEXT NOT NULL{columns}, \
+         PRIMARY KEY (tenant_id, row_key)"
+    )
+}
+
+/// The one name a declared field's index is created and recognised under.
+fn projection_index(table: &str, position: usize) -> String {
+    format!("{table}_idx_{position}")
 }
 
 fn select_versions(
@@ -2340,4 +3163,97 @@ fn backend(error: impl std::fmt::Display) -> EventLogError {
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, recognized_sqlite_blob_shape,
+    };
+
+    #[test]
+    fn sqlite_blob_admission_recognises_only_the_bodies_this_kit_writes() {
+        let created = "CREATE TABLE owner_blobs (
+             tenant_id TEXT NOT NULL,
+             digest TEXT NOT NULL,
+             bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,
+             recorded_at TEXT NOT NULL,
+             integrity_sha256 TEXT,
+             integrity_v1 INTEGER NOT NULL DEFAULT 1
+                 CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL),
+             PRIMARY KEY (tenant_id, digest))";
+        let migrated = "CREATE TABLE owner_blobs (
+             tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+             PRIMARY KEY (tenant_id,digest), integrity_sha256 TEXT,
+             integrity_v1 INTEGER NOT NULL DEFAULT 1
+                 CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL))";
+        let predecessor = "CREATE TABLE owner_blobs (
+             tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BLOB NOT NULL,
+             byte_count INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+             PRIMARY KEY (tenant_id,digest))";
+        assert_eq!(
+            recognized_sqlite_blob_shape(created),
+            Some(SqliteBlobShape::Current)
+        );
+        assert_eq!(
+            recognized_sqlite_blob_shape(migrated),
+            Some(SqliteBlobShape::Current)
+        );
+        assert_eq!(
+            recognized_sqlite_blob_shape(predecessor),
+            Some(SqliteBlobShape::Legacy)
+        );
+
+        // One member per clause a column or index pragma cannot report, on both editions.
+        for clause in [
+            "digest TEXT NOT NULL",
+            "digest TEXT NOT NULL COLLATE NOCASE",
+            "digest TEXT NOT NULL COLLATE RTRIM",
+            "digest TEXT NOT NULL REFERENCES elsewhere(id) ON DELETE CASCADE",
+            "digest TEXT NOT NULL UNIQUE",
+            "digest TEXT NOT NULL ON CONFLICT REPLACE",
+            "digest TEXT NOT NULL GENERATED ALWAYS AS (tenant_id) VIRTUAL",
+            "digest TEXT NOT NULL DEFAULT ''",
+        ] {
+            for body in [created, migrated, predecessor] {
+                let altered = body.replace("digest TEXT NOT NULL", clause);
+                assert_eq!(
+                    recognized_sqlite_blob_shape(&altered).is_some(),
+                    clause == "digest TEXT NOT NULL",
+                    "{clause}"
+                );
+            }
+        }
+        for suffix in [
+            "PRIMARY KEY (tenant_id, digest) ON CONFLICT REPLACE",
+            "PRIMARY KEY (tenant_id, digest), CHECK (byte_count >= 0)",
+            "PRIMARY KEY (tenant_id, digest), UNIQUE (digest)",
+            "PRIMARY KEY (tenant_id, digest), FOREIGN KEY (tenant_id) REFERENCES elsewhere(id)",
+        ] {
+            let altered = created.replace("PRIMARY KEY (tenant_id, digest)", suffix);
+            assert!(recognized_sqlite_blob_shape(&altered).is_none(), "{suffix}");
+        }
+        for option in ["WITHOUT ROWID", "STRICT"] {
+            let altered = format!("{created} {option}");
+            assert!(recognized_sqlite_blob_shape(&altered).is_none(), "{option}");
+        }
+    }
+
+    #[test]
+    fn sqlite_integrity_check_recognition_uses_sql_syntax() {
+        let required = "CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)";
+        assert!(has_exact_sqlite_blob_integrity_check(required));
+
+        for sql in [
+            "CONSTRAINT \"CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)\" CHECK (1)",
+            "CHECK ('CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL)' IS NOT NULL)",
+            "/* CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL) */ CHECK (1)",
+            "CHECK (integrity_v1 = 1 OR integrity_sha256 IS NOT NULL)",
+            "CHECK (integrity_v1 = 1 AND integrity_sha256 IS NOT NULL), CHECK (1)",
+        ] {
+            assert!(!has_exact_sqlite_blob_integrity_check(sql), "{sql}");
+        }
+    }
 }

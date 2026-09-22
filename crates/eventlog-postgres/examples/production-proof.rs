@@ -1,10 +1,15 @@
 //! Required real-backend runner. Missing prerequisites and selected-zero lanes are refusals.
+#[path = "production-proof/admission.rs"]
+mod admission;
+#[path = "production-proof/required.rs"]
+mod required;
 use clap::Parser;
 use serde_json::json;
 #[derive(Parser)]
 struct Args {}
 use sha2::{Digest, Sha256};
 use std::{
+    fmt::Write as _,
     process::{Command, ExitCode},
     time::Instant,
 };
@@ -32,194 +37,98 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("required fixture {required} is absent").into());
         }
     }
+    // Nested Cargo builds may replace the example executable; retain this run's bytes first.
+    let binary = std::fs::read(std::env::current_exe()?)?;
     let started = time::OffsetDateTime::now_utc();
     let elapsed = Instant::now();
-    // The nested workspace build can replace this executable as feature sets
-    // unify. Capture the running artifact before Cargo unlinks its old inode.
-    let binary = std::fs::read(std::env::current_exe()?)?;
-    let output = Command::new("cargo")
-        .args(["test", "--workspace", "--locked", "--", "--nocapture"])
+    let metadata = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--locked", "--format-version", "1"])
+        .output()?;
+    if !metadata.status.success() {
+        return Err("Cargo workspace metadata failed".into());
+    }
+    let build = Command::new("cargo")
+        .args([
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run",
+            "--message-format=json",
+        ])
+        .output()?;
+    let mut raw = format!(
+        "cargo metadata --no-deps --locked --format-version 1\n{}\n{}\ncargo test --workspace --locked --no-run --message-format=json\n{}\n{}\n",
+        String::from_utf8(metadata.stdout.clone())?,
+        String::from_utf8(metadata.stderr)?,
+        String::from_utf8(build.stdout.clone())?,
+        String::from_utf8(build.stderr.clone())?
+    );
+    preserve_raw(&raw)?;
+    eprint!("{}", String::from_utf8(build.stderr)?);
+    if !build.status.success() {
+        return Err("Cargo workspace test build failed".into());
+    }
+    let targets = admission::select_artifacts(
+        &String::from_utf8(metadata.stdout)?,
+        &String::from_utf8(build.stdout)?,
+    )?;
+    let mut executions = Vec::new();
+    for selected in targets {
+        let command = format!(
+            "{} {} {}: {} --show-output --test-threads=1 --format=pretty",
+            selected.target.package,
+            selected.target.kind,
+            selected.target.name,
+            selected.executable.display()
+        );
+        let mut process = Command::new(&selected.executable);
+        selected.apply_execution_context(&mut process);
+        let output = process
+            .args(["--show-output", "--test-threads=1", "--format=pretty"])
+            .env("EVENTLOG_REQUIRE_POSTGRES", "1")
+            .env("RUST_TEST_THREADS", "1")
+            .output()?;
+        executions.push(record_execution(
+            selected.target,
+            &format!("cwd {}: {command}", selected.working_directory.display()),
+            output,
+            &mut raw,
+        )?);
+    }
+    // Cargo's workspace documentation selection is a separate authority; no test artifact represents it.
+    let docs = Command::new("cargo")
+        .args([
+            "test",
+            "--workspace",
+            "--locked",
+            "--doc",
+            "--",
+            "--show-output",
+            "--test-threads=1",
+            "--format=pretty",
+        ])
         .env("EVENTLOG_REQUIRE_POSTGRES", "1")
         .env("RUST_TEST_THREADS", "1")
         .output()?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    if let Ok(path) = std::env::var("EVENTLOG_PROOF_RAW") {
-        std::fs::write(path, format!("{stdout}\n{stderr}"))?;
-    }
-    print!("{stdout}");
-    eprint!("{stderr}");
-    let mut passed = 0_usize;
-    let mut failed = 0_usize;
-    let mut ignored = 0_usize;
-    let mut summaries = Vec::new();
-    for line in stdout
-        .lines()
-        .filter(|line| line.starts_with("test result:"))
-    {
-        summaries.push(line);
-        for part in line.split(';') {
-            let words: Vec<_> = part.split_whitespace().collect();
-            for pair in words.windows(2) {
-                if let Ok(count) = pair[0].parse::<usize>() {
-                    match pair[1] {
-                        "passed" => passed += count,
-                        "failed" => failed += count,
-                        "ignored" => ignored += count,
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    let required = [
-        "file_adversary_equal_length_collision_rolls_back",
-        "file_adversary_rebound_retry_preserves_receipt_and_current_binding",
-        "file_adversary_cancelled_guard_preserves_existing_content_and_receipt",
-        "sqlite_adversary_equal_length_collision_rolls_back",
-        "sqlite_adversary_rebound_retry_preserves_receipt_and_current_binding",
-        "postgres_adversary_equal_length_collision_rolls_back",
-        "postgres_adversary_rebound_retry_preserves_receipt_and_current_binding",
-        "postgres_adversary_cancelled_guard_preserves_existing_content_and_receipt",
-        "atomic_blob::tests::atomic_blob_fingerprint_binds_actual_bytes_not_caller_hashes",
-        "atomic_blob::tests::atomic_blob_fingerprint_freezes_legacy_and_explicit_format",
-        "atomic_blob::tests::atomic_blob_fingerprint_sorts_keys_and_refuses_empty_duplicate_or_invalid_input",
-        "journal::tests::atomic_blob_crash_boundaries_recover_only_complete_publication",
-        "journal::tests::atomic_blob_postcommit_cleanup_failure_keeps_committed_content",
-        "atomic_group::tests::atomic_blob_native_commit_failure_is_unknown_and_retry_resolves",
-        "file_atomic_blob_content_contract",
-        "file_atomic_blob_known_abort_cleans_only_owned_staging",
-        "file_atomic_blob_cleanup_failure_reports_retained_unbound_artifact",
-        "file_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
-        "file_atomic_blob_independent_writers_keep_only_complete_winner",
-        "sqlite_atomic_blob_content_contract",
-        "sqlite_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
-        "sqlite_atomic_blob_independent_writers_keep_only_complete_winner",
-        "postgres_atomic_blob_content_contract",
-        "postgres_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
-        "postgres_atomic_blob_independent_writers_keep_only_complete_winner",
-        "postgres_atomic_blob_lost_commit_response_resolves_without_resurrection",
-        "postgres_atomic_blob_reuse_serializes_standalone_delete",
-        "postgres_atomic_blob_disjoint_streams_share_reversed_blob_sets",
-        "file_inspection_body_fields_and_zero_schema_are_preserved",
-        "adversary_file_duplicate_event_identity_is_corruption",
-        "adversary_file_unknown_recorded_envelope_field_is_not_discarded",
-        "adversary_file_empty_identity_refuses_and_zero_result_caps_allow_absence",
-        "adversary_file_inadmissible_recorded_envelope_is_corruption",
-        "adversary_sqlite_inadmissible_recorded_envelope_is_corruption",
-        "adversary_sqlite_empty_identity_and_exact_source_cap",
-        "adversary_sqlite_success_preserves_preexisting_reader_lock",
-        "adversary_sqlite_public_descriptor_bound_keeps_prior_writer_lock",
-        "file_inspection_history_preserves_source",
-        "file_inspection_missing_sources_never_create",
-        "file_inspection_recovery_and_corruption_preserve_source",
-        "file_inspection_native_lock_is_nonblocking",
-        "file_inspection_identity_redaction_and_unknown_format",
-        "file_inspection_concurrent_append_is_one_observation",
-        "sqlite_inspection_history_preserves_source",
-        "sqlite_inspection_missing_sources_never_create",
-        "sqlite_inspection_wal_and_journal_refusals_preserve_source",
-        "sqlite_inspection_native_writer_refuses_without_changes",
-        "sqlite_inspection_identity_corruption_schema_and_uri",
-        "inspection::linux::tests::inspection_ofd_blocks_native_writers_in_process",
-        "inspection::linux::tests::inspection_ofd_blocks_native_writer_process",
-        "inspection::linux::tests::inspection_ofd_detects_replaced_source",
-        "inspection::linux::tests::inspection_refusal_preserves_existing_process_writer_lock",
-        "inspection::linux::tests::inspection_refusal_preserves_existing_process_reader_lock",
-        "inspection::linux::tests::inspection_concurrent_call_cannot_unlock_another_observation",
-        "inspection::linux::tests::inspection_descriptor_exhaustion_never_opens_or_closes_source",
-        "file_storage_contract",
-        "file_groups_contract",
-        "file_claims_contract",
-        "file_snapshots_contract",
-        "file_scopes_contract",
-        "file_callback_failure_contract",
-        "file_projections_contract",
-        "file_inline_contract",
-        "file_paging_contract",
-        "file_rebuild_contract",
-        "file_public_inputs_contract",
-        "journal::tests::process_death_at_each_append_boundary",
-        "journal::tests::process_death_at_each_privacy_boundary",
-        "journal::tests::privacy_crash_cleans_cached_bodies_and_blobs_on_open",
-        "journal::tests::committed_damage_and_unproven_suffix_are_never_repaired",
-        "journal::tests::divergent_longer_history_does_not_extend_observed_head",
-        "journal::tests::mixed_recovery_intents_refuse_before_changing_authority",
-        "independent_processes_serialize_groups_and_duplicate_keys",
-        "conflicting_groups_commit_exactly_one_complete_request",
-        "blob_damage_and_missing_manifest_refuse_reopen",
-        "reopen_preserves_receipts_and_cache_deletion_preserves_authority",
-        "privacy_removes_active_bytes_and_never_reuses_feed_positions",
-        "redaction_fences_projection_reads_and_new_writes_until_complete_rebuild",
-        "ordered_groups_commit_and_rollback_as_one_unit",
-        "concurrent_groups_preserve_order_without_partial_commits",
-        "group_retry_survives_database_reopen",
-        "schema::group_migration_tests::snapshot_edition_migrates_to_groups_and_foreign_group_shape_refuses",
-        "snapshot_history_and_repository_privacy_interleavings",
-        "schema::snapshot_tests::snapshot_schema_upgrade_retains_history_and_refuses_partial_metadata",
-        "committed_commands_survive_snapshot_storage_failure",
-        "snapshot_capture_waits_for_complete_tenant_erasure",
-        "independent_first_appends_return_contract_outcomes",
-        "isolated_transport_cannot_hide_a_remote_address_behind_localhost",
-        "lost_commit_response_reconnects_to_exact_durable_receipt",
-        "missing_scope_bootstrap_is_atomic_across_independent_processes",
-        "caught_reservation_cancellation_cannot_commit_an_unchecked_append",
-        "inline_failure_preserves_all_atomic_state_and_callback_authority",
-        "killed_projector_restarts_competing_workers_without_partial_view_or_cursor",
-        "a_reader_never_skips_an_event_that_committed_late",
-        "a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid",
-        "unrelated_xmin_cannot_make_committed_positions_noncontiguous",
-        "schema_admission_refuses_inherited_event_children",
-        "legacy_projection_rows_are_erased_without_reregistering_retired_projectors",
-        "legacy_erasure_matches_literal_underscores_and_preserves_other_owners",
-        "ambiguous_legacy_namespace_refuses_and_rolls_back_all_erasure",
-        "absent_deployment_scope_races_across_tenants_and_clients",
-        "registration_freezes_and_pool_refuses_bounded_overload",
-        "pool_observation_preserves_two_connections_and_four_waiters",
-        "shutdown_cancellation_preserves_public_pool_lifetimes",
-        "public_queue_cancellation_and_broken_idle_reclaim_exact_capacity",
-        "empty_catch_up_reuses_the_same_settled_session",
-        "contended_catch_up_reuses_the_same_settled_session",
-        "unsettled_catch_up_rollback_never_recycles_a_session",
-        "pool::tests::reusable_retirement_preserves_two_connection_four_waiter_snapshot",
-        "pool::tests::quarantine_retirement_cannot_count_a_replacement_twice",
-        "pool::tests::idle_checkout_has_one_coherent_owner",
-        "pool::tests::queued_cancellation_timeout_and_granted_cancellation_release_capacity",
-        "pool::tests::zero_waiter_pool_reuses_and_refuses_without_queueing",
-        "pool::tests::shutdown_cancels_waiters_and_drains_quarantine",
-        "pool::tests::closed_idle_driver_is_joined_before_replacement_connects",
-        "pool::tests::shutdown_does_not_recycle_a_returning_connection_after_close",
-        "verified_tls_requires_matching_server_and_separate_application_role",
-        "legacy_populated_schema_migrates_atomically_and_unknown_checksums_refuse",
-        "schema_admission_refuses_triggers_policies_generation_and_foreign_sequences",
-        "schema_admission_refuses_rules_that_suppress_command_receipts",
-        "hosted_schema_admission_refuses_rewrite_rules",
-        "rewrite_rules_are_rejected_on_every_durable_table",
-        "rewrite_rules_are_rejected_during_projection_migration_and_registration",
-        "public_input_validation_is_atomic_on_postgresql",
-        "public_input_validation_is_atomic_on_sqlite",
-        "append_refuses_deserialized_events_that_bypass_constructor_checks",
-        "append_refuses_deserialized_streams_that_bypass_constructor_checks",
-        "append_refuses_claim_fields_that_bypass_constructor_checks",
-        "tests::input_validation_preserves_valid_wire_and_exact_field_limits",
-        "scope_reservations_are_atomic_and_confined",
-        "rebuild_preserves_other_tenants_and_previous_view_on_failure",
-    ];
-    let missing: Vec<_> = required
-        .iter()
-        .filter(|name| {
-            !stdout
-                .lines()
-                .any(|line| line.starts_with(&format!("test {name} ...")) && line.ends_with("ok"))
-        })
-        .collect();
-    let valid = output.status.success()
-        && passed > 0
-        && failed == 0
-        && ignored == 0
-        && missing.is_empty()
-        && !stderr.contains("skipped:")
-        && !stdout.contains("skipped:");
+    executions.push(record_execution(
+        admission::Target {
+            package: "workspace".into(),
+            kind: "doc".into(),
+            name: "workspace".into(),
+        },
+        "cargo test --workspace --locked --doc -- --show-output --test-threads=1 --format=pretty",
+        docs,
+        &mut raw,
+    )?);
+    let assessment = admission::assess(&executions, &required::required_cases());
+    let admission::Assessment {
+        passed,
+        failed,
+        ignored,
+        summaries,
+        missing,
+        valid,
+    } = assessment;
     let revision = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
@@ -249,4 +158,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("required backend suite did not execute completely and pass".into());
     }
     Ok(())
+}
+
+fn preserve_raw(raw: &str) -> Result<(), std::io::Error> {
+    if let Ok(path) = std::env::var("EVENTLOG_PROOF_RAW") {
+        std::fs::write(path, raw)?;
+    }
+    Ok(())
+}
+fn record_execution(
+    target: admission::Target,
+    command: &str,
+    output: std::process::Output,
+    raw: &mut String,
+) -> Result<admission::Execution, Box<dyn std::error::Error>> {
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    write!(
+        raw,
+        "\nexecution: {command}\nexit: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\n",
+        output.status.code()
+    )?;
+    preserve_raw(raw)?;
+    println!("execution: {command}; exit: {:?}", output.status.code());
+    print!("{stdout}");
+    eprint!("{stderr}");
+    Ok(admission::Execution {
+        target,
+        success: output.status.success(),
+        stdout,
+        stderr,
+    })
 }

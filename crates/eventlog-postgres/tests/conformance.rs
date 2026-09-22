@@ -3,9 +3,45 @@
 //! Set `EVENTLOG_TEST_POSTGRES_URL` to run these. Without it they report themselves as not run
 //! rather than passing quietly, because a backend nobody exercised is not a backend anybody proved.
 
-use eventlog_core::{EventStore, Expected, StreamId, TenantId};
-use eventlog_postgres::PostgresEventStore;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use eventlog_core::{BoxFuture, EventLogError, EventStore, Expected, StreamId, TenantId};
+use eventlog_postgres::{
+    AuthorizedConnection, PostgresConnectionAuthority, PostgresEventStore,
+    PostgresTransportAssurance,
+};
 use tokio_postgres::NoTls;
+
+struct VerifiedTlsAuthority {
+    config: tokio_postgres::Config,
+    tls: rustls::ClientConfig,
+    calls: AtomicUsize,
+}
+
+impl PostgresConnectionAuthority for VerifiedTlsAuthority {
+    fn assurance(&self) -> PostgresTransportAssurance {
+        PostgresTransportAssurance::Verified
+    }
+
+    fn connect(
+        &self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let mut config = self.config.clone();
+        config.connect_timeout(timeout);
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(self.tls.clone());
+        Box::pin(async move {
+            let (client, driver) = config.connect(tls).await.map_err(|_| {
+                EventLogError::Backend("caller-owned verified TLS connection failed".to_owned())
+            })?;
+            Ok(AuthorizedConnection::new(client, driver))
+        })
+    }
+}
 
 /// The watermark couples feed visibility across every connection in the instance
 /// (`pg_snapshot_xmin` is cluster-wide), so a test holding a transaction open while another
@@ -697,6 +733,25 @@ async fn client(url: &str) -> tokio_postgres::Client {
     client
 }
 
+async fn downgrade_blob_table(sql: &tokio_postgres::Client, prefix: &str) {
+    sql.batch_execute(&format!(
+        "BEGIN;
+         ALTER TABLE {prefix}_blobs RENAME TO {prefix}_blobs_current;
+         CREATE TABLE {prefix}_blobs (
+             tenant_id TEXT NOT NULL,digest TEXT NOT NULL,bytes BYTEA NOT NULL,
+             byte_count BIGINT NOT NULL,recorded_at TIMESTAMPTZ NOT NULL,
+             PRIMARY KEY(tenant_id,digest));
+         INSERT INTO {prefix}_blobs(tenant_id,digest,bytes,byte_count,recorded_at)
+             SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {prefix}_blobs_current;
+         DROP TABLE {prefix}_blobs_current;
+         UPDATE {prefix}_schema_version
+             SET checksum='9d31a95af97bbdb3f675197383851f73758e1459166837171ef367c46530aa1f';
+         COMMIT;"
+    ))
+    .await
+    .expect("exact predecessor blob table");
+}
+
 async fn store(prefix: &str) -> Option<PostgresEventStore> {
     let url = url()?;
     let sql = client(&url).await;
@@ -1312,6 +1367,54 @@ async fn verified_tls_requires_matching_server_and_separate_application_role() {
             .is_err(),
         "missing connection reserve cannot be admitted"
     );
+    let mut caller_config: tokio_postgres::Config = app_url.parse().expect("application config");
+    caller_config.ssl_mode(tokio_postgres::config::SslMode::Require);
+    let caller_authority = Arc::new(VerifiedTlsAuthority {
+        config: caller_config,
+        tls: rustls::ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+        calls: AtomicUsize::new(0),
+    });
+    let caller_owned = PostgresEventStore::open(
+        PostgresConfig::caller_owned("hosted_owner", "kit", caller_authority.clone())
+            .expect("caller-owned config"),
+        PoolOptions::default(),
+        16,
+        2,
+        8,
+    )
+    .await
+    .expect("caller-owned verified TLS authority is admitted");
+    let caller_stream = StreamId::new(
+        TenantId::new("caller-owned-tenant").expect("tenant"),
+        "item",
+        "one",
+    )
+    .expect("stream");
+    caller_owned
+        .append(
+            &caller_stream,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("caller-owned-tls", &serde_json::json!({})),
+        )
+        .await
+        .expect("caller-owned TLS append");
+    assert_eq!(
+        caller_owned
+            .read_stream(&caller_stream, 0, 10)
+            .await
+            .expect("caller-owned TLS read")
+            .events
+            .len(),
+        1
+    );
+    caller_owned
+        .shutdown()
+        .await
+        .expect("caller-owned shutdown");
+    assert!(caller_authority.calls.load(Ordering::Acquire) >= 1);
     let store = PostgresEventStore::open(config, PoolOptions::default(), 16, 2, 8)
         .await
         .expect("verified DML-only application");
@@ -2174,6 +2277,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
         .expect("old data");
     original.shutdown().await.expect("old writer stopped");
     let sql = client(&url).await;
+    downgrade_blob_table(&sql, "schema_upgrade").await;
     sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("exact original populated schema");
     let config = PostgresConfig::isolated(&url, "schema_upgrade").expect("config");
     let (a, b) = tokio::join!(
@@ -2203,6 +2307,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
             .is_err(),
         "unknown version/checksum refuses before serving"
     );
+    downgrade_blob_table(&sql, "schema_upgrade").await;
     sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("restore old fixture");
     PostgresEventStore::migrate(
         PostgresConfig::isolated(&url, "schema_upgrade").expect("config"),
@@ -2770,4 +2875,751 @@ async fn snapshot_capture_waits_for_complete_tenant_erasure() {
             .events
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn concurrent_differing_blob_writers_have_one_winner() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(first) = store("blob_race").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().expect("selected database");
+    let second = PostgresEventStore::connect(&url, "blob_race")
+        .await
+        .expect("second connection");
+    let sql = client(&url).await;
+    sql.batch_execute("CREATE OR REPLACE FUNCTION blob_race_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.02); RETURN NEW; END $$; CREATE TRIGGER blob_race_delay BEFORE INSERT ON blob_race_blobs FOR EACH ROW EXECUTE FUNCTION blob_race_delay()").await.expect("overlapping puts");
+    eventlog_conformance::run_blob_binding_race(&first, &second).await;
+    sql.batch_execute(
+        "DROP TRIGGER blob_race_delay ON blob_race_blobs; DROP FUNCTION blob_race_delay()",
+    )
+    .await
+    .expect("remove delay fixture");
+}
+
+#[tokio::test]
+async fn postgres_blob_integrity_covers_all_read_boundaries_and_binding_controls() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(store) = store("blob_integrity").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().expect("selected database");
+    let tenant = TenantId::new("blob-integrity").expect("tenant");
+    store
+        .put_blob(&tenant, "opaque", b"original")
+        .await
+        .expect("binding");
+    store.shutdown().await.expect("close original store");
+
+    let sql = client(&url).await;
+    sql.execute(
+        "UPDATE blob_integrity_blobs SET bytes=$1 WHERE tenant_id=$2 AND digest=$3",
+        &[&b"mutated".as_slice(), &tenant.as_str(), &"opaque"],
+    )
+    .await
+    .expect("same-length corruption");
+
+    let reopened = PostgresEventStore::connect(&url, "blob_integrity")
+        .await
+        .expect("reopened store");
+    assert!(
+        matches!(
+            reopened.get_blob(&tenant, "opaque").await,
+            Err(eventlog_core::EventLogError::Backend(_))
+        ),
+        "same-length corruption must be refused after reopening"
+    );
+    assert!(matches!(
+        reopened.put_blob(&tenant, "opaque", b"original").await,
+        Err(eventlog_core::EventLogError::Backend(_))
+    ));
+    for hash in [
+        "BAD",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        sql.execute(
+            "UPDATE blob_integrity_blobs SET bytes=$1,byte_count=7,integrity_sha256=$2 WHERE tenant_id=$3 AND digest='opaque'",
+            &[&b"original".as_slice(), &hash, &tenant.as_str()],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reopened.get_blob(&tenant, "opaque").await,
+            Err(eventlog_core::EventLogError::Backend(_))
+        ));
+    }
+    sql.execute(
+        "UPDATE blob_integrity_blobs SET byte_count=8,integrity_sha256='0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5' WHERE tenant_id=$1 AND digest='opaque'",
+        &[&tenant.as_str()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.get_blob(&tenant, "opaque").await.unwrap(),
+        Some(b"original".to_vec())
+    );
+    reopened.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn postgres_callback_blob_corruption_poison_rolls_back_every_owner() {
+    use eventlog_core::{
+        AdmissionScope, AppendGroup, AtomicEventStore, EventLogError, Reservation, StreamAppend,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    };
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(store) = store("blob_callback").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().unwrap();
+    let tenant = TenantId::new("blob-callback").unwrap();
+    store
+        .put_blob(&tenant, "opaque", b"original")
+        .await
+        .unwrap();
+    let mode = Arc::new(AtomicU8::new(0));
+    let projector = Arc::new(eventlog_conformance::BlobReadingProjector {
+        driver_name: "blob_integrity_inline",
+        digest: "opaque".into(),
+        mode: Arc::clone(&mode),
+    });
+    store.register_inline(projector.clone()).await.unwrap();
+    let first = StreamId::new(tenant.clone(), "item", "present").unwrap();
+    store
+        .append(
+            &first,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("present", &serde_json::json!({})),
+        )
+        .await
+        .expect("present callback read");
+    let before = store
+        .projection_get(&eventlog_conformance::BLOB_PROBE, &tenant, "item/present")
+        .await
+        .unwrap();
+    client(&url)
+        .await
+        .execute(
+            "UPDATE blob_callback_blobs SET bytes=$1 WHERE tenant_id=$2 AND digest='opaque'",
+            &[&b"mutated".as_slice(), &tenant.as_str()],
+        )
+        .await
+        .unwrap();
+    for (mode_value, id) in [(1, "propagated"), (2, "caught")] {
+        mode.store(mode_value, Ordering::Release);
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        assert!(matches!(
+            store
+                .append(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(id, &serde_json::json!({}))
+                )
+                .await,
+            Err(EventLogError::Backend(_))
+        ));
+        assert!(
+            store
+                .read_stream(&stream, 0, 10)
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            store
+                .projection_get(
+                    &eventlog_conformance::BLOB_PROBE,
+                    &tenant,
+                    &format!("item/{id}")
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let guarded = StreamId::new(tenant.clone(), "item", "guarded").unwrap();
+    let guarded_check = Arc::new(eventlog_conformance::BlobReadingGuard {
+        digest: "opaque".into(),
+        catch_failure: true,
+        reservation: Some((
+            store.admission_permit(),
+            vec![Reservation {
+                scope: AdmissionScope::Tenant {
+                    tenant: tenant.clone(),
+                    key: "blob-single".into(),
+                },
+                delta: 1,
+                ceiling: 1,
+            }],
+        )),
+    });
+    assert!(matches!(
+        store
+            .append_guarded(
+                &guarded,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta("guarded", &serde_json::json!({})),
+                guarded_check.clone()
+            )
+            .await,
+        Err(EventLogError::Backend(_))
+    ));
+    assert!(
+        store
+            .read_stream(&guarded, 0, 10)
+            .await
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let group_stream = StreamId::new(tenant.clone(), "item", "grouped").unwrap();
+    let group = AppendGroup {
+        tenant: tenant.clone(),
+        appends: vec![StreamAppend {
+            stream: group_stream.clone(),
+            expected: Expected::NoStream,
+            events: vec![eventlog_conformance::event("item.received", 1)],
+        }],
+        meta: eventlog_conformance::meta("grouped", &serde_json::json!({})),
+    };
+    let group_check = Arc::new(eventlog_conformance::BlobReadingGuard {
+        digest: "opaque".into(),
+        catch_failure: true,
+        reservation: Some((
+            store.admission_permit(),
+            vec![Reservation {
+                scope: AdmissionScope::Tenant {
+                    tenant: tenant.clone(),
+                    key: "blob-group".into(),
+                },
+                delta: 1,
+                ceiling: 1,
+            }],
+        )),
+    });
+    assert!(matches!(
+        store
+            .append_group_guarded(&group, group_check.clone())
+            .await,
+        Err(EventLogError::Backend(_))
+    ));
+    assert!(
+        store
+            .read_stream(&group_stream, 0, 10)
+            .await
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let catch_up = Arc::new(eventlog_conformance::BlobReadingProjector {
+        driver_name: "blob_integrity_catchup",
+        digest: "opaque".into(),
+        mode: Arc::clone(&mode),
+    });
+    store.create_projections(catch_up.clone()).await.unwrap();
+    assert!(matches!(
+        store.run_catch_up(catch_up.clone(), &tenant, 10).await,
+        Err(EventLogError::Backend(_))
+    ));
+    assert_eq!(
+        store
+            .projection_get(&eventlog_conformance::BLOB_PROBE, &tenant, "item/present")
+            .await
+            .unwrap(),
+        before
+    );
+    let rebuild = Arc::new(eventlog_conformance::BlobReadingProjector {
+        driver_name: "blob_integrity_rebuild",
+        digest: "opaque".into(),
+        mode: Arc::clone(&mode),
+    });
+    assert!(matches!(
+        store.rebuild_projection(rebuild.clone(), &tenant).await,
+        Err(EventLogError::Backend(_))
+    ));
+    assert_eq!(
+        store
+            .projection_get(&eventlog_conformance::BLOB_PROBE, &tenant, "item/present")
+            .await
+            .unwrap(),
+        before
+    );
+    client(&url)
+        .await
+        .execute(
+            "UPDATE blob_callback_blobs SET bytes=$1,byte_count=8,integrity_sha256='0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5' WHERE tenant_id=$2 AND digest='opaque'",
+            &[&b"original".as_slice(), &tenant.as_str()],
+        )
+        .await
+        .unwrap();
+    mode.store(0, Ordering::Release);
+    assert!(
+        !store
+            .append_guarded(
+                &guarded,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta("guarded", &serde_json::json!({})),
+                guarded_check,
+            )
+            .await
+            .expect("failed callback rolled back command receipt and reservation")
+            .deduplicated
+    );
+    let group_result = store
+        .append_group_guarded(&group, group_check)
+        .await
+        .expect("failed callback rolled back group receipt and reservation");
+    assert!(!group_result.deduplicated);
+    assert!(store.append_group(&group).await.unwrap().deduplicated);
+    assert_eq!(
+        store
+            .run_catch_up(catch_up, &tenant, 10)
+            .await
+            .unwrap()
+            .applied,
+        3
+    );
+    assert_eq!(store.rebuild_projection(rebuild, &tenant).await.unwrap(), 3);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_blob_migration_is_exact_explicit_atomic_and_fenced() {
+    use eventlog_core::{EventLogError, LegacyBlobMigration};
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(original) = store("blob_migration").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().unwrap();
+    let tenant = TenantId::new("legacy-tenant").unwrap();
+    original
+        .put_blob(&tenant, "opaque", b"legacy bytes")
+        .await
+        .unwrap();
+    original.shutdown().await.unwrap();
+    let sql = client(&url).await;
+    downgrade_blob_table(&sql, "blob_migration").await;
+    let config = PostgresConfig::isolated(&url, "blob_migration").unwrap();
+    assert!(matches!(
+        PostgresEventStore::migrate(config.clone(), PoolOptions::default(), &[]).await,
+        Err(EventLogError::Invalid(_))
+    ));
+    let columns: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid='blob_migration_blobs'::regclass AND attnum>0 AND NOT attisdropped",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        columns, 5,
+        "default refusal leaves predecessor shape intact"
+    );
+    let before = sql
+        .query_one(
+            "SELECT bytes,byte_count,recorded_at FROM blob_migration_blobs WHERE tenant_id='legacy-tenant' AND digest='opaque'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before_bytes: Vec<u8> = before.get(0);
+    let before_count: i64 = before.get(1);
+    let before_time: time::OffsetDateTime = before.get(2);
+    let report = PostgresEventStore::migrate_with_blob_migration(
+        config.clone(),
+        PoolOptions::default(),
+        &[],
+        LegacyBlobMigration::TrustObservedBytes,
+    )
+    .await
+    .unwrap();
+    assert!(report.upgraded);
+    assert_eq!(report.trusted_legacy_rows, 1);
+    let after = sql
+        .query_one(
+            "SELECT bytes,byte_count,recorded_at FROM blob_migration_blobs WHERE tenant_id='legacy-tenant' AND digest='opaque'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.get::<_, Vec<u8>>(0), before_bytes);
+    assert_eq!(after.get::<_, i64>(1), before_count);
+    assert_eq!(after.get::<_, time::OffsetDateTime>(2), before_time);
+    assert!(
+        sql.execute(
+            "INSERT INTO blob_migration_blobs VALUES($1,$2,$3,$4,$5)",
+            &[
+                &"old-reader",
+                &"opaque",
+                &b"bytes".as_slice(),
+                &5_i64,
+                &before_time
+            ],
+        )
+        .await
+        .is_err()
+    );
+    let retry = PostgresEventStore::migrate_with_blob_migration(
+        config,
+        PoolOptions::default(),
+        &[],
+        LegacyBlobMigration::TrustObservedBytes,
+    )
+    .await
+    .unwrap();
+    assert!(!retry.upgraded);
+    assert_eq!(retry.trusted_legacy_rows, 0);
+
+    let malformed = store("blob_migration_bad").await.unwrap();
+    malformed
+        .put_blob(&tenant, "opaque", b"bytes")
+        .await
+        .unwrap();
+    malformed.shutdown().await.unwrap();
+    downgrade_blob_table(&sql, "blob_migration_bad").await;
+    sql.execute("UPDATE blob_migration_bad_blobs SET byte_count=99", &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        PostgresEventStore::migrate_with_blob_migration(
+            PostgresConfig::isolated(&url, "blob_migration_bad").unwrap(),
+            PoolOptions::default(),
+            &[],
+            LegacyBlobMigration::TrustObservedBytes,
+        )
+        .await,
+        Err(EventLogError::Backend(_))
+    ));
+    let columns: i64 = sql.query_one("SELECT count(*) FROM pg_attribute WHERE attrelid='blob_migration_bad_blobs'::regclass AND attnum>0 AND NOT attisdropped", &[]).await.unwrap().get(0);
+    assert_eq!(columns, 5, "failed import rolls back additive metadata");
+
+    let concurrent = store("blob_migration_concurrent").await.unwrap();
+    concurrent.shutdown().await.unwrap();
+    downgrade_blob_table(&sql, "blob_migration_concurrent").await;
+    let config = PostgresConfig::isolated(&url, "blob_migration_concurrent").unwrap();
+    let (first, second) = tokio::join!(
+        PostgresEventStore::migrate_with_blob_migration(
+            config.clone(),
+            PoolOptions::default(),
+            &[],
+            LegacyBlobMigration::TrustObservedBytes,
+        ),
+        PostgresEventStore::migrate_with_blob_migration(
+            config,
+            PoolOptions::default(),
+            &[],
+            LegacyBlobMigration::TrustObservedBytes,
+        )
+    );
+    let reports = [first.unwrap(), second.unwrap()];
+    assert_eq!(reports.iter().filter(|report| report.upgraded).count(), 1);
+    assert_eq!(reports.iter().filter(|report| !report.upgraded).count(), 1);
+}
+
+#[tokio::test]
+async fn postgres_blob_migration_unknown_commit_has_no_report() {
+    use eventlog_core::EventLogError;
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let setup = store("blob_migration_unknown").await.unwrap();
+    setup.shutdown().await.unwrap();
+    let sql = client(&url).await;
+    downgrade_blob_table(&sql, "blob_migration_unknown").await;
+    let parsed: tokio_postgres::Config = url.parse().unwrap();
+    let upstream_port = parsed.get_ports()[0];
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let intercepted = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&intercepted);
+    let proxy = std::thread::spawn(move || {
+        let (mut downstream, _) = listener.accept().unwrap();
+        let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).unwrap();
+        downstream.set_nodelay(true).unwrap();
+        upstream.set_nodelay(true).unwrap();
+        let mut inbound = downstream.try_clone().unwrap();
+        let mut outbound = upstream.try_clone().unwrap();
+        let forward = std::thread::spawn(move || {
+            let _ = std::io::copy(&mut inbound, &mut outbound);
+            let _ = outbound.shutdown(Shutdown::Both);
+        });
+        loop {
+            let mut header = [0_u8; 5];
+            if upstream.read_exact(&mut header).is_err() {
+                break;
+            }
+            let length = u32::from_be_bytes(header[1..].try_into().unwrap());
+            let mut body = vec![0; usize::try_from(length - 4).unwrap()];
+            if upstream.read_exact(&mut body).is_err() {
+                break;
+            }
+            if header[0] == b'C' && body == b"COMMIT\0" {
+                observed.store(true, Ordering::Release);
+                break;
+            }
+            if downstream
+                .write_all(&header)
+                .and_then(|()| downstream.write_all(&body))
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = upstream.shutdown(Shutdown::Both);
+        let _ = downstream.shutdown(Shutdown::Both);
+        forward.join().unwrap();
+    });
+    let proxy_url = format!("host=127.0.0.1 port={proxy_port} user=postgres dbname=postgres");
+    let result = PostgresEventStore::migrate(
+        PostgresConfig::isolated(&proxy_url, "blob_migration_unknown").unwrap(),
+        PoolOptions::default(),
+        &[],
+    )
+    .await;
+    assert_eq!(result, Err(EventLogError::BlobMigrationCommitUnknown));
+    assert!(intercepted.load(Ordering::Acquire));
+    proxy.join().unwrap();
+    let retry = PostgresEventStore::migrate_with_blob_migration(
+        PostgresConfig::isolated(&url, "blob_migration_unknown").unwrap(),
+        PoolOptions::default(),
+        &[],
+        eventlog_core::LegacyBlobMigration::TrustObservedBytes,
+    )
+    .await
+    .unwrap();
+    assert!(!retry.upgraded);
+    assert_eq!(retry.trusted_legacy_rows, 0);
+}
+
+async fn review_wait_for_blob_insert_lock(sql: &tokio_postgres::Client, prefix: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sql.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND wait_event = 'advisory' AND query LIKE $1", &[&format!("INSERT INTO {prefix}_blobs%")]).await.unwrap().get(0);
+            if count == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("put reached the exact insert pause");
+}
+
+#[tokio::test]
+async fn review_blob_deleted_after_ignored_insert_is_republished() {
+    use std::sync::Arc;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let first = Arc::new(store("review_blob_delete").await.expect("explicit fixture"));
+    let second = PostgresEventStore::connect(&url().unwrap(), "review_blob_delete")
+        .await
+        .unwrap();
+    let sql = client(&url().unwrap()).await;
+    let tenant = TenantId::new("review").unwrap();
+    first.put_blob(&tenant, "opaque", b"old").await.unwrap();
+    sql.batch_execute("SELECT pg_advisory_lock(903151); CREATE OR REPLACE FUNCTION review_blob_delete_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(903151); RETURN NULL; END $$; CREATE TRIGGER review_blob_delete_pause AFTER INSERT ON review_blob_delete_blobs FOR EACH STATEMENT EXECUTE FUNCTION review_blob_delete_pause()").await.unwrap();
+    let writer = Arc::clone(&first);
+    let owner = tenant.clone();
+    let put = tokio::spawn(async move { writer.put_blob(&owner, "opaque", b"new").await });
+    review_wait_for_blob_insert_lock(&sql, "review_blob_delete").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        second.delete_blob(&tenant, "opaque"),
+    )
+    .await
+    .expect("delete is not held by the ignored insert")
+    .unwrap();
+    assert_eq!(second.get_blob(&tenant, "opaque").await.unwrap(), None);
+    sql.batch_execute("SELECT pg_advisory_unlock(903151)")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), put)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"new"[..])
+    );
+    sql.batch_execute("DROP TRIGGER review_blob_delete_pause ON review_blob_delete_blobs; DROP FUNCTION review_blob_delete_pause()").await.unwrap();
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+    eprintln!(
+        "forced deletion after ignored INSERT: old binding absent before resume, new binding published after retry"
+    );
+}
+
+#[tokio::test]
+async fn review_blob_cancelled_insert_retires_connection_and_retries() {
+    use std::sync::Arc;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let store = Arc::new(store("review_blob_cancel").await.expect("explicit fixture"));
+    let sql = client(&url().unwrap()).await;
+    sql.batch_execute("SELECT pg_advisory_lock(903152); CREATE OR REPLACE FUNCTION review_blob_cancel_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(903152); RETURN NEW; END $$; CREATE TRIGGER review_blob_cancel_pause BEFORE INSERT ON review_blob_cancel_blobs FOR EACH ROW EXECUTE FUNCTION review_blob_cancel_pause()").await.unwrap();
+    let tenant = TenantId::new("review").unwrap();
+    let writer = Arc::clone(&store);
+    let owner = tenant.clone();
+    let put = tokio::spawn(async move { writer.put_blob(&owner, "opaque", b"cancelled").await });
+    review_wait_for_blob_insert_lock(&sql, "review_blob_cancel").await;
+    put.abort();
+    assert!(put.await.unwrap_err().is_cancelled());
+    sql.batch_execute("SELECT pg_advisory_unlock(903152)")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sql.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query LIKE 'INSERT INTO review_blob_cancel_blobs%'", &[]).await.unwrap().get(0);
+            if count == 0 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("cancelled connection driver retired");
+    assert_eq!(store.get_blob(&tenant, "opaque").await.unwrap(), None);
+    store.put_blob(&tenant, "opaque", b"retry").await.unwrap();
+    assert_eq!(
+        store.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"retry"[..])
+    );
+    sql.batch_execute("DROP TRIGGER review_blob_cancel_pause ON review_blob_cancel_blobs; DROP FUNCTION review_blob_cancel_pause()").await.unwrap();
+    store.shutdown().await.unwrap();
+    eprintln!(
+        "cancelled pre-publication INSERT: no durable binding, driver retired, next operation succeeds"
+    );
+}
+
+#[tokio::test]
+async fn review_blob_empty_content_and_conflict_rollback_reuse() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let first = store("review_blob_empty").await.expect("explicit fixture");
+    let second = PostgresEventStore::connect(&url().unwrap(), "review_blob_empty")
+        .await
+        .unwrap();
+    let tenant = TenantId::new("review").unwrap();
+    first.put_blob(&tenant, "opaque", b"").await.unwrap();
+    second.put_blob(&tenant, "opaque", b"").await.unwrap();
+    for _ in 0..32 {
+        assert!(matches!(
+            first.put_blob(&tenant, "opaque", b"nonempty").await,
+            Err(eventlog_core::EventLogError::Invalid(_))
+        ));
+        assert_eq!(
+            second.get_blob(&tenant, "opaque").await.unwrap(),
+            Some(Vec::new())
+        );
+    }
+    first.delete_blob(&tenant, "opaque").await.unwrap();
+    second
+        .put_blob(&tenant, "opaque", b"rebound")
+        .await
+        .unwrap();
+    assert!(matches!(
+        first.put_blob(&tenant, "opaque", b"").await,
+        Err(eventlog_core::EventLogError::Invalid(_))
+    ));
+    assert_eq!(
+        first.get_blob(&tenant, "opaque").await.unwrap().as_deref(),
+        Some(&b"rebound"[..])
+    );
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review2_postgres_admission_refuses_unenforced_check_and_unmigrated_legacy_shape() {
+    use eventlog_core::EventLogError;
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(weakened) = store("reviewtwo_check").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let url = url().unwrap();
+    weakened.shutdown().await.unwrap();
+    let sql = client(&url).await;
+    // Keep the constraint name, weaken the enforced expression to CHECK (true).
+    let name: String = sql
+        .query_one(
+            "SELECT conname FROM pg_constraint WHERE conrelid='reviewtwo_check_blobs'::regclass AND contype='c'",
+            &[],
+        )
+        .await
+        .expect("exactly one CHECK on the blob table")
+        .get(0);
+    sql.batch_execute(&format!(
+        "ALTER TABLE reviewtwo_check_blobs DROP CONSTRAINT {name};
+         ALTER TABLE reviewtwo_check_blobs ADD CONSTRAINT {name} CHECK (true);"
+    ))
+    .await
+    .unwrap();
+    let five_column_insert_accepted = sql
+        .execute(
+            "INSERT INTO reviewtwo_check_blobs (tenant_id,digest,bytes,byte_count,recorded_at) VALUES ('t','d',$1,1,now())",
+            &[&b"x".as_slice()],
+        )
+        .await
+        .is_ok();
+    assert!(
+        five_column_insert_accepted,
+        "fixture control: the weakened table really admits an old five-column INSERT"
+    );
+    let config = PostgresConfig::isolated(&url, "reviewtwo_check").unwrap();
+    assert!(
+        matches!(
+            PostgresEventStore::migrate(config, PoolOptions::default(), &[]).await,
+            Err(EventLogError::Invalid(_))
+        ),
+        "migration admission must compare the enforced CHECK expression, not its name"
+    );
+    assert!(
+        PostgresEventStore::connect(&url, "reviewtwo_check")
+            .await
+            .is_err(),
+        "an unenforced integrity check must not be served"
+    );
+
+    // A populated predecessor is not served by the ordinary constructor without explicit trust.
+    let legacy = store("reviewtwo_legacy").await.unwrap();
+    let tenant = TenantId::new("legacy").unwrap();
+    legacy.put_blob(&tenant, "opaque", b"bytes").await.unwrap();
+    legacy.shutdown().await.unwrap();
+    downgrade_blob_table(&sql, "reviewtwo_legacy").await;
+    assert!(
+        matches!(
+            PostgresEventStore::connect(&url, "reviewtwo_legacy").await,
+            Err(EventLogError::Invalid(_))
+        ),
+        "connect must refuse a populated predecessor instead of migrating or serving it"
+    );
+    let columns: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid='reviewtwo_legacy_blobs'::regclass AND attnum>0 AND NOT attisdropped",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(columns, 5, "refusal leaves the predecessor shape untouched");
 }

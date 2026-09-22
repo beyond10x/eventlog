@@ -16,8 +16,11 @@ frame with an empty digest field. Unknown physical fields, wrong sequence/previo
 missing committed bytes and damaged committed frames refuse without altering the history.
 
 `writer.lock` is permanent and outside the disposable cache. Each operation opens its own lock
-file description, takes an exclusive process lock, verifies the journal and folds its operations,
-then retains that lock through callbacks and commit. Never unlink the lock file while a process
+file description, takes an exclusive process lock, establishes the committed history it will work
+against, and retains that lock through callbacks and commit. A resumed handle that cannot establish
+its history under that lock is the one exception: every fall-through in `Journal::resume` drops its
+lock description and `Journal::open_existing` takes a fresh one, which re-reads and re-validates
+everything before the operation proceeds. Never unlink the lock file while a process
 can use the directory. All writers serialize, including absent streams and reverse-order groups.
 Callbacks access blobs and projections through their transaction context. Re-entering the outer
 store from a callback is unsupported, as with the SQL providers.
@@ -55,16 +58,158 @@ rebuild. A rebuild commits all rows and its cursor together. Snapshots live unde
 a persisted history-generation coordinate, and may be deleted or discarded when unreadable.
 They are never a substitute for history and unproven snapshot writes refuse.
 
-The v1 implementation rereads and verifies history per operation. This deliberately has no
-production throughput or large-history claim. A later accelerator must preserve the same
-verification and disposal contracts.
+A handle verifies the complete history and every active blob once, when the store is opened: every
+frame is rechained from the zero digest to the manifest digest, every active object is read and
+hashed, and stale snapshots and unreferenced objects are disposed of. The opener also keeps a
+SHA-256 over the raw committed bytes it read. Each later operation takes the lock, reads
+`manifest.json`, and re-reads the committed bytes behind the head it observed and hashes them
+against that value. That raw pass is what makes it safe for a handle to trust frames it is not
+decoding again: a committed frame damaged in place after the handle verified it fails the
+comparison, so the handle neither serves it nor appends after it. When the manifest names the same
+store, epoch, sequence, byte length and digest the handle observed and the committed bytes are
+still the bytes it verified, the handle reuses the frames and the fold it already has, decoding no
+frame and reading no blob. When it names a longer history on the same store and epoch, the handle
+reads only the bytes past its observed length, chains them from its observed digest to the new
+manifest digest, folds those frames onto the state it had, verifies the objects those frames bind,
+and disposes of snapshots they retired. A resumed operation also removes the staging names no
+durable intent selected, as a complete open does. Anything else — a new epoch, a pending recovery
+intent, a shorter or unchained file, a byte length that disagrees with the manifest, a committed
+prefix that is not the bytes this handle verified, or a head this handle never folded — falls back
+to the complete reread, which refuses a history that does not extend the observed head exactly as
+before. So an operation costs one raw pass over the committed bytes plus what the file gained
+since the handle last looked: no frame is decoded twice and no object is read twice.
+
+A consistent tenant capture reuses the same verified history, under the same rules and one
+restriction. A handle that has already observed the committed head re-reads and hashes the
+committed bytes behind it, folds only the frames past it, and answers the per-handle divergence
+guard from that comparison rather than by re-encoding the observed prefix: what the comparison
+establishes — the committed prefix is byte for byte the history this handle verified, and the
+frames past it chain from the head it observed — is strictly more than the guard asks. Everything
+the strict reader refuses before it decodes, the resumed reader reaches too, by handing the
+decision back to it: a writers' lock that is not a regular file or cannot be held, a reserved
+`append.json` or `privacy.json` entry — present whenever the directory entry is, even when
+following it reaches nothing — a manifest on another store or epoch, a file whose length is not
+the committed length, a committed prefix that is no longer the bytes the handle verified, or a
+tail that does not chain. The restriction is the one that separates a reader from a writer: the
+resumed reader removes no staging name and synchronizes no directory, because an inspector that
+mutates a store has changed the thing it came to observe. Its cached view is a reader's view and
+a transaction cannot use it: it carries the fold and the committed-byte hash, not the frames a
+writer appends onto, and not the promise that every object the fold binds has been hashed. Bound
+content is read and hashed by the capture that hands those bytes to its caller, which is the same
+rule a read on the write path follows — see *When bound content is read* below for which capture
+that is.
+
+### When bound content is read
+
+`capture_tenant` reads and hashes every bound object before it returns. `capture_tenant_deferred`
+returns the same observation and reads none of them: which digests a tenant binds, in what order,
+and whether they cross the caller's caps are all decided from the committed records, which already
+name the object behind each digest and the hash its content must have. The content is read, and
+hashed, by `DeferredBlob::bytes` — on the read that hands it out. **The rule is unchanged: this
+crate hashes what it hands out.** What changed is that a caller which never asks for a binding's
+content never pays for it.
+
+Two consequences, both deliberate:
+
+- A deferred observation's *bindings* are decided under the writers' lock, exactly as before. Its
+  *content* is read afterwards, without that lock. A binding whose object a later writer removed
+  or replaced is therefore refused by `DeferredBlob::bytes` rather than returned — the recorded
+  hash decides every read, so the observation answers with the content it bound or with nothing.
+  It never substitutes.
+- Nothing is cached. A second ask is a second read, which is what keeps a deferred capture's cost
+  in memory the size of its digests rather than the size of the store's content.
+
+The caps are charged identically on both paths. The payload cap is charged in bytes, so the
+deferred path `stat`s each object for its length — which is also where the half of the
+complete-content check that does not need the content already lived: an admitted object name and a
+regular file.
+
+**The decision, 2026-09-22.** Measured on this workstation (i9-10900K, no SHA-NI; release build;
+7,815 blobs totalling 157.0 MB, the shape of the migrated ESS authority;
+`crates/eventlog-file/tests/measure_capture.rs`):
+
+| capture of the whole authority | wall |
+| --- | --- |
+| `capture_tenant` (reads and hashes every object) | 667 / 675 / 706 / 729 ms |
+| `capture_tenant_deferred` (reads none) | 61 / 61 / 103 ms |
+
+The same harness separates the two costs the read pays, and the answer is that both are real:
+7,815 blobs of 128 bytes each cost 284 ms — about 36 µs per object of open/read/decode — and 61
+blobs totalling the same 157.0 MB cost 596 ms, about 263 MB/s, which is software SHA-256 on this
+CPU. An authority's capture pays both, on every capture, whether or not its caller looks at one
+binding. Three alternatives were weighed and not taken: keeping the read (the cost above); a digest
+cache keyed by file identity, which would serve a blob damaged in place with its identity preserved
+unverified once; and hashing only where the CPU has SHA-NI, which changes nothing here. None of
+them is needed once the committed record is the source of the digest.
 
 ## Content and privacy
 
 Blob bytes live separately in `blobs/`; journal entries contain a tenant/digest binding, object
 identity and content hash. Bytes and their directory entry are synchronized before the binding
-commits. Reusing a binding for different bytes refuses. Reads and reopen verify active content
-hashes. Deletion and tenant erasure remove unreferenced objects from the active directory.
+commits. Reusing a binding for different bytes refuses.
+
+**Where the barrier is for a grouped write.** A blob written on its own takes a transaction of its
+own, so it takes its own barrier: object bytes synchronized, directory entry synchronized, then the
+commit sequence `append.json` → frame → manifest → directory. `append_group_with_blobs` writes the
+blobs inside the group's transaction instead, so a batch of any size takes **the group's one
+barrier and none besides**: every object is written and synchronized, the object directory is
+synchronized **once for the whole batch**, and the bindings are pending operations in the single
+frame the group commits. The barrier is therefore in exactly the same place it was — before the
+manifest that publishes the frame — and what changed is how many frames the same work costs. The
+durability promise is unchanged in both directions: nothing of the batch is observable before that
+manifest, and a crash before it leaves object files no committed frame names, which the refusing
+transaction itself, the next committed transaction and the complete opener dispose of as
+unreferenced. A deduplicated group retry binds nothing, because the original commit already bound
+it — and that is checked rather than assumed. A group's identity is its tenant, members and command
+meta and deliberately not its batch, so the batch the commit carried is **recorded in the group's
+own committed operation**, and a retry's batch is compared against that record.
+
+**Against the record, never against what is bound now.** A digest the commit recorded still counts
+as recorded after `delete_blob`, an erasure or a retention sweep has removed the binding: deleting
+a blob is its own act and does not make a committed group belong to somebody else's request. A
+retry after one deduplicates. Deciding this on live blob state instead turns an ordinary deletion
+into `IdempotencyMismatch`, and the only recovery from that is a new idempotency key — which
+appends every member of the group a second time into an append-only log.
+
+So: a retry whose batch is the recorded set deduplicates; a retry whose batch is some other set is
+not that request and refuses with `IdempotencyMismatch`; a retry carrying **no** batch is the
+ordinary group retry, asks nothing about blobs and deduplicates as it always did. A digest that is
+still bound is additionally held to its bytes, and differing bytes refuse as `Invalid` exactly as
+they would on a fresh commit — the key is not in question there, the content is. Refusing one blob
+of a batch refuses the whole group and publishes neither.
+
+**A retry that carries a batch runs admission first.** The batch is part of what such a retry is
+asking about, so the guard runs before anything is said about it; otherwise replaying a key one
+once committed would report whether a digest is bound, and whether bytes match, with no guard ever
+called. A retry carrying no batch does not repeat admission, which is the port's own contract and
+what the shared conformance exercise asserts by counting guard calls.
+
+**Who disposes of an object no frame references.** A blob written on its own could not be refused
+after it was written — its transaction had nothing after it. A batch written inside a group can:
+a member append, an inline projector or an admission guard may all refuse after the objects are
+on disk. So the refusing transaction disposes of the objects it wrote before it returns, by object
+identity rather than by what its rolled-back in-memory state references. The next committed
+transaction and the complete opener remain the disposers for objects a crash leaves behind.
+
+**The guarded form.** `append_group_guarded_with_blobs` is the same commit under an admission
+guard, and it is on the `AtomicEventStore` port rather than on this provider because the caller it
+exists for — a migration importing many boundaries at once — holds a trait object. Admission runs
+before a byte of the batch is written, so a refused guard publishes neither the group nor a blob.
+
+**A provider that cannot make that guarantee refuses instead of weakening it.** The port's default
+implementation writes nothing, commits nothing and refuses with `eventlog_core::UNAVAILABLE`; only
+this provider overrides it. An earlier default wrote each blob on its own path first and then ran
+admission, which meant a refused guard had already published the whole batch on the two SQL
+providers — and a caller holding a trait object cannot tell which provider it has, so the method
+would have meant one thing here and the opposite there. A blob row is a binding, not scratch:
+nothing reference-counts it, nothing sweeps it, and content-addressed storage has no way to take a
+published blob back. A caller that wants the slow path still has `put_blob` in a loop followed by
+`append_group_guarded`; what it cannot have is that sequence under a name promising the batch was
+not published. The shared conformance exercise runs both halves of this against all three
+providers. Open and reopen verify every active content hash;
+afterwards a read verifies the bytes it reads, and the first sight of a frame another writer
+committed verifies the objects that frame binds, so damaged bytes are refused whether they are
+read or newly bound. Deletion and tenant erasure remove unreferenced objects from the active directory.
 The public digest spelling retains the existing blob-port compatibility; an additional computed
 SHA-256 verifies the actual stored bytes.
 
@@ -98,4 +243,26 @@ expectations, blob corruption, missing authority, physical privacy and projectio
 Journal unit tests kill subprocesses at prepared, torn-write, synchronized and published append
 boundaries, and at prepared, renamed and published privacy boundaries. They also check that
 corruption and unexplained tails are preserved on refusal and that a longer fork does not extend
-a previously observed head. These are process-death tests, not simulated drive power failure.
+a previously observed head. A journal unit test checks that a resumed handle reads only the frames
+past its observed head and hands a shorter file, an unchained tail, an unchained fork and a new
+privacy epoch back to the complete opener, and a second checks that a resumed handle removes the
+staging names no durable intent selected; durability tests check that a blob damaged after open no
+longer fails an unrelated transaction while its own read still refuses, that frames another handle
+committed are folded and the objects they bind verified, that a longer fork of the same store is
+still refused, that a bound object removed after open refuses its read without changing state, and
+that a committed frame damaged in place after open refuses the next append without altering the
+history. A separate suite checks the same damage against an open handle's reads, its appends and a
+history whose observed prefix was rewritten under a genuine tail. A capture unit test counts the
+frames a handle decodes, re-encodes and folds and the objects it hashes, and requires ten captures
+with no write between them to verify the committed history once and the content they hand out
+every time; `tests/consistent_capture.rs` checks that a capture reusing a view still folds what
+another writer committed, that a committed frame damaged in place afterwards refuses through the
+strict reader without changing a file, that damaged content still refuses the next capture, that a
+writers' lock that is no longer a regular file refuses one, and that a reserved recovery entry
+appearing after a capture — including one that cannot be followed — refuses the next. A grouped-blob
+unit test kills a subprocess at every boundary the joined write has, including the one between
+synchronized object files and the unpublished frame that binds them, and requires the group and
+every blob of it to be present together or absent together, the unreferenced objects of an
+interrupted batch to be gone, and the retry to deduplicate; a second counts the barriers a batch
+takes against the barriers the same work takes one blob per transaction, and a third checks that
+both paths bind the same digests to the same bytes. These are process-death tests, not simulated drive power failure.

@@ -9,10 +9,19 @@ pub(crate) struct View<'a> {
     pub tx: &'a mut Transaction,
     pub tenant: &'a TenantId,
     pub admission: bool,
+    pub selected: Option<&'a [ProjectionSpec]>,
 }
 impl View<'_> {
     pub fn validate(&self, spec: &ProjectionSpec, tenant: &TenantId) -> Result<(), EventLogError> {
         spec.validate()?;
+        if self
+            .selected
+            .is_some_and(|selected| !selected.iter().any(|admitted| admitted == spec))
+        {
+            return Err(EventLogError::Invalid(
+                "projection is outside this rebuild's selected tables".into(),
+            ));
+        }
         if tenant != self.tenant {
             return Err(EventLogError::Invalid(
                 "projection crosses tenant boundary".into(),

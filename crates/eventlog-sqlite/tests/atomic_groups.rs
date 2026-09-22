@@ -6,6 +6,18 @@ async fn ordered_groups_commit_and_rollback_as_one_unit() {
 }
 
 #[tokio::test]
+async fn guarded_group_blobs_contract() {
+    let store = SqliteEventStore::in_memory("guarded_group_blobs")
+        .await
+        .unwrap();
+    assert!(
+        !eventlog_conformance::run_guarded_group_blobs(&store).await,
+        "this provider has not implemented the guarded blob-bearing group and must fail closed; \
+         implementing it means taking the published-nothing guarantee with it"
+    );
+}
+
+#[tokio::test]
 async fn group_retry_survives_database_reopen() {
     use eventlog_core::{
         AppendGroup, AtomicEventStore, Expected, StreamAppend, StreamId, TenantId,

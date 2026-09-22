@@ -347,7 +347,8 @@ mod linux {
             if kind != "table" || compact(&sql) != compact(&expected_sql) {
                 return Err(InspectionError::UnsupportedSource);
             }
-            let triggers: u64 = connection
+            // `rusqlite` 0.40 reads SQLite integers as `i64`; `u64` has no `FromSql`.
+            let triggers: i64 = connection
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1",
                     [&name],
@@ -499,7 +500,7 @@ mod linux {
                     .unwrap();
             reader
                 .query_row("SELECT count(*) FROM fixture", [], |row| {
-                    row.get::<_, u64>(0)
+                    row.get::<_, i64>(0)
                 })
                 .unwrap();
             drop(reader);

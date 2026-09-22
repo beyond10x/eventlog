@@ -123,7 +123,9 @@ async fn file_atomic_blob_reopen_retry_preserves_erasure_and_receipt() {
     let root = tempfile::tempdir().unwrap();
     let request = eventlog_conformance::atomic_blob_request("reopen", "one", "content");
     let store = FileEventStore::open(root.path()).await.unwrap();
-    let original = store.append_group_with_blobs(&request).await.unwrap();
+    let original = AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+        .await
+        .unwrap();
     let journal = std::fs::read_to_string(root.path().join("events.jsonl")).unwrap();
     assert!(
         !journal.contains("retained-payload-marker"),
@@ -131,7 +133,9 @@ async fn file_atomic_blob_reopen_retry_preserves_erasure_and_receipt() {
     );
     drop(store);
     let store = FileEventStore::open(root.path()).await.unwrap();
-    let retried = store.append_group_with_blobs(&request).await.unwrap();
+    let retried = AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+        .await
+        .unwrap();
     assert!(retried.deduplicated);
     assert_eq!(retried.appends[0].events, original.appends[0].events);
     store
@@ -141,8 +145,7 @@ async fn file_atomic_blob_reopen_retry_preserves_erasure_and_receipt() {
     drop(store);
     let store = FileEventStore::open(root.path()).await.unwrap();
     assert!(
-        store
-            .append_group_with_blobs(&request)
+        AtomicBlobEventStore::append_group_with_blobs(&store, &request)
             .await
             .unwrap()
             .deduplicated
@@ -184,8 +187,8 @@ async fn file_atomic_blob_independent_writers_keep_only_complete_winner() {
                 .unwrap();
         }
         let (a, b) = tokio::join!(
-            left.append_group_with_blobs(&requests[0]),
-            right.append_group_with_blobs(&requests[1])
+            AtomicBlobEventStore::append_group_with_blobs(&left, &requests[0]),
+            AtomicBlobEventStore::append_group_with_blobs(&right, &requests[1])
         );
         // Check physical bindings before any read's ordinary recovery cleanup.
         let binding_count = std::fs::read_dir(root.path().join("blobs"))

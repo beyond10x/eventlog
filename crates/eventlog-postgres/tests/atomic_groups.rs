@@ -16,6 +16,27 @@ async fn ordered_groups_commit_and_rollback_as_one_unit() {
     store.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn guarded_group_blobs_contract() {
+    let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned real PostgreSQL URL");
+    let suffix: String = time::OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .to_string()
+        .bytes()
+        .map(|digit| char::from(b'a' + digit - b'0'))
+        .collect();
+    let store = PostgresEventStore::connect(&url, &format!("gblobs_{suffix}"))
+        .await
+        .unwrap();
+    assert!(
+        !eventlog_conformance::run_guarded_group_blobs(&store).await,
+        "this provider has not implemented the guarded blob-bearing group and must fail closed; \
+         implementing it means taking the published-nothing guarantee with it"
+    );
+    store.drop_tables().await.unwrap();
+    store.shutdown().await.unwrap();
+}
+
 // Opposite request orders must not become opposite lock orders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_groups_preserve_order_without_partial_commits() {
