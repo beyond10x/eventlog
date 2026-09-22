@@ -32,6 +32,32 @@ under bare-version tags such as `0.1.0`.
   Rebuild uses the attached instance, complete committed history and active blobs, preserving
   unrelated tenants and publishing selected rows and cursor together.
 
+- `AtomicBlobEventStore` publishes a group's blob bindings and its events in one native
+  transaction across File, SQLite and PostgreSQL. `BlobAppendGroup` carries the group and its
+  `BlobWrite` batch; the request fingerprint binds the actual bytes, an original receipt is
+  resolved before any callback or binding runs, and a failed append rolls tentative content back.
+  An append that cannot be classified after its content is published reports
+  `EventLogError::UnknownCommit` rather than a success or a plain backend failure. Legacy
+  fingerprint and storage formats are unchanged. Opt-in: a provider that does not implement the
+  trait is unaffected.
+
+- `AtomicEventStore::append_group_guarded_with_blobs` commits a group and the blobs it binds under
+  the group's one durability barrier, with the guard running before a byte of the batch is
+  written, so a refused guard publishes neither the group nor a blob. File implements it; the
+  other providers take the trait's refusal. A batch of any size costs the frame the group already
+  commits and no barrier besides, where `put_blob` costs one barrier per blob. The committed group
+  record now carries the sorted digests of the batch it bound, so a retry under a committed
+  idempotency key is compared against what that commit actually carried.
+
+- `InspectHistory` reads one tenant's complete decoded history from a store nobody opened for
+  writing, granting no writer or recovery authority and creating no root, lock or table.
+  `InspectionLimits` states explicit source-byte, event-count and envelope-byte caps where zero is
+  a real limit rather than a default; `HistoryInspection` is the decoded result and
+  `InspectionError` its payload-free refusals. `FileHistoryInspector` and `SqliteHistoryInspector`
+  implement it. A redacted or malformed envelope refuses rather than being returned. On Linux the
+  SQLite inspector requires an open-file-description lock before it will admit a source, so a
+  native writer cannot run underneath an observation in progress.
+
 ### Changed
 
 - File verifies the complete committed history and every active blob once, when the store is
@@ -79,6 +105,25 @@ under bare-version tags such as `0.1.0`.
   with `EventLogError::Invalid`, retaining the original content. Identical retries still succeed;
   deletion permits rebinding, and concurrent differing writers have exactly one winner, matching
   the file provider's immutable binding contract.
+
+- A refused SQLite inspection leaves every lock the store already held exactly as it found it — a
+  prior writer lock, a prior reader lock, and the source file itself. An inspection that cannot be
+  admitted changes nothing it looked at.
+
+- Atomic blob publication writes the same blob-integrity columns the standalone `put_blob` port
+  writes, on SQLite and PostgreSQL, and compares a readback through the same validation. Without
+  them the binding failed the blobs table's own `integrity_v1 = 1 AND integrity_sha256 IS NOT NULL`
+  check at publication time.
+
+### Known
+
+- `FileEventStore` carries two public methods named `append_group_with_blobs`: the inherent one
+  taking `(&AppendGroup, &[(String, Vec<u8>)])`, and `AtomicBlobEventStore`'s taking
+  `&BlobAppendGroup`. Rust resolves `store.append_group_with_blobs(..)` to the inherent one, so the
+  trait method needs `AtomicBlobEventStore::append_group_with_blobs(&store, &request)` to be
+  reached. Both arrived in this release, from two lines of work that met at the merge; the two
+  capabilities are real and neither is deprecated. Naming is to be settled before either is relied
+  on by name.
 
 ## 0.2.1 — 2026-09-10
 

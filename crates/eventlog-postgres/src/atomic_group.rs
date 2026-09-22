@@ -5,7 +5,10 @@ use super::{
     StreamId, backend, check_expected, ensure_callback_integrity, lock_identity, new_event_id,
     parse_uuid, poisoned, publication_gate, read_event, select_versions, to_i32, to_i64, to_u64,
 };
-use eventlog_core::{AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange};
+use eventlog_core::{
+    AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
+    BlobWrite, GroupRange, blob_integrity_sha256, validate_stored_blob,
+};
 
 #[cfg(test)]
 fn checkpoint(point: &str) {
@@ -287,6 +290,7 @@ impl PostgresEventStore {
         transaction: &tokio_postgres::Transaction<'_>,
         group: &AppendGroup,
         fingerprint: &str,
+        blobs: &[BlobWrite],
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
@@ -349,6 +353,43 @@ impl PostgresEventStore {
                 ],
             )
             .await?;
+        }
+        for blob in blobs {
+            // Row/unique locking also serializes the existing standalone blob ports.
+            // Advisory locks alone cannot protect against writers that do not take them.
+            let byte_count = to_i64(
+                u64::try_from(blob.bytes.len())
+                    .map_err(|_| EventLogError::Invalid("blob length exceeds u64".into()))?,
+            )?;
+            // The integrity columns are the same contract the standalone port writes; a binding
+            // this path published without them would fail the table's own check.
+            let integrity_sha256 = blob_integrity_sha256(&blob.bytes);
+            transaction.execute(
+                &format!("INSERT INTO {prefix}_blobs (tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1) VALUES ($1,$2,$3,$4,$5,$6,1) ON CONFLICT (tenant_id,digest) DO NOTHING"),
+                &[&group.tenant.as_str(),&blob.digest,&blob.bytes,&byte_count,&OffsetDateTime::now_utc(),&integrity_sha256],
+            ).await.map_err(backend)?;
+            let row = transaction.query_opt(
+                &format!("SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs WHERE tenant_id=$1 AND digest=$2 FOR UPDATE"),
+                &[&group.tenant.as_str(),&blob.digest],
+            ).await.map_err(backend)?;
+            let stored = match row {
+                Some(row) => validate_stored_blob(
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    i64::from(row.get::<_, i32>(3)),
+                )?,
+                None => {
+                    return Err(EventLogError::Invalid(
+                        "blob digest already names different content".into(),
+                    ));
+                }
+            };
+            if stored != blob.bytes {
+                return Err(EventLogError::Invalid(
+                    "blob digest already names different content".into(),
+                ));
+            }
         }
         {
             let mut projections = PostgresProjections {
@@ -433,6 +474,60 @@ impl AtomicEventStore for PostgresEventStore {
                         &transaction,
                         group,
                         &fingerprint,
+                        &[],
+                        admission.as_ref(),
+                        &callback_failed,
+                    )
+                    .await;
+                match result {
+                    Ok(result) => {
+                        #[cfg(test)]
+                        checkpoint("group-precommit");
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(|_| EventLogError::UnknownCommit)?;
+                        client.settled();
+                        #[cfg(test)]
+                        checkpoint("group-postcommit");
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        transaction.rollback().await.map_err(backend)?;
+                        client.settled();
+                        Err(error)
+                    }
+                }
+            })
+            .await
+            .map_err(|_| EventLogError::UnknownCommit)?
+        })
+    }
+}
+
+impl AtomicBlobEventStore for PostgresEventStore {
+    fn append_group_with_blobs_guarded<'a>(
+        &'a self,
+        request: &'a BlobAppendGroup,
+        admission: Arc<dyn Guard>,
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        Box::pin(async move {
+            let fingerprint = request.fingerprint()?;
+            let mut request = request.clone();
+            request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
+            self.freeze().await;
+            tokio::time::timeout(self.pool.options.transaction_timeout, async {
+                let mut client = self.pool.acquire().await?;
+                client.quarantine();
+                let transaction = client.transaction().await.map_err(backend)?;
+                publication_gate(&transaction, &self.prefix, false).await?;
+                let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let result = self
+                    .group_in_transaction(
+                        &transaction,
+                        &request.group,
+                        &fingerprint,
+                        &request.blobs,
                         admission.as_ref(),
                         &callback_failed,
                     )

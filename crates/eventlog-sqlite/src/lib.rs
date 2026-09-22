@@ -14,6 +14,8 @@
 mod atomic_group;
 mod capture;
 mod inline_admin;
+mod inspection;
+pub use inspection::SqliteHistoryInspector;
 
 use std::{
     collections::BTreeSet,

@@ -4,7 +4,9 @@ mod capture;
 #[cfg(test)]
 mod cost;
 mod inline_admin;
+mod inspection;
 mod journal;
+pub use inspection::FileHistoryInspector;
 mod projection;
 mod state;
 
@@ -79,6 +81,8 @@ struct Transaction {
     /// them. A transaction that refuses has already applied its own `Op::Blob`s to `state`, so
     /// `clean_blobs` would read those objects as live; this is the list that says otherwise.
     written: Vec<String>,
+    staged_blobs: Vec<PathBuf>,
+    atomic_content: bool,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -162,7 +166,13 @@ impl FileEventStore {
                 // reference. Dispose of them here rather than leaving them for whatever writes to
                 // this store next; a disposal that itself fails is reported over the refusal,
                 // because it means the store is not writable.
-                blocking(move || tx.discard_written()).await?;
+                // Publication has not begun either, so this request's own staging files go with
+                // them — only those, never preexisting or potentially committed content.
+                blocking(move || {
+                    tx.cleanup_staged_blobs()?;
+                    tx.discard_written()
+                })
+                .await?;
                 return Err(refusal);
             }
         };
@@ -188,7 +198,16 @@ impl FileEventStore {
                     journal::checkpoint("group-precommit");
                 }
                 tx.journal
-                    .append(serde_json::to_value(&tx.pending).map_err(backend)?)?;
+                    .append(serde_json::to_value(&tx.pending).map_err(backend)?)
+                    // An atomic content request has already published its objects, so a failure to
+                    // append the frame that binds them leaves a commit nobody can classify.
+                    .map_err(|error| {
+                        if tx.atomic_content {
+                            EventLogError::UnknownCommit
+                        } else {
+                            error
+                        }
+                    })?;
                 #[cfg(test)]
                 if group_pending {
                     journal::checkpoint("group-postcommit");
@@ -197,7 +216,16 @@ impl FileEventStore {
             // Disposal belongs to the writer that changed what is referenced.
             let committed = tx.privacy || !tx.pending.is_empty();
             if committed {
-                tx.clean_blobs()?;
+                tx.clean_blobs().map_err(|error| {
+                    if tx.atomic_content && !tx.pending.is_empty() {
+                        EventLogError::UnknownCommit
+                    } else {
+                        error
+                    }
+                })?;
+            }
+            if !tx.staged_blobs.is_empty() {
+                journal::checkpoint("blob-cleaned");
             }
             // A privacy rewrite mints a new epoch over replaced bytes. Reverify it from scratch.
             let cacheable = !tx.privacy;
@@ -344,6 +372,72 @@ impl FileEventStore {
     }
 }
 impl Transaction {
+    fn cleanup_staged_blobs(&self) -> Result<(), EventLogError> {
+        for path in &self.staged_blobs {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(backend(
+                    "aborted atomic blob request retained unbound staging content",
+                ));
+            }
+        }
+        if !self.staged_blobs.is_empty() {
+            fs::File::open(self.root.join("blobs"))
+                .and_then(|file| file.sync_all())
+                .map_err(|_| {
+                    backend("aborted atomic blob staging cleanup was not durably confirmed")
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn bind_blob(
+        &mut self,
+        tenant: &TenantId,
+        blob: &eventlog_core::BlobWrite,
+    ) -> Result<(), EventLogError> {
+        if let Some(old) = self.blob(tenant, &blob.digest)? {
+            if old != blob.bytes {
+                return Err(EventLogError::Invalid(
+                    "blob digest already names different content".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let object = Blob {
+            id: new_event_id(),
+            hash: hash(&blob.bytes),
+        };
+        let directory = self.root.join("blobs");
+        fs::create_dir_all(&directory).map_err(backend)?;
+        self::directory(&directory)?;
+        let path = directory.join(&object.id);
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(backend)?;
+        self.staged_blobs.push(path.clone());
+        let bytes = blob.bytes.clone();
+        blocking(move || {
+            use std::io::Write;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(backend)?;
+            fs::File::open(directory)
+                .and_then(|file| file.sync_all())
+                .map_err(backend)
+        })
+        .await?;
+        journal::checkpoint("blob-staged");
+        self.record(Op::Blob {
+            tenant: tenant.clone(),
+            digest: blob.digest.clone(),
+            object: Some(object),
+        })
+    }
+
     fn record(&mut self, op: Op) -> Result<(), EventLogError> {
         self.state.apply(op.clone())?;
         self.pending.push(op);
@@ -876,6 +970,8 @@ fn enter(
             privacy: false,
             permit,
             written: Vec::new(),
+            staged_blobs: Vec::new(),
+            atomic_content: false,
         };
         // Only the objects the new frames bind are new to this handle; the rest it already hashed.
         for (tenant, digest) in &bound {
@@ -904,6 +1000,8 @@ fn enter(
         privacy: false,
         permit,
         written: Vec::new(),
+        staged_blobs: Vec::new(),
+        atomic_content: false,
     };
     tx.clear_snapshots()?;
     tx.clean_blobs()?;
@@ -1013,6 +1111,95 @@ impl AtomicEventStore for FileEventStore {
         blobs: &'a [(String, Vec<u8>)],
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(self.group(group, guard, blobs))
+    }
+}
+
+impl eventlog_core::AtomicBlobEventStore for FileEventStore {
+    fn append_group_with_blobs_guarded<'a>(
+        &'a self,
+        request: &'a eventlog_core::BlobAppendGroup,
+        guard: Arc<dyn Guard>,
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        Box::pin(async move {
+            let digest = request.fingerprint()?;
+            let mut blobs = request.blobs.clone();
+            blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
+            self.append_atomic_group(request.group.clone(), digest, blobs, guard)
+                .await
+        })
+    }
+}
+
+impl FileEventStore {
+    async fn append_atomic_group(
+        &self,
+        group: AppendGroup,
+        digest: String,
+        blobs: Vec<eventlog_core::BlobWrite>,
+        guard: Arc<dyn Guard>,
+    ) -> Result<AppendGroupResult, EventLogError> {
+        self.freeze().await;
+        self.transaction(move |tx| {
+            Box::pin(async move {
+                if let Some((old, ranges, _)) = tx
+                    .state
+                    .groups
+                    .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
+                {
+                    if old != &digest {
+                        return Err(EventLogError::IdempotencyMismatch {
+                            key: group.meta.idempotency_key.clone(),
+                        });
+                    }
+                    return Ok(AppendGroupResult {
+                        appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
+                        deduplicated: true,
+                    });
+                }
+                for blob in &blobs {
+                    tx.bind_blob(&group.tenant, blob).await?;
+                }
+                tx.atomic_content = !blobs.is_empty();
+                guard
+                    .check(&mut projection::View {
+                        admission: true,
+                        selected: None,
+                        tx,
+                        tenant: &group.tenant,
+                    })
+                    .await?;
+                let mut appends = Vec::new();
+                let mut ranges = Vec::new();
+                for entry in &group.appends {
+                    let result = tx
+                        .append(&entry.stream, entry.expected, &entry.events, &group.meta)
+                        .await?;
+                    ranges.push(GroupRange {
+                        stream: entry.stream.clone(),
+                        first_version: result.first_version,
+                        last_version: result.last_version,
+                    });
+                    appends.push(result);
+                }
+                tx.record(Op::Group {
+                    tenant: group.tenant,
+                    key: group.meta.idempotency_key,
+                    digest,
+                    ranges,
+                    blobs: batch(
+                        &blobs
+                            .iter()
+                            .map(|blob| (blob.digest.clone(), Vec::new()))
+                            .collect::<Vec<_>>(),
+                    ),
+                })?;
+                Ok(AppendGroupResult {
+                    appends,
+                    deduplicated: false,
+                })
+            })
+        })
+        .await
     }
 }
 
@@ -1407,6 +1594,8 @@ impl EventStore for FileEventStore {
                 privacy: false,
                 permit: self.permit.clone(),
                 written: Vec::new(),
+                staged_blobs: Vec::new(),
+                atomic_content: false,
             };
             tx.register(projector.as_ref())?;
             let manifest = blocking(move || {

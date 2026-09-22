@@ -5,7 +5,10 @@ use super::{
     ensure_callback_integrity, finish_transaction, params, poisoned, run_blocking, select_versions,
     to_i64,
 };
-use eventlog_core::{AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange};
+use eventlog_core::{
+    AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
+    BlobWrite, GroupRange,
+};
 use rusqlite::OptionalExtension as _;
 
 #[cfg(test)]
@@ -41,6 +44,7 @@ impl AtomicEventStore for SqliteEventStore {
                 &mut connection,
                 &group,
                 &fingerprint,
+                &[],
                 admission.as_ref(),
                 &callback_failed,
             );
@@ -58,12 +62,63 @@ impl AtomicEventStore for SqliteEventStore {
     }
 }
 
+impl AtomicBlobEventStore for SqliteEventStore {
+    fn append_group_with_blobs_guarded<'a>(
+        &'a self,
+        request: &'a BlobAppendGroup,
+        admission: Arc<dyn Guard>,
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let mut request = request.clone();
+        Box::pin(run_blocking(move || {
+            let fingerprint = request.fingerprint()?;
+            request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
+            *inner.registration.lock().map_err(poisoned)? = true;
+            let mut connection = inner.connection.lock().map_err(poisoned)?;
+            begin_immediate(&connection)?;
+            let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let result = inner.group_in_transaction(
+                &mut connection,
+                &request.group,
+                &fingerprint,
+                &request.blobs,
+                admission.as_ref(),
+                &callback_failed,
+            );
+            finish_blob_transaction(&connection, result)
+        }))
+    }
+}
+
+fn finish_blob_transaction<T>(
+    connection: &Connection,
+    result: Result<T, EventLogError>,
+) -> Result<T, EventLogError> {
+    match result {
+        Ok(value) => {
+            if connection.execute_batch("COMMIT").is_ok() {
+                Ok(value)
+            } else {
+                // COMMIT may have taken effect before its response failed. Do not
+                // compensate blobs; resolve the original durable command identity.
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(EventLogError::UnknownCommit)
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 impl Inner {
     fn group_in_transaction(
         &self,
         connection: &mut Connection,
         group: &AppendGroup,
         fingerprint: &str,
+        blobs: &[BlobWrite],
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
@@ -104,6 +159,32 @@ impl Inner {
                 appends,
                 deduplicated: true,
             });
+        }
+        for blob in blobs {
+            let prior: Option<Vec<u8>> = connection
+                .query_row(
+                    &format!("SELECT bytes FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
+                    params![group.tenant.as_str(), blob.digest],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if let Some(bytes) = prior {
+                if bytes != blob.bytes {
+                    return Err(EventLogError::Invalid(
+                        "blob digest already names different content".into(),
+                    ));
+                }
+            } else {
+                let byte_count = u64::try_from(blob.bytes.len()).map_err(backend)?;
+                // The integrity columns are the same contract the standalone port writes; a
+                // binding this path published without them would fail the table's own check.
+                let integrity_sha256 = eventlog_core::blob_integrity_sha256(&blob.bytes);
+                connection.execute(
+                    &format!("INSERT INTO {prefix}_blobs (tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1) VALUES (?1,?2,?3,?4,?5,?6,1)"),
+                    params![group.tenant.as_str(),blob.digest,blob.bytes,to_i64(byte_count)?,super::format_time(time::OffsetDateTime::now_utc())?,integrity_sha256],
+                ).map_err(backend)?;
+            }
         }
         {
             let mut projections = SqliteProjections {
@@ -308,5 +389,69 @@ mod native_group_crash {
                 assert!(again.deduplicated, "{point}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eventlog_core::EventStore;
+
+    #[tokio::test]
+    async fn atomic_blob_native_commit_failure_is_unknown_and_retry_resolves() {
+        let store = SqliteEventStore::in_memory("atomic_unknown").await.unwrap();
+        let request = eventlog_conformance::atomic_blob_request("same-key", "one", "content");
+        {
+            let mut connection = store.inner.connection.lock().unwrap();
+            connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE fault_parent(id INTEGER PRIMARY KEY); CREATE TABLE fault_child(id INTEGER REFERENCES fault_parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
+            begin_immediate(&connection).unwrap();
+            let staged = store
+                .inner
+                .group_in_transaction(
+                    &mut connection,
+                    &request.group,
+                    &request.fingerprint().unwrap(),
+                    &request.blobs,
+                    &NoGuard,
+                    &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+                .unwrap();
+            assert!(!staged.deduplicated);
+            connection
+                .execute("INSERT INTO fault_child VALUES (1)", [])
+                .unwrap();
+            assert_eq!(
+                finish_blob_transaction(&connection, Ok(staged)),
+                Err(EventLogError::UnknownCommit)
+            );
+            for table in [
+                "atomic_unknown_blobs",
+                "atomic_unknown_events",
+                "atomic_unknown_append_groups",
+            ] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
+        let resolved = store.append_group_with_blobs(&request).await.unwrap();
+        assert!(!resolved.deduplicated);
+        assert!(
+            store
+                .append_group_with_blobs(&request)
+                .await
+                .unwrap()
+                .deduplicated
+        );
+        assert_eq!(
+            store
+                .get_blob(&request.group.tenant, "content")
+                .await
+                .unwrap(),
+            Some(request.blobs[0].bytes.clone())
+        );
     }
 }

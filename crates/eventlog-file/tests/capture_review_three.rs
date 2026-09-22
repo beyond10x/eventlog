@@ -267,13 +267,22 @@ async fn a_foreign_process_append_is_observed_by_the_next_capture() {
         .expect("complete observation");
     assert_eq!((first.events.len(), first.blobs.len()), (1, 1));
 
-    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args(["--exact", "foreign_writer_child", "--nocapture"])
+    // Captured, not inherited: a nested runner writing its own `test … ok` and `test result:`
+    // lines into this one's stdout is a second suite to anything that reads test output, and the
+    // production proof refuses the ambiguity rather than guessing which run it is looking at.
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "foreign_writer_child"])
         .env("EVENTLOG_U6R2_WRITER_ROOT", directory.path())
         .env("EVENTLOG_U6R2_WRITER_TENANT", tenant.as_str())
-        .status()
+        .output()
         .expect("spawned the foreign writer");
-    assert!(status.success(), "the foreign writer failed: {status:?}");
+    assert!(
+        child.status.success(),
+        "the foreign writer failed: {:?}\n{}\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
 
     let second = handle
         .capture_tenant(&tenant, &[], limits())

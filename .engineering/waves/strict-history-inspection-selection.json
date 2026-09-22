@@ -1,0 +1,78 @@
+{
+  "waves": [
+    {
+      "wave": 1,
+      "artifacts": [
+        {
+          "id": "story:strict-read-only-history-inspection",
+          "inferred": true,
+          "scope": [
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-conformance/src/inspection.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-conformance/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-core/src/inspection.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-core/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-file/src/inspection.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/journal.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-file/tests/strict_inspection.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-postgres/examples/production-proof.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-sqlite/src/inspection.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-sqlite/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-sqlite/tests/strict_inspection.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "docs/design/strict-history-inspection.md"
+            },
+            {
+              "confidence": "inferred",
+              "path": "ess/inspection/domains/inspection.yaml"
+            },
+            {
+              "confidence": "inferred",
+              "path": "ess/inspection/system.yaml"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "collisions": [],
+  "unassessed": [],
+  "cycles": []
+}

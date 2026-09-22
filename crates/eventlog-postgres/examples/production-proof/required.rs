@@ -206,5 +206,90 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "capture::tests::stored_order_identity_and_request_shapes_are_checked",
         "capture::tests::captured_content_is_ordered_bytewise_and_never_repeats_a_coordinate",
     ));
+    required.extend(cases!("eventlog-core", "lib", "eventlog_core";
+        "atomic_blob::tests::atomic_blob_fingerprint_binds_actual_bytes_not_caller_hashes",
+        "atomic_blob::tests::atomic_blob_fingerprint_freezes_legacy_and_explicit_format",
+        "atomic_blob::tests::atomic_blob_fingerprint_sorts_keys_and_refuses_empty_duplicate_or_invalid_input",
+    ));
+    required.extend(cases!("eventlog-file", "lib", "eventlog_file";
+        "journal::tests::atomic_blob_crash_boundaries_recover_only_complete_publication",
+        "journal::tests::atomic_blob_postcommit_cleanup_failure_keeps_committed_content",
+    ));
+    required.extend(cases!("eventlog-file", "test", "adversary_atomic_blob";
+        "file_adversary_cancelled_guard_preserves_existing_content_and_receipt",
+        "file_adversary_equal_length_collision_rolls_back",
+        "file_adversary_rebound_retry_preserves_receipt_and_current_binding",
+    ));
+    required.extend(
+        cases!("eventlog-file", "test", "adversary_strict_inspection";
+            "adversary_file_duplicate_event_identity_is_corruption",
+            "adversary_file_empty_identity_refuses_and_zero_result_caps_allow_absence",
+            "adversary_file_inadmissible_recorded_envelope_is_corruption",
+            "adversary_file_unknown_recorded_envelope_field_is_not_discarded",
+        ),
+    );
+    required.extend(cases!("eventlog-file", "test", "atomic_blob";
+        "file_atomic_blob_cleanup_failure_reports_retained_unbound_artifact",
+        "file_atomic_blob_content_contract",
+        "file_atomic_blob_independent_writers_keep_only_complete_winner",
+        "file_atomic_blob_known_abort_cleans_only_owned_staging",
+        "file_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
+    ));
+    required.extend(cases!("eventlog-file", "test", "strict_inspection";
+        "file_inspection_body_fields_and_zero_schema_are_preserved",
+        "file_inspection_concurrent_append_is_one_observation",
+        "file_inspection_history_preserves_source",
+        "file_inspection_identity_redaction_and_unknown_format",
+        "file_inspection_missing_sources_never_create",
+        "file_inspection_native_lock_is_nonblocking",
+        "file_inspection_recovery_and_corruption_preserve_source",
+    ));
+    required.extend(cases!("eventlog-postgres", "test", "adversary_atomic_blob";
+        "postgres_adversary_cancelled_guard_preserves_existing_content_and_receipt",
+        "postgres_adversary_equal_length_collision_rolls_back",
+        "postgres_adversary_rebound_retry_preserves_receipt_and_current_binding",
+    ));
+    required.extend(cases!("eventlog-postgres", "test", "atomic_blob";
+        "postgres_atomic_blob_content_contract",
+        "postgres_atomic_blob_disjoint_streams_share_reversed_blob_sets",
+        "postgres_atomic_blob_independent_writers_keep_only_complete_winner",
+        "postgres_atomic_blob_lost_commit_response_resolves_without_resurrection",
+        "postgres_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
+        "postgres_atomic_blob_reuse_serializes_standalone_delete",
+    ));
+    required.extend(cases!("eventlog-sqlite", "lib", "eventlog_sqlite";
+        "atomic_group::tests::atomic_blob_native_commit_failure_is_unknown_and_retry_resolves",
+        "inspection::linux::tests::inspection_concurrent_call_cannot_unlock_another_observation",
+        "inspection::linux::tests::inspection_descriptor_exhaustion_never_opens_or_closes_source",
+        "inspection::linux::tests::inspection_ofd_blocks_native_writer_process",
+        "inspection::linux::tests::inspection_ofd_blocks_native_writers_in_process",
+        "inspection::linux::tests::inspection_ofd_detects_replaced_source",
+        "inspection::linux::tests::inspection_refusal_preserves_existing_process_reader_lock",
+        "inspection::linux::tests::inspection_refusal_preserves_existing_process_writer_lock",
+    ));
+    required.extend(cases!("eventlog-sqlite", "test", "adversary_atomic_blob";
+        "sqlite_adversary_equal_length_collision_rolls_back",
+        "sqlite_adversary_rebound_retry_preserves_receipt_and_current_binding",
+    ));
+    required.extend(
+        cases!("eventlog-sqlite", "test", "adversary_strict_inspection";
+            "adversary_sqlite_empty_identity_and_exact_source_cap",
+            "adversary_sqlite_inadmissible_recorded_envelope_is_corruption",
+            "adversary_sqlite_public_descriptor_bound_keeps_prior_writer_lock",
+            "adversary_sqlite_success_preserves_preexisting_reader_lock",
+        ),
+    );
+    required.extend(cases!("eventlog-sqlite", "test", "atomic_blob";
+        "sqlite_atomic_blob_content_contract",
+        "sqlite_atomic_blob_independent_writers_keep_only_complete_winner",
+        "sqlite_atomic_blob_reopen_retry_preserves_erasure_and_receipt",
+    ));
+    required.extend(cases!("eventlog-sqlite", "test", "strict_inspection";
+        "sqlite_inspection_history_preserves_source",
+        "sqlite_inspection_identity_corruption_schema_and_uri",
+        "sqlite_inspection_missing_sources_never_create",
+        "sqlite_inspection_native_writer_refuses_without_changes",
+        "sqlite_inspection_wal_and_journal_refusals_preserve_source",
+    ));
     required
 }

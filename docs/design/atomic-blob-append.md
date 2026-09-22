@@ -1,0 +1,84 @@
+# Atomic blob binding and event append
+
+This additive provider capability serves O2 and O6. It satisfies the existing
+RFC 0020 payload boundary while publishing metadata/events and their retained
+content in one native transaction. File, SQLite and PostgreSQL implement this
+capability. The implementation and independent review reports in
+`.engineering/reviews/atomic-content-implementation.md` and
+`.engineering/reviews/atomic-content-adversary.md` record the native provider
+exercises and their measured limits. The inspected scope is
+`.engineering/waves/atomic-content-scope.md`; source admission additionally
+requires the production, comparative and restart checks below.
+
+## Public port
+
+Add BlobWrite { digest: String, bytes: Vec<u8> } and
+BlobAppendGroup { group: AppendGroup, blobs: Vec<BlobWrite> }.
+AtomicBlobEventStore extends AtomicEventStore with append_group_with_blobs and
+append_group_with_blobs_guarded, returning the existing AppendGroupResult.
+There is no independent-put fallback or new required method on an existing trait.
+
+The group tenant contains every blob binding and append. Require a nonempty
+valid append group and at least one blob. Existing blob-key and event/metadata
+validation applies. Duplicate blob keys refuse even with equal bytes. Blob order
+does not change semantics: sort by digest for fingerprint and binding. Preserve
+the append group's entry order and repeated-stream behavior.
+
+The new fingerprint is domain version eventlog-blob-append-group/1, binding the
+unchanged legacy group fingerprint plus sorted digest, checked byte length and
+SHA-256 of actual bytes for each blob. A caller's digest/request_hash alone
+cannot certify equal request content. Reuse the existing group receipt namespace.
+New versus legacy use of one key conflicts; freeze legacy fingerprint vectors.
+No DDL change or new File journal operation is required.
+
+## Transaction and retry semantics
+
+Validate the whole request, then enter the provider's native transaction.
+Look up the durable group receipt before binding bytes or invoking callbacks.
+An exact retry returns original event IDs, positions and ranges as deduplicated.
+It repeats neither admission nor projection and does not recreate a blob erased
+after the original success. A changed request under that identity refuses.
+
+For a new request compare preexisting bindings against actual bytes. Equal bytes
+may be reused; differing bytes refuse. Install tentative blob bindings before
+admission and inline projectors so their tenant-confined get_blob sees the new
+content. Guard failure, stream conflict, projector failure and later-entry failure
+roll back both bindings and events. Existing external bindings are never deleted
+as error cleanup. Missing/redacted bytes on a retry do not authorize resurrection.
+
+SQLite uses its existing blob table in the same BEGIN IMMEDIATE as events and
+group receipt. A failed response after COMMIT begins is conservatively
+UnknownCommit for the new capability; resolve through its original request key.
+
+File writes uniquely named staged physical content and fsyncs it before one
+journal transaction containing existing Blob, Event and Group operations.
+The committed binding is the public visibility boundary. Known prepublication
+failure may remove only this request's unique unbound staging objects; cleanup
+failure is an explicit retained unbound artifact. A crash/unknown commit does not
+authorize deleting potentially committed bytes. Existing journal recovery first
+establishes the manifest state; ordinary cleanup can later collect proven unbound
+objects. This promises no losing public binding, not zero physical I/O before a
+crash. Reuse the provider's native lock, journal, privacy and integrity machinery.
+
+PostgreSQL implements the same applicable contract under its publication gate
+and existing tenant/group/stream ordering, with sorted blob-key locking. Native
+unique conflicts and SELECT FOR UPDATE compare existing bytes while preserving
+standalone put/delete correctness. Keep cancellation quarantine, exact receipt
+resolution and UnknownCommit semantics. No product-specific backend omission.
+
+## Verification and delivery
+
+Shared conformance runs through File, SQLite and PostgreSQL. Cover exact reopen
+retry, real changed bytes under a reused caller digest, existing equal/different
+content, empty/duplicate/cross-tenant requests, guard/projector/later-stream
+rollback, tentative callback reads, legacy/new identity conflicts and retry
+after authorized erasure. Independently inspect raw blob bindings as well as
+event streams. Concurrent writers and native crash/unknown-commit cases prove
+one complete result or named refusal without deleting another writer's content.
+
+Keep existing tests and legacy persisted formats. Add exact new case names to
+the production-proof roster. All source checks, independent review, mutation
+evidence, PostgreSQL verified-TLS/hosted-role production and comparative/restart
+proof precede publication. Consumers update all dependency selectors and locks
+to the exact published required-checks-green commit together; no tag is required
+for that immutable Git adoption.

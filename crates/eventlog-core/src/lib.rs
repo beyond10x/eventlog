@@ -12,10 +12,12 @@
 
 mod admission;
 mod aggregate;
+mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod blob_integrity;
 mod capture;
 mod inline_admin;
+pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
 mod projection;
 
 pub use capture::{
@@ -37,6 +39,8 @@ pub use projection::{
     ProjectionStore, Projector, indexed_value, validate_identifier,
 };
 
+mod atomic_blob;
+pub use atomic_blob::{AtomicBlobEventStore, BlobAppendGroup, BlobWrite};
 mod atomic_group;
 pub use atomic_group::{
     AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend, UNAVAILABLE,

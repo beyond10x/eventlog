@@ -1,5 +1,5 @@
 //! Durable JSONL framing. The manifest is the commit point, never a best-effort cache.
-use eventlog_core::{CaptureError, CaptureMaterial, EventLogError, new_event_id};
+use eventlog_core::{CaptureError, CaptureMaterial, EventLogError, InspectionError, new_event_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -14,12 +14,19 @@ const ZERO: &str = "000000000000000000000000000000000000000000000000000000000000
 
 #[cfg(test)]
 pub(crate) fn checkpoint(name: &str) {
+    if name == "append-committed"
+        && std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some()
+    {
+        let root = std::env::var_os("EVENTLOG_FILE_CRASH_ROOT").expect("test-owned store");
+        fs::create_dir(Path::new(&root).join("blobs/00000000-0000-0000-0000-000000000000"))
+            .expect("inject a native post-commit cleanup error");
+    }
     if std::env::var("EVENTLOG_FILE_CRASH_AT").as_deref() == Ok(name) {
         std::process::exit(73);
     }
 }
 #[cfg(not(test))]
-fn checkpoint(_: &str) {}
+pub(crate) fn checkpoint(_: &str) {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +101,102 @@ impl Content {
     fn digest(&self) -> String {
         format!("{:x}", self.0.clone().finalize())
     }
+}
+
+/// Retains the native lock while the caller folds and examines this observation.
+pub(crate) struct InspectedJournal {
+    _lock: File,
+    pub transactions: Vec<Value>,
+}
+
+/// Source bytes count the manifest and journal, the only files decoded here.
+pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal, InspectionError> {
+    // The one predicate, not a second copy of the decision: an inspection that read a link as a
+    // store is the same defect the write paths already refuse.
+    if !physical_directory(root).map_err(inspection_io)? {
+        return Err(InspectionError::UnsupportedSource);
+    }
+    let root_metadata = fs::symlink_metadata(root).map_err(inspection_io)?;
+    let lock = inspection_file(&root.join("writer.lock"))?;
+    lock.try_lock().map_err(|_| InspectionError::SourceBusy)?;
+    for name in ["append.json", "privacy.json"] {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(_) => return Err(InspectionError::RecoveryRequired),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(inspection_io(error)),
+        }
+    }
+    let manifest_file = inspection_file(&root.join("manifest.json"))?;
+    let events_file = inspection_file(&root.join("events.jsonl"))?;
+    let manifest_len = manifest_file.metadata().map_err(inspection_io)?.len();
+    let events_len = events_file.metadata().map_err(inspection_io)?.len();
+    if manifest_len
+        .checked_add(events_len)
+        .ok_or(InspectionError::LimitExceeded)?
+        > source_bytes
+    {
+        return Err(InspectionError::LimitExceeded);
+    }
+    let manifest: Manifest = serde_json::from_slice(&inspection_read(manifest_file, manifest_len)?)
+        .map_err(|_| InspectionError::CorruptSource)?;
+    if manifest.format != FORMAT {
+        return Err(InspectionError::UnsupportedSource);
+    }
+    if manifest.store.is_empty() || manifest.length != events_len {
+        return Err(InspectionError::CorruptSource);
+    }
+    let transactions = decode(&inspection_read(events_file, events_len)?, &manifest)
+        .map_err(|_| InspectionError::CorruptSource)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let after = fs::symlink_metadata(root).map_err(|_| InspectionError::SourceChanged)?;
+        let after_lock = fs::symlink_metadata(root.join("writer.lock"))
+            .map_err(|_| InspectionError::SourceChanged)?;
+        let locked = lock.metadata().map_err(inspection_io)?;
+        if (after.dev(), after.ino()) != (root_metadata.dev(), root_metadata.ino())
+            || (after_lock.dev(), after_lock.ino()) != (locked.dev(), locked.ino())
+        {
+            return Err(InspectionError::SourceChanged);
+        }
+    }
+    Ok(InspectedJournal {
+        _lock: lock,
+        transactions,
+    })
+}
+
+fn inspection_io(error: std::io::Error) -> InspectionError {
+    let kind = error.kind();
+    // This boundary consumes the original diagnostic; retained paths never enter errors.
+    drop(error);
+    if kind == std::io::ErrorKind::NotFound {
+        InspectionError::MissingSource
+    } else {
+        InspectionError::SourceBusy
+    }
+}
+
+fn inspection_file(path: &Path) -> Result<File, InspectionError> {
+    if !fs::symlink_metadata(path).map_err(inspection_io)?.is_file() {
+        return Err(InspectionError::UnsupportedSource);
+    }
+    File::open(path).map_err(inspection_io)
+}
+
+fn inspection_read(file: File, length: u64) -> Result<Vec<u8>, InspectionError> {
+    let mut bytes = Vec::new();
+    file.take(
+        length
+            .checked_add(1)
+            .ok_or(InspectionError::LimitExceeded)?,
+    )
+    .read_to_end(&mut bytes)
+    .map_err(inspection_io)?;
+    if u64::try_from(bytes.len()).map_err(|_| InspectionError::LimitExceeded)? != length {
+        return Err(InspectionError::SourceChanged);
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn backend(error: impl std::fmt::Display) -> EventLogError {
@@ -928,6 +1031,24 @@ mod tests {
         let Ok(root) = std::env::var("EVENTLOG_FILE_CRASH_ROOT") else {
             return;
         };
+        if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB").is_some() {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let store = crate::FileEventStore::open(&root).await.unwrap();
+                let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
+                let result =
+                    eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+                        .await;
+                if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
+                    assert_eq!(result, Err(EventLogError::UnknownCommit));
+                } else {
+                    result.unwrap();
+                }
+            });
+            if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
+                return;
+            }
+            panic!("atomic blob failpoint was not reached");
+        }
         if std::env::var_os("EVENTLOG_FILE_PROVIDER_PRIVACY").is_some() {
             use eventlog_core::EventStore;
             tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -964,6 +1085,117 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn atomic_blob_crash_boundaries_recover_only_complete_publication() {
+        use eventlog_core::EventStore;
+        for point in [
+            "blob-staged",
+            "append-prepared",
+            "append-torn",
+            "append-synced",
+            "append-committed",
+            "blob-cleaned",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            drop(crate::FileEventStore::open(root.path()).await.unwrap());
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "journal::tests::crash_child", "--nocapture"])
+                .env("EVENTLOG_FILE_CRASH_ROOT", root.path())
+                .env("EVENTLOG_FILE_CRASH_AT", point)
+                .env("EVENTLOG_FILE_ATOMIC_BLOB", "1")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{point}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
+            let store = crate::FileEventStore::open(root.path()).await.unwrap();
+            let committed = matches!(point, "append-committed" | "blob-cleaned");
+            let events = store
+                .read_stream(&request.group.appends[0].stream, 0, 100)
+                .await
+                .unwrap()
+                .events;
+            assert_eq!(events.len(), usize::from(committed), "{point}");
+            assert_eq!(
+                store
+                    .get_blob(&request.group.tenant, "content")
+                    .await
+                    .unwrap(),
+                committed.then(|| request.blobs[0].bytes.clone()),
+                "{point}"
+            );
+            assert_eq!(
+                fs::read_dir(root.path().join("blobs")).unwrap().count(),
+                usize::from(committed),
+                "unbound crash staging reclaimed at {point}"
+            );
+            let resolved =
+                eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+                    .await
+                    .unwrap();
+            assert_eq!(resolved.deduplicated, committed);
+            if committed {
+                assert_eq!(resolved.appends[0].events, events);
+            }
+            assert_eq!(
+                store
+                    .stream_version(&request.group.appends[0].stream)
+                    .await
+                    .unwrap(),
+                Some(1)
+            );
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn atomic_blob_postcommit_cleanup_failure_keeps_committed_content() {
+        use eventlog_core::EventStore;
+        let root = tempfile::tempdir().unwrap();
+        drop(crate::FileEventStore::open(root.path()).await.unwrap());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "journal::tests::crash_child", "--nocapture"])
+            .env("EVENTLOG_FILE_CRASH_ROOT", root.path())
+            .env("EVENTLOG_FILE_ATOMIC_BLOB", "1")
+            .env("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // Remove only the obstruction deliberately injected above, then recover normally.
+        fs::remove_dir(
+            root.path()
+                .join("blobs/00000000-0000-0000-0000-000000000000"),
+        )
+        .unwrap();
+        let store = crate::FileEventStore::open(root.path()).await.unwrap();
+        let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
+        let events = store
+            .read_stream(&request.group.appends[0].stream, 0, 10)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            store
+                .get_blob(&request.group.tenant, "content")
+                .await
+                .unwrap(),
+            Some(request.blobs[0].bytes.clone())
+        );
+        let result = eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
+            .await
+            .unwrap();
+        assert!(result.deduplicated);
+        assert_eq!(result.appends[0].events, events);
+    }
+
     #[test]
     fn process_death_at_each_append_boundary() {
         for point in [

@@ -1,0 +1,21 @@
+domain: eventlog.atomic_content
+# Value-only contract for the additive atomic content capability. Native provider
+# exercises cover its values. AppendGroup and AppendGroupResult keep their existing
+# Rust contracts; this document does not claim to redefine their wire formats.
+types:
+  - name: eventlog.atomic_content.BlobWrite
+    kind: struct
+    fields:
+      - name: digest
+        type: String
+      - name: bytes
+        type: Bytes
+  - name: eventlog.atomic_content.BlobFingerprintEntry
+    kind: struct
+    fields:
+      - name: digest
+        type: String
+      - name: byte_count
+        type: Integer
+      - name: content_sha256
+        type: String

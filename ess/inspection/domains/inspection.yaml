@@ -1,0 +1,45 @@
+domain: eventlog.inspection
+# Value-only coordinates for the additive read capability. Runtime projection
+# agreement remains unexecuted until the strict-inspection implementation tests.
+types:
+  - name: eventlog.inspection.InspectionLimits
+    kind: struct
+    fields:
+      - name: source_bytes
+        type: Integer
+      - name: events
+        type: Integer
+      - name: envelope_bytes
+        type: Integer
+  - name: eventlog.inspection.Refusal
+    kind: enum
+    variants:
+      - MissingSource
+      - UnsupportedSource
+      - RecoveryRequired
+      - CorruptSource
+      - RedactedHistory
+      - SourceBusy
+      - SourceChanged
+      - LimitExceeded
+  - name: eventlog.inspection.EventCoordinate
+    kind: struct
+    fields:
+      - name: global_seq
+        type: Integer
+      - name: tenant
+        type: String
+      - name: stream_type
+        type: String
+      - name: stream_id
+        type: String
+      - name: version
+        type: Integer
+      - name: event_id
+        type: String
+      - name: name
+        type: String
+      - name: schema_version
+        type: Integer
+# EventCoordinate is explicitly a projection. RecordedEvent retains its existing
+# full attribution, timestamps, request fields and typed Rust JSON payload.
