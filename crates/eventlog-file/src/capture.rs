@@ -17,8 +17,8 @@ use eventlog_core::{
     BoundBlobs, BoxFuture, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial,
     CapturedBlob, CapturedProjection, ConsistentTenantCapture, DeferredBlob, DeferredTenantCapture,
     EventLogError, ProjectionCaptureRefusal, ProjectionSpec, RecordedEvent, TenantCapture,
-    TenantId, order_blobs, order_deferred_blobs, order_rows, validate_capture_request,
-    validate_captured_digest, validate_captured_order,
+    TenantId, order_blobs, order_rows, validate_capture_request, validate_captured_digest,
+    validate_captured_order,
 };
 use tokio::sync::Mutex;
 
@@ -499,11 +499,10 @@ fn observe_deferred(
         root: root.to_owned(),
         objects,
     });
-    let mut blobs: Vec<DeferredBlob> = digests
+    let blobs: Vec<DeferredBlob> = digests
         .into_iter()
         .map(|digest| DeferredBlob::deferred(digest, Arc::clone(&source)))
         .collect();
-    order_deferred_blobs(&mut blobs)?;
 
     let captured = observed_projections(state, tenant, admitted, &mut budget)?;
     Ok(DeferredTenantCapture {
@@ -556,8 +555,8 @@ impl BoundBlobs for BoundObjects {
 /// two ways is how the answer drifts.
 fn bound_length(root: &Path, blob: &Blob) -> Result<u64, CaptureError> {
     crate::validate_object(&blob.id).map_err(|_| corrupt())?;
-    let metadata = std::fs::symlink_metadata(root.join("blobs").join(&blob.id))
-        .map_err(|error| material(&error))?;
+    let path = root.join("blobs").join(&blob.id);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| material(&path, &error))?;
     if !metadata.is_file() {
         return Err(corrupt());
     }
@@ -603,32 +602,53 @@ fn corrupt() -> CaptureError {
 
 /// Which refusal one filesystem error about a bound object is.
 ///
-/// **`NotFound` is the only kind that says anything about the stored material**: the object the
-/// committed record names is not there, which is the "the stored object is gone" half of
-/// [`BoundBlobs::read`]'s contract. Everything else the operating system reports — a permission
-/// change, an exhausted descriptor table, an `EIO` from the device — is a fact about this attempt
-/// and not about the store. Answering those with [`CaptureError::Corrupt`] tells a consumer that
-/// stored material failed its integrity check, and `CaptureMaterial`'s own documentation says the
-/// variant is the whole diagnostic, so there is nothing else for that consumer to read: it cannot
-/// tell a store it must stop trusting from one it should simply retry.
+/// **The question is not which `ErrorKind` this is. It is the one
+/// [`BoundBlobs::read`]'s contract asks: is the stored material gone, or did this attempt fail?**
+/// Correction round 1 answered it with `ErrorKind` alone, on the reasoning that `NotFound` is the
+/// only kind that says anything about the stored material. That is true of one object and false
+/// of the path above it, and **one errno answers wrongly on each side of it**:
+///
+/// - `ENOENT` on an object whose directory is still there is the object being **gone** — the
+///   record names material this store no longer has, which is exactly what `Corrupt` is for.
+/// - `ENOENT` on an object whose directory is *also* gone says nothing about that object. The
+///   store was moved, unmounted or swept out from under a reader that holds a path and no handle,
+///   no lock and no manifest — and every byte of it may be intact somewhere else, which is what
+///   makes this the operational refusal a consumer retries rather than the one it stops trusting
+///   a store over.
+/// - `ENOTDIR` is **gone** however it reads: a path component that is not a directory fails every
+///   read of every object under it, identically, forever. There is nothing there to retry for.
 ///
 /// **This only became reachable when the read moved.** The eager capture read every object inside
 /// the strict read, under the writers' lock, microseconds after the `stat` that admitted it — a
-/// window in which essentially nothing but real damage happens. A [`DeferredBlob`] is read
-/// whenever its holder gets round to it, outside every boundary this provider owns, which is
-/// exactly where `EACCES`, `EMFILE` and `EIO` land. The read was moved and the taxonomy had to
-/// follow it.
+/// window in which the store cannot be moved out from under it and essentially nothing but real
+/// damage happens. A [`DeferredBlob`] is read whenever its holder gets round to it, outside every
+/// boundary this provider owns, and it is the first thing in this crate that can outlive the
+/// store it reads. The read was moved and the taxonomy has had to follow it twice.
+///
+/// The refusal carries the `ErrorKind` and nothing else — no root, no object id, no tenant, no
+/// digest, no byte of content — because `CaptureMaterial`'s own documentation is that the variant
+/// is the whole diagnostic, and a refusal a consumer may log must not be the thing that leaks the
+/// store.
 ///
 /// One function, because it is one rule: every filesystem error on the capture path comes through
 /// here, so there is no second site at which to apply it differently.
-fn material(error: &std::io::Error) -> CaptureError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return corrupt();
+fn material(path: &Path, error: &std::io::Error) -> CaptureError {
+    match error.kind() {
+        // Gone, and the directory that would hold it is there to say so.
+        std::io::ErrorKind::NotFound
+            if path
+                .parent()
+                .is_some_and(|parent| std::fs::symlink_metadata(parent).is_ok()) =>
+        {
+            corrupt()
+        }
+        // Permanently unreachable under a component that is not a directory: also gone.
+        std::io::ErrorKind::NotADirectory => corrupt(),
+        // Everything else, including an `ENOENT` that is really about the path above the object.
+        kind => CaptureError::Store(EventLogError::Backend(format!(
+            "bound object could not be read: {kind:?}"
+        ))),
     }
-    CaptureError::Store(EventLogError::Backend(format!(
-        "bound object could not be read: {:?}",
-        error.kind()
-    )))
 }
 
 /// The existing complete-content check: admitted object name, regular file, exact stored hash.
@@ -644,12 +664,12 @@ fn read_blob(root: &Path, blob: &Blob) -> Result<Vec<u8>, CaptureError> {
     crate::validate_object(&blob.id).map_err(|_| corrupt())?;
     let path = root.join("blobs").join(&blob.id);
     if !std::fs::symlink_metadata(&path)
-        .map_err(|error| material(&error))?
+        .map_err(|error| material(&path, &error))?
         .is_file()
     {
         return Err(corrupt());
     }
-    let bytes = std::fs::read(&path).map_err(|error| material(&error))?;
+    let bytes = std::fs::read(&path).map_err(|error| material(&path, &error))?;
     crate::verified(root, &bytes, &blob.hash).ok_or_else(corrupt)?;
     Ok(bytes)
 }

@@ -294,10 +294,12 @@ pub trait ConsistentTenantCapture: Send + Sync + 'static {
 
     /// The same observation, handing blob content out through a reader rather than by value.
     ///
-    /// Every refusal, every cap and every ordering is [`Self::capture_tenant`]'s. What differs is
-    /// *when* the content behind a binding is read, and therefore what an observation costs a
-    /// caller that never looks at one: a provider whose committed records already name what each
-    /// binding's content must hash to can answer this without opening an object at all.
+    /// Every cap and every ordering is [`Self::capture_tenant`]'s, and so is every refusal this
+    /// still decides. What differs is *when* the content behind a binding is read, and therefore
+    /// what an observation costs a caller that never looks at one: a provider whose committed
+    /// records already name what each binding's content must hash to can answer this without
+    /// opening an object at all. **A refusal only that read could have produced moves with it**,
+    /// to [`DeferredBlob::bytes`], and is therefore not one this returns.
     ///
     /// The default answers it from [`Self::capture_tenant`], which reads every object, so a
     /// provider with no cheaper source of the digests neither gains nor loses anything and every
@@ -305,8 +307,24 @@ pub trait ConsistentTenantCapture: Send + Sync + 'static {
     /// the same capture with the reads moved to the reader.
     ///
     /// # Errors
-    /// Exactly what [`Self::capture_tenant`] returns, except that stored content which fails its
-    /// integrity check is refused by [`DeferredBlob::bytes`] rather than here.
+    /// Exactly what [`Self::capture_tenant`] returns, except for **every refusal that reading a
+    /// binding's content produces** — whichever refusal that is — which [`DeferredBlob::bytes`]
+    /// gives on the read that hands the content out rather than this giving it here.
+    ///
+    /// The exception used to name one class, "stored content which fails its integrity check",
+    /// and that was a mistake this crate could not see while a failed read and damaged content
+    /// were the same verdict. They are not: an object that cannot be opened is
+    /// [`CaptureError::Store`], an operational failure, and expressly not an integrity check
+    /// failure. The exception is about **which read** produced a refusal, not about which refusal
+    /// the read produced, and naming one verdict inside it said that an observation which never
+    /// performs the read must somehow still produce the other verdicts of it.
+    ///
+    /// The cost of the exception is therefore stated plainly rather than narrowed until it looks
+    /// small: **a deferred capture can succeed where [`Self::capture_tenant`] refuses**, because
+    /// the refusal is waiting on a read the caller has not asked for yet. It is the same fact as
+    /// the one [`DeferredTenantCapture`] already states — bindings are decided under the
+    /// provider's boundary, content afterwards — and a caller that wants the eager answer has
+    /// [`DeferredTenantCapture::load`], which is that answer.
     fn capture_tenant_deferred<'a>(
         &'a self,
         tenant: &'a TenantId,
@@ -886,11 +904,16 @@ mod tests {
     /// `order_deferred_blobs` orders and de-duplicates, which nothing else here can observe.
     ///
     /// The sibling case below passes `order_blobs` an out-of-order pair, so deleting the `sort_by`
-    /// inside the rule both share goes red. Nothing passed `order_deferred_blobs` anything: the
-    /// one provider that calls it takes its bindings from a `BTreeMap`, which already yields
-    /// bytewise order, so the call could be replaced by `Ok(())` and the whole suite would stay
-    /// green. The entry point is new even though the no-op is not, and this is the input that
-    /// makes the call load-bearing.
+    /// inside the rule both share goes red; nothing passed `order_deferred_blobs` anything, and
+    /// this is that input.
+    ///
+    /// **It pins the function and says nothing about any call site**, which is worth stating
+    /// because the opposite was claimed once and was false. No provider calls this today: the
+    /// file provider did, and its call was deleted after review pass 2 measured that removing it
+    /// left the suite green — its bindings come from a `BTreeMap` keyed by `(tenant, digest)`, so
+    /// neither the sort nor the dedup had a reachable input and no case could have been written
+    /// to give it one. This exists for a provider that builds its bindings in some other order,
+    /// and for that provider it is the rule.
     #[test]
     fn a_deferred_captures_bindings_are_ordered_and_never_repeat_a_coordinate() {
         let mut blobs = vec![
