@@ -105,9 +105,9 @@ Common-check receipts never replace the persistence proof below. Rust caching an
 superseded PR proof runs are independent cost improvements; expensive repository-specific proof
 reuse is deferred.
 
-The PostgreSQL exercise runs only when `EVENTLOG_TEST_POSTGRES_URL` is set, and **reports itself as
-not run rather than passing quietly** when it is not. A gate that skipped a backend has not proved
-that backend. The required `bash scripts/gate.sh --production-proof` mode also requires the
+Set `EVENTLOG_TEST_POSTGRES_URL` to a disposable fixture for the full gate. Some PostgreSQL
+tests refuse a missing URL while others report that they did not run. A skipped backend has not
+been proved. The required `bash scripts/gate.sh --production-proof` mode also requires the
 hosted-role URL and test CA, rejects every selected-zero/ignored/skipped lane, and records exact
 runner output and counts. The Persistence proof CI job runs this mode against PostgreSQL 17.6
 with verified TLS. Comparative capacity and restart receipts remain separate evidence; neither
