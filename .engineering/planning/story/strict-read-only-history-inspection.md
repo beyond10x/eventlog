@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:strict-read-only-history-inspection
 kind: story
-status: active
+status: implemented
 title: Inspect File and SQLite history without changing source storage
 scope:
 - confidence: cited
@@ -43,7 +43,7 @@ scope:
   path: ess/inspection/domains/inspection.yaml
 - confidence: cited
   path: ess/inspection/system.yaml
-revision: 18
+revision: 20
 ---
 ## Outcome
 
@@ -261,3 +261,24 @@ Stable Rust was updated before publication and reported unchanged.
 Required remote common checks, comparative capacity and restart proof remain
 pending on the exact candidate. This record does not claim main publication,
 consumer adoption, capacity admission, store migration or project completion.
+
+## Published source verification
+
+The bot integrated the exact checked source at
+d90637b2fe2bbb33c9b395b0367cab8fbb80286d through
+https://github.com/beyond10x/eventlog/pull/10; the primary checkout is synchronized.
+Required source CI ran the real PostgreSQL production, comparative and restart
+proof alongside the shared security/privacy check. The downloaded proof identifies
+the synthetic PR merge; every candidate source-manifest byte was independently
+compared to the integrated source. No candidate source was dirty.
+
+The production proof reports the results appended below. The comparative report
+declares laboratory validity and retains the paired configurations and restart
+observations. It does not admit production deployment capacity. The CI proof and
+source-byte comparison are retained in the completion run's inspection scratch.
+
+This completes the bounded history inspection API. It does not establish a
+complete store backup, blob extraction, history verification, migration or EKR
+consumer adoption. The consumer will pin this source together with the subsequent
+atomic blob publication capability through its own coordinated manifest and lock.
+CI production result: 156 passed, 0 failed, 0 skipped; conformance_valid=true. Missing required cases: 0. Source: d512109dc2c651614cdc74a2b5fc17fc5817c50e.
