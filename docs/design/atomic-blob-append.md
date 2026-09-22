@@ -2,9 +2,13 @@
 
 This additive provider capability serves O2 and O6. It satisfies the existing
 RFC 0020 payload boundary while publishing metadata/events and their retained
-content in one native transaction. Implementation and conformance agreement are
-unexecuted. The detailed inspected scope is
-../../.engineering/waves/atomic-content-scope.md.
+content in one native transaction. File, SQLite and PostgreSQL implement this
+capability. The implementation and independent review reports in
+`.engineering/reviews/atomic-content-implementation.md` and
+`.engineering/reviews/atomic-content-adversary.md` record the native provider
+exercises and their measured limits. The inspected scope is
+`.engineering/waves/atomic-content-scope.md`; source admission additionally
+requires the production, comparative and restart checks below.
 
 ## Public port
 

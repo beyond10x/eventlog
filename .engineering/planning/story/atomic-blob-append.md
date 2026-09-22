@@ -5,14 +5,12 @@ kind: story
 status: active
 title: Commit blob bindings and ordered event appends atomically
 scope:
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-conformance/src/atomic_blob.rs
 - confidence: cited
   path: crates/eventlog-conformance/src/lib.rs
-- confidence: inferred
-  path: crates/eventlog-core/src/atomic_blob.rs
 - confidence: cited
-  path: crates/eventlog-core/src/atomic_group.rs
+  path: crates/eventlog-core/src/atomic_blob.rs
 - confidence: cited
   path: crates/eventlog-core/src/lib.rs
 - confidence: cited
@@ -20,38 +18,39 @@ scope:
 - confidence: cited
   path: crates/eventlog-file/src/lib.rs
 - confidence: cited
-  path: crates/eventlog-file/src/state.rs
-- confidence: inferred
   path: crates/eventlog-file/tests/adversary_atomic_blob.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-file/tests/atomic_blob.rs
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
 - confidence: cited
   path: crates/eventlog-postgres/src/atomic_group.rs
 - confidence: cited
-  path: crates/eventlog-postgres/src/lib.rs
-- confidence: inferred
   path: crates/eventlog-postgres/tests/adversary_atomic_blob.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-postgres/tests/atomic_blob.rs
 - confidence: cited
   path: crates/eventlog-sqlite/src/atomic_group.rs
 - confidence: cited
-  path: crates/eventlog-sqlite/src/lib.rs
-- confidence: inferred
   path: crates/eventlog-sqlite/tests/adversary_atomic_blob.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-sqlite/tests/atomic_blob.rs
-revision: 23
+- confidence: cited
+  path: docs/design/atomic-blob-append.md
+- confidence: cited
+  path: ess/atomic-content/domains/atomic-content.yaml
+revision: 27
 ---
 # Atomic blob binding and event append
 
 This additive provider capability serves O2 and O6. It satisfies the existing
 RFC 0020 payload boundary while publishing metadata/events and their retained
-content in one native transaction. Implementation and conformance agreement are
-unexecuted. The detailed inspected scope is
-../../.engineering/waves/atomic-content-scope.md.
+content in one native transaction. File, SQLite and PostgreSQL implementations
+and native provider exercises are integrated at 7e442bb. The required local
+production run executed 184 passed, zero failed and zero skipped against
+PostgreSQL 17.6, with no missing required cases. Exact-source CI, comparative
+and restart admission remain pending. Detailed inspected scope and retained
+review reports record the limits of these measurements.
 
 ## Public port
 
@@ -60,6 +59,19 @@ BlobAppendGroup { group: AppendGroup, blobs: Vec<BlobWrite> }.
 AtomicBlobEventStore extends AtomicEventStore with append_group_with_blobs and
 append_group_with_blobs_guarded, returning the existing AppendGroupResult.
 There is no independent-put fallback or new required method on an existing trait.
+
+## Scope
+
+The implementation report confirms all twelve authored Rust files; the
+independent report adds three provider test files. Every formerly inferred new
+file now exists in source commit 5d3f5fa and is recorded as cited. The coordinator
+owns the production roster additions, ESS byte_count correction and normative
+status update. Inspection found that the existing core atomic_group module,
+File state module and PostgreSQL/SQLite lib modules need no change; their
+opening scope entries are removed rather than claimed as landed work.
+
+The relevant exact paths remain machine-readable in this artifact's scope.
+Source inspection, not an estimate of work, is the basis for this reconciliation.
 
 The group tenant contains every blob binding and append. Require a nonempty
 valid append group and at least one blob. Existing blob-key and event/metadata
@@ -140,3 +152,23 @@ The new opt-in capability covers File, SQLite and PostgreSQL with receipt-first
 retry, tentative callback visibility, rollback, native contention and explicit
 unknown outcomes. Original inspection source/cases remain unchanged. Independent
 review and required source comparative/restart CI precede consumer adoption.
+
+## Independent review and integration
+
+The independent review is retained verbatim in
+review-result:atomic-content-adversary and
+.engineering/reviews/atomic-content-adversary.md. It reports eight new cases
+and a same-command workspace result of 184 passed, zero failed, zero ignored.
+All twelve implementation hashes were unchanged by the reviewer.
+
+Coordinator integration added all eight case names to the required production
+roster. A coordinator mutation replaced SQLite existing-binding byte equality
+with length equality. The independent equal-length collision case executed
+and failed at its refusal assertion (exit 101, one failed case). Exact source
+restoration was verified against the implementation SHA-256 manifest.
+
+The source unit is 5d3f5fa and its integration merge is 7e442bb. The inferred new
+module and test paths are now cited from those committed files. Source admission
+still requires the final integration production gate and exact-source CI with
+comparative and restart receipts. This paragraph does not claim those pending
+checks or authorize a deployment capacity.

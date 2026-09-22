@@ -1,6 +1,6 @@
 domain: eventlog.atomic_content
-# Value-only contract for the additive atomic content capability. Runtime
-# agreement is unexecuted. AppendGroup and AppendGroupResult keep their existing
+# Value-only contract for the additive atomic content capability. Native provider
+# exercises cover its values. AppendGroup and AppendGroupResult keep their existing
 # Rust contracts; this document does not claim to redefine their wire formats.
 types:
   - name: eventlog.atomic_content.BlobWrite
