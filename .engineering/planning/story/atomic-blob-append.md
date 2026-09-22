@@ -22,6 +22,8 @@ scope:
 - confidence: cited
   path: crates/eventlog-file/src/state.rs
 - confidence: inferred
+  path: crates/eventlog-file/tests/adversary_atomic_blob.rs
+- confidence: inferred
   path: crates/eventlog-file/tests/atomic_blob.rs
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
@@ -30,14 +32,18 @@ scope:
 - confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
 - confidence: inferred
+  path: crates/eventlog-postgres/tests/adversary_atomic_blob.rs
+- confidence: inferred
   path: crates/eventlog-postgres/tests/atomic_blob.rs
 - confidence: cited
   path: crates/eventlog-sqlite/src/atomic_group.rs
 - confidence: cited
   path: crates/eventlog-sqlite/src/lib.rs
 - confidence: inferred
+  path: crates/eventlog-sqlite/tests/adversary_atomic_blob.rs
+- confidence: inferred
   path: crates/eventlog-sqlite/tests/atomic_blob.rs
-revision: 19
+revision: 23
 ---
 # Atomic blob binding and event append
 
@@ -119,3 +125,18 @@ evidence, PostgreSQL verified-TLS/hosted-role production and comparative/restart
 proof precede publication. Consumers update all dependency selectors and locks
 to the exact published required-checks-green commit together; no tag is required
 for that immutable Git adoption.
+
+## Implementation handback
+
+The implementor's stable source report is
+.engineering/reviews/atomic-content-implementation.md. It reports the same-command
+whole suite rising from 156 to 176 passed, with no failures or ignored cases,
+and the required real PostgreSQL production gate passing. Its restored mutation
+sweep caught every recorded mutation behaviorally; development test/harness misses
+remain disclosed in the report. These are unit results, not independent approval.
+
+The source preserves existing fingerprints, native schema and File operations.
+The new opt-in capability covers File, SQLite and PostgreSQL with receipt-first
+retry, tentative callback visibility, rollback, native contention and explicit
+unknown outcomes. Original inspection source/cases remain unchanged. Independent
+review and required source comparative/restart CI precede consumer adoption.
