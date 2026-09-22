@@ -23,6 +23,8 @@ pub use projection::{
     ProjectionStore, Projector, indexed_value, validate_identifier,
 };
 
+mod atomic_blob;
+pub use atomic_blob::{AtomicBlobEventStore, BlobAppendGroup, BlobWrite};
 mod atomic_group;
 pub use atomic_group::{
     AppendGroup, AppendGroupResult, AtomicEventStore, GroupRange, StreamAppend,
