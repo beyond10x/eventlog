@@ -4,7 +4,7 @@ Rust libraries for durable event streams and rebuildable application state. Appe
 command receipts, and derive projections from committed history. The host supplies domain rules,
 authentication and trusted tenant identity.
 
-[Project guide](https://beyond10x.github.io/eventlog/) · [Quickstart](website/docs/quickstart.md)
+[Project guide](website/docs/intro.md) · [Quickstart](website/docs/quickstart.md)
 
 ## Where it sits
 
