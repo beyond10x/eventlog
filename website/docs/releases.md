@@ -17,3 +17,9 @@ Read the [authoritative 0.3.0 release notes](https://github.com/beyond10x/eventl
 for exact changes and the File method-name collision. The
 [full changelog](https://github.com/beyond10x/eventlog/blob/0.3.0/CHANGELOG.md)
 retains earlier releases as history.
+
+## After 0.3.0
+
+An unreleased SQLite correction validates existing blob integrity metadata before reuse in a
+fresh atomic group. See the [provider limitation](providers.md#sqlite) and its linked source
+commit. This documentation update does not cut a new software release.

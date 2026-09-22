@@ -32,6 +32,8 @@ selecting the inherent method with a different argument shape.
 Blob bindings are immutable while present: identical bytes may be retried, different bytes under
 the same tenant/digest binding refuse. Providers verify stored length and content integrity when
 handing bytes out. Domain payloads belong in content storage; events refer to them.
+See the [SQLite 0.3.0 limitation](providers.md#sqlite) before relying on integrity admission
+when a fresh atomic group reuses an existing binding.
 
 ## Inspection and capture
 

@@ -13,13 +13,14 @@ Choose an empty working directory:
 ```bash
 git clone --branch 0.3.0 --depth 1 https://github.com/beyond10x/eventlog.git
 cd eventlog
-cargo test --locked -p eventlog-file
-cargo test --locked -p eventlog-sqlite
+cargo test --locked -p eventlog-file -- --test-threads=1
+cargo test --locked -p eventlog-sqlite -- --test-threads=1
 ```
 
 Both commands must finish with successful test results. The suites create disposable directories
 and databases and exercise the provider contracts, including committed history and refused writes.
 This proves the selected local providers; it does not run the PostgreSQL suite.
+The commands serialize the released fixtures, including process-lock exercises.
 
 ## Add the library
 

@@ -33,6 +33,12 @@ Use a database file for persistence and `:memory:` for disposable state. The pro
 the pinned SQLite dependency. A successful SQLite test does not establish PostgreSQL behavior.
 Existing-only open refuses absent databases or owner tables without creating them.
 
+In **0.3.0**, a fresh atomic group reusing an existing blob binding compares its bytes but does
+not validate all stored integrity metadata. Ordinary blob reads still validate that metadata.
+The [post-release correction](https://github.com/beyond10x/eventlog/commit/28e578568846fc860e44a5f7c76b7e807abddc12)
+adds the missing check; it is on `main`, not part of tag `0.3.0`. An exact already-committed retry
+returns its retained receipt without re-reading content.
+
 ## PostgreSQL
 
 The convenience `connect` constructor is restricted to loopback, localhost or Unix sockets with

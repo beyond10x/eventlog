@@ -22,8 +22,8 @@ Version **0.3.0**, under [Apache-2.0](LICENSE). Pin the bare Git tag `0.3.0`.
 Install Git and Rust 1.91 or newer. From a checkout of tag `0.3.0`:
 
 ```bash
-cargo test --locked -p eventlog-file
-cargo test --locked -p eventlog-sqlite
+cargo test --locked -p eventlog-file -- --test-threads=1
+cargo test --locked -p eventlog-sqlite -- --test-threads=1
 ```
 
 The full `bash scripts/gate.sh` gate runs tests, formatting and Clippy. Its PostgreSQL cases need

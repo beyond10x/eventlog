@@ -2,11 +2,11 @@
 format: aep.planning-md/1
 id: task:refresh-project-documentation
 kind: task
-status: draft
+status: active
 title: Refresh released documentation and automatic project publication
 relations:
 - serves: vision:O2
-revision: 2
+revision: 4
 ---
 ## Context
 
