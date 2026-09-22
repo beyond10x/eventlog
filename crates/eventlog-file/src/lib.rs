@@ -45,6 +45,8 @@ struct Transaction {
     root: PathBuf,
     privacy: bool,
     permit: AdmissionPermit,
+    staged_blobs: Vec<PathBuf>,
+    atomic_content: bool,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -108,6 +110,8 @@ impl FileEventStore {
             root: self.root.clone(),
             privacy: false,
             permit: self.permit.clone(),
+            staged_blobs: Vec::new(),
+            atomic_content: false,
         };
         tx = blocking(move || {
             tx.clear_snapshots()?;
@@ -118,7 +122,15 @@ impl FileEventStore {
             Ok(tx)
         })
         .await?;
-        let result = work(&mut tx).await?;
+        let result = match work(&mut tx).await {
+            Ok(result) => result,
+            Err(error) => {
+                // Publication has not begun. Remove only this request's unique
+                // staging files, never preexisting or potentially committed content.
+                blocking(move || tx.cleanup_staged_blobs()).await?;
+                return Err(error);
+            }
+        };
         let manifest = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
@@ -135,9 +147,25 @@ impl FileEventStore {
                 tx.clear_snapshots()?;
             } else if !tx.pending.is_empty() {
                 tx.journal
-                    .append(serde_json::to_value(&tx.pending).map_err(backend)?)?;
+                    .append(serde_json::to_value(&tx.pending).map_err(backend)?)
+                    .map_err(|error| {
+                        if tx.atomic_content {
+                            EventLogError::UnknownCommit
+                        } else {
+                            error
+                        }
+                    })?;
             }
-            tx.clean_blobs()?;
+            tx.clean_blobs().map_err(|error| {
+                if tx.atomic_content && !tx.pending.is_empty() {
+                    EventLogError::UnknownCommit
+                } else {
+                    error
+                }
+            })?;
+            if !tx.staged_blobs.is_empty() {
+                journal::checkpoint("blob-cleaned");
+            }
             Ok(tx.journal.manifest.clone())
         })
         .await?;
@@ -149,6 +177,72 @@ impl FileEventStore {
     }
 }
 impl Transaction {
+    fn cleanup_staged_blobs(&self) -> Result<(), EventLogError> {
+        for path in &self.staged_blobs {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(backend(
+                    "aborted atomic blob request retained unbound staging content",
+                ));
+            }
+        }
+        if !self.staged_blobs.is_empty() {
+            fs::File::open(self.root.join("blobs"))
+                .and_then(|file| file.sync_all())
+                .map_err(|_| {
+                    backend("aborted atomic blob staging cleanup was not durably confirmed")
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn bind_blob(
+        &mut self,
+        tenant: &TenantId,
+        blob: &eventlog_core::BlobWrite,
+    ) -> Result<(), EventLogError> {
+        if let Some(old) = self.blob(tenant, &blob.digest)? {
+            if old != blob.bytes {
+                return Err(EventLogError::Invalid(
+                    "blob digest already names different content".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let object = Blob {
+            id: new_event_id(),
+            hash: hash(&blob.bytes),
+        };
+        let directory = self.root.join("blobs");
+        fs::create_dir_all(&directory).map_err(backend)?;
+        self::directory(&directory)?;
+        let path = directory.join(&object.id);
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(backend)?;
+        self.staged_blobs.push(path.clone());
+        let bytes = blob.bytes.clone();
+        blocking(move || {
+            use std::io::Write;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(backend)?;
+            fs::File::open(directory)
+                .and_then(|file| file.sync_all())
+                .map_err(backend)
+        })
+        .await?;
+        journal::checkpoint("blob-staged");
+        self.record(Op::Blob {
+            tenant: tenant.clone(),
+            digest: blob.digest.clone(),
+            object: Some(object),
+        })
+    }
+
     fn record(&mut self, op: Op) -> Result<(), EventLogError> {
         self.state.apply(op.clone())?;
         self.pending.push(op);
@@ -468,59 +562,91 @@ impl AtomicEventStore for FileEventStore {
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(async move {
             let digest = group.fingerprint()?;
-            let group = group.clone();
-            self.freeze().await;
-            self.transaction(move |tx| {
-                Box::pin(async move {
-                    if let Some((old, ranges)) = tx
-                        .state
-                        .groups
-                        .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
-                    {
-                        if old != &digest {
-                            return Err(EventLogError::IdempotencyMismatch {
-                                key: group.meta.idempotency_key.clone(),
-                            });
-                        }
-                        return Ok(AppendGroupResult {
-                            appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
-                            deduplicated: true,
+            self.append_atomic_group(group.clone(), digest, Vec::new(), guard)
+                .await
+        })
+    }
+}
+
+impl eventlog_core::AtomicBlobEventStore for FileEventStore {
+    fn append_group_with_blobs_guarded<'a>(
+        &'a self,
+        request: &'a eventlog_core::BlobAppendGroup,
+        guard: Arc<dyn Guard>,
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        Box::pin(async move {
+            let digest = request.fingerprint()?;
+            let mut blobs = request.blobs.clone();
+            blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
+            self.append_atomic_group(request.group.clone(), digest, blobs, guard)
+                .await
+        })
+    }
+}
+
+impl FileEventStore {
+    async fn append_atomic_group(
+        &self,
+        group: AppendGroup,
+        digest: String,
+        blobs: Vec<eventlog_core::BlobWrite>,
+        guard: Arc<dyn Guard>,
+    ) -> Result<AppendGroupResult, EventLogError> {
+        self.freeze().await;
+        self.transaction(move |tx| {
+            Box::pin(async move {
+                if let Some((old, ranges)) = tx
+                    .state
+                    .groups
+                    .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
+                {
+                    if old != &digest {
+                        return Err(EventLogError::IdempotencyMismatch {
+                            key: group.meta.idempotency_key.clone(),
                         });
                     }
-                    guard
-                        .check(&mut projection::View {
-                            admission: true,
-                            tx,
-                            tenant: &group.tenant,
-                        })
-                        .await?;
-                    let mut appends = Vec::new();
-                    let mut ranges = Vec::new();
-                    for entry in &group.appends {
-                        let result = tx
-                            .append(&entry.stream, entry.expected, &entry.events, &group.meta)
-                            .await?;
-                        ranges.push(GroupRange {
-                            stream: entry.stream.clone(),
-                            first_version: result.first_version,
-                            last_version: result.last_version,
-                        });
-                        appends.push(result);
-                    }
-                    tx.record(Op::Group {
-                        tenant: group.tenant,
-                        key: group.meta.idempotency_key,
-                        digest,
-                        ranges,
-                    })?;
-                    Ok(AppendGroupResult {
-                        appends,
-                        deduplicated: false,
+                    return Ok(AppendGroupResult {
+                        appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
+                        deduplicated: true,
+                    });
+                }
+                for blob in &blobs {
+                    tx.bind_blob(&group.tenant, blob).await?;
+                }
+                tx.atomic_content = !blobs.is_empty();
+                guard
+                    .check(&mut projection::View {
+                        admission: true,
+                        tx,
+                        tenant: &group.tenant,
                     })
+                    .await?;
+                let mut appends = Vec::new();
+                let mut ranges = Vec::new();
+                for entry in &group.appends {
+                    let result = tx
+                        .append(&entry.stream, entry.expected, &entry.events, &group.meta)
+                        .await?;
+                    ranges.push(GroupRange {
+                        stream: entry.stream.clone(),
+                        first_version: result.first_version,
+                        last_version: result.last_version,
+                    });
+                    appends.push(result);
+                }
+                tx.record(Op::Group {
+                    tenant: group.tenant,
+                    key: group.meta.idempotency_key,
+                    digest,
+                    ranges,
+                })?;
+                Ok(AppendGroupResult {
+                    appends,
+                    deduplicated: false,
                 })
             })
-            .await
         })
+        .await
     }
 }
 
@@ -951,6 +1077,8 @@ impl EventStore for FileEventStore {
                 root: self.root.clone(),
                 privacy: false,
                 permit: self.permit.clone(),
+                staged_blobs: Vec::new(),
+                atomic_content: false,
             };
             tx.register(projector.as_ref())?;
             let manifest = blocking(move || {

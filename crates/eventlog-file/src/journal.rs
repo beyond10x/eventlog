@@ -13,13 +13,20 @@ const FORMAT: &str = "eventlog-file/1";
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[cfg(test)]
-fn checkpoint(name: &str) {
+pub(crate) fn checkpoint(name: &str) {
+    if name == "append-committed"
+        && std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some()
+    {
+        let root = std::env::var_os("EVENTLOG_FILE_CRASH_ROOT").expect("test-owned store");
+        fs::create_dir(Path::new(&root).join("blobs/00000000-0000-0000-0000-000000000000"))
+            .expect("inject a native post-commit cleanup error");
+    }
     if std::env::var("EVENTLOG_FILE_CRASH_AT").as_deref() == Ok(name) {
         std::process::exit(73);
     }
 }
 #[cfg(not(test))]
-fn checkpoint(_: &str) {}
+pub(crate) fn checkpoint(_: &str) {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -535,6 +542,23 @@ mod tests {
         let Ok(root) = std::env::var("EVENTLOG_FILE_CRASH_ROOT") else {
             return;
         };
+        if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB").is_some() {
+            use eventlog_core::AtomicBlobEventStore;
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let store = crate::FileEventStore::open(&root).await.unwrap();
+                let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
+                let result = store.append_group_with_blobs(&request).await;
+                if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
+                    assert_eq!(result, Err(EventLogError::UnknownCommit));
+                } else {
+                    result.unwrap();
+                }
+            });
+            if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
+                return;
+            }
+            panic!("atomic blob failpoint was not reached");
+        }
         if std::env::var_os("EVENTLOG_FILE_PROVIDER_PRIVACY").is_some() {
             use eventlog_core::EventStore;
             tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -571,6 +595,112 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn atomic_blob_crash_boundaries_recover_only_complete_publication() {
+        use eventlog_core::{AtomicBlobEventStore, EventStore};
+        for point in [
+            "blob-staged",
+            "append-prepared",
+            "append-torn",
+            "append-synced",
+            "append-committed",
+            "blob-cleaned",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            drop(crate::FileEventStore::open(root.path()).await.unwrap());
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "journal::tests::crash_child", "--nocapture"])
+                .env("EVENTLOG_FILE_CRASH_ROOT", root.path())
+                .env("EVENTLOG_FILE_CRASH_AT", point)
+                .env("EVENTLOG_FILE_ATOMIC_BLOB", "1")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{point}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
+            let store = crate::FileEventStore::open(root.path()).await.unwrap();
+            let committed = matches!(point, "append-committed" | "blob-cleaned");
+            let events = store
+                .read_stream(&request.group.appends[0].stream, 0, 100)
+                .await
+                .unwrap()
+                .events;
+            assert_eq!(events.len(), usize::from(committed), "{point}");
+            assert_eq!(
+                store
+                    .get_blob(&request.group.tenant, "content")
+                    .await
+                    .unwrap(),
+                committed.then(|| request.blobs[0].bytes.clone()),
+                "{point}"
+            );
+            assert_eq!(
+                fs::read_dir(root.path().join("blobs")).unwrap().count(),
+                usize::from(committed),
+                "unbound crash staging reclaimed at {point}"
+            );
+            let resolved = store.append_group_with_blobs(&request).await.unwrap();
+            assert_eq!(resolved.deduplicated, committed);
+            if committed {
+                assert_eq!(resolved.appends[0].events, events);
+            }
+            assert_eq!(
+                store
+                    .stream_version(&request.group.appends[0].stream)
+                    .await
+                    .unwrap(),
+                Some(1)
+            );
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn atomic_blob_postcommit_cleanup_failure_keeps_committed_content() {
+        use eventlog_core::{AtomicBlobEventStore, EventStore};
+        let root = tempfile::tempdir().unwrap();
+        drop(crate::FileEventStore::open(root.path()).await.unwrap());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "journal::tests::crash_child", "--nocapture"])
+            .env("EVENTLOG_FILE_CRASH_ROOT", root.path())
+            .env("EVENTLOG_FILE_ATOMIC_BLOB", "1")
+            .env("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // Remove only the obstruction deliberately injected above, then recover normally.
+        fs::remove_dir(
+            root.path()
+                .join("blobs/00000000-0000-0000-0000-000000000000"),
+        )
+        .unwrap();
+        let store = crate::FileEventStore::open(root.path()).await.unwrap();
+        let request = eventlog_conformance::atomic_blob_request("crash", "one", "content");
+        let events = store
+            .read_stream(&request.group.appends[0].stream, 0, 10)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            store
+                .get_blob(&request.group.tenant, "content")
+                .await
+                .unwrap(),
+            Some(request.blobs[0].bytes.clone())
+        );
+        let result = store.append_group_with_blobs(&request).await.unwrap();
+        assert!(result.deduplicated);
+        assert_eq!(result.appends[0].events, events);
+    }
+
     #[test]
     fn process_death_at_each_append_boundary() {
         for point in [

@@ -6,7 +6,9 @@
 //! that agree with it. It exists because the only divergence ever found between b10x store
 //! backends was found by an exercise like this one and not by review.
 
+mod atomic_blob;
 mod atomic_group;
+pub use atomic_blob::{assert_atomic_blob_competition, atomic_blob_request, run_atomic_blobs};
 mod inspection;
 pub use atomic_group::run_atomic_groups;
 pub use inspection::{INSPECTION_LIMITS, prepare_inspection_history, run_history_inspection};
