@@ -41,3 +41,13 @@ command's own exit status remain retained; no local full-gate success is claimed
 The required CI supplies the real PostgreSQL/TLS fixture and must pass before
 integration. Populated legacy blob migration and the consumer's live stores
 remain outside this repair.
+
+## Source closure
+
+The repaired source is merged through PR #15 at a791284413bc115f785b101a469864e02620b7ef.
+Required exact-source CI passed: https://github.com/beyond10x/eventlog/actions/runs/35720472752.
+The full backend lane and comparative/restart lane both succeeded.
+The coordinator also completed strict workspace Clippy and the integrated
+production-admission roster checks locally; their raw statuses remain retained.
+The task is implemented. This closing metadata change awaits its own required
+publication checks; no new source or release is included.
