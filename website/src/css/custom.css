@@ -1,0 +1,29 @@
+/* Map Docusaurus chrome to the shared documentation palette. */
+:root,
+[data-theme='light'],
+[data-theme='dark'] {
+  --ifm-color-primary: var(--b10x-color-link);
+  --ifm-background-color: var(--b10x-color-canvas);
+  --ifm-background-surface-color: var(--b10x-color-surface);
+  --ifm-font-color-base: var(--b10x-color-text);
+  --ifm-heading-color: var(--b10x-color-heading);
+  --ifm-font-family-base: var(--b10x-font-sans);
+  --ifm-font-family-monospace: var(--b10x-font-mono);
+  --ifm-line-height-base: 1.7;
+  --ifm-code-font-size: 90%;
+  --ifm-heading-line-height: 1.2;
+  --ifm-h1-font-size: 2.5rem;
+  --ifm-footer-background-color: var(--b10x-footer-background);
+  --ifm-footer-color: var(--b10x-footer-text);
+  --ifm-footer-link-color: var(--b10x-footer-text);
+}
+
+.navbar { box-shadow: none; border-bottom: 1px solid var(--b10x-color-line); }
+.theme-doc-markdown h2 { margin-top: 2.5rem; }
+.theme-doc-markdown table { display: block; max-width: 100%; overflow-x: auto; }
+.theme-doc-markdown :is(p, ul, ol) { max-width: 76ch; }
+.footer__title { color: var(--b10x-footer-accent); }
+
+@media (max-width: 576px) {
+  :root { --ifm-h1-font-size: 2rem; }
+}

@@ -13,6 +13,11 @@ under bare-version tags such as `0.1.0`.
   of an already committed group still return its retained result without reading
   or restoring subsequently corrupted or erased blob content.
 
+### Documentation
+
+- Add a public guide for File, SQLite and PostgreSQL, shorten the README while retaining its
+  anchors, and validate and package an exact-commit project site without deployment credentials.
+
 ## 0.3.0 — 2026-09-22
 
 ### Added

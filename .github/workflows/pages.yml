@@ -1,0 +1,51 @@
+# Atlas-classified former Pages workflow: repository-owned validation only; deployment authority is forbidden.
+# Builds the public guide without deployment authority.
+name: Documentation validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Docusaurus
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Build the public documentation
+        run: npm --prefix website ci --ignore-scripts && npm --prefix website run build
+
+      - name: Declare the built project site
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          mkdir -p website/build/.well-known
+          printf '{"schema":"b10x-project-site/v1","repository":"eventlog","commit":"%s","baseUrl":"/eventlog/"}\n' \
+            "$GITHUB_SHA" > website/build/.well-known/b10x-site.json
+
+      - name: Upload the built project site
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b10x-project-site
+          path: website/build
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
