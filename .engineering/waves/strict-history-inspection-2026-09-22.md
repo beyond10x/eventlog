@@ -90,6 +90,15 @@ separate-process writer interleavings must prove the boundary. Default WAL-mode
 inspection may refuse explicitly; the frozen rollback-mode fixture must prove
 usable success. No source repair or checkpoint is permitted in inspection.
 
+The next primitive probe found that closing an independent database descriptor
+after a refused OFD admission released a pre-existing same-process writer's
+POSIX lock. A separate process then acquired a write transaction. The correction
+uses the design's bounded process-lifetime descriptor registry, with capacity
+reserved before opening and explicit OFD release without descriptor close.
+The observed red is retained in the unit scratch as
+`ofd-existing-writer-red.log`; writer-before-inspection, bounded exhaustion and
+concurrent inspector cases are required before this claim is accepted.
+
 Free space at dispatch preparation:   25G
 
 Toolchain: rustc 1.98.1 (48a229cea 2026-09-01)

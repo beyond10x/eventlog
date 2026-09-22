@@ -64,6 +64,22 @@ prevents a check-then-open switch to WAL. A normal flock is insufficient.
 Other platforms receive `UnsupportedSource`. Runtime lock compatibility remains
 unexecuted until same-process and separate-process writer cases establish it.
 
+Closing an independently opened database descriptor can release an existing
+same-process SQLite connection's POSIX locks, even when inspection refused.
+Therefore a Linux process-lifetime registry retains at most 64 database
+descriptors. Reserve capacity before opening; retain every successfully opened
+descriptor through all refusals and identity races. Metadata-only lookup may
+reuse a retained inode, but no helper may open and close a redundant descriptor.
+Exhaustion returns `SourceBusy` before opening. Serialize inspections using a
+nonblocking registry mutex; explicitly release the OFD lock after the native
+connection drops, while retaining the descriptor until process exit. No unsafe
+code, fork, unbounded descriptor retention or connection callback is introduced.
+This bounded resource cost is part of the public inspection contract. Callers
+needing more distinct sources must use another process. A writer already open
+before inspection, and a separate-process contention probe after refusal, must
+establish that refusal preserves the existing writer's lock; runtime agreement
+is unexecuted until that regression runs green.
+
 SQLite uses READ_ONLY without CREATE and one deferred native read transaction.
 Admit the exact supported published schema before selecting event/identity rows;
 do not run DDL, pragmas that change journal mode, `BEGIN IMMEDIATE`, checkpoint,

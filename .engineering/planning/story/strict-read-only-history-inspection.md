@@ -39,7 +39,7 @@ scope:
   path: ess/inspection/domains/inspection.yaml
 - confidence: inferred
   path: ess/inspection/system.yaml
-revision: 7
+revision: 8
 ---
 ## Outcome
 
@@ -119,3 +119,23 @@ writer tests, plus unchanged bytes/entries on success/refusal/drop, remain
 required. Cleanly closed default WAL-mode sources may be named unsupported;
 a separately prepared and frozen rollback-mode published-schema fixture must
 establish useful success. Inspection never prepares or checkpoints its source.
+
+## Descriptor preservation correction
+
+The native primitive probe reproduced another side effect: closing an independent
+database descriptor after refused OFD admission releases pre-existing same-process
+SQLite POSIX locks. A separate process then acquires a write transaction.
+See docs/design/strict-history-inspection.md and the wave's probe citation.
+
+Adopt a Linux process-lifetime registry bounded at 64 descriptors. Reserve capacity
+before any open; retain every successfully opened descriptor on success or refusal,
+including identity mismatch and duplicate-inode races. Metadata-only lookup may
+reuse retained descriptors. Nonblocking serialization prevents one inspection
+unlocking another. Explicitly release the OFD lock only after native connection
+drop; keep the descriptor alive. Exhaustion returns SourceBusy before opening.
+No unsafe code, fork, unbounded retention or caller connection callback.
+
+Runtime agreement remains unexecuted until the existing-writer/subprocess,
+registry exhaustion/no-open preservation and concurrent-inspector cases pass.
+This resource limitation is documented publicly; callers requiring additional
+distinct sources use another process.
