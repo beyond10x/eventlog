@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.3.0 — 2026-09-22
+
 ### Added
 
 - `ConsistentTenantCapture::capture_tenant_deferred` returns one tenant's complete observation
