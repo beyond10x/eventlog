@@ -37,27 +37,29 @@ impl AtomicEventStore for SqliteEventStore {
         Box::pin(run_blocking(move || {
             let fingerprint = group.fingerprint()?;
             *inner.registration.lock().map_err(poisoned)? = true;
-            let mut connection = inner.connection.lock().map_err(poisoned)?;
-            begin_immediate(&connection)?;
-            let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let result = inner.group_in_transaction(
-                &mut connection,
-                &group,
-                &fingerprint,
-                GroupBlobs::NONE,
-                admission.as_ref(),
-                &callback_failed,
-            );
-            #[cfg(test)]
-            if result.is_ok() {
-                checkpoint("group-precommit");
-            }
-            let result = finish_transaction(&connection, result);
-            #[cfg(test)]
-            if result.is_ok() {
-                checkpoint("group-postcommit");
-            }
-            result
+            inner.keeping_restored_on_refusal(|| {
+                let mut connection = inner.connection.lock().map_err(poisoned)?;
+                begin_immediate(&connection)?;
+                let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let result = inner.group_in_transaction(
+                    &mut connection,
+                    &group,
+                    &fingerprint,
+                    GroupBlobs::NONE,
+                    admission.as_ref(),
+                    &callback_failed,
+                );
+                #[cfg(test)]
+                if result.is_ok() {
+                    checkpoint("group-precommit");
+                }
+                let result = finish_transaction(&connection, result);
+                #[cfg(test)]
+                if result.is_ok() {
+                    checkpoint("group-postcommit");
+                }
+                result
+            })
         }))
     }
 }
@@ -74,21 +76,23 @@ impl AtomicBlobEventStore for SqliteEventStore {
             let (fingerprint, hashes) = request.fingerprint_and_hashes()?;
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
             *inner.registration.lock().map_err(poisoned)? = true;
-            let mut connection = inner.connection.lock().map_err(poisoned)?;
-            begin_immediate(&connection)?;
-            let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let result = inner.group_in_transaction(
-                &mut connection,
-                &request.group,
-                &fingerprint,
-                GroupBlobs {
-                    writes: &request.blobs,
-                    hashes: &hashes,
-                },
-                admission.as_ref(),
-                &callback_failed,
-            );
-            finish_blob_transaction(&connection, result)
+            inner.keeping_restored_on_refusal(|| {
+                let mut connection = inner.connection.lock().map_err(poisoned)?;
+                begin_immediate(&connection)?;
+                let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let result = inner.group_in_transaction(
+                    &mut connection,
+                    &request.group,
+                    &fingerprint,
+                    GroupBlobs {
+                        writes: &request.blobs,
+                        hashes: &hashes,
+                    },
+                    admission.as_ref(),
+                    &callback_failed,
+                );
+                finish_blob_transaction(&connection, result)
+            })
         }))
     }
 }

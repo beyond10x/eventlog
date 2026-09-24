@@ -18,7 +18,7 @@ mod inspection;
 pub use inspection::SqliteHistoryInspector;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -67,7 +67,25 @@ struct Inner {
 pub struct RestoredEvent {
     pub event_id: String,
     pub recorded_at: OffsetDateTime,
+    /// Where the event stood in the branchable history it is copied from, when it is copied rather
+    /// than replayed into a store of its own. Recorded beside the event, never in its body.
+    pub origin: Option<EventOrigin>,
 }
+
+/// An event's place in a branchable history, kept when a linear store holds a copy of it: the
+/// version it had there, its content digest, and the digests it followed on its stream.
+///
+/// Kept in its own table beside the event row rather than in `data`, so a redaction, which
+/// replaces `data`, cannot erase it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventOrigin {
+    pub version: u64,
+    pub digest: String,
+    pub parents: Vec<String>,
+}
+
+/// Each copied event's origin, by `(stream_type, stream_id, version)` in the linear store.
+pub type OriginMap = BTreeMap<(String, String, u64), EventOrigin>;
 
 impl SqliteEventStore {
     /// Give only the trusted host this grant; the domain's `EventStore` port cannot issue it.
@@ -150,6 +168,43 @@ impl SqliteEventStore {
     /// Returns [`EventLogError::Backend`] when the queue's lock is poisoned.
     pub fn restored_pending(&self) -> Result<usize, EventLogError> {
         Ok(self.inner.restored.lock().map_err(poisoned)?.len())
+    }
+
+    /// Every origin a copy recorded for `tenant`'s events.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the table cannot be read or holds a row this
+    /// reader did not write.
+    pub async fn origins(&self, tenant: &TenantId) -> Result<OriginMap, EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        run_blocking(move || inner.origins(&tenant)).await
+    }
+
+    /// The stream identity `tenant` already has, without minting one as
+    /// [`EventStore::stream_identity`] does, so a caller can check before it writes.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the identity table cannot be read.
+    pub async fn stored_stream_identity(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<String>, EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        run_blocking(move || {
+            let prefix = &inner.prefix;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            connection
+                .query_row(
+                    &format!("SELECT stream_identity FROM {prefix}_identity WHERE tenant_id = ?1"),
+                    params![tenant.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)
+        })
+        .await
     }
 
     /// Record the stream identity another store gave `tenant`, before anything asks for it.
@@ -471,8 +526,10 @@ impl Inner {
              CREATE TABLE IF NOT EXISTS {prefix}_projection_registry(
                  projection_name TEXT PRIMARY KEY,
                  indexed_fields TEXT NOT NULL
-             );",
-            atomic_group::ddl(prefix)
+             );
+             {}",
+            atomic_group::ddl(prefix),
+            origins_ddl(prefix)
         );
         let mut connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
@@ -1392,21 +1449,42 @@ impl Inner {
     ) -> Result<AppendResult, EventLogError> {
         validate_append(events, meta)?;
         *self.registration.lock().map_err(poisoned)? = true;
-        let mut connection = self.connection.lock().map_err(poisoned)?;
-        let connection = &mut *connection;
-        begin_immediate(connection)?;
-        let callback_failed = Arc::new(AtomicBool::new(false));
-        let result = self.append_in_transaction(
-            connection,
-            stream,
-            expected,
-            events,
-            meta,
-            admission,
-            true,
-            &callback_failed,
-        );
-        finish_transaction(connection, result)
+        self.keeping_restored_on_refusal(|| {
+            let mut connection = self.connection.lock().map_err(poisoned)?;
+            let connection = &mut *connection;
+            begin_immediate(connection)?;
+            let callback_failed = Arc::new(AtomicBool::new(false));
+            let result = self.append_in_transaction(
+                connection,
+                stream,
+                expected,
+                events,
+                meta,
+                admission,
+                true,
+                &callback_failed,
+            );
+            finish_transaction(connection, result)
+        })
+    }
+
+    /// Run one append transaction, and when it rolls back put back every restored identity it
+    /// took. An append takes them as it inserts, before it knows it will commit; without this a
+    /// refused append leaves the queue short, and the next append on the handle takes an identity
+    /// and origin that belong to another event. An unknown commit may have taken effect, so its
+    /// identities stay taken and the caller resolves the command by its key.
+    pub(crate) fn keeping_restored_on_refusal<T>(
+        &self,
+        append: impl FnOnce() -> Result<T, EventLogError>,
+    ) -> Result<T, EventLogError> {
+        let before = self.restored.lock().map_err(poisoned)?.clone();
+        let result = append();
+        if let Err(error) = &result
+            && !matches!(error, EventLogError::UnknownCommit)
+        {
+            *self.restored.lock().map_err(poisoned)? = before;
+        }
+        result
     }
 
     /// The append, between `BEGIN IMMEDIATE` and `COMMIT`.
@@ -1530,9 +1608,10 @@ impl Inner {
         let mut written = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
             let version = head + 1 + offset as u64;
-            let (event_id, now) = match self.restored.lock().map_err(poisoned)?.pop_front() {
-                Some(restored) => (restored.event_id, restored.recorded_at),
-                None => (new_event_id(), minted),
+            let (event_id, now, origin) = match self.restored.lock().map_err(poisoned)?.pop_front()
+            {
+                Some(restored) => (restored.event_id, restored.recorded_at, restored.origin),
+                None => (new_event_id(), minted, None),
             };
             let recorded_at = format_time(now)?;
             connection
@@ -1566,6 +1645,28 @@ impl Inner {
                 )
                 .map_err(backend)?;
             let global_seq = to_u64(connection.last_insert_rowid())?;
+            // In the append's transaction, so a copied event and its origin commit together.
+            if let Some(origin) = origin {
+                connection
+                    .execute_batch(&origins_ddl(prefix))
+                    .map_err(backend)?;
+                connection
+                    .execute(
+                        &format!(
+                            "INSERT INTO {prefix}_{ORIGINS}
+                             (tenant_id, stream_type, stream_id, version, origin)
+                             VALUES (?1, ?2, ?3, ?4, ?5)"
+                        ),
+                        params![
+                            stream.tenant().as_str(),
+                            stream.stream_type(),
+                            stream.stream_id(),
+                            to_i64(version)?,
+                            origin_value(&origin).to_string(),
+                        ],
+                    )
+                    .map_err(backend)?;
+            }
             #[cfg(test)]
             if !record_command && offset == 0 {
                 atomic_group::checkpoint("group-event-1");
@@ -2039,6 +2140,16 @@ impl Inner {
                 )
                 .map_err(backend)?;
         }
+        // An owner provisioned before copies existed has no origin table, and nothing to erase
+        // from it.
+        if has_table(&transaction, &format!("{prefix}_{ORIGINS}"))? {
+            transaction
+                .execute(
+                    &format!("DELETE FROM {prefix}_{ORIGINS} WHERE tenant_id = ?1"),
+                    params![tenant.as_str()],
+                )
+                .map_err(backend)?;
+        }
         // Every read model this owner has ever created, not only the ones registered in this
         // process. A projection table left behind after an erasure is the erased tenant, still
         // readable, in a table nobody thought to name.
@@ -2173,6 +2284,39 @@ impl Inner {
             ));
         }
         Ok(found)
+    }
+
+    fn origins(&self, tenant: &TenantId) -> Result<OriginMap, EventLogError> {
+        let prefix = &self.prefix;
+        let connection = self.connection.lock().map_err(poisoned)?;
+        let table = format!("{prefix}_{ORIGINS}");
+        if !has_table(&connection, &table)? {
+            return Ok(OriginMap::new());
+        }
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT stream_type, stream_id, version, origin FROM {table} WHERE tenant_id = ?1"
+            ))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map(params![tenant.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut origins = OriginMap::new();
+        for row in rows {
+            let (stream_type, stream_id, version, origin) = row.map_err(backend)?;
+            origins.insert(
+                (stream_type, stream_id, to_u64(version)?),
+                parse_origin(&origin)?,
+            );
+        }
+        Ok(origins)
     }
 
     fn restore_stream_identity(
@@ -3312,6 +3456,73 @@ fn validate_prefix(prefix: &str) -> Result<(), EventLogError> {
         ));
     }
     Ok(())
+}
+
+/// The suffix of the table that holds copied events' origins, beside the events table.
+const ORIGINS: &str = "origins";
+
+/// The origin table, created with every other table by `open`, and by the first origin-carrying
+/// append into an owner provisioned before it existed: `open_existing` and `from_image` never
+/// create a table, so an older owner gains this one only when a copy writes to it, inside that
+/// append's transaction.
+fn origins_ddl(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_{ORIGINS} (
+             tenant_id TEXT NOT NULL,
+             stream_type TEXT NOT NULL,
+             stream_id TEXT NOT NULL,
+             version INTEGER NOT NULL,
+             origin TEXT NOT NULL,
+             PRIMARY KEY (tenant_id, stream_type, stream_id, version)
+         );"
+    )
+}
+
+fn has_table(connection: &Connection, name: &str) -> Result<bool, EventLogError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            params![name],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(backend)
+}
+
+fn origin_value(origin: &EventOrigin) -> Value {
+    serde_json::json!({
+        "version": origin.version,
+        "digest": origin.digest,
+        "parents": origin.parents,
+    })
+}
+
+fn parse_origin(text: &str) -> Result<EventOrigin, EventLogError> {
+    let invalid = || EventLogError::Backend("stored origin is not one this kit wrote".to_owned());
+    let value: Value = serde_json::from_str(text).map_err(|_| invalid())?;
+    let map = value.as_object().ok_or_else(invalid)?;
+    if map.len() != 3 {
+        return Err(invalid());
+    }
+    Ok(EventOrigin {
+        version: map
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or_else(invalid)?,
+        digest: map
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?
+            .to_owned(),
+        parents: map
+            .get("parents")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|parent| parent.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 fn format_time(value: OffsetDateTime) -> Result<String, EventLogError> {
