@@ -398,7 +398,7 @@ fn prepare(root: &Path) -> Result<(), EventLogError> {
             "this directory holds an eventlog-file store, not a tree store".into(),
         ));
     }
-    fs::create_dir_all(&root).map_err(backend)?;
+    fs::create_dir_all(root).map_err(backend)?;
     let manifest = root.join("store.json");
     match fs::read(&manifest) {
         Ok(bytes) => {
