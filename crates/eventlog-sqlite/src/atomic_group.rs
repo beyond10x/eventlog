@@ -44,8 +44,7 @@ impl AtomicEventStore for SqliteEventStore {
                 &mut connection,
                 &group,
                 &fingerprint,
-                &[],
-                &std::collections::BTreeMap::new(),
+                GroupBlobs::NONE,
                 admission.as_ref(),
                 &callback_failed,
             );
@@ -82,8 +81,10 @@ impl AtomicBlobEventStore for SqliteEventStore {
                 &mut connection,
                 &request.group,
                 &fingerprint,
-                &request.blobs,
-                &hashes,
+                GroupBlobs {
+                    writes: &request.blobs,
+                    hashes: &hashes,
+                },
                 admission.as_ref(),
                 &callback_failed,
             );
@@ -114,14 +115,28 @@ fn finish_blob_transaction<T>(
     }
 }
 
+/// The blobs a group binds, and the SHA-256 of each one's content where the caller already
+/// computed it, so the integrity column does not hash the same bytes again.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupBlobs<'a> {
+    pub(crate) writes: &'a [BlobWrite],
+    pub(crate) hashes: &'a std::collections::BTreeMap<String, String>,
+}
+
+impl GroupBlobs<'_> {
+    const NONE: GroupBlobs<'static> = GroupBlobs {
+        writes: &[],
+        hashes: &std::collections::BTreeMap::new(),
+    };
+}
+
 impl Inner {
     fn group_in_transaction(
         &self,
         connection: &mut Connection,
         group: &AppendGroup,
         fingerprint: &str,
-        blobs: &[BlobWrite],
-        hashes: &std::collections::BTreeMap<String, String>,
+        blobs: GroupBlobs<'_>,
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
@@ -163,7 +178,8 @@ impl Inner {
                 deduplicated: true,
             });
         }
-        for blob in blobs {
+        let hashes = blobs.hashes;
+        for blob in blobs.writes {
             let prior = connection
                 .query_row(
                     &format!("SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
@@ -419,8 +435,10 @@ mod tests {
                     &mut connection,
                     &request.group,
                     &request.fingerprint().unwrap(),
-                    &request.blobs,
-                    &std::collections::BTreeMap::new(),
+                    GroupBlobs {
+                        writes: &request.blobs,
+                        hashes: &std::collections::BTreeMap::new(),
+                    },
                     &NoGuard,
                     &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )
