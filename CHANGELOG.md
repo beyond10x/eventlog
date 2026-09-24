@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.4.0 — 2026-09-24
+
 ### Added
 
 - Fork vocabulary for stores whose history is merged outside them:
