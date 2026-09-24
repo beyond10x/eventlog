@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: verification-report:final-integration-proof-20260909
 kind: verification-report
 status: draft

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:validate-public-append-inputs
 kind: story
 status: implemented

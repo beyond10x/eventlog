@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:strict-reader-lock-case-races-a-forked-crash-child
 kind: story
 status: draft

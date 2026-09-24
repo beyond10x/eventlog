@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:schema-evolution-and-golden-vectors
 kind: story
 status: implemented

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:postgres-feed-reads-drain-under-a-held-watermark
 kind: story
 status: draft

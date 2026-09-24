@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: blocker:inline-admin-source-review-restriction
 kind: blocker
 status: cleared
