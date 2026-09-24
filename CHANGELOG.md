@@ -5,6 +5,29 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- `eventlog_tree::copy` linearizes a tree store into a SQLite store:
+  - every committed group is appended in the tree's position order, with its original event
+    ids, instants and receipt, so each stream is gapless and a retry of a copied command writes
+    nothing;
+  - tenant identities, blobs (bound and alone) and redactions are copied;
+  - each event's tree `{version, digest, parents}` is kept in an origin map beside the event
+    rows, not in `data`, so a redaction cannot erase it; `SqliteEventStore::origins` reads it;
+  - a target that already holds events for one of the tree's tenants, gave one a different
+    stream identity, binds one of its blob digests to other bytes, or holds queued restored
+    identities is refused before anything is written.
+- SQLite gains an additive `<prefix>_origins` table, `RestoredEvent.origin`,
+  `SqliteEventStore::origins` and `SqliteEventStore::stored_stream_identity`, which reads an
+  identity without minting one. Erasing a tenant erases its origins. An owner provisioned
+  before the table existed reads an empty map, and gains the table inside the first append that
+  carries an origin; `open_existing` still creates no table.
+
+### Fixed
+
+- A SQLite append or group that rolls back now puts back every restored identity it took, so the
+  next append on the handle no longer takes another event's id and instant.
+
 ## 0.4.0 — 2026-09-24
 
 ### Added

@@ -25,11 +25,13 @@
 //! while the store is open, claims are refused, and snapshots, catch-up cursors and admission
 //! counters live only in memory.
 
+mod copy;
 mod fold;
 mod history;
 mod layout;
 mod verify;
 
+pub use copy::{CopyReport, copy};
 pub use verify::{Finding, verify};
 
 use eventlog_core::{
@@ -41,7 +43,7 @@ use eventlog_core::{
     RecordedEvent, Snapshot, SnapshotGeneration, StreamAppend, StreamId, StreamSlice,
     TenantCapture, TenantId, redaction_tombstone,
 };
-use eventlog_sqlite::{RestoredEvent, SqliteEventStore};
+use eventlog_sqlite::{EventOrigin, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
     FORMAT, backend, blob_path, canonical, corrupt, event_path, group_path, identity_path,
@@ -593,7 +595,7 @@ async fn replay_all(
             engine.put_blob(&tenant, digest, bytes).await?;
         }
         for committed in &tenant_history.groups {
-            let versions = replay(&engine, &tenant, committed).await?;
+            let versions = replay(&engine, &tenant, committed, None).await?;
             for (record, version) in committed.events.iter().flatten().zip(versions) {
                 let key = (
                     record.tenant.clone(),
@@ -638,20 +640,37 @@ async fn replay_all(
 
 /// Append one committed group to the engine as its writer did, keeping its identities and
 /// instants. Returns each event's version, in the group's order.
+///
+/// `origins` holds the tree's version of each event, by event id, when the engine is a copy's
+/// target rather than the tree's own; each event then records where it stood in the tree.
 async fn replay(
     engine: &SqliteEventStore,
     tenant: &TenantId,
     committed: &Committed,
+    origins: Option<&BTreeMap<String, u64>>,
 ) -> Result<Vec<u64>, EventLogError> {
     let restored = committed
         .events
         .iter()
         .flatten()
-        .map(|record| RestoredEvent {
-            event_id: record.event_id.clone(),
-            recorded_at: record.recorded_at,
+        .map(|record| {
+            let origin = match origins {
+                None => None,
+                Some(versions) => Some(EventOrigin {
+                    version: *versions
+                        .get(&record.event_id)
+                        .ok_or_else(|| corrupt("a committed event the tree does not serve"))?,
+                    digest: record.digest()?,
+                    parents: record.parents.clone(),
+                }),
+            };
+            Ok(RestoredEvent {
+                event_id: record.event_id.clone(),
+                recorded_at: record.recorded_at,
+                origin,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, EventLogError>>()?;
     engine.restore_events(restored)?;
     let mut appends = Vec::with_capacity(committed.events.len());
     for (member, records) in committed.record.members.iter().zip(&committed.events) {
