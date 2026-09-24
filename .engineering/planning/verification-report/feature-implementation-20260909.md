@@ -63,8 +63,8 @@ New conformance contract was applied before adding the missing public enum varia
     Checking serde v1.0.229
     Checking thiserror v2.0.20
     Checking uuid v1.24.1
-    Checking eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-    Checking eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
+    Checking eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+    Checking eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
 error[E0599]: no variant named `GuardRefused` found for enum `EventLogError`
    --> crates/eventlog-conformance/src/lib.rs:856:28
     |
@@ -97,7 +97,7 @@ After porting original effect code and adding negative cases, before hardening i
    Compiling serde v1.0.229
    Compiling serde_json v1.0.151
    Compiling time v0.3.55
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
     Finished `test` profile [unoptimized] target(s) in 4.57s
      Running unittests src/lib.rs (target/debug/deps/eventlog_core-01691989ec7aec74)
 
@@ -138,10 +138,10 @@ test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out;
 error: test failed, to rerun pass `-p eventlog-core --lib`
 
 Runtime guard-code mutation changed the guard's returned code to tally.other_refusal while retaining the exact-code assertion. PostgreSQL: EVENTLOG_TEST_POSTGRES_URL=<disposable-fixture-url> CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --workspace --locked the_inline_projection_exercise. Exit 101. SQLite: CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p eventlog-sqlite --locked the_inline_projection_exercise. Exit 101. Mutation was reverted before final gate.
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `test` profile [unoptimized] target(s) in 2.38s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
 
@@ -197,9 +197,9 @@ error: test failed, to rerun pass `-p eventlog-postgres --test conformance`
    Compiling tokio v1.53.1
    Compiling thiserror v2.0.20
    Compiling serde v1.0.229
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
     Finished `test` profile [unoptimized] target(s) in 6.26s
      Running unittests src/lib.rs (target/debug/deps/eventlog_sqlite-c37871d8445dc672)
 
@@ -240,19 +240,19 @@ error: test failed, to rerun pass `-p eventlog-sqlite --test conformance`
 
 Command: EVENTLOG_TEST_POSTGRES_URL=<disposable-fixture-url> CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 bash scripts/gate.sh
 Exit 0. Ordinary workspace gate, not production-proof. Root owns final combined production proof. Full runner output:
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `dev` profile [unoptimized] target(s) in 0.47s
      Running `target/debug/examples/gate`
 gate: cargo test --workspace --locked
    Compiling ring v0.17.14
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
    Compiling rustls v0.23.43
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `test` profile [unoptimized] target(s) in 3.54s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
 
@@ -436,15 +436,15 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 gate: cargo fmt --all --check
 gate: cargo clippy --workspace --all-targets --locked -- -D warnings
-    Checking eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
+    Checking eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
     Checking ring v0.17.14
     Checking rustls-webpki v0.103.15
-    Checking eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-    Checking eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+    Checking eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+    Checking eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
     Checking rustls v0.23.43
     Checking tokio-rustls v0.26.5
     Checking tokio-postgres-rustls v0.14.0
-    Checking eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+    Checking eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `dev` profile [unoptimized] target(s) in 2.42s
 gate: green
 
@@ -476,7 +476,7 @@ README/CHANGELOG prose for coordinator:
 
 No public field/variant names from original feature changed. Error enum addition can affect consumer exhaustive matches. Stronger metadata validation intentionally refuses spaces/@ in all effect identifiers/codes and boundary names, addressing the whole class: attempt, operation, authority, optional grant/retry/downstream, failure/refusal code, inventory boundary.
 
-ESS exact wire projection is unsupported: `~/beyond10x/ess/crates/generate/ess-gen/src/schema.rs:68` defines adjacent union content keys; `~/beyond10x/ess/crates/specify/ess-domain/src/types.rs:1289` tests rejection of empty struct variants. Rust's internally tagged mixed unit/struct EffectStage cannot be represented as that ESS union without changing public wire bytes. With coordinator agreement, the semantic model uses a stage-name enum plus optional outcome code and explicitly documents the gap. No schema generator is run or exact wire equivalence asserted. Types remain values; no entity identities, lifecycles or external ownership/cardinality are invented.
+ESS exact wire projection is unsupported: `home-path:sha256:b0b4d0a3ab1306b0d328a71b7e60b46e035fdbcc826e39e0c0a2fea5d3a2475a` defines adjacent union content keys; `home-path:sha256:784815f8b9a30a3be40929f4ab1668f4ad4685e8e39f959680ae8291c22be843` tests rejection of empty struct variants. Rust's internally tagged mixed unit/struct EffectStage cannot be represented as that ESS union without changing public wire bytes. With coordinator agreement, the semantic model uses a stage-name enum plus optional outcome code and explicitly documents the gap. No schema generator is run or exact wire equivalence asserted. Types remain values; no entity identities, lifecycles or external ownership/cardinality are invented.
 
 No full TLS production-proof or comparative/restart proof was run for this unit. Final combined release gate belongs to coordinator. No branches were pushed by worker; coordinator owns publication and worktree cleanup. Retain these scratch logs before finishing the tree. No container removed.
 

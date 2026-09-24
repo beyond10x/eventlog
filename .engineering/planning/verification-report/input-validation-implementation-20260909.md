@@ -36,8 +36,8 @@ Author: b10x-bot[bot] <316511680+b10x-bot[bot]@users.noreply.github.com>
 3. Red evidence, preserved before implementation
 
 The original three retained SQLite regressions were created before this implementation; their first executed run is input-validation-red.log from the prior adversary phase. Exact command: TMPDIR="$PWD/target/review-scratch" CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p eventlog-sqlite --test input_validation_review --locked. Exit101; all3 failed with accepted invalid records.
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
     Finished `test` profile [unoptimized] target(s) in 0.69s
      Running tests/input_validation_review.rs (target/debug/deps/input_validation_review-914d5ffd7d995a3b)
 
@@ -77,10 +77,10 @@ error: test failed, to rerun pass `-p eventlog-sqlite --test input_validation_re
 New shared exercise was added before the fix. Initial both-backends-red.log contains a real SQLite rejection failure and a PostgreSQL test-fixture prefix mistake; the prefix error is NOT counted as a product regression. After fixing the fixture (legal lowercase-only prefix), event/claim mutation runs below prove both actual backends detect removed validators. A subsequent invalid-NUL claim lookup fixture was adjusted because PostgreSQL rejects NUL query parameters; the test still demands Invalid on NUL append inputs, checks no event/receipt/projection writes, and checks a valid claim namespace remains absent. All other invalid claim coordinates are queried exactly as well.
 
 Mutation1 removed event.validate at the shared append boundary. Mutation2 removed claim.validate in CommandMeta. Each targeted both-backend command exited101 with both wrappers red. Commands use TMPDIR="$PWD/target/review-scratch" EVENTLOG_TEST_POSTGRES_URL=postgres://postgres@127.0.0.1:32876/postgres CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --workspace --locked public_input_validation_is_atomic --no-fail-fast.
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `test` profile [unoptimized] target(s) in 1.89s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
 
@@ -203,10 +203,10 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; fini
 error: 2 targets failed:
     `-p eventlog-postgres --test input_validation`
     `-p eventlog-sqlite --test input_validation_review`
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `test` profile [unoptimized] target(s) in 1.69s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
 
@@ -331,9 +331,9 @@ error: 2 targets failed:
     `-p eventlog-sqlite --test input_validation_review`
 
 Mutation3 bypassed TenantId::new during deserialization. Mutation4 bypassed StreamId::new. Each targeted retained stream regression failed with a real accepted invalid stream. Command: TMPDIR="$PWD/target/review-scratch" CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p eventlog-sqlite --test input_validation_review --locked append_refuses_deserialized_streams. Exit101 each. All four mutants were reverted before final production gate.
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
     Finished `test` profile [unoptimized] target(s) in 1.86s
      Running tests/input_validation_review.rs (target/debug/deps/input_validation_review-914d5ffd7d995a3b)
 
@@ -355,9 +355,9 @@ failures:
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 
 error: test failed, to rerun pass `-p eventlog-sqlite --test input_validation_review`
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
     Finished `test` profile [unoptimized] target(s) in 0.81s
      Running tests/input_validation_review.rs (target/debug/deps/input_validation_review-914d5ffd7d995a3b)
 
@@ -397,7 +397,7 @@ Verbatim final gate output:
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `dev` profile [unoptimized] target(s) in 1.25s
      Running `target/debug/examples/gate --production-proof`
 gate: cargo run --locked -p eventlog-postgres --example production-proof
@@ -406,7 +406,7 @@ gate: cargo run --locked -p eventlog-postgres --example production-proof
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `dev` profile [unoptimized] target(s) in 1.40s
      Running `target/debug/examples/production-proof`
 
@@ -598,7 +598,7 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `test` profile [unoptimized] target(s) in 1.17s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
      Running unittests src/lib.rs (target/debug/deps/eventlog_core-6e06060c4a60d048)
@@ -636,15 +636,15 @@ retained_projection_after_successful_erasure=None
 {"backend_server":{"version":"17.6","version_num":"170006"},"binary_sha256":"069e20f38398cd9d22cf282c7ba00b871e313d75871adfd234ee284fb12b4640","capacity_admitted":false,"capacity_requirement":"comparative laboratory artifact is separately required; this runner does not manufacture capacity evidence","conformance_valid":true,"default_pool":{"acquisition_ms":2000,"connections":4,"transaction_ms":10000,"waiters":32},"duration_ms":25354,"failed":0,"finished_at":"2026-09-09 0:55:24.316710759 +00:00:00","format":"eventlog-production-proof/1","missing_required_cases":[],"owner_fixture_handoff":["SDK current authority and exact realm/service bindings","SDK original and generated stream/feed/cursor/view/effect vectors"],"passed":94,"runner_summaries":["test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s","test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.40s","test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s","test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s","test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s","test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"],"schema_setup":"test-owned exact prefixes and hosted_owner schema; additive checksum admission exercised","skipped":0,"source_dirty":true,"source_revision":"5c1ff2690f07ec0b91f14cce307fff2a6b65ddca","started_at":"2026-09-09 0:54:58.962115327 +00:00:00"}
 gate: cargo fmt --all --check
 gate: cargo clippy --workspace --all-targets --locked -- -D warnings
-    Checking eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-core)
+    Checking eventlog-core v0.1.0-dev.1 (home-path:sha256:5a535810ed5bc57bb372b94ac556c0257330740f0a8597773e104017179129e4)
     Checking ring v0.17.14
     Checking rustls-webpki v0.103.15
     Checking rustls v0.23.43
-    Checking eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-conformance)
-    Checking eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-sqlite)
+    Checking eventlog-conformance v0.1.0-dev.1 (home-path:sha256:5b24d3ce7db4a0539bf2befd011035352a3abd51f372abee7239812008fa67a9)
+    Checking eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:b6650718bcc103a49fafbd339ab163c02843f72c1068b8d325e0a409572c4cb7)
     Checking tokio-rustls v0.26.5
     Checking tokio-postgres-rustls v0.14.0
-    Checking eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-21668c971b1d/crates/eventlog-postgres)
+    Checking eventlog-postgres v0.1.0-dev.1 (home-path:sha256:e693cf25519c372c143475730ea7311790aeba6adb2ffe6414bc58771d19c5ee)
     Finished `dev` profile [unoptimized] target(s) in 3.54s
 gate: green
 

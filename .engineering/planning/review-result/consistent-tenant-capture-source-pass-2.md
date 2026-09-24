@@ -306,8 +306,8 @@ three findings independently of their measured behavior.
 
 ## 6. Every path written outside the worktree
 
-1. `~/beyond10x/.ess-evolution/waves/0011-provider-capture/source-review-2/READY.md`
-2. `~/beyond10x/.ess-evolution/waves/0011-provider-capture/source-review-2/report.md`
+1. `home-path:sha256:829617d9681f8591a5b200d50e4ca8dda2b623bd90020235ca970402578f609e`
+2. `home-path:sha256:5172da8be7cc34a3c05dfa48848a5ab44a88de88102f3adbff8f315523553693`
 
 No `/tmp`, build directory, production store, external integration, planning record or root file
 was written by this reviewer. Root owns the `execution/` logs and exits. The review lease is

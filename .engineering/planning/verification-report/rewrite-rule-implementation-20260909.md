@@ -34,9 +34,9 @@ Prior original finding records remain ../rewrite-rule-red.log and ../hosted-rewr
 On the integrated base, new class cases and hosted case were then run before the guard existed:
 Command: cargo test -p eventlog-postgres --test conformance --locked rewrite_rules -- --nocapture --test-threads=1
 Exit101; executed3, 0passed/3failed. This filter excludes the separately retained original local-case name. Full output:
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:2513b1bcee86978c5eb16c5976c69265eb050168fca678d5e55ca30a67362539)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:6ecaa517b5aee9fd4b273c05315396cec4f0199103c7703f3b13ca961aea5277)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:91a792aba24f64fa749708cec10d3dd4473141713f407cca749d8986a5b99bc4)
     Finished `test` profile [unoptimized] target(s) in 4.89s
      Running tests/conformance.rs (target/debug/deps/conformance-ffc713f485ccb72b)
 
@@ -73,7 +73,7 @@ Mutation command: same focused command, changing only the shared pg_rewrite pred
 Full command: bash scripts/gate.sh --production-proof
 Exit0; executed88→92 using coordinator baseline88 and runner total92; failed0, skipped0, missing_required_cases=[]. PostgreSQL conformance32→36; unaffected lanes retained their expected counts. Workspace formatting and clippy exit0. Exact gate output follows; underlying combined runner output is production-proof.raw.log.
 Environment: TMPDIR=$PWD/target/review-scratch; CARGO_BUILD_JOBS=4; CARGO_PROFILE_DEV_DEBUG=0; CARGO_PROFILE_TEST_DEBUG=0; EVENTLOG_REQUIRE_POSTGRES=1; dedicated PostgreSQL17.6 container eventlog-catchup-20260909 on32875; CA in ../tls/ca.crt with dedicated application-role URL. Existing rustup-update.log earlier this same session records stable1.98.1 current.
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:6ecaa517b5aee9fd4b273c05315396cec4f0199103c7703f3b13ca961aea5277)
     Finished `dev` profile [unoptimized] target(s) in 0.61s
      Running `target/debug/examples/gate --production-proof`
 gate: cargo run --locked -p eventlog-postgres --example production-proof
@@ -82,7 +82,7 @@ gate: cargo run --locked -p eventlog-postgres --example production-proof
    Compiling rustls-webpki v0.103.15
    Compiling tokio-rustls v0.26.5
    Compiling tokio-postgres-rustls v0.14.0
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:6ecaa517b5aee9fd4b273c05315396cec4f0199103c7703f3b13ca961aea5277)
     Finished `dev` profile [unoptimized] target(s) in 1.66s
      Running `target/debug/examples/production-proof`
 
@@ -262,10 +262,10 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-   Compiling eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
-   Compiling eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-sqlite)
-   Compiling eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
-   Compiling eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
+   Compiling eventlog-postgres v0.1.0-dev.1 (home-path:sha256:6ecaa517b5aee9fd4b273c05315396cec4f0199103c7703f3b13ca961aea5277)
+   Compiling eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:f18da58afbf8349fbdc511eb86c7dbe86a76e1887d2acfc9b734fc9f4d949d18)
+   Compiling eventlog-conformance v0.1.0-dev.1 (home-path:sha256:91a792aba24f64fa749708cec10d3dd4473141713f407cca749d8986a5b99bc4)
+   Compiling eventlog-core v0.1.0-dev.1 (home-path:sha256:2513b1bcee86978c5eb16c5976c69265eb050168fca678d5e55ca30a67362539)
     Finished `test` profile [unoptimized] target(s) in 4.58s
      Running unittests src/lib.rs (target/debug/deps/eventlog_conformance-81307400d91e72d5)
      Running unittests src/lib.rs (target/debug/deps/eventlog_core-6e06060c4a60d048)
@@ -302,15 +302,15 @@ retained_projection_after_successful_erasure=None
 {"backend_server":{"version":"17.6","version_num":"170006"},"binary_sha256":"069e20f38398cd9d22cf282c7ba00b871e313d75871adfd234ee284fb12b4640","capacity_admitted":false,"capacity_requirement":"comparative laboratory artifact is separately required; this runner does not manufacture capacity evidence","conformance_valid":true,"default_pool":{"acquisition_ms":2000,"connections":4,"transaction_ms":10000,"waiters":32},"duration_ms":37130,"failed":0,"finished_at":"2026-09-09 0:51:46.255985138 +00:00:00","format":"eventlog-production-proof/1","missing_required_cases":[],"owner_fixture_handoff":["SDK current authority and exact realm/service bindings","SDK original and generated stream/feed/cursor/view/effect vectors"],"passed":92,"runner_summaries":["test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s","test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.50s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.98s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s","test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s","test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s","test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s","test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s","test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"],"schema_setup":"test-owned exact prefixes and hosted_owner schema; additive checksum admission exercised","skipped":0,"source_dirty":true,"source_revision":"5c1ff2690f07ec0b91f14cce307fff2a6b65ddca","started_at":"2026-09-09 0:51:09.125206092 +00:00:00"}
 gate: cargo fmt --all --check
 gate: cargo clippy --workspace --all-targets --locked -- -D warnings
-    Checking eventlog-core v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-core)
+    Checking eventlog-core v0.1.0-dev.1 (home-path:sha256:2513b1bcee86978c5eb16c5976c69265eb050168fca678d5e55ca30a67362539)
     Checking ring v0.17.14
     Checking rustls-webpki v0.103.15
     Checking rustls v0.23.43
-    Checking eventlog-conformance v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-conformance)
-    Checking eventlog-sqlite v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-sqlite)
+    Checking eventlog-conformance v0.1.0-dev.1 (home-path:sha256:91a792aba24f64fa749708cec10d3dd4473141713f407cca749d8986a5b99bc4)
+    Checking eventlog-sqlite v0.1.0-dev.1 (home-path:sha256:f18da58afbf8349fbdc511eb86c7dbe86a76e1887d2acfc9b734fc9f4d949d18)
     Checking tokio-rustls v0.26.5
     Checking tokio-postgres-rustls v0.14.0
-    Checking eventlog-postgres v0.1.0-dev.1 (~/.local/state/worktree/trees/b10x/eventlog/wt-655da8b1406c/crates/eventlog-postgres)
+    Checking eventlog-postgres v0.1.0-dev.1 (home-path:sha256:6ecaa517b5aee9fd4b273c05315396cec4f0199103c7703f3b13ca961aea5277)
     Finished `dev` profile [unoptimized] target(s) in 3.13s
 gate: green
 

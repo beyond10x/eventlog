@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:file-eventlog-verifies-once-per-open
 kind: story
-status: active
+status: implemented
 title: A file Eventlog transaction costs what it touches, not the whole store
 owner: eventlog
 relations:
@@ -22,7 +22,7 @@ scope:
   path: crates/eventlog-file/tests/
 - confidence: cited
   path: docs/design/file-provider.md
-revision: 6
+revision: 7
 ---
 ## Outcome
 

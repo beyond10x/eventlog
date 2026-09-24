@@ -22,11 +22,11 @@ the platform-side interruption of the assigned gpt-5.6-sol examination (B-ADMIN-
 implementor, not a prior reviewer. Read-only over all planning stores; no `aep` command, no commit,
 no push, no stash, no `worktree finish`, no cleanup. Managed review tree
 `ess-evolution-inline-admin-review-1-claude-20260918`
-(`~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-inline-admin-review-1-claude-20260918`),
+(`home-path:sha256:7fc25df102b55912d0b51bbef1825e9d6ae9ae12780dd0d9e4e5a665daafaf58`),
 detached at the exact submission, own lease `claude-adminrev-20260918-2209765` acquired, heartbeaten
 and released by this session only. The interrupted Sol reviewer tree and its lease were not touched.
 
-Deviation from `source-review-1-brief.md`: builds used `CARGO_TARGET_DIR=$HOME/.cache/b10x-target/eventlog`
+Deviation from `source-review-1-brief.md`: builds used `CARGO_TARGET_DIR=home-path:sha256:4647893c24db046f2519ab31ad7ad196db1b799e685d1b2874d8ef2920b88348`
 (the operator's standing workstation rule) instead of a tree-local `target/`, and `RUSTC_WRAPPER`
 was unset because the inherited `sccache` wrapper refuses a socket path this long. Rust 1.98.1,
 `--locked --offline`. PostgreSQL lanes were not executed: the disposable database and heavy build
@@ -143,8 +143,8 @@ same finding reaching a second provider rather than a second executed case.
 ## 6. Paths written outside the worktree
 
 One: this evidence directory,
-`~/beyond10x/.ess-evolution/waves/0008-eventlog-inline-admin/source-review-1-claude/`
-(`report.md` and `logs/`). Build output went to the shared `~/.cache/b10x-target/eventlog`, which is
+`home-path:sha256:933a6003a1582e08ef7e42b9200f51b10c39e40f5dd0c745b49912ac5353b19c`
+(`report.md` and `logs/`). Build output went to the shared `home-path:sha256:914353ffa8bda7f691bfcdfade880a68e065ddf85ab4c91f225378d280e88e22`, which is
 the operator's standing target directory and not created by this review. No `/tmp` use.
 
 ```findings

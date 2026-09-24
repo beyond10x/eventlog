@@ -8,11 +8,11 @@ relations:
 - reviews: story:file-eventlog-verifies-once-per-open
 revision: 2
 ---
-unit: story:file-eventlog-verifies-once-per-open — commit 9f234c5d09b234cf207d5d8a311ac8a642c6bc69, worktree ~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-verify-once-review-2-20260921 (HEAD detached, no tracked file modified)
+unit: story:file-eventlog-verifies-once-per-open — commit 9f234c5d09b234cf207d5d8a311ac8a642c6bc69, worktree home-path:sha256:c6f7196df0de052f1281caadc0abc05ee2a917544fba7002b8322fdacc393934 (HEAD detached, no tracked file modified)
 verdict: green
 cases: executed 65→84, red 0
 origin: introduced 3, pre-existing 0, undecided 0
-wrote-outside-worktree: 4 roots — this report, ~/.cache/ess-wave-v2/el1r2/tmp/, ~/.cache/ess-wave-v2/el1r2/measure/, ~/.cache/ess-wave-v2/el1r2/mutate/; full list in §10
+wrote-outside-worktree: 4 roots — this report, home-path:sha256:8d125eb91451c318a4140344d52adf4dfc7c2c41e87e21438a57b4d36a541bae, home-path:sha256:afea5b0577319da857321acb8fcfac2d1446e67072e8b8dc55d2dfeb44cff79a, home-path:sha256:baae5287c847c8e21569454757040d5a216d2be2a5561b94c9e8e717679d8c4c; full list in §10
 needs-coordinator: yes
 
 **Nothing I could express as a program found an acceptance invariant unenforced.** Seventeen cases
@@ -34,7 +34,7 @@ already passes.
 ## 1. `git status --porcelain` — proof of the bound
 
 ```
-$ cd ~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-verify-once-review-2-20260921
+$ cd home-path:sha256:c6f7196df0de052f1281caadc0abc05ee2a917544fba7002b8322fdacc393934
 $ git --no-pager diff --stat
 $ git status --porcelain
 ?? crates/eventlog-file/tests/measure_review_two.rs
@@ -152,7 +152,7 @@ basis, so two handles in one process serialize as strictly as two processes do. 
 
 ## 5. The finding: `Journal::resume`'s gate fails AGENTS.md invariant 5
 
-Probed on a `git archive 9f234c5` extraction under `~/.cache/ess-wave-v2/el1r2/mutate`,
+Probed on a `git archive 9f234c5` extraction under `home-path:sha256:75a8f42fdb5f8c54ffcec1826b3c22d520251d50c50ea16a3f1a9ab3439a01ae`,
 never in the worktree. Each row is one deletion from the code **this unit added**, with the rest of
 the crate left alone; the tree was restored from saved copies between every row and verified
 identical to 9f234c5 at the end.
@@ -370,14 +370,14 @@ One line each; this is the part that says what my silence is worth.
 
 ## 10. Every path written outside the worktree
 
-- `~/beyond10x/.ess-evolution/waves/0005-aep-migration/wave-validate-v2-20260920/unit-3-eventlog-verify-once/review-2-report.md` — this report, as the brief's `report:` line directs
-- `~/.cache/ess-wave-v2/el1r2/tmp/` (108 KB) — the assigned `TMPDIR` for every cargo
+- `home-path:sha256:26783499a8d9f2cb09ed38b6c31306c89e3a44bec1728755707e4a9ab17d905f` — this report, as the brief's `report:` line directs
+- `home-path:sha256:8d125eb91451c318a4140344d52adf4dfc7c2c41e87e21438a57b4d36a541bae` (108 KB) — the assigned `TMPDIR` for every cargo
   command, and the logs: `build.log`, `cases-alone.log`, `cases-alone-2.log`, `cases-alone-3.log`,
   `suite.log`, `suite2.log`, `suite-final.log`, `before.log`, `workspace.log`, `fmt.log`,
   `fmt2.log`, `clippy.log`, `clippy2.log`, `relbuild.log`, `relbuild2.log`
-- `~/.cache/ess-wave-v2/el1r2/measure/` (27 MB) — `fixture/` (the 2,000-frame,
+- `home-path:sha256:afea5b0577319da857321acb8fcfac2d1446e67072e8b8dc55d2dfeb44cff79a` (27 MB) — `fixture/` (the 2,000-frame,
   1,000-blob acceptance fixture) and `run/` (the copy each timed run consumes)
-- `~/.cache/ess-wave-v2/el1r2/mutate/` (906 MB) — a `git archive 9f234c5` extraction with
+- `home-path:sha256:baae5287c847c8e21569454757040d5a216d2be2a5561b94c9e8e717679d8c4c` (906 MB) — a `git archive 9f234c5` extraction with
   its own `target/`, plus `journal.rs.orig` and `lib.rs.orig`, used only for §5. **The sources in
   it are restored to 9f234c5 and verified byte-identical**; the worktree was never mutated and
   never moved.

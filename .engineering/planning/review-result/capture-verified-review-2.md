@@ -8,11 +8,11 @@ relations:
 - reviews: story:file-capture-reuses-the-verified-view
 revision: 2
 ---
-unit: story:file-capture-reuses-the-verified-view — commit b5a6e0ae19a5d02616a8c260a1f3d67060317ba3, worktree ~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-capture-verified-review-2-20260921 (HEAD detached, no tracked file modified)
+unit: story:file-capture-reuses-the-verified-view — commit b5a6e0ae19a5d02616a8c260a1f3d67060317ba3, worktree home-path:sha256:9fb7a0cbaea99ddb6c55d7d287408c61cd17a3710f8df99690692b2a5a614431 (HEAD detached, no tracked file modified)
 verdict: red
 cases: executed 90→97, red 1
 origin: introduced 6, pre-existing 2, undecided 0
-wrote-outside-worktree: 2 roots — this report and ~/.cache/ess-wave-v2/u6r2/; full list in §6
+wrote-outside-worktree: 2 roots — this report and home-path:sha256:013116d0027a9ec782c1118a9df9244537e19dfd82e3fde0b08b6d0a6d36b34a; full list in §6
 needs-coordinator: no
 
 **The unit's own new design paragraph is false, and one line is why.** `docs/design/file-provider.md:87`
@@ -36,7 +36,7 @@ fourteen green and four fail-open.
 ## 1. `git --no-pager diff --stat` and `git status --porcelain` — proof of the bound
 
 ```
-$ cd ~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-capture-verified-review-2-20260921
+$ cd home-path:sha256:9fb7a0cbaea99ddb6c55d7d287408c61cd17a3710f8df99690692b2a5a614431
 $ git --no-pager diff --stat
 $ git status --porcelain
 ?? crates/eventlog-file/tests/capture_review_three.rs
@@ -47,7 +47,7 @@ is therefore the bound's proof — **exactly one path, a test file under
 `crates/eventlog-file/tests/`**. No implementation file, no document, no conformance exercise and no
 `.engineering/` path was touched, and no `git` write command (`commit`, `add`, `stash`, `switch`,
 `checkout`, `branch`, `worktree`) was run at any point. Every mutation in §3 was applied to
-`git archive` extractions under `~/.cache/ess-wave-v2/u6r2/`, never to this worktree.
+`git archive` extractions under `home-path:sha256:013116d0027a9ec782c1118a9df9244537e19dfd82e3fde0b08b6d0a6d36b34a`, never to this worktree.
 
 `cargo clippy -p eventlog-file --all-targets -- -D warnings` exits **0** with my file present, and
 the file is `rustfmt`-clean, so nothing I added moves the gate.
@@ -128,7 +128,7 @@ if !fs::symlink_metadata(root).ok()?.is_dir() {
 ### Origin, run rather than read
 
 The same file against a `git archive db608cd` extraction
-(`~/.cache/ess-wave-v2/u6r2/base`, this worktree never moved):
+(`home-path:sha256:227b0887ac93826fb3191d128e8fe11bb0714d6bed6ab434aed46894e5a05a04`, this worktree never moved):
 
 ```
 $ cargo test -p eventlog-file --test capture_review_three --no-fail-fast
@@ -150,7 +150,7 @@ All seven green at db608cd, where every capture is a strict open. **Introduced.*
 ## 3. Which added lines can be deleted while the suite stays green
 
 The question this pass was sent for. Eleven one-line changes to the code this unit added, applied
-to a `git archive b5a6e0a` extraction under `~/.cache/ess-wave-v2/u6r2/mutate` — never to
+to a `git archive b5a6e0a` extraction under `home-path:sha256:bfce33d1d42ddafe609b8f95907fa0280c412c760d593756befed9eef2ea1703` — never to
 this worktree — each run against the **shipped** 90-case suite with my file absent, then against my
 file with the one case that is red unmutated deselected. The tree was restored from saved originals
 between every row and the restore row is the control.
@@ -170,7 +170,7 @@ between every row and the restore row is the control.
 | A12 | `journal.rs:454` the committed-prefix comparison → `if false` (control) | exit 101 ✓ | — | — |
 | A13 | `capture.rs:244-248` the fold of the frames past the observed head, deleted (control) | exit 101 ✓ | — | — |
 
-Script and full logs: `~/.cache/ess-wave-v2/u6r2/tmp/{mutate.py,run-mutations.sh,run-mine.sh,mutations-shipped.log,mine-under-mutation.log}`.
+Script and full logs: `home-path:sha256:a7421faef1d998366e3733227a3f7c79819da7a29f78d05296c51c39a3546c24,run-mutations.sh,run-mine.sh,mutations-shipped.log,mine-under-mutation.log}`.
 
 ```
 $ bash run-mutations.sh <mutate-tree> mutations-shipped.log restore A1 A2 A3 A4 A6 A7 A8 A9 A10 A12 A13
@@ -221,7 +221,7 @@ evidence and record A3 in the unit's own table.
 
 **A7 — `regular(&events_path)` — is unpinned at db608cd too, measured.** Deleting the same line from
 `Journal::resume` at the base leaves the base's 84-case suite green (exit 0, log
-`~/.cache/ess-wave-v2/u6r2/tmp/`). So the coverage gap is old; what is new is that a
+`home-path:sha256:56ad2eab64440cb3d3e45bfdd2a020fa878e6d73984199e6798d8ba4d5283bea`). So the coverage gap is old; what is new is that a
 **capture** now depends on that line. Without it `fs::metadata` follows the link and reports the
 target's length, so every remaining question in the walk is answered by the target and the capture
 serves history through an entry `open_strict` refuses. Origin is `introduced` under the charter's
@@ -272,7 +272,7 @@ assertion `left == right` failed: a resumed capture observed a store root the st
 EXIT=101
 ```
 
-Full output: `~/.cache/ess-wave-v2/u6r2/tmp/suite.log`. **executed 90 → 97**: `<before>` is
+Full output: `home-path:sha256:cbc7f56c08d039a6101184706c3cccd8ed003efd817e9a6ead6268935ec98f34`. **executed 90 → 97**: `<before>` is
 the `cases: executed 84→90` the implementing state reported, corroborated by the restore row of §3,
 which is this commit's sources with my file absent and prints 90 across the same twelve lanes.
 `<after>` is 97, the twelve lanes above with `capture_review_three`'s seven. One red, and it is §2's.
@@ -331,14 +331,14 @@ not worth the disk.
 
 ## 6. Every path written outside the worktree
 
-- `~/beyond10x/.ess-evolution/waves/0005-aep-migration/wave-validate-v2-20260920/unit-6-capture-verified/review-2-report.md` — this file, as the dispatch directs
-- `~/.cache/ess-wave-v2/u6r2/tmp/` — `mutate.py`, `base-mutate.py`, `run-mutations.sh`,
+- `home-path:sha256:da2b6364ba61bf82acfe44cf18c1b8d8db5de5f2306e67881000d0fffa002c75` — this file, as the dispatch directs
+- `home-path:sha256:56ad2eab64440cb3d3e45bfdd2a020fa878e6d73984199e6798d8ba4d5283bea` — `mutate.py`, `base-mutate.py`, `run-mutations.sh`,
   `run-mine.sh`, `case1-alone.log`, `mutations-shipped.log`, `mutations-withmine.log`,
   `mine-under-mutation.log`, `base-mycases.log`, `suite.log`, `base-journal.rs.orig`, and the
   `TMPDIR` every cargo command in this session used
-- `~/.cache/ess-wave-v2/u6r2/base/` — a `git archive db608cd` extraction with my test file
+- `home-path:sha256:95e15393d70494a5ac332b96b19c23d384b835fe6840309aa59bde9ba362a735` — a `git archive db608cd` extraction with my test file
   copied in, its own `target/`, used for every origin run
-- `~/.cache/ess-wave-v2/u6r2/mutate/` — a `git archive b5a6e0a` extraction with my test
+- `home-path:sha256:a2c82afcf9b77220059176ca5769d7d4c2aa98ec7bd314e708966ef09329415d` — a `git archive b5a6e0a` extraction with my test
   file copied in, its own `target/` and a `.orig/` of the two mutated sources, used for §3
 
 Nothing under `/tmp`. `CARGO_TARGET_DIR` never set. No `git` write command, no `.engineering/`
