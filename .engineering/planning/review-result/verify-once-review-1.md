@@ -8,17 +8,17 @@ relations:
 - reviews: story:file-eventlog-verifies-once-per-open
 revision: 2
 ---
-unit: story:file-eventlog-verifies-once-per-open — commit c698923038de4413e0bbba3cd91ae108607d6be9, worktree ~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-verify-once-review-1-20260921 (HEAD detached, no tracked file modified)
+unit: story:file-eventlog-verifies-once-per-open — commit c698923038de4413e0bbba3cd91ae108607d6be9, worktree home-path:sha256:d30a97f67dd9c970031b7f1d0664be59b72fc6a61618902ce26b329f11655122 (HEAD detached, no tracked file modified)
 verdict: red
 cases: executed 60→63, red 3
 origin: introduced 5, pre-existing 1, undecided 0
-wrote-outside-worktree: 3 roots — ~/.cache/ess-wave-v2/el1r1/tmp/ (logs), ~/.cache/ess-wave-v2/el1r1/base/ (git archive of f802eb8 + my test file + its own target/), and this report; full list in §6
+wrote-outside-worktree: 3 roots — home-path:sha256:846ccc829abc0b551289c324ef204d829ca019a39c20039893bf45796faf2347 (logs), home-path:sha256:d951da5fcf29f837c1965cf53e104eec4faf81cdd96775c0688fcd2916f1f253 (git archive of f802eb8 + my test file + its own target/), and this report; full list in §6
 needs-coordinator: yes
 
 ## 1. `git --no-pager diff --stat`
 
 ```
-$ cd ~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-verify-once-review-1-20260921
+$ cd home-path:sha256:d30a97f67dd9c970031b7f1d0664be59b72fc6a61618902ce26b329f11655122
 $ git --no-pager diff --stat
 $ git status --porcelain
 ?? crates/eventlog-file/tests/verify_once_review.rs
@@ -41,7 +41,7 @@ suite.
 | `an_open_handle_does_not_commit_onto_a_history_it_can_no_longer_validate` (`:105`) | the rest of line 16 — *without altering the history*: either the operation refuses, or the store it wrote into still opens | red |
 | `a_rewritten_prefix_does_not_extend_the_head_an_open_handle_observed` (`:166`) | story `## Outcome` — "a chain that does not extend the observed manifest is still refused"; design line 33 | red |
 
-Verbatim, each run alone (`TMPDIR=~/.cache/ess-wave-v2/el1r1/tmp`, build dir
+Verbatim, each run alone (`TMPDIR=home-path:sha256:a9ff4945e162727cfe00cd5dca8cc80a34be4bc3316d7c9e27130bd3cb7e279b`, build dir
 `<worktree>/target`, `CARGO_TARGET_DIR` never set):
 
 ```
@@ -116,12 +116,12 @@ EXIT=101
 ### Origin, settled by a program and not by reading
 
 The same three cases were run against the **base commit f802eb8**, in a scratch tree built with
-`git archive f802eb8 | tar -x -C ~/.cache/ess-wave-v2/el1r1/base` with only my test file
+`git archive f802eb8 | tar -x -C home-path:sha256:e036105923cf725c94daae78b1fe53bda5897fe6749f765e5e39e373780a5683` with only my test file
 copied in. The worktree was never moved; no `checkout`, `switch`, `stash` or `worktree` command was
 run.
 
 ```
-$ cd ~/.cache/ess-wave-v2/el1r1/base && cargo test -p eventlog-file --test verify_once_review
+$ cd home-path:sha256:e036105923cf725c94daae78b1fe53bda5897fe6749f765e5e39e373780a5683 && cargo test -p eventlog-file --test verify_once_review
 running 3 tests
 test an_open_handle_does_not_commit_onto_a_history_it_can_no_longer_validate ... ok
 test a_damaged_committed_frame_refuses_on_an_open_handle ... ok
@@ -136,7 +136,7 @@ Green at f802eb8, red at c698923: **origin `introduced`**, demonstrated.
 ## 3. The suite, after the cases existed
 
 ```
-$ cd <worktree> && TMPDIR=~/.cache/ess-wave-v2/el1r1/tmp cargo test -p eventlog-file --no-fail-fast
+$ cd <worktree> && TMPDIR=home-path:sha256:a9ff4945e162727cfe00cd5dca8cc80a34be4bc3316d7c9e27130bd3cb7e279b cargo test -p eventlog-file --no-fail-fast
      Running unittests src/lib.rs (target/debug/deps/eventlog_file-4cb1bc046873d058)
 test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.30s
      Running tests/capture_review_one.rs (target/debug/deps/capture_review_one-79ca1617fee85d5b)
@@ -284,9 +284,9 @@ bytes, which makes "cleaned less often" worth one line even without a reacher.
 
 ## 6. Every path written outside the worktree
 
-- `~/beyond10x/.ess-evolution/waves/0005-aep-migration/wave-validate-v2-20260920/unit-3-eventlog-verify-once/review-1-report.md` — this report, as the brief's `report:` line directs
-- `~/.cache/ess-wave-v2/el1r1/tmp/` — `case1.log`, `case2.log`, `case3.log`, `cases-final.log`, `suite.log`, `suite-final.log`, `base-run.log`, `fmt.log`, `clippy.log`; also the assigned `TMPDIR` for every cargo invocation
-- `~/.cache/ess-wave-v2/el1r1/base/` — a `git archive` extraction of f802eb8 with my test file copied in, plus its own `target/`, used only to settle origin (§2). About 400 MB together with the logs. Nothing was written under `/tmp`.
+- `home-path:sha256:f70c978bfd9a5e1552a7d5e9dc95107d0afca41f803ed73ad169e14624138d67` — this report, as the brief's `report:` line directs
+- `home-path:sha256:846ccc829abc0b551289c324ef204d829ca019a39c20039893bf45796faf2347` — `case1.log`, `case2.log`, `case3.log`, `cases-final.log`, `suite.log`, `suite-final.log`, `base-run.log`, `fmt.log`, `clippy.log`; also the assigned `TMPDIR` for every cargo invocation
+- `home-path:sha256:d951da5fcf29f837c1965cf53e104eec4faf81cdd96775c0688fcd2916f1f253` — a `git archive` extraction of f802eb8 with my test file copied in, plus its own `target/`, used only to settle origin (§2). About 400 MB together with the logs. Nothing was written under `/tmp`.
 
 Nothing was written to the planning store. No `aep plan artifact` command of any kind was run; the
 store was read once, with `aep artifact show`.

@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:file-capture-reuses-the-verified-view
 kind: story
-status: active
+status: implemented
 title: A file-provider capture reuses the handle's verified history instead of reverifying the journal
 relations:
 - depends_on: story:file-eventlog-verifies-once-per-open
@@ -18,7 +18,7 @@ scope:
   path: crates/eventlog-file/src/lib.rs
 - confidence: inferred
   path: docs/design/file-provider.md
-revision: 9
+revision: 10
 ---
 ## Outcome
 

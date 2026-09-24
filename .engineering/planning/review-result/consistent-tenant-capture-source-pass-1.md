@@ -20,7 +20,7 @@ needs-coordinator: whether a foreign SQL writer's rows are a state this reader m
 ## 1. `git --no-pager diff --stat`
 
 Empty. No tracked file changed. `git status --porcelain` in
-`~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-capture-source-review-1-20260916`:
+`home-path:sha256:89e9105168f2b00bbf6e68e4ed912347a9bbe250ff750a35977dfb23efb8a9ae`:
 
 ```
 ?? crates/eventlog-core/tests/

@@ -12,7 +12,7 @@ unit: story:file-capture-reuses-the-verified-view — commit b5a6e0ae19a5d02616a
 verdict: red
 cases: executed 90→95, red 2
 origin: introduced 1, pre-existing 0, undecided 0
-wrote-outside-worktree: ~/.cache/ess-wave-v2/u6r1/ (6 paths, §6) and this report
+wrote-outside-worktree: home-path:sha256:99c5fc3210f02356a9700ccf18d69884f8e8e9a67a43b97c20e26cc6fdb703ae (6 paths, §6) and this report
 needs-coordinator: no
 
 Two red cases, one defect: `journal::resume_strict` is the only entry point onto a store root that
@@ -55,10 +55,10 @@ was run once to format that file, and `git status --porcelain` above is the read
 ### 2a. The failing case, run alone, verbatim
 
 ```
-$ TMPDIR=~/.cache/ess-wave-v2/u6r1/tmp cargo test -p eventlog-file \
+$ TMPDIR=home-path:sha256:3bfb11956d81824f9cf72f82af5d4c9ebc4e7eee3992f7d9ef68ed7c6c86080d cargo test -p eventlog-file \
     --test capture_verified_review_one -- --exact \
     a_store_root_that_is_no_longer_a_physical_directory_refuses_a_resumed_capture
-   Compiling eventlog-file v0.2.1 (~/.local/state/worktree/trees/b10x/eventlog/ess-evolution-capture-verified-review-1-20260921/crates/eventlog-file)
+   Compiling eventlog-file v0.2.1 (home-path:sha256:d7bb5b3586c3f6988210b0ad8f2c775cc56ce53689423a74c5b747f89c193a58)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 6.70s
      Running tests/capture_verified_review_one.rs (target/debug/deps/capture_verified_review_one-6b3c8e1db28f9e36)
 
@@ -92,7 +92,7 @@ is real and is the root check and not some other one.
 ### 2b. The parity sweep, run alone, verbatim — nine of ten shapes hold
 
 ```
-$ TMPDIR=~/.cache/ess-wave-v2/u6r1/tmp cargo test -p eventlog-file \
+$ TMPDIR=home-path:sha256:3bfb11956d81824f9cf72f82af5d4c9ebc4e7eee3992f7d9ef68ed7c6c86080d cargo test -p eventlog-file \
     --test capture_verified_review_one -- --exact \
     every_shape_the_strict_opener_refuses_is_refused_through_the_resumed_path
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
@@ -165,12 +165,12 @@ EXIT=0
 
 ### 2d. Origin, settled by running against `git archive db608cd`
 
-`git archive db608cd | tar -x -C ~/.cache/ess-wave-v2/u6r1/base`; the same test file
+`git archive db608cd | tar -x -C home-path:sha256:90143c9ecbe3c4324f4fa4f4fcc14ef4ae5bf6c48371c9ffdaab79cdc409b890`; the same test file
 copied in unchanged; this worktree never moved.
 
 ```
-$ cd ~/.cache/ess-wave-v2/u6r1/base && TMPDIR=.../tmp cargo test -p eventlog-file --test capture_verified_review_one
-   Compiling eventlog-file v0.2.1 (~/.cache/ess-wave-v2/u6r1/base/crates/eventlog-file)
+$ cd home-path:sha256:90143c9ecbe3c4324f4fa4f4fcc14ef4ae5bf6c48371c9ffdaab79cdc409b890 && TMPDIR=.../tmp cargo test -p eventlog-file --test capture_verified_review_one
+   Compiling eventlog-file v0.2.1 (home-path:sha256:8158821d2ccca08d89ded8580e73c78051c465fb829df479ce6d787ef8cdd80c)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 6.48s
      Running tests/capture_verified_review_one.rs
 
@@ -190,7 +190,7 @@ case was written after this run and is green on both sides; it is not a finding.
 ## 3. The suite, after the cases in §2 exist
 
 ```
-$ TMPDIR=~/.cache/ess-wave-v2/u6r1/tmp cargo test -p eventlog-file --no-fail-fast
+$ TMPDIR=home-path:sha256:3bfb11956d81824f9cf72f82af5d4c9ebc4e7eee3992f7d9ef68ed7c6c86080d cargo test -p eventlog-file --no-fail-fast
      Running unittests src/lib.rs
 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
      Running tests/capture_review_one.rs
@@ -313,7 +313,7 @@ and `privacy.next` survive byte-identically after all six steps. Green.
 ### Area 4 — the six mutations, re-applied. **6/6 still red on their named case.**
 
 Applied to a `git archive b5a6e0a` extraction under my scratch, never to the worktree. Script:
-`~/.cache/ess-wave-v2/u6r1/tmp/{mutate.py,run-mutations.sh}`; full log `mutations.log`.
+`home-path:sha256:d8f02cfccce83141d5af31142657f9654b7f723f430b8c318b2af9dea43a387d,run-mutations.sh}`; full log `mutations.log`.
 Each mutation's anchor is asserted to match exactly once before it is applied, so a mutation that
 silently did not land cannot be reported as red.
 
@@ -344,7 +344,7 @@ Commit covered: `b5a6e0ae19a5d02616a8c260a1f3d67060317ba3`; base compared agains
 | **what reaches it** | *Nothing found in-repo.* No caller in this repository or in the AEP CLI was shown to produce a symlinked store root; my case builds it. It is the same external-actor model the unit's own shipped cases use for the dangling-intent, displaced-lock and damaged-frame shapes, and the model `open_strict`'s doc comment is written against. The **document** half needs no actor at all: `docs/design/file-provider.md:87` states a universal that is false as written, and that sentence is public source. |
 | **defect** | `journal.rs:554` `resume_strict` begins at `root.join("writer.lock")`. `open_strict` (`:629`), `Journal::open_with_creation` (`:154`) and `Journal::resume` (`:326`) each check `fs::symlink_metadata(root)…is_dir()` first. `resume_strict` is the fourth entry point onto the same root and the only one that does not. |
 | **integrity impact, stated so it is not overstated** | Bounded. The bytes a capture serves through the link are still checked: store identity and epoch against the observed manifest, the committed prefix against the hash this handle took, and every object against the hash the committed history records. I did not find a way to serve forged content through it. What is broken is the refusal contract and the document that states it. |
-| **the correction, named not applied** | one line at the top of `resume_strict`, mirroring `Journal::resume`: `fs::symlink_metadata(root).ok()?.is_dir().then_some(())?;` — returning `None`, so `open_strict` makes the refusal with the evidence where it was found, as the rest of the function does. **Applied in the scratch copy only** (`~/.cache/ess-wave-v2/u6r1/mutant`, `tmp/apply-correction.py`) and run there: `cargo test -p eventlog-file --no-fail-fast` → **exit 0, all thirteen lanes green, 95 passed, 0 failed**, including both of my red cases and every existing case. It needs no change to either document. Fixing the document instead of the code would mean writing down that the reader is laxer than the writer on the same store, which is what the two types and the shared walk exist to avoid. The worktree under review is untouched: `git status --porcelain` still reads one untracked test file. |
+| **the correction, named not applied** | one line at the top of `resume_strict`, mirroring `Journal::resume`: `fs::symlink_metadata(root).ok()?.is_dir().then_some(())?;` — returning `None`, so `open_strict` makes the refusal with the evidence where it was found, as the rest of the function does. **Applied in the scratch copy only** (`home-path:sha256:05d9ee85f344d1c20a20c3f8e3fa6bc7b7454168224cfef3b321a211c1b6a558`, `tmp/apply-correction.py`) and run there: `cargo test -p eventlog-file --no-fail-fast` → **exit 0, all thirteen lanes green, 95 passed, 0 failed**, including both of my red cases and every existing case. It needs no change to either document. Fixing the document instead of the code would mean writing down that the reader is laxer than the writer on the same store, which is what the two types and the shared walk exist to avoid. The worktree under review is untouched: `git status --porcelain` still reads one untracked test file. |
 
 | file:line | category | severity | verdict | origin |
 | --- | --- | --- | --- | --- |
@@ -384,20 +384,20 @@ something to fix.
 
 ## 7. Every path written outside the worktree
 
-- `~/beyond10x/.ess-evolution/waves/0005-aep-migration/wave-validate-v2-20260920/unit-6-capture-verified/review-1-report.md` — this file, as the dispatch directs
-- `~/.cache/ess-wave-v2/u6r1/base/` — `git archive db608cd` extraction plus a copy of the
+- `home-path:sha256:fcc7df59d25525cae43ba8d2c42e6664c1cf6cece27022a7b1d8b00b731bc3f3` — this file, as the dispatch directs
+- `home-path:sha256:1ca8a76f2546385785233fa1e1c05a30a7b23a8780d200144325b3374c4caa50` — `git archive db608cd` extraction plus a copy of the
   new test file, and its `target/` (the origin run, §2d)
-- `~/.cache/ess-wave-v2/u6r1/mutant/` — `git archive b5a6e0a` extraction and its `target/`
+- `home-path:sha256:7f9c9d2dbe1d8fc8159bb0a99fd9406dec5878c5de3fafe83291212782d3fca1` — `git archive b5a6e0a` extraction and its `target/`
   (the mutation runs, §4); restored to pristine and green, then a copy of the new test file added
   and the named one-line correction applied to `src/journal.rs` **in that copy only**, which is the
   state it is left in
-- `~/.cache/ess-wave-v2/u6r1/tmp/apply-correction.py`
-- `~/.cache/ess-wave-v2/u6r1/pristine/crates/eventlog-file/src/{journal.rs,capture.rs}` —
+- `home-path:sha256:3ada529a55859b97d874bb8957559a1d79f7e5c38c7c1648ddfe334af0ce9529`
+- `home-path:sha256:da369f55da6b0f198e3750dceb13d0f8e007f7b1f8b0d82b290afc610d6d4dcc,capture.rs}` —
   the unmodified sources each mutation is reverted from
-- `~/.cache/ess-wave-v2/u6r1/tmp/mutate.py`, `run-mutations.sh`
-- `~/.cache/ess-wave-v2/u6r1/tmp/mutations.log`, `suite.log`, `suite-final.log`
+- `home-path:sha256:e20e4303ded8ae03bbf1e700e0fe8a4063160256d81b154f0ef4c2dd99da57f5`, `run-mutations.sh`
+- `home-path:sha256:60eba0abeb3632d9f95203a35c2139e52f093fed0b6a760ece74e922285e65b3`, `suite.log`, `suite-final.log`
 
-Nothing under `/tmp`; `TMPDIR` was `~/.cache/ess-wave-v2/u6r1/tmp` for every cargo command.
+Nothing under `/tmp`; `TMPDIR` was `home-path:sha256:3bfb11956d81824f9cf72f82af5d4c9ebc4e7eee3992f7d9ef68ed7c6c86080d` for every cargo command.
 `CARGO_TARGET_DIR` never set. No `.engineering/` write and no `aep artifact` verb of any kind.
 Disk 40 G free and MemAvailable 46 GiB throughout. This report approves nothing.
 

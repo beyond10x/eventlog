@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:file-capture-blob-digests-without-rehashing
 kind: story
-status: draft
+status: implemented
 title: A repeated capture does not re-hash blob content it has verified, or the design page says why it must
 relations:
 - depends_on: story:file-capture-reuses-the-verified-view
@@ -12,7 +12,7 @@ scope:
   path: crates/eventlog-file/src/capture.rs
 - confidence: cited
   path: docs/design/file-provider.md
-revision: 4
+revision: 7
 ---
 ## Outcome
 
