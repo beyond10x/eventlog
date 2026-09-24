@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:aggregates-repository-and-snapshots
 kind: story
 status: implemented

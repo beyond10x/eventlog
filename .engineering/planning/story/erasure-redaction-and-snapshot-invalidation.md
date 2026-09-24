@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:erasure-redaction-and-snapshot-invalidation
 kind: story
 status: implemented

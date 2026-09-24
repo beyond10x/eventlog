@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: review-result:consistent-tenant-capture-source-pass-2
 kind: review-result
 status: active

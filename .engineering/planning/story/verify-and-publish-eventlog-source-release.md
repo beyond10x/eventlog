@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:verify-and-publish-eventlog-source-release
 kind: story
 status: implemented

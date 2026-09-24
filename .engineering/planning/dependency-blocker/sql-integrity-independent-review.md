@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: dependency-blocker:sql-integrity-independent-review
 kind: dependency-blocker
 status: cleared

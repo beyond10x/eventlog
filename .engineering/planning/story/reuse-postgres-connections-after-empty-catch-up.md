@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: story:reuse-postgres-connections-after-empty-catch-up
 kind: story
 status: implemented

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: review-result:strict-inspection-adversary
 kind: review-result
 status: active

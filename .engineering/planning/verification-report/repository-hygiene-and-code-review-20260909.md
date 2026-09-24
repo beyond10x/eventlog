@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/2
 id: verification-report:repository-hygiene-and-code-review-20260909
 kind: verification-report
 status: draft
