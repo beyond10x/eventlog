@@ -5,6 +5,72 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- Fork vocabulary for stores whose history is merged outside them:
+  - `Expected::Merge(HeadSetDigest)` and `HeadSetDigest::of`;
+  - `RecordedEvent.digest` and `RecordedEvent.parents`, omitted from the wire when empty, so
+    existing file, SQLite and PostgreSQL bytes are unchanged;
+  - `EventStore::capabilities` with `Capabilities::LINEAR` as the default;
+  - `BranchableEventStore::heads`;
+  - `validate_captured_branchable_order`, which requires causal order instead of gapless versions.
+- `EventLogError::Forked` and `EventLogError::Unsupported`. File, SQLite and PostgreSQL refuse a
+  merge expectation as `Unsupported`, and the shared conformance exercise now checks that a
+  linear store refuses a merge and writes nothing.
+
+- `eventlog-tree`, a file event store whose history merges under version control:
+  - one immutable file per event and one per command, with the command's file as the commit
+    point and no store-wide file, so branches that wrote different streams merge without a
+    conflict;
+  - branches that wrote one stream fork it, and only an `Expected::Merge` over its exact heads
+    joins it again;
+  - history is replayed on open, in causal order, into SQLite `:memory:`, which serves every
+    read and projection;
+  - event ids, instants, receipts, tenant identities, blobs and redactions survive reopening;
+  - a torn write is never served, and `repair` removes it;
+  - an edited file refuses the open;
+  - it passes the shared storage, group, guarded blob-group, projection, inline, paging,
+    rebuild, input-validation and snapshot exercises;
+  - its capabilities declare claims unsupported and positions valid only while open.
+- `SqliteEventStore::restore_events`, `restored_pending` and `restore_stream_identity` let a
+  provider replay history it keeps elsewhere with the original identities and instants.
+- The shared input-validation exercise skips claim lookups on a store whose capabilities
+  declare claims unsupported.
+- `EventStore::read_many` answers a batch of stream and blob reads. The default loops, so SQLite
+  and PostgreSQL are unchanged. The file provider answers the whole batch in one transaction, so
+  a caller loading a history object by object resumes the store once instead of once per object.
+  A test counts it: 50 reads in one batch hash the prefix once, and 50 separate reads hash it
+  50 times.
+
+### Performance
+
+- `eventlog-tree` keeps the state it replayed under `.cache/state/`, named by a digest of every
+  history file's stamp, the registered projectors and the running program. An open of an
+  unchanged tree loads it and opens no event file; any changed, added or removed file replays
+  and verifies the whole tree, and no state is kept while a file is less than two seconds old.
+  `.cache/` ignores itself in Git and `verify` never reads it. On a 9,939-file store, a planning
+  `list` fell from 5.1 s to 1.2 s.
+- `TreeEventStore::open_with_inline` registers inline projectors before the replay, which
+  `open` followed by `attach_inline_existing` did twice.
+- An in-memory SQLite store checks a stored blob's length and integrity metadata on read, and no
+  longer hashes its bytes again: its rows change only through its own statements. A file
+  database hashes them as before.
+- A blob group's fingerprint and the blob's integrity column share one SHA-256 of its content.
+- `SqliteEventStore::image` and `SqliteEventStore::from_image` write and reopen a whole store.
+
+- A file-provider operation no longer re-reads and re-hashes the committed journal while the
+  file's inode stamp is unchanged and was taken at least two seconds after the file last changed.
+  Two hundred reads over an unchanged 20-frame history now hash 0 prefix bytes; before, each read
+  re-hashed the whole prefix. `docs/design/file-provider.md` records what the stamp does and does
+  not detect.
+- A read that refuses after recording and writing nothing keeps the handle's verified view. The
+  next operation resumes instead of reopening the store and hashing every object.
+
+### Changed
+
+- `Expected`, `Capabilities` and `EventLogError` are `#[non_exhaustive]`. A downstream exhaustive
+  `match` needs one wildcard arm, once.
+
 ### Fixed
 
 - SQLite validates an existing blob's stored length, integrity hash and edition

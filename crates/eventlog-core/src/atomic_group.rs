@@ -53,6 +53,9 @@ impl AppendGroup {
                 Expected::Any => json!(["any"]),
                 Expected::NoStream => json!(["no-stream"]),
                 Expected::Exact(version) => json!(["exact", version]),
+                // The head set is part of the request: two merges over different heads are
+                // different requests, even under one idempotency key.
+                Expected::Merge(heads) => json!(["merge", heads.to_hex()]),
             };
             entries
                 .push(json!({"stream":append.stream,"expected":expected,"events":append.events}));

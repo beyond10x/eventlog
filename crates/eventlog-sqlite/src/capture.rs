@@ -14,7 +14,6 @@ use eventlog_core::{
     CapturedBlob, CapturedProjection, ConsistentTenantCapture, EventLogError,
     ProjectionCaptureRefusal, ProjectionSpec, RecordedEvent, TenantCapture, TenantId, order_blobs,
     order_rows, validate_capture_request, validate_captured_digest, validate_captured_order,
-    validate_stored_blob,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde_json::Value;
@@ -409,7 +408,7 @@ fn read_blobs(
                 .transpose()
                 .map_err(|_| corrupt(CaptureMaterial::Blob))?;
             // The accepted SQL complete-content validator, not a checksum column read back raw.
-            let bytes = validate_stored_blob(bytes, count, hash, edition)
+            let bytes = crate::checked_blob(connection, bytes, count, hash, edition)
                 .map_err(|_| corrupt(CaptureMaterial::Blob))?;
             budget.admit_blob(bytes.len() as u64)?;
             after = Some(digest.clone());

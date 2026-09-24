@@ -567,6 +567,54 @@ pub fn validate_captured_order(
     Ok(())
 }
 
+/// [`validate_captured_order`] for a store whose streams can fork.
+///
+/// Positions still rise strictly, but a stream's versions need not be gapless or unique: two
+/// branches that each appended to one stream hold two events at one version. What must hold
+/// instead is causality. Every event carries its digest, and each parent it names was captured
+/// earlier on the same stream, so a fold never applies a child before its parent.
+///
+/// # Errors
+/// Returns [`CaptureError::Corrupt`] for any event that fails [`validate_captured_event`], a
+/// position that does not rise, an event with no digest, a digest seen twice, a parent not seen
+/// earlier on the same stream, or a version other than one past its highest parent's.
+pub fn validate_captured_branchable_order(
+    tenant: &TenantId,
+    events: &[RecordedEvent],
+) -> Result<(), CaptureError> {
+    let corrupt = || CaptureError::Corrupt {
+        material: CaptureMaterial::Event,
+    };
+    let mut position = 0_u64;
+    let mut seen: BTreeMap<(&str, &str, &str), u64> = BTreeMap::new();
+    for event in events {
+        validate_captured_event(tenant, event)?;
+        if event.global_seq <= position {
+            return Err(corrupt());
+        }
+        position = event.global_seq;
+        let digest = event.digest.as_deref().ok_or_else(corrupt)?;
+        let stream = (event.stream_type.as_str(), event.stream_id.as_str());
+        let mut highest = 0_u64;
+        for parent in &event.parents {
+            let version = seen
+                .get(&(stream.0, stream.1, parent.as_str()))
+                .ok_or_else(corrupt)?;
+            highest = highest.max(*version);
+        }
+        if highest.checked_add(1) != Some(event.version) {
+            return Err(corrupt());
+        }
+        if seen
+            .insert((stream.0, stream.1, digest), event.version)
+            .is_some()
+        {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
 /// Check one stored blob digest before it is returned as a binding coordinate.
 ///
 /// The digest stays opaque: this admits exactly what a writer here could have bound, and reads no
@@ -744,7 +792,97 @@ mod tests {
             causation_depth: 0,
             redacted_at: None,
             data: json!({ "value": 1 }),
+            digest: None,
+            parents: Vec::new(),
         }
+    }
+
+    fn chained(global_seq: u64, version: u64, digest: &str, parents: &[&str]) -> RecordedEvent {
+        RecordedEvent {
+            digest: Some(digest.to_owned()),
+            parents: parents.iter().map(|parent| (*parent).to_owned()).collect(),
+            ..recorded(global_seq, version, "one")
+        }
+    }
+
+    #[test]
+    fn a_branchable_capture_admits_a_fork_and_its_merge() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let history = [
+            chained(1, 1, "a", &[]),
+            chained(2, 2, "b", &["a"]),
+            chained(3, 2, "c", &["a"]),
+            chained(4, 3, "m", &["b", "c"]),
+        ];
+        validate_captured_branchable_order(&tenant, &history)
+            .expect("two appends at version 2 and the event that joins them are one valid history");
+        assert!(
+            validate_captured_order(&tenant, &history).is_err(),
+            "the linear rule still refuses a fork, so a linear provider cannot serve one"
+        );
+    }
+
+    #[test]
+    fn a_branchable_capture_refuses_a_child_before_its_parent() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let history = [chained(1, 2, "b", &["a"]), chained(2, 1, "a", &[])];
+        assert!(
+            matches!(
+                validate_captured_branchable_order(&tenant, &history),
+                Err(CaptureError::Corrupt {
+                    material: CaptureMaterial::Event
+                })
+            ),
+            "a child captured before its parent was admitted"
+        );
+    }
+
+    #[test]
+    fn a_branchable_capture_refuses_a_version_that_does_not_follow_its_parents() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let skipped = [chained(1, 1, "a", &[]), chained(2, 3, "b", &["a"])];
+        assert!(
+            validate_captured_branchable_order(&tenant, &skipped).is_err(),
+            "version 3 over a version-1 parent was admitted"
+        );
+        let merge_below = [
+            chained(1, 1, "a", &[]),
+            chained(2, 2, "b", &["a"]),
+            chained(3, 3, "c", &["b"]),
+            chained(4, 3, "m", &["a", "c"]),
+        ];
+        assert!(
+            validate_captured_branchable_order(&tenant, &merge_below).is_err(),
+            "a merge at its lower parent's version plus one was admitted"
+        );
+    }
+
+    #[test]
+    fn a_branchable_capture_refuses_a_missing_or_repeated_digest() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        assert!(
+            validate_captured_branchable_order(&tenant, &[recorded(1, 1, "one")]).is_err(),
+            "an event with no digest was admitted into a chained history"
+        );
+        let repeated = [chained(1, 1, "a", &[]), chained(2, 2, "a", &["a"])];
+        assert!(
+            validate_captured_branchable_order(&tenant, &repeated).is_err(),
+            "one digest at two versions was admitted"
+        );
+    }
+
+    #[test]
+    fn a_branchable_capture_keeps_parents_to_their_own_stream() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let other = RecordedEvent {
+            stream_id: "two".to_owned(),
+            ..chained(1, 1, "a", &[])
+        };
+        let history = [other, chained(2, 2, "b", &["a"])];
+        assert!(
+            validate_captured_branchable_order(&tenant, &history).is_err(),
+            "a parent on another stream was accepted"
+        );
     }
 
     #[test]

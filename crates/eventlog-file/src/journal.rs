@@ -84,11 +84,20 @@ pub(crate) struct Journal {
 /// verified to the complete opener, which refuses it. Without it, damage inside the committed
 /// prefix is invisible to every later transaction, including the one that appends onto it.
 #[derive(Clone)]
-pub(crate) struct Content(Sha256);
+pub(crate) struct Content {
+    hash: Sha256,
+    /// The inode metadata `events.jsonl` had while these bytes were read from it, when it held
+    /// still for the whole read and was last changed well before it began. While the file still
+    /// carries exactly this stamp, its bytes are these bytes, and a resume need not read them.
+    stamp: Option<Stamp>,
+}
 
 impl Content {
     fn empty() -> Self {
-        Self(Sha256::new())
+        Self {
+            hash: Sha256::new(),
+            stamp: None,
+        }
     }
     fn of(bytes: &[u8]) -> Self {
         let mut content = Self::empty();
@@ -96,10 +105,81 @@ impl Content {
         content
     }
     fn absorb(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
+        self.hash.update(bytes);
+        // Bytes appended after the stamp was taken are not what the stamp describes.
+        self.stamp = None;
     }
     fn digest(&self) -> String {
-        format!("{:x}", self.0.clone().finalize())
+        format!("{:x}", self.hash.clone().finalize())
+    }
+    fn stamped(mut self, stamp: Option<Stamp>) -> Self {
+        self.stamp = stamp;
+        self
+    }
+}
+
+/// The inode metadata the kernel moves whenever a file's bytes change through the filesystem.
+///
+/// Userspace cannot set `ctime`: `utimensat` sets `mtime` and moves `ctime` to now, a write or
+/// truncate moves both, and a rename over the name moves the inode. So a file whose stamp is
+/// unchanged still holds the bytes it held, with two exceptions this store does not defend
+/// against: a write to the block device under the filesystem, and a shared mapping written after
+/// its first fault of a dirty cycle. `docs/design/file-provider.md` records that envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+/// How long after a change a stamp is still untrusted: one second of filesystem timestamp
+/// granularity plus the coarse clock tick. A file changed inside the window can carry the same
+/// timestamps as the change that follows it, so it is not stamped until the window has passed.
+/// A handle's own writes get no exemption: a same-length edit microseconds after its commit can
+/// land in the same tick (`tests/verify_once_review.rs`).
+const UNTRUSTED_NS: i128 = 2_000_000_000;
+
+impl Stamp {
+    #[cfg(unix)]
+    fn of(file: &File) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata().ok()?;
+        Some(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                + i128::from(metadata.mtime_nsec()),
+            ctime_ns: i128::from(metadata.ctime()) * 1_000_000_000
+                + i128::from(metadata.ctime_nsec()),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_file: &File) -> Option<Self> {
+        None
+    }
+}
+
+/// The wall clock, as the kernel stamps `ctime` from it.
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i128::try_from(elapsed.as_nanos()).unwrap_or(0))
+}
+
+/// The stamp to keep for bytes read between `before` and `after`, which began at `started`:
+/// only when the file did not move during the read and had not moved for the window before it.
+fn trusted(before: Option<Stamp>, after: Option<Stamp>, started: i128) -> Option<Stamp> {
+    match (before, after) {
+        (Some(before), Some(after))
+            if before == after && before.ctime_ns < started - UNTRUSTED_NS =>
+        {
+            Some(before)
+        }
+        _ => None,
     }
 }
 
@@ -267,6 +347,13 @@ impl Journal {
     }
 
     fn open_with_creation(root: &Path, create: bool) -> Result<Self, EventLogError> {
+        // A tree store keeps its history as one file per event under `store.json`. Opening one
+        // here would write a journal beside it, which neither store could then read.
+        if root.join("store.json").exists() {
+            return Err(EventLogError::Invalid(
+                "this directory holds an eventlog-tree store, not a file store".into(),
+            ));
+        }
         if create {
             fs::create_dir_all(root).map_err(backend)?;
         }
@@ -334,6 +421,8 @@ impl Journal {
         if events.metadata().map_err(backend)?.len() < manifest.length {
             return Err(corrupt());
         }
+        let started = now_ns();
+        let before = Stamp::of(&events);
         let mut committed = Vec::new();
         (&mut events)
             .take(manifest.length)
@@ -347,7 +436,7 @@ impl Journal {
         if events.metadata().map_err(backend)?.len() > manifest.length {
             return Err(corrupt());
         }
-        let content = Content::of(&committed);
+        let content = Content::of(&committed).stamped(trusted(before, Stamp::of(&events), started));
         sweep_unselected(root)?;
         sync_dir(root)?;
         Ok(Self {
@@ -559,9 +648,20 @@ fn resumed_committed(
     if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
         return Ok(None);
     }
-    // The committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
-    // rechaining it, and the only way a handle can tell that what it verified is still there.
     let mut events = File::open(&events_path).map_err(backend)?;
+    let started = now_ns();
+    let before = Stamp::of(&events);
+    // A file that still carries the stamp taken when these bytes were verified still holds them,
+    // and nothing was appended: its length is in the stamp. Nothing needs re-reading.
+    if content.stamp.is_some() && content.stamp == before && manifest == *observed {
+        #[cfg(test)]
+        crate::cost::charge(root, |cost| {
+            cost.resumes_trusted += 1;
+        });
+        return Ok(Some((manifest, Vec::new(), content.clone())));
+    }
+    // Otherwise the committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
+    // rechaining it, and the only way a handle can tell that what it verified is still there.
     let mut observed_content = Content::empty();
     let mut remaining = observed.length;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -599,6 +699,8 @@ fn resumed_committed(
     crate::cost::charge(root, |cost| {
         cost.frames_chained += fresh.len() as u64;
     });
+    // Every byte of the file has now been read and matched; stamp them for the next resume.
+    let observed_content = observed_content.stamped(trusted(before, Stamp::of(&events), started));
     Ok(Some((manifest, fresh, observed_content)))
 }
 

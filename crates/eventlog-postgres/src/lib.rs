@@ -1717,6 +1717,8 @@ fn read_event(row: &Row) -> Result<RecordedEvent, EventLogError> {
         causation_depth: to_u32(causation_depth)?,
         redacted_at: row.get(16),
         data: row.get(17),
+        digest: None,
+        parents: Vec::new(),
     })
 }
 
@@ -1732,6 +1734,10 @@ fn check_expected(expected: Expected, head: u64) -> Result<(), EventLogError> {
         Expected::Exact(version) => Err(EventLogError::Conflict {
             expected: version,
             actual: head,
+        }),
+        // A linear store never forks, so there is no head set for a merge to join.
+        _ => Err(EventLogError::Unsupported {
+            capability: "merge expectations",
         }),
     }
 }

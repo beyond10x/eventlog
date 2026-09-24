@@ -394,6 +394,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventlog-tree"
+version = "0.3.0"
+dependencies = [
+ "eventlog-conformance",
+ "eventlog-core",
+ "eventlog-sqlite",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
