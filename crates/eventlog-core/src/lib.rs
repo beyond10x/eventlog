@@ -24,8 +24,8 @@ pub use capture::{
     BoundBlobs, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CaptureRequestRefusal,
     CaptureResource, CapturedBlob, CapturedProjection, ConsistentTenantCapture, DeferredBlob,
     DeferredTenantCapture, ProjectionCaptureRefusal, TenantCapture, order_blobs,
-    order_deferred_blobs, order_rows, validate_capture_request, validate_captured_digest,
-    validate_captured_event, validate_captured_order,
+    order_deferred_blobs, order_rows, validate_capture_request, validate_captured_branchable_order,
+    validate_captured_digest, validate_captured_event, validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 
@@ -190,6 +190,7 @@ impl StreamId {
 /// last-write-wins could not hold one, because two commands that each read a valid state would
 /// both be allowed to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Expected {
     /// Append whatever the head is. Correct only when the events carry no decision.
     Any,
@@ -197,6 +198,78 @@ pub enum Expected {
     NoStream,
     /// The stream's head must be exactly this version.
     Exact(u64),
+    /// The stream has forked, and this append joins every one of its heads.
+    ///
+    /// Only a store whose [`Capabilities::forks`] is true can hold a fork, so every other store
+    /// refuses this with [`EventLogError::Unsupported`]. The digest names the sorted head set rather
+    /// than listing it, which keeps the expectation `Copy`; the heads themselves travel on the
+    /// request, where the store checks them against this digest.
+    Merge(HeadSetDigest),
+}
+
+/// The SHA-256 of a stream's sorted head digests, each followed by a newline.
+///
+/// Two writers that saw the same fork compute the same value, whatever order they read the heads
+/// in; a writer that missed a head computes a different one and is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeadSetDigest(pub [u8; 32]);
+
+impl HeadSetDigest {
+    /// The digest of `heads`, in any order.
+    #[must_use]
+    pub fn of<S: AsRef<str>>(heads: &[S]) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut sorted: Vec<&str> = heads.iter().map(AsRef::as_ref).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut hash = Sha256::new();
+        for head in sorted {
+            hash.update(head.as_bytes());
+            hash.update(b"\n");
+        }
+        Self(hash.finalize().into())
+    }
+
+    /// Lower-case hexadecimal, for hashing into a request and for display.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        use std::fmt::Write as _;
+        self.0
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
+}
+
+/// What a store can promise, so a caller and the shared conformance exercise can tell a refusal
+/// that is a store's declared limit from one that is a defect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Capabilities {
+    /// A `global_seq` a caller saved stays valid after the store is reopened.
+    pub durable_positions: bool,
+    /// Claims (`recorded_claim` and the claim half of a command) are kept.
+    pub claims: bool,
+    /// A stream may hold more than one head, and [`Expected::Merge`] joins them.
+    pub forks: bool,
+}
+
+impl Capabilities {
+    /// The promise every provider before branchable stores made.
+    pub const LINEAR: Self = Self {
+        durable_positions: true,
+        claims: true,
+        forks: false,
+    };
+
+    /// A store whose history is merged outside it, such as a tree of files under version control.
+    pub const BRANCHABLE: Self = Self {
+        durable_positions: false,
+        claims: false,
+        forks: true,
+    };
 }
 
 /// A fact a command decided on, before the store gave it a place in history.
@@ -540,6 +613,13 @@ pub struct RecordedEvent {
     pub causation_depth: u32,
     pub redacted_at: Option<OffsetDateTime>,
     pub data: Value,
+    /// The event's content digest, in a store that chains events per stream; `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// The digests of the events this one follows on its stream: empty for a stream's first event
+    /// and in a store that keeps no digests, more than one only for an event that joined a fork.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<String>,
 }
 
 impl RecordedEvent {
@@ -580,6 +660,26 @@ pub struct AppendResult {
     pub events: Vec<RecordedEvent>,
     /// True when this command had already been recorded and the stored result was returned.
     pub deduplicated: bool,
+}
+
+/// One read in a [`EventStore::read_many`] batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// [`EventStore::read_stream`].
+    Stream {
+        stream: StreamId,
+        after_version: u64,
+        limit: usize,
+    },
+    /// [`EventStore::get_blob`].
+    Blob { tenant: TenantId, digest: String },
+}
+
+/// What one [`Read`] returned, in the batch's order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadResult {
+    Stream(StreamSlice),
+    Blob(Option<Vec<u8>>),
 }
 
 /// A window on one stream.
@@ -649,6 +749,7 @@ impl std::str::FromStr for SnapshotGeneration {
 
 /// Everything that can go wrong that a caller must tell apart.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum EventLogError {
     #[error("{0}")]
     Invalid(String),
@@ -684,6 +785,12 @@ pub enum EventLogError {
     NotFound,
     #[error("event store is unavailable: {0}")]
     Backend(String),
+    /// The stream has more than one head; only an [`Expected::Merge`] naming all of them appends.
+    #[error("stream {stream} has forked into {} heads", heads.len())]
+    Forked { stream: String, heads: Vec<String> },
+    /// The store declared, in its [`Capabilities`], that it does not do this.
+    #[error("this event store does not support {capability}")]
+    Unsupported { capability: &'static str },
 }
 
 /// Where facts are kept.
@@ -696,6 +803,12 @@ pub enum EventLogError {
 /// lives inside the backends rather than in every caller. Forgetting a caller-side
 /// `spawn_blocking` wrap used to panic a worker at startup; there is no wrap left to forget.
 pub trait EventStore: Send + Sync + 'static {
+    /// What this store promises. Every provider that predates branchable stores is
+    /// [`Capabilities::LINEAR`], which is why that is the default.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::LINEAR
+    }
+
     /// Record what a command decided.
     ///
     /// # Errors
@@ -1032,6 +1145,38 @@ pub trait EventStore: Send + Sync + 'static {
         tenant: &'a TenantId,
         digest: &'a str,
     ) -> BoxFuture<'a, Result<(), EventLogError>>;
+
+    /// Answer many reads from one observation of the store.
+    ///
+    /// A caller that loads a whole history object by object otherwise pays each store's per-call
+    /// cost once per object. The default answers each read in turn, as separate calls would; a
+    /// provider whose calls each verify the store overrides it to verify once for the batch.
+    ///
+    /// # Errors
+    /// Returns the first read's error, as the separate call would have.
+    fn read_many<'a>(
+        &'a self,
+        reads: &'a [Read],
+    ) -> BoxFuture<'a, Result<Vec<ReadResult>, EventLogError>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(reads.len());
+            for read in reads {
+                results.push(match read {
+                    Read::Stream {
+                        stream,
+                        after_version,
+                        limit,
+                    } => {
+                        ReadResult::Stream(self.read_stream(stream, *after_version, *limit).await?)
+                    }
+                    Read::Blob { tenant, digest } => {
+                        ReadResult::Blob(self.get_blob(tenant, digest).await?)
+                    }
+                });
+            }
+            Ok(results)
+        })
+    }
 }
 
 /// What a caller asked for, clamped to what a page may be.
@@ -1104,9 +1249,45 @@ pub fn validate_append(events: &[NewEvent], meta: &CommandMeta) -> Result<(), Ev
     meta.validate()
 }
 
+/// A store whose streams can fork, because its history is merged outside it.
+///
+/// Implemented only by stores whose [`EventStore::capabilities`] declare `forks`. A forked stream
+/// refuses every append except one with [`Expected::Merge`] over exactly the heads this reports.
+pub trait BranchableEventStore: EventStore {
+    /// The digests of the stream's heads: none for an absent stream, one for a linear one.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] for an unusable stream id.
+    fn heads<'a>(
+        &'a self,
+        stream: &'a StreamId,
+    ) -> BoxFuture<'a, Result<Vec<String>, EventLogError>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_head_set_digest_ignores_order_and_repeats_but_not_membership() {
+        let one = HeadSetDigest::of(&["b", "a"]);
+        assert_eq!(
+            one,
+            HeadSetDigest::of(&["a", "b", "a"]),
+            "two writers that saw one fork disagreed"
+        );
+        assert_ne!(
+            one,
+            HeadSetDigest::of(&["a"]),
+            "a writer that missed a head computed the same digest"
+        );
+        assert_ne!(
+            HeadSetDigest::of(&["ab", "c"]),
+            HeadSetDigest::of(&["a", "bc"]),
+            "heads that concatenate alike were not told apart"
+        );
+        assert_eq!(one.to_hex().len(), 64);
+    }
 
     fn meta() -> CommandMeta {
         CommandMeta {

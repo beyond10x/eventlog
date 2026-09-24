@@ -16,7 +16,8 @@ pub(crate) enum Op {
         value: i64,
     },
     Event {
-        event: RecordedEvent,
+        // Boxed so one large variant does not size every operation; serde writes it unchanged.
+        event: Box<RecordedEvent>,
     },
     Command {
         stream: StreamId,
@@ -189,7 +190,7 @@ impl State {
                     return Err(backend("invalid recorded event order"));
                 }
                 self.next_position = event.global_seq;
-                self.events.insert(event.global_seq, event);
+                self.events.insert(event.global_seq, *event);
             }
             Op::Command {
                 stream,

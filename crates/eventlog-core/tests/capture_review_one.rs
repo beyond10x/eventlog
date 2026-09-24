@@ -43,6 +43,8 @@ fn recorded(global_seq: u64, version: u64, stream_id: &str) -> RecordedEvent {
         causation_depth: 0,
         redacted_at: None,
         data: json!({ "value": 1 }),
+        digest: None,
+        parents: Vec::new(),
     }
 }
 

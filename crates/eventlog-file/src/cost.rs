@@ -25,6 +25,8 @@ pub(crate) struct Cost {
     pub frames_folded: u64,
     /// Bytes of an already verified committed prefix re-read and hashed without decoding it.
     pub prefix_bytes_hashed: u64,
+    /// Resumes that trusted an unchanged file stamp and read no prefix byte.
+    pub resumes_trusted: u64,
     /// Blob objects read, hashed against the hash the committed history recorded for them, and
     /// found to be that content.
     ///
@@ -58,6 +60,7 @@ impl std::ops::Sub for Cost {
             frames_reencoded: self.frames_reencoded - earlier.frames_reencoded,
             frames_folded: self.frames_folded - earlier.frames_folded,
             prefix_bytes_hashed: self.prefix_bytes_hashed - earlier.prefix_bytes_hashed,
+            resumes_trusted: self.resumes_trusted - earlier.resumes_trusted,
             blobs_hashed: self.blobs_hashed - earlier.blobs_hashed,
             durability_barriers: self.durability_barriers - earlier.durability_barriers,
             object_syncs: self.object_syncs - earlier.object_syncs,

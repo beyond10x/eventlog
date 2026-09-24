@@ -1,0 +1,27 @@
+[package]
+name = "eventlog-tree"
+description = "A file event store whose history merges under version control: one file per event and per group, no store-wide file"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+eventlog-core.workspace = true
+# The in-memory engine: every read and every projection is served by SQLite `:memory:`, the kit's
+# in-memory store (AGENTS.md invariant 2), so this crate adds persistence and forks and nothing else.
+eventlog-sqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+eventlog-conformance.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

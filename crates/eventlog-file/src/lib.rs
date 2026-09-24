@@ -16,8 +16,8 @@ use eventlog_core::{
     AdmissionPermit, AppendGroup, AppendGroupResult, AppendResult, AtomicEventStore, BoxFuture,
     CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError, EventStore, Expected,
     FeedPage, GroupRange, Guard, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector,
-    RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, bounded_limit,
-    new_event_id, redaction_tombstone, validate_append, validate_field,
+    Read, ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId,
+    bounded_limit, new_event_id, redaction_tombstone, validate_append, validate_field,
 };
 use journal::{Journal, backend, hash};
 use serde_json::Value;
@@ -147,9 +147,10 @@ impl FileEventStore {
         let mut runtime = self.runtime.lock().await;
         let path = self.root.clone();
         let observed = runtime.observed.clone();
-        // Taken, not borrowed: a transaction that refuses leaves no cache behind, so the next one
-        // reverifies everything rather than trusting a view assembled beside a refusal. Filtered,
-        // because another entry point may have moved the observed head past what this view folded.
+        // Taken, not borrowed: a transaction that refuses after recording or writing anything
+        // leaves no cache behind, so the next one reverifies everything rather than trusting a
+        // view assembled beside that refusal. Filtered, because another entry point may have moved
+        // the observed head past what this view folded.
         let verified = runtime
             .verified
             .take()
@@ -161,6 +162,28 @@ impl FileEventStore {
         let outcome = work(&mut tx).await;
         let result = match outcome {
             Ok(result) => result,
+            // A refusal that recorded nothing and wrote nothing leaves the view exactly as the
+            // resume verified it: `record` is the only thing that moves `tx.state`, and it also
+            // pushes to `pending`. Keeping it spares the next call a complete open, which would
+            // re-hash every object for a read that merely found nothing.
+            Err(refusal)
+                if tx.pending.is_empty()
+                    && tx.written.is_empty()
+                    && tx.staged_blobs.is_empty()
+                    && !tx.privacy
+                    && !tx.atomic_content =>
+            {
+                let state = tx.state;
+                let (manifest, transactions, content) = tx.journal.into_parts();
+                runtime.observed = Some(manifest.clone());
+                runtime.verified = Some(Verified {
+                    manifest,
+                    transactions,
+                    state,
+                    content,
+                });
+                return Err(refusal);
+            }
             Err(refusal) => {
                 // A refusal after the batch is on disk leaves objects no frame will ever
                 // reference. Dispose of them here rather than leaving them for whatever writes to
@@ -439,9 +462,10 @@ impl Transaction {
     }
 
     fn record(&mut self, op: Op) -> Result<(), EventLogError> {
-        self.state.apply(op.clone())?;
-        self.pending.push(op);
-        Ok(())
+        // Pushed before it is applied: an apply that fails part-way has still touched the state,
+        // and a non-empty `pending` is what tells a refusal not to keep this view.
+        self.pending.push(op.clone());
+        self.state.apply(op)
     }
     fn result(&self, range: &GroupRange, deduplicated: bool) -> AppendResult {
         AppendResult {
@@ -504,6 +528,12 @@ impl Transaction {
             Expected::Any => head,
             Expected::NoStream => 0,
             Expected::Exact(v) => v,
+            // A linear store never forks, so there is no head set for a merge to join.
+            _ => {
+                return Err(EventLogError::Unsupported {
+                    capability: "merge expectations",
+                });
+            }
         };
         if wanted != head {
             return Err(EventLogError::Conflict {
@@ -543,9 +573,11 @@ impl Transaction {
                 causation_depth: meta.causation_depth,
                 redacted_at: None,
                 data: event.data.clone(),
+                digest: None,
+                parents: Vec::new(),
             };
             self.record(Op::Event {
-                event: recorded.clone(),
+                event: Box::new(recorded.clone()),
             })?;
             written.push(recorded);
         }
@@ -1203,6 +1235,24 @@ impl FileEventStore {
     }
 }
 
+/// One window on a stream, as `read_stream` answers it.
+fn slice(state: &State, stream: &StreamId, after: u64, limit: usize) -> StreamSlice {
+    let mut events: Vec<_> = state
+        .events
+        .values()
+        .filter(|e| matches_stream(e, stream) && e.version > after)
+        .take(bounded_limit(limit) + 1)
+        .cloned()
+        .collect();
+    let end_of_stream = events.len() <= bounded_limit(limit);
+    events.truncate(bounded_limit(limit));
+    StreamSlice {
+        next_version: events.last().map_or(after, |e| e.version),
+        events,
+        end_of_stream,
+    }
+}
+
 impl EventStore for FileEventStore {
     fn append<'a>(
         &'a self,
@@ -1242,6 +1292,12 @@ impl EventStore for FileEventStore {
                         Expected::Any => head,
                         Expected::NoStream => 0,
                         Expected::Exact(v) => v,
+                        // A linear store never forks, so there is no head set for a merge to join.
+                        _ => {
+                            return Err(EventLogError::Unsupported {
+                                capability: "merge expectations",
+                            });
+                        }
                     };
                     if head != wanted {
                         return Err(EventLogError::Conflict {
@@ -1319,22 +1375,30 @@ impl EventStore for FileEventStore {
     ) -> BoxFuture<'a, Result<StreamSlice, EventLogError>> {
         let stream = stream.clone();
         Box::pin(self.transaction(move |tx| {
+            Box::pin(async move { Ok(slice(&tx.state, &stream, after, limit)) })
+        }))
+    }
+    /// Every read in one transaction: one resume and one lock hold for the batch, where separate
+    /// calls would each resume the store.
+    fn read_many<'a>(
+        &'a self,
+        reads: &'a [Read],
+    ) -> BoxFuture<'a, Result<Vec<ReadResult>, EventLogError>> {
+        let reads = reads.to_vec();
+        Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
-                let mut events: Vec<_> = tx
-                    .state
-                    .events
-                    .values()
-                    .filter(|e| matches_stream(e, &stream) && e.version > after)
-                    .take(bounded_limit(limit) + 1)
-                    .cloned()
-                    .collect();
-                let end_of_stream = events.len() <= bounded_limit(limit);
-                events.truncate(bounded_limit(limit));
-                Ok(StreamSlice {
-                    next_version: events.last().map_or(after, |e| e.version),
-                    events,
-                    end_of_stream,
-                })
+                let mut results = Vec::with_capacity(reads.len());
+                for read in &reads {
+                    results.push(match read {
+                        Read::Stream {
+                            stream,
+                            after_version,
+                            limit,
+                        } => ReadResult::Stream(slice(&tx.state, stream, *after_version, *limit)),
+                        Read::Blob { tenant, digest } => ReadResult::Blob(tx.blob(tenant, digest)?),
+                    });
+                }
+                Ok(results)
             })
         }))
     }
@@ -1514,7 +1578,7 @@ impl EventStore for FileEventStore {
             event.data = redaction_tombstone(&reason); event.redacted_at = Some(OffsetDateTime::now_utc());
             for transaction in &mut tx.journal.transactions {
                 let mut ops: Vec<Op> = serde_json::from_value(transaction.clone()).map_err(backend)?;
-                for op in &mut ops { if let Op::Event { event: old } = op && old.event_id == event.event_id { *old = event.clone(); } }
+                for op in &mut ops { if let Op::Event { event: old } = op && old.event_id == event.event_id { **old = event.clone(); } }
                 // Derived rows can carry the old body too. Remove them and require replay.
                 ops.retain(|op| !matches!(op, Op::Row { tenant, .. } | Op::Cursor { tenant, .. } if tenant == stream.tenant()));
                 *transaction = serde_json::to_value(ops).map_err(backend)?;
@@ -2346,5 +2410,157 @@ mod grouped_blob_barrier {
                 "{point}: no duplicate or missing group member"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stamped_resume_cost {
+    use super::*;
+    use eventlog_conformance::{event, meta};
+
+    /// A read that refuses after recording nothing keeps the verified view, so the read after it
+    /// resumes instead of opening the store from scratch and hashing every object again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_refusal_keeps_the_verified_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        let tenant = stream().tenant().clone();
+        store.put_blob(&tenant, "blob-1", b"bytes").await.unwrap();
+        store.read_stream(&stream(), 0, 10).await.unwrap();
+        let refused = store
+            .redact(&stream(), 7, "no such version")
+            .await
+            .expect_err("a redaction of an absent event refuses");
+        assert!(matches!(refused, EventLogError::NotFound));
+        let before = crate::cost::of(root);
+        store.read_stream(&stream(), 0, 10).await.unwrap();
+        let after = crate::cost::of(root) - before;
+        assert_eq!(
+            after.blobs_hashed, 0,
+            "the refusal discarded the view: {after:?}"
+        );
+        assert_eq!(
+            after.frames_folded, 0,
+            "the refusal discarded the view: {after:?}"
+        );
+    }
+
+    /// Fifty reads in one batch resume the store once; fifty separate reads resume it fifty times.
+    /// Inside the untrusted window every resume hashes the prefix, so the hashed bytes count them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_of_reads_resumes_the_store_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append(
+                &stream(),
+                Expected::NoStream,
+                &[event("item.changed", 1)],
+                &meta("one", &serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        let reads: Vec<Read> = (0..50)
+            .map(|_| Read::Stream {
+                stream: stream(),
+                after_version: 0,
+                limit: 10,
+            })
+            .collect();
+        let before = crate::cost::of(root);
+        store.read_many(&reads).await.unwrap();
+        let batch = crate::cost::of(root) - before;
+        let before = crate::cost::of(root);
+        for _ in 0..50 {
+            store.read_stream(&stream(), 0, 10).await.unwrap();
+        }
+        let separate = crate::cost::of(root) - before;
+        assert!(
+            batch.prefix_bytes_hashed > 0,
+            "the fixture did not hash at all: {batch:?}"
+        );
+        assert_eq!(
+            separate.prefix_bytes_hashed,
+            50 * batch.prefix_bytes_hashed,
+            "the batch did not resume once: batch {batch:?}, separate {separate:?}"
+        );
+    }
+
+    fn stream() -> StreamId {
+        StreamId::new(TenantId::new("stamp-cost").unwrap(), "item", "one").unwrap()
+    }
+
+    /// Two hundred reads over an unchanged file, from a handle whose stamp is trusted, hash no
+    /// prefix byte; the counting case of `story:incremental-history-digest-for-a-resumed-handle`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_over_an_unchanged_file_hash_nothing_once_the_window_has_passed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        {
+            let writer = FileEventStore::open(root).await.unwrap();
+            for index in 0..20 {
+                writer
+                    .append(
+                        &stream(),
+                        if index == 0 {
+                            Expected::NoStream
+                        } else {
+                            Expected::Exact(index)
+                        },
+                        &[event("item.changed", i64::try_from(index).unwrap())],
+                        &meta(&format!("key-{index}"), &serde_json::json!({})),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+        let store = FileEventStore::open(root).await.unwrap();
+        let before = crate::cost::of(root);
+        for _ in 0..200 {
+            store.read_stream(&stream(), 0, 100).await.unwrap();
+        }
+        let spent = crate::cost::of(root) - before;
+        assert_eq!(
+            spent.prefix_bytes_hashed, 0,
+            "an unchanged file was re-hashed: {spent:?}"
+        );
+        assert_eq!(
+            spent.resumes_trusted, 200,
+            "a read did not trust the stamp: {spent:?}"
+        );
+    }
+
+    /// Inside the window nothing is trusted, a handle's own write included: that is what keeps a
+    /// same-tick edit after a commit from being served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_does_not_trust_its_own_fresh_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append(
+                &stream(),
+                Expected::NoStream,
+                &[event("item.changed", 1)],
+                &meta("one", &serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        let before = crate::cost::of(root);
+        // The second read must re-hash too: the file changed inside the window.
+        store.read_stream(&stream(), 0, 100).await.unwrap();
+        store.read_stream(&stream(), 0, 100).await.unwrap();
+        let spent = crate::cost::of(root) - before;
+        assert_eq!(
+            spent.resumes_trusted, 0,
+            "a fresh write was trusted: {spent:?}"
+        );
+        assert!(
+            spent.prefix_bytes_hashed > 0,
+            "a fresh write was not re-read: {spent:?}"
+        );
     }
 }

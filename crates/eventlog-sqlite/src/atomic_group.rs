@@ -3,7 +3,7 @@ use super::{
     AppendResult, Arc, BoxFuture, Connection, EventLogError, Guard, Inner, NoGuard,
     SqliteEventStore, SqliteProjections, backend, begin_immediate, drive,
     ensure_callback_integrity, finish_transaction, params, poisoned, run_blocking, select_versions,
-    to_i64, validate_stored_blob,
+    to_i64,
 };
 use eventlog_core::{
     AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
@@ -44,7 +44,7 @@ impl AtomicEventStore for SqliteEventStore {
                 &mut connection,
                 &group,
                 &fingerprint,
-                &[],
+                GroupBlobs::NONE,
                 admission.as_ref(),
                 &callback_failed,
             );
@@ -71,7 +71,7 @@ impl AtomicBlobEventStore for SqliteEventStore {
         let inner = Arc::clone(&self.inner);
         let mut request = request.clone();
         Box::pin(run_blocking(move || {
-            let fingerprint = request.fingerprint()?;
+            let (fingerprint, hashes) = request.fingerprint_and_hashes()?;
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
             *inner.registration.lock().map_err(poisoned)? = true;
             let mut connection = inner.connection.lock().map_err(poisoned)?;
@@ -81,7 +81,10 @@ impl AtomicBlobEventStore for SqliteEventStore {
                 &mut connection,
                 &request.group,
                 &fingerprint,
-                &request.blobs,
+                GroupBlobs {
+                    writes: &request.blobs,
+                    hashes: &hashes,
+                },
                 admission.as_ref(),
                 &callback_failed,
             );
@@ -112,13 +115,28 @@ fn finish_blob_transaction<T>(
     }
 }
 
+/// The blobs a group binds, and the SHA-256 of each one's content where the caller already
+/// computed it, so the integrity column does not hash the same bytes again.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupBlobs<'a> {
+    pub(crate) writes: &'a [BlobWrite],
+    pub(crate) hashes: &'a std::collections::BTreeMap<String, String>,
+}
+
+impl GroupBlobs<'_> {
+    const NONE: GroupBlobs<'static> = GroupBlobs {
+        writes: &[],
+        hashes: &std::collections::BTreeMap::new(),
+    };
+}
+
 impl Inner {
     fn group_in_transaction(
         &self,
         connection: &mut Connection,
         group: &AppendGroup,
         fingerprint: &str,
-        blobs: &[BlobWrite],
+        blobs: GroupBlobs<'_>,
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
@@ -160,7 +178,8 @@ impl Inner {
                 deduplicated: true,
             });
         }
-        for blob in blobs {
+        let hashes = blobs.hashes;
+        for blob in blobs.writes {
             let prior = connection
                 .query_row(
                     &format!("SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
@@ -170,7 +189,7 @@ impl Inner {
                 .optional()
                 .map_err(backend)?;
             if let Some((bytes, count, hash, version)) = prior {
-                let bytes = validate_stored_blob(bytes, count, hash, version)?;
+                let bytes = crate::checked_blob(connection, bytes, count, hash, version)?;
                 if bytes != blob.bytes {
                     return Err(EventLogError::Invalid(
                         "blob digest already names different content".into(),
@@ -180,7 +199,11 @@ impl Inner {
                 let byte_count = u64::try_from(blob.bytes.len()).map_err(backend)?;
                 // The integrity columns are the same contract the standalone port writes; a
                 // binding this path published without them would fail the table's own check.
-                let integrity_sha256 = eventlog_core::blob_integrity_sha256(&blob.bytes);
+                // The request's fingerprint already hashed this content; it is the same value.
+                let integrity_sha256 = hashes
+                    .get(&blob.digest)
+                    .cloned()
+                    .unwrap_or_else(|| eventlog_core::blob_integrity_sha256(&blob.bytes));
                 connection.execute(
                     &format!("INSERT INTO {prefix}_blobs (tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1) VALUES (?1,?2,?3,?4,?5,?6,1)"),
                     params![group.tenant.as_str(),blob.digest,blob.bytes,to_i64(byte_count)?,super::format_time(time::OffsetDateTime::now_utc())?,integrity_sha256],
@@ -412,7 +435,10 @@ mod tests {
                     &mut connection,
                     &request.group,
                     &request.fingerprint().unwrap(),
-                    &request.blobs,
+                    GroupBlobs {
+                        writes: &request.blobs,
+                        hashes: &std::collections::BTreeMap::new(),
+                    },
                     &NoGuard,
                     &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )

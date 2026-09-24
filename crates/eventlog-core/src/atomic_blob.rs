@@ -24,6 +24,20 @@ impl BlobAppendGroup {
     /// # Errors
     /// Refuses invalid groups, invalid or duplicate blob keys, and empty content sets.
     pub fn fingerprint(&self) -> Result<String, EventLogError> {
+        Ok(self.fingerprint_and_hashes()?.0)
+    }
+
+    /// [`Self::fingerprint`], and the SHA-256 of each blob's content by its digest, which the
+    /// fingerprint is built from.
+    ///
+    /// A provider that also stores that hash as the blob's integrity column takes it from here
+    /// rather than hashing the same bytes a second time.
+    ///
+    /// # Errors
+    /// As [`Self::fingerprint`].
+    pub fn fingerprint_and_hashes(
+        &self,
+    ) -> Result<(String, BTreeMap<String, String>), EventLogError> {
         let group_fingerprint = self.group.fingerprint()?;
         if self.blobs.is_empty() {
             return Err(EventLogError::Invalid(
@@ -39,13 +53,21 @@ impl BlobAppendGroup {
                 ));
             }
         }
-        let blobs = ordered.into_iter().map(|(digest, bytes)| {
-            let byte_count = u64::try_from(bytes.len()).map_err(|_| EventLogError::Invalid("blob length exceeds u64".into()))?;
-            Ok(json!({"digest":digest,"byte_count":byte_count,"content_sha256":format!("{:x}", Sha256::digest(bytes))}))
-        }).collect::<Result<Vec<_>, EventLogError>>()?;
-        crate::request_hash(
+        let mut hashes = BTreeMap::new();
+        let blobs = ordered
+            .into_iter()
+            .map(|(digest, bytes)| {
+                let byte_count = u64::try_from(bytes.len())
+                    .map_err(|_| EventLogError::Invalid("blob length exceeds u64".into()))?;
+                let content_sha256 = format!("{:x}", Sha256::digest(bytes));
+                hashes.insert(digest.clone(), content_sha256.clone());
+                Ok(json!({"digest":digest,"byte_count":byte_count,"content_sha256":content_sha256}))
+            })
+            .collect::<Result<Vec<_>, EventLogError>>()?;
+        let fingerprint = crate::request_hash(
             &json!({"format":"eventlog-blob-append-group/1","group_fingerprint":group_fingerprint,"blobs":blobs}),
-        )
+        )?;
+        Ok((fingerprint, hashes))
     }
 }
 

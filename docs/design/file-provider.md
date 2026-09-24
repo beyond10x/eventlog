@@ -79,6 +79,42 @@ to the complete reread, which refuses a history that does not extend the observe
 before. So an operation costs one raw pass over the committed bytes plus what the file gained
 since the handle last looked: no frame is decoded twice and no object is read twice.
 
+The raw pass is skipped while the file provably holds still. When a read of `events.jsonl`
+verifies its bytes, the handle also keeps the file's inode stamp: device, inode, length, `mtime`
+and `ctime`, taken before and after the read. The handle keeps the stamp only if two things hold:
+
+- the file did not move during the read;
+- its `ctime` was at least two seconds older than the moment the read began.
+
+A later operation that finds the same stamp and an unchanged manifest reads no committed byte.
+
+The two seconds are one second of filesystem timestamp granularity plus the coarse clock tick.
+A file changed inside that window can carry the same timestamps as the change that follows it, so
+it is re-read and hashed on every operation until the window has passed. This includes the
+handle's own writes: a same-length edit microseconds after a commit can land in the same tick
+(`tests/verify_once_review.rs`).
+
+What the stamp detects, and what it does not:
+
+| change | detected |
+| --- | --- |
+| a `write`, `pwrite`, `truncate` or rename over the name, by any process | yes: `ctime` or the inode moves, and userspace cannot set `ctime` (`utimensat` moves it to now) |
+| a change inside the two-second window | yes: nothing inside the window is trusted |
+| a store to a shared mapping after its first write fault in a dirty cycle | no |
+| a write to the block device under a mounted filesystem, or root setting the clock back to the exact nanosecond | no; outside this provider's threat model. The complete verification at every open still reads everything |
+
+`tests/stamped_resume.rs` damages a file after its stamp is trusted and checks that nothing is
+appended onto the damage. The unit cases in `src/lib.rs` (`stamped_resume_cost`) count what a
+resume re-reads. Two hundred reads over an unchanged file re-read nothing.
+
+`EventStore::read_many` answers a batch of stream and blob reads inside one transaction: one
+resume and one lock hold for the batch. A caller that loads a whole history object by object uses
+it instead of paying one resume per object.
+
+A read that refuses after recording and writing nothing, such as a redaction of an absent
+version, keeps the verified view instead of discarding it. So the next operation resumes, and does
+not open from scratch.
+
 A consistent tenant capture reuses the same verified history, under the same rules and one
 restriction. A handle that has already observed the committed head re-reads and hashes the
 committed bytes behind it, folds only the frames past it, and answers the per-handle divergence

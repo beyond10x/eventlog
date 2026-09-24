@@ -165,7 +165,9 @@ pub async fn run(store: &dyn EventStore) {
 
     a_new_stream_starts_at_one(store, &stream).await;
     a_stream_reads_back_in_order(store, &stream).await;
+    many_reads_answer_as_separate_reads_would(store, &stream).await;
     the_expected_version_is_enforced(store, &stream).await;
+    a_linear_store_refuses_a_merge_and_writes_nothing(store, &stream).await;
     a_repeated_command_is_not_a_second_write(store, &stream).await;
     a_reused_key_with_a_different_body_is_refused(store, &stream).await;
     a_command_that_decided_nothing_is_refused(store, &stream).await;
@@ -230,6 +232,81 @@ async fn a_stream_reads_back_in_order(store: &dyn EventStore, stream: &StreamId)
         .expect("readable");
     assert_eq!(rest.events.len(), 1);
     assert_eq!(rest.events[0].version, 2);
+}
+
+/// A store that cannot fork has no head set for a merge to join. It says so as a declared limit,
+/// not as a conflict, and the refused append leaves the stream where it was.
+/// A batch of reads answers each read exactly as the separate call would, in the batch's order,
+/// whether or not the provider overrides the default.
+async fn many_reads_answer_as_separate_reads_would(store: &dyn EventStore, stream: &StreamId) {
+    use eventlog_core::{Read, ReadResult};
+    let missing = StreamId::new(stream.tenant().clone(), "item", "never-written").expect("stream");
+    let reads = [
+        Read::Stream {
+            stream: stream.clone(),
+            after_version: 0,
+            limit: 10,
+        },
+        Read::Blob {
+            tenant: stream.tenant().clone(),
+            digest: "never-put".into(),
+        },
+        Read::Stream {
+            stream: missing.clone(),
+            after_version: 0,
+            limit: 10,
+        },
+        Read::Stream {
+            stream: stream.clone(),
+            after_version: 1,
+            limit: 1,
+        },
+    ];
+    let batch = store.read_many(&reads).await.expect("a batch of reads");
+    let separate = vec![
+        ReadResult::Stream(store.read_stream(stream, 0, 10).await.expect("read")),
+        ReadResult::Blob(
+            store
+                .get_blob(stream.tenant(), "never-put")
+                .await
+                .expect("blob"),
+        ),
+        ReadResult::Stream(store.read_stream(&missing, 0, 10).await.expect("read")),
+        ReadResult::Stream(store.read_stream(stream, 1, 1).await.expect("read")),
+    ];
+    assert_eq!(
+        batch, separate,
+        "a batch of reads answered differently from separate reads"
+    );
+}
+
+async fn a_linear_store_refuses_a_merge_and_writes_nothing(
+    store: &dyn EventStore,
+    stream: &StreamId,
+) {
+    if store.capabilities().forks {
+        return;
+    }
+    let before = store.stream_version(stream).await.expect("readable");
+    let body = json!({ "command": "merge" });
+    let error = store
+        .append(
+            stream,
+            Expected::Merge(eventlog_core::HeadSetDigest::of(&["a", "b"])),
+            &[event("item.merged", 9)],
+            &meta("key-merge", &body),
+        )
+        .await
+        .expect_err("a linear store accepted a merge expectation");
+    assert!(
+        matches!(error, EventLogError::Unsupported { .. }),
+        "a merge on a linear store was refused as {error:?}, not as a declared limit"
+    );
+    assert_eq!(
+        store.stream_version(stream).await.expect("readable"),
+        before,
+        "a refused merge moved the stream"
+    );
 }
 
 async fn the_expected_version_is_enforced(store: &dyn EventStore, stream: &StreamId) {
@@ -1407,6 +1484,8 @@ pub fn fold_vectors<A: eventlog_core::Aggregate>(
             causation_depth: 0,
             redacted_at: None,
             data: vector.data.clone(),
+            digest: None,
+            parents: Vec::new(),
         };
         let event = <A::Event as eventlog_core::DomainEvent>::from_data(
             &recorded.name,
@@ -2370,18 +2449,22 @@ pub async fn run_public_input_validation(store: &std::sync::Arc<dyn EventStore>)
                 .expect("receipt lookup")
                 .is_none()
         );
+        // A store that declares claims unsupported has no claim to look up.
+        let claims = store.capabilities().claims;
         assert!(
-            store
-                .recorded_claim(&tenant, &good_claim)
-                .await
-                .expect("valid claim lookup")
-                .is_none()
+            !claims
+                || store
+                    .recorded_claim(&tenant, &good_claim)
+                    .await
+                    .expect("valid claim lookup")
+                    .is_none()
         );
         // PostgreSQL cannot encode NUL in a lookup parameter. Other invalid constructor
         // values remain queryable, so also check their exact claim coordinates.
-        if ![&claim.scope, &claim.key, &claim.digest]
-            .iter()
-            .any(|value| value.contains('\0'))
+        if claims
+            && ![&claim.scope, &claim.key, &claim.digest]
+                .iter()
+                .any(|value| value.contains('\0'))
         {
             assert!(
                 store
@@ -2429,7 +2512,9 @@ pub async fn run_public_input_validation(store: &std::sync::Arc<dyn EventStore>)
     );
     let stream: StreamId = serde_json::from_value(wire).expect("same stream wire");
     let mut command = meta("valid-command", &json!({"valid": true}));
-    command.claim = Some(good_claim);
+    if store.capabilities().claims {
+        command.claim = Some(good_claim);
+    }
     let batch = [event("item.received", 1)];
     let first = store
         .append(&stream, Expected::NoStream, &batch, &command)

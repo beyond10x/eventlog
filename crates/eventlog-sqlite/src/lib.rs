@@ -57,6 +57,16 @@ struct Inner {
     inline_names: Mutex<BTreeSet<String>>,
     admission_permit: eventlog_core::AdmissionPermit,
     registration: Mutex<bool>,
+    /// Identities and instants the next appended events take instead of minting their own, in
+    /// order. Empty except while [`SqliteEventStore::restore_events`] replays history.
+    restored: Mutex<std::collections::VecDeque<RestoredEvent>>,
+}
+
+/// The identity and instant one replayed event had when another store first recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredEvent {
+    pub event_id: String,
+    pub recorded_at: OffsetDateTime,
 }
 
 impl SqliteEventStore {
@@ -111,6 +121,52 @@ impl SqliteEventStore {
         ))
     }
 
+    /// Queue the identities and instants the next appended events take, in order.
+    ///
+    /// For a provider that keeps its history elsewhere and replays it into an in-memory store when
+    /// it opens: the replayed events keep the ids and instants they were first recorded with,
+    /// instead of receiving new ones on every open. Positions are still assigned here, in replay
+    /// order, and while events are queued an append's expectation is not checked: it was checked
+    /// when the event was first written. Never call this on a store other writers use; an append by
+    /// another caller would take a queued identity.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] when events from an earlier call are still queued, which
+    /// means that call's append did not consume them.
+    pub fn restore_events(&self, events: Vec<RestoredEvent>) -> Result<(), EventLogError> {
+        let mut queue = self.inner.restored.lock().map_err(poisoned)?;
+        if !queue.is_empty() {
+            return Err(EventLogError::Invalid(
+                "restored identities from an earlier replay were never used".into(),
+            ));
+        }
+        queue.extend(events);
+        Ok(())
+    }
+
+    /// How many queued restored identities no append has taken yet.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the queue's lock is poisoned.
+    pub fn restored_pending(&self) -> Result<usize, EventLogError> {
+        Ok(self.inner.restored.lock().map_err(poisoned)?.len())
+    }
+
+    /// Record the stream identity another store gave `tenant`, before anything asks for it.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Invalid`] when the tenant already has a different identity.
+    pub async fn restore_stream_identity(
+        &self,
+        tenant: &TenantId,
+        identity: &str,
+    ) -> Result<(), EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let identity = identity.to_owned();
+        run_blocking(move || inner.restore_stream_identity(&tenant, &identity)).await
+    }
+
     /// An empty store that lives only as long as the process.
     ///
     /// # Errors
@@ -118,6 +174,49 @@ impl SqliteEventStore {
     pub async fn in_memory(prefix: &str) -> Result<Self, EventLogError> {
         let prefix = prefix.to_owned();
         let (inner, _) = run_blocking(move || Inner::in_memory(&prefix)).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// The whole database, as bytes [`SqliteEventStore::from_image`] reopens.
+    ///
+    /// An in-memory store that a caller rebuilds by replay can keep this instead and skip the
+    /// replay next time. Registrations are not part of it: a reopened store's inline projectors
+    /// are registered again.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the database cannot be serialized.
+    pub async fn image(&self) -> Result<Vec<u8>, EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || {
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let data = connection.serialize("main").map_err(backend)?;
+            Ok(data.to_vec())
+        })
+        .await
+    }
+
+    /// An in-memory store holding `image`, as [`SqliteEventStore::image`] wrote it.
+    ///
+    /// The image's tables are checked as any reopened database's are.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] or [`EventLogError::Invalid`] for bytes that are not
+    /// such an image.
+    pub async fn from_image(prefix: &str, image: Vec<u8>) -> Result<Self, EventLogError> {
+        let prefix = prefix.to_owned();
+        let (inner, _) = run_blocking(move || {
+            let mut connection = Connection::open_in_memory().map_err(backend)?;
+            connection
+                .deserialize_read_exact("main", image.as_slice(), image.len(), false)
+                .map_err(backend)?;
+            let (inner, report) =
+                Inner::from_connection(connection, &prefix, LegacyBlobMigration::RefusePopulated)?;
+            inner.require_existing_schema()?;
+            Ok((inner, report))
+        })
+        .await?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -196,6 +295,7 @@ impl Inner {
             inline_names: Mutex::new(BTreeSet::new()),
             admission_permit: eventlog_core::AdmissionPermit::default(),
             registration: Mutex::new(false),
+            restored: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -1403,7 +1503,11 @@ impl Inner {
             Some(value) => to_u64(value)?,
             None => 0,
         };
-        check_expected(expected, head)?;
+        // A replayed append already passed its expectation when it was first written; history
+        // merged since may have placed it after events its writer never saw.
+        if self.restored.lock().map_err(poisoned)?.is_empty() {
+            check_expected(expected, head)?;
+        }
 
         {
             let mut projections = SqliteProjections {
@@ -1421,13 +1525,16 @@ impl Inner {
             result?;
         }
 
-        let now = OffsetDateTime::now_utc();
-        let recorded_at = format_time(now)?;
+        let minted = OffsetDateTime::now_utc();
         let occurred_at = format_time(meta.occurred_at)?;
         let mut written = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
             let version = head + 1 + offset as u64;
-            let event_id = new_event_id();
+            let (event_id, now) = match self.restored.lock().map_err(poisoned)?.pop_front() {
+                Some(restored) => (restored.event_id, restored.recorded_at),
+                None => (new_event_id(), minted),
+            };
+            let recorded_at = format_time(now)?;
             connection
                 .execute(
                     &format!(
@@ -1482,11 +1589,16 @@ impl Inner {
                 causation_depth: meta.causation_depth,
                 redacted_at: None,
                 data: event.data.clone(),
+                digest: None,
+                parents: Vec::new(),
             });
         }
 
         let first_version = head + 1;
         let last_version = head + events.len() as u64;
+        // The command is recorded at its last event's instant: the minted one normally, and the
+        // restored one when history is replayed, so a replay leaves the receipts it found.
+        let recorded_at = format_time(written.last().map_or(minted, |event| event.recorded_at))?;
         if record_command {
             connection
                 .execute(
@@ -2063,6 +2175,38 @@ impl Inner {
         Ok(found)
     }
 
+    fn restore_stream_identity(
+        &self,
+        tenant: &TenantId,
+        identity: &str,
+    ) -> Result<(), EventLogError> {
+        validate_field("stream identity", identity)?;
+        let prefix = &self.prefix;
+        let guard = self.connection.lock().map_err(poisoned)?;
+        guard
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}_identity (tenant_id, stream_identity) VALUES (?1, ?2)
+                     ON CONFLICT (tenant_id) DO NOTHING"
+                ),
+                params![tenant.as_str(), identity],
+            )
+            .map_err(backend)?;
+        let stored: String = guard
+            .query_row(
+                &format!("SELECT stream_identity FROM {prefix}_identity WHERE tenant_id = ?1"),
+                params![tenant.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if stored != identity {
+            return Err(EventLogError::Invalid(
+                "tenant already has a different stream identity".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn stream_identity(&self, tenant: &TenantId) -> Result<String, EventLogError> {
         let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
@@ -2139,7 +2283,7 @@ impl Inner {
                 },
             )
             .map_err(backend)?;
-        let stored = validate_stored_blob(stored.0, stored.1, stored.2, stored.3)?;
+        let stored = checked_blob(&transaction, stored.0, stored.1, stored.2, stored.3)?;
         if stored != bytes {
             return Err(EventLogError::Invalid(
                 "blob digest already names different content".into(),
@@ -2170,7 +2314,7 @@ impl Inner {
             .optional()
             .map_err(backend)?;
         stored
-            .map(|(bytes, count, hash, version)| validate_stored_blob(bytes, count, hash, version))
+            .map(|(bytes, count, hash, version)| checked_blob(&guard, bytes, count, hash, version))
             .transpose()
     }
 
@@ -2635,7 +2779,7 @@ impl ProjectionStore for SqliteProjections<'_> {
                     .map_err(backend)?;
                 stored
                     .map(|(bytes, count, hash, version)| {
-                        validate_stored_blob(bytes, count, hash, version)
+                        checked_blob(self.connection, bytes, count, hash, version)
                     })
                     .transpose()
             })();
@@ -3100,6 +3244,8 @@ fn build_event(
         redacted_at: redacted_at.map(parse_time).transpose()?,
         data: serde_json::from_str(data)
             .map_err(|error| EventLogError::Backend(format!("stored body is not JSON: {error}")))?,
+        digest: None,
+        parents: Vec::new(),
     })
 }
 
@@ -3116,7 +3262,42 @@ fn check_expected(expected: Expected, head: u64) -> Result<(), EventLogError> {
             expected: version,
             actual: head,
         }),
+        // A linear store never forks, so there is no head set for a merge to join.
+        _ => Err(EventLogError::Unsupported {
+            capability: "merge expectations",
+        }),
     }
+}
+
+/// Validate a stored blob row read through `connection`.
+///
+/// A database file can be damaged at rest, so its rows are hashed again on every read. An
+/// in-memory database's rows change only through this store's own statements, and hashing them
+/// again on each read cost `eventlog-tree` most of its open: a tree replays every blob into one,
+/// then the replay, the projection and each capture read it back. Its metadata is still checked.
+pub(crate) fn checked_blob(
+    connection: &Connection,
+    bytes: Vec<u8>,
+    byte_count: i64,
+    integrity_sha256: Option<String>,
+    integrity_v1: i64,
+) -> Result<Vec<u8>, EventLogError> {
+    if connection.path().is_some_and(|path| !path.is_empty()) {
+        return validate_stored_blob(bytes, byte_count, integrity_sha256, integrity_v1);
+    }
+    validate_legacy_blob_count(&bytes, byte_count)?;
+    let well_formed = integrity_sha256.as_deref().is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if integrity_v1 != 1 || !well_formed {
+        return Err(EventLogError::Backend(
+            "stored blob integrity metadata is invalid".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), EventLogError> {
@@ -3170,6 +3351,32 @@ mod tests {
     use super::{
         SqliteBlobShape, has_exact_sqlite_blob_integrity_check, recognized_sqlite_blob_shape,
     };
+
+    #[test]
+    fn a_file_database_hashes_a_blob_again_and_an_in_memory_one_checks_its_metadata() {
+        use eventlog_core::blob_integrity_sha256;
+        let directory = tempfile::tempdir().expect("a scratch directory");
+        let file = rusqlite::Connection::open(directory.path().join("store.db")).expect("a file");
+        let memory = rusqlite::Connection::open_in_memory().expect("an in-memory database");
+        let other = Some(blob_integrity_sha256(b"other"));
+
+        let refused = super::checked_blob(&file, b"bytes".to_vec(), 5, other.clone(), 1);
+        assert!(
+            matches!(refused, Err(eventlog_core::EventLogError::Backend(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            super::checked_blob(&memory, b"bytes".to_vec(), 5, other.clone(), 1).expect("trusted"),
+            b"bytes"
+        );
+        for (count, hash, version) in [(4, other.clone(), 1), (5, None, 1), (5, other, 0)] {
+            let refused = super::checked_blob(&memory, b"bytes".to_vec(), count, hash, version);
+            assert!(
+                matches!(refused, Err(eventlog_core::EventLogError::Backend(_))),
+                "{refused:?}"
+            );
+        }
+    }
 
     #[test]
     fn sqlite_blob_admission_recognises_only_the_bodies_this_kit_writes() {
