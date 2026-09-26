@@ -28,6 +28,11 @@ under bare-version tags such as `0.1.0`.
 - A SQLite append or group that rolls back now puts back every restored identity it took, so the
   next append on the handle no longer takes another event's id and instant.
 
+### Fixed
+
+- PostgreSQL `stream_identity` reads an existing identity instead of upserting it. The upsert
+  rewrote the row and committed on every call, so every resumed feed page paid a commit flush.
+
 ## 0.4.0 — 2026-09-24
 
 ### Added
