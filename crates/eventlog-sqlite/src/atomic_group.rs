@@ -26,6 +26,79 @@ pub(super) fn ddl(prefix: &str) -> String {
     )
 }
 
+/// The suffix of the table recording the sorted digests a guarded blob-bearing group bound.
+pub(super) const BATCHES: &str = "group_batches";
+
+/// Created with every other table by `open`, and inside the first guarded blob-bearing group of
+/// an owner provisioned before it existed: `open_existing` and `from_image` create no table, so
+/// such an owner gains this one in the transaction that first needs it. A group committed without
+/// a batch has no row here, and a missing table is the same as a missing row.
+pub(super) fn batches_ddl(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_{BATCHES} (
+        tenant_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digests TEXT NOT NULL,
+        PRIMARY KEY(tenant_id,idempotency_key));"
+    )
+}
+
+/// A guarded group's batch, validated once before the transaction: equal repetitions of a digest
+/// collapse to one binding, a digest repeated with other bytes refuses, and each content's
+/// SHA-256 is computed here so the integrity column does not hash it again.
+struct Batch {
+    writes: Vec<BlobWrite>,
+    hashes: std::collections::BTreeMap<String, String>,
+    /// The fingerprint `AtomicBlobEventStore` records for this same group and batch.
+    blob_fingerprint: String,
+}
+
+impl Batch {
+    fn new(group: &AppendGroup, blobs: &[(String, Vec<u8>)]) -> Result<Self, EventLogError> {
+        let mut unique: std::collections::BTreeMap<&str, &[u8]> = std::collections::BTreeMap::new();
+        for (digest, bytes) in blobs {
+            eventlog_core::validate_field("blob digest", digest)?;
+            if let Some(earlier) = unique.insert(digest, bytes)
+                && earlier != bytes.as_slice()
+            {
+                return Err(EventLogError::Invalid(
+                    "blob digest already names different content".into(),
+                ));
+            }
+        }
+        let request = BlobAppendGroup {
+            group: group.clone(),
+            blobs: unique
+                .into_iter()
+                .map(|(digest, bytes)| BlobWrite {
+                    digest: digest.to_owned(),
+                    bytes: bytes.to_vec(),
+                })
+                .collect(),
+        };
+        // One SHA-256 per content serves the fingerprint and the integrity column alike.
+        let (blob_fingerprint, hashes) = request.fingerprint_and_hashes()?;
+        Ok(Self {
+            writes: request.blobs,
+            hashes,
+            blob_fingerprint,
+        })
+    }
+
+    /// The sorted, distinct digests, as the committed record stores them.
+    fn digests(&self) -> Vec<&str> {
+        self.writes
+            .iter()
+            .map(|blob| blob.digest.as_str())
+            .collect()
+    }
+
+    fn blobs(&self) -> GroupBlobs<'_> {
+        GroupBlobs {
+            writes: &self.writes,
+            hashes: &self.hashes,
+        }
+    }
+}
+
 impl AtomicEventStore for SqliteEventStore {
     fn append_group_guarded<'a>(
         &'a self,
@@ -62,6 +135,61 @@ impl AtomicEventStore for SqliteEventStore {
             })
         }))
     }
+
+    /// The group and its batch in the group's one `BEGIN IMMEDIATE`, so the batch costs the one
+    /// WAL commit the group already takes where a `put_blob` per blob costs one each.
+    ///
+    /// Admission runs before a byte of the batch is bound, and a refusal anywhere rolls back the
+    /// bindings with the events, so no blob of a group that did not commit is reachable. The
+    /// sorted digests the commit bound are recorded beside its receipt: a retry carrying a batch
+    /// is admitted again and must carry exactly those digests, whether or not each is still bound;
+    /// a retry carrying none is the ordinary group retry and repeats no admission.
+    fn append_group_guarded_with_blobs<'a>(
+        &'a self,
+        group: &'a AppendGroup,
+        admission: Arc<dyn Guard>,
+        blobs: &'a [(String, Vec<u8>)],
+    ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
+        if blobs.is_empty() {
+            return self.append_group_guarded(group, admission);
+        }
+        let inner = Arc::clone(&self.inner);
+        let group = group.clone();
+        let blobs = blobs.to_vec();
+        Box::pin(run_blocking(move || {
+            let fingerprint = group.fingerprint()?;
+            let batch = Batch::new(&group, &blobs)?;
+            *inner.registration.lock().map_err(poisoned)? = true;
+            inner.keeping_restored_on_refusal(|| {
+                let mut connection = inner.connection.lock().map_err(poisoned)?;
+                begin_immediate(&connection)?;
+                let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let result = inner.guarded_batch_in_transaction(
+                    &mut connection,
+                    &group,
+                    &fingerprint,
+                    &batch,
+                    admission.as_ref(),
+                    &callback_failed,
+                );
+                match result {
+                    // A deduplicated answer wrote nothing, and commits nothing its re-run
+                    // admission may have staged.
+                    Ok(result) if result.deduplicated => {
+                        connection.execute_batch("ROLLBACK").map_err(backend)?;
+                        Ok(result)
+                    }
+                    result => {
+                        let result = finish_blob_transaction(&connection, result);
+                        if result.is_err() {
+                            inner.verified.forget();
+                        }
+                        result
+                    }
+                }
+            })
+        }))
+    }
 }
 
 impl AtomicBlobEventStore for SqliteEventStore {
@@ -91,7 +219,12 @@ impl AtomicBlobEventStore for SqliteEventStore {
                     admission.as_ref(),
                     &callback_failed,
                 );
-                finish_blob_transaction(&connection, result)
+                let result = finish_blob_transaction(&connection, result);
+                // Tentative bindings, and anything a callback read from them, rolled back.
+                if result.is_err() {
+                    inner.verified.forget();
+                }
+                result
             })
         }))
     }
@@ -144,56 +277,213 @@ impl Inner {
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendGroupResult, EventLogError> {
+        if let Some(ranges) = self.committed_ranges(connection, group, fingerprint)? {
+            return self.replay(connection, group, ranges);
+        }
+        self.bind_group_blobs(connection, &group.tenant, blobs)?;
+        self.admit(connection, group, admission, callback_failed)?;
+        self.append_members(connection, group, fingerprint, callback_failed)
+    }
+
+    /// [`AtomicEventStore::append_group_guarded_with_blobs`]'s transaction body.
+    fn guarded_batch_in_transaction(
+        &self,
+        connection: &mut Connection,
+        group: &AppendGroup,
+        fingerprint: &str,
+        batch: &Batch,
+        admission: &dyn Guard,
+        callback_failed: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<AppendGroupResult, EventLogError> {
         let prefix = &self.prefix;
-        let prior: Option<(String,String)> = connection.query_row(
-            &format!("SELECT request_hash,ranges FROM {prefix}_append_groups WHERE tenant_id=?1 AND idempotency_key=?2"),
-            params![group.tenant.as_str(),group.meta.idempotency_key],
-            |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(backend)?;
-        if let Some((digest, ranges)) = prior {
-            if digest != fingerprint {
+        let accepted = [fingerprint, batch.blob_fingerprint.as_str()];
+        if let Some((recorded, ranges)) = self.receipt(connection, group)? {
+            // A retry carrying a batch is answering for it, so admission runs before anything is
+            // said about the batch, including which fingerprint the receipt matches; otherwise a
+            // replayed key would tell its caller whether a digest is bound and whether bytes match.
+            self.admit(connection, group, admission, callback_failed)?;
+            let Some(matched) = accepted.iter().position(|candidate| *candidate == recorded) else {
+                return Err(EventLogError::IdempotencyMismatch {
+                    key: group.meta.idempotency_key.clone(),
+                });
+            };
+            let ranges: Vec<GroupRange> = serde_json::from_str(&ranges).map_err(backend)?;
+            // Committed through `AtomicBlobEventStore` (an `eventlog_tree::copy` replays every
+            // blob group that way): that receipt's fingerprint already binds this group, these
+            // sorted digests and the SHA-256 of these bytes, so it is this request. Its content
+            // is not read, exactly as that method's own retry does not read it.
+            if matched == 1 {
+                return self.replay(connection, group, ranges);
+            }
+            let recorded: Option<String> = if super::has_table(
+                connection,
+                &format!("{prefix}_{BATCHES}"),
+            )? {
+                connection
+                    .query_row(
+                        &format!("SELECT digests FROM {prefix}_{BATCHES} WHERE tenant_id=?1 AND idempotency_key=?2"),
+                        params![group.tenant.as_str(), group.meta.idempotency_key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(backend)?
+            } else {
+                None
+            };
+            let recorded: Vec<String> = match recorded {
+                Some(digests) => serde_json::from_str(&digests).map_err(backend)?,
+                None => Vec::new(),
+            };
+            // Decided by what the commit recorded, not by what is bound now: a deletion is not a
+            // different request.
+            if recorded.iter().map(String::as_str).ne(batch.digests()) {
                 return Err(EventLogError::IdempotencyMismatch {
                     key: group.meta.idempotency_key.clone(),
                 });
             }
-            let ranges: Vec<GroupRange> = serde_json::from_str(&ranges).map_err(backend)?;
-            let mut appends = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                if range.stream.tenant() != &group.tenant {
+            for blob in &batch.writes {
+                if let Some(bound) = self.bound_blob(connection, &group.tenant, &blob.digest)?
+                    && bound != blob.bytes
+                {
                     return Err(EventLogError::Invalid(
-                        "stored group crosses tenants".into(),
+                        "blob digest already names different content".into(),
                     ));
                 }
-                let events = select_versions(
-                    connection,
-                    prefix,
-                    &range.stream,
-                    to_i64(range.first_version)?,
-                    to_i64(range.last_version)?,
-                )?;
-                appends.push(AppendResult {
-                    first_version: range.first_version,
-                    last_version: range.last_version,
-                    events,
-                    deduplicated: true,
-                });
             }
-            return Ok(AppendGroupResult {
-                appends,
+            return self.replay(connection, group, ranges);
+        }
+        self.admit(connection, group, admission, callback_failed)?;
+        self.bind_group_blobs(connection, &group.tenant, batch.blobs())?;
+        let result = self.append_members(connection, group, fingerprint, callback_failed)?;
+        connection
+            .execute_batch(&batches_ddl(prefix))
+            .map_err(backend)?;
+        connection
+            .execute(
+                &format!("INSERT INTO {prefix}_{BATCHES} (tenant_id,idempotency_key,digests) VALUES (?1,?2,?3)"),
+                params![
+                    group.tenant.as_str(),
+                    group.meta.idempotency_key,
+                    serde_json::to_string(&batch.digests()).map_err(backend)?
+                ],
+            )
+            .map_err(backend)?;
+        Ok(result)
+    }
+
+    /// The committed ranges under this group's key, or `None` when the key is fresh.
+    fn committed_ranges(
+        &self,
+        connection: &Connection,
+        group: &AppendGroup,
+        fingerprint: &str,
+    ) -> Result<Option<Vec<GroupRange>>, EventLogError> {
+        Ok(self
+            .committed_receipt(connection, group, &[fingerprint])?
+            .map(|(_, ranges)| ranges))
+    }
+
+    /// The recorded fingerprint and ranges under this group's key, compared with nothing.
+    fn receipt(
+        &self,
+        connection: &Connection,
+        group: &AppendGroup,
+    ) -> Result<Option<(String, String)>, EventLogError> {
+        let prefix = &self.prefix;
+        connection.query_row(
+            &format!("SELECT request_hash,ranges FROM {prefix}_append_groups WHERE tenant_id=?1 AND idempotency_key=?2"),
+            params![group.tenant.as_str(),group.meta.idempotency_key],
+            |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(backend)
+    }
+
+    /// The committed ranges under this group's key and which of `accepted` its receipt recorded,
+    /// or `None` when the key is fresh. A receipt recording none of them is another request.
+    fn committed_receipt(
+        &self,
+        connection: &Connection,
+        group: &AppendGroup,
+        accepted: &[&str],
+    ) -> Result<Option<(usize, Vec<GroupRange>)>, EventLogError> {
+        let Some((digest, ranges)) = self.receipt(connection, group)? else {
+            return Ok(None);
+        };
+        let Some(matched) = accepted.iter().position(|candidate| *candidate == digest) else {
+            return Err(EventLogError::IdempotencyMismatch {
+                key: group.meta.idempotency_key.clone(),
+            });
+        };
+        let ranges = serde_json::from_str(&ranges).map_err(backend)?;
+        Ok(Some((matched, ranges)))
+    }
+
+    /// The original result of a committed group, read back from its recorded ranges.
+    fn replay(
+        &self,
+        connection: &Connection,
+        group: &AppendGroup,
+        ranges: Vec<GroupRange>,
+    ) -> Result<AppendGroupResult, EventLogError> {
+        let mut appends = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if range.stream.tenant() != &group.tenant {
+                return Err(EventLogError::Invalid(
+                    "stored group crosses tenants".into(),
+                ));
+            }
+            let events = select_versions(
+                connection,
+                &self.prefix,
+                &range.stream,
+                to_i64(range.first_version)?,
+                to_i64(range.last_version)?,
+            )?;
+            appends.push(AppendResult {
+                first_version: range.first_version,
+                last_version: range.last_version,
+                events,
                 deduplicated: true,
             });
         }
-        let hashes = blobs.hashes;
+        Ok(AppendGroupResult {
+            appends,
+            deduplicated: true,
+        })
+    }
+
+    /// The validated bytes bound to one digest, or `None`.
+    fn bound_blob(
+        &self,
+        connection: &Connection,
+        tenant: &eventlog_core::TenantId,
+        digest: &str,
+    ) -> Result<Option<Vec<u8>>, EventLogError> {
+        let prefix = &self.prefix;
+        let prior = connection
+            .query_row(
+                &format!("SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
+                params![tenant.as_str(), digest],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        prior
+            .map(|(bytes, count, hash, version)| {
+                self.verified.check(connection, bytes, count, hash, version)
+            })
+            .transpose()
+    }
+
+    /// Bind each blob inside the open transaction, reusing an equal binding and refusing a
+    /// different one. Nothing here commits.
+    fn bind_group_blobs(
+        &self,
+        connection: &Connection,
+        tenant: &eventlog_core::TenantId,
+        blobs: GroupBlobs<'_>,
+    ) -> Result<(), EventLogError> {
+        let prefix = &self.prefix;
         for blob in blobs.writes {
-            let prior = connection
-                .query_row(
-                    &format!("SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs WHERE tenant_id=?1 AND digest=?2"),
-                    params![group.tenant.as_str(), blob.digest],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)),
-                )
-                .optional()
-                .map_err(backend)?;
-            if let Some((bytes, count, hash, version)) = prior {
-                let bytes = crate::checked_blob(connection, bytes, count, hash, version)?;
+            if let Some(bytes) = self.bound_blob(connection, tenant, &blob.digest)? {
                 if bytes != blob.bytes {
                     return Err(EventLogError::Invalid(
                         "blob digest already names different content".into(),
@@ -204,31 +494,55 @@ impl Inner {
                 // The integrity columns are the same contract the standalone port writes; a
                 // binding this path published without them would fail the table's own check.
                 // The request's fingerprint already hashed this content; it is the same value.
-                let integrity_sha256 = hashes
+                let integrity_sha256 = blobs
+                    .hashes
                     .get(&blob.digest)
                     .cloned()
                     .unwrap_or_else(|| eventlog_core::blob_integrity_sha256(&blob.bytes));
                 connection.execute(
                     &format!("INSERT INTO {prefix}_blobs (tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1) VALUES (?1,?2,?3,?4,?5,?6,1)"),
-                    params![group.tenant.as_str(),blob.digest,blob.bytes,to_i64(byte_count)?,super::format_time(time::OffsetDateTime::now_utc())?,integrity_sha256],
+                    params![tenant.as_str(),blob.digest,blob.bytes,to_i64(byte_count)?,super::format_time(time::OffsetDateTime::now_utc())?,integrity_sha256],
                 ).map_err(backend)?;
+                self.verified.remember(&integrity_sha256, &blob.bytes);
             }
         }
-        {
-            let mut projections = SqliteProjections {
-                connection: &mut *connection,
-                blob_prefix: prefix,
-                projection_prefix: prefix,
-                inline: &self.inline_names,
-                tenant: &group.tenant,
-                admission: Some((&self.admission_permit, &group.tenant)),
-                callback_failed: Arc::clone(callback_failed),
-                selected: None,
-            };
-            let result = drive(admission.check(&mut projections));
-            ensure_callback_integrity(callback_failed)?;
-            result?;
-        }
+        Ok(())
+    }
+
+    /// Run the group's admission guard inside the open transaction.
+    fn admit(
+        &self,
+        connection: &mut Connection,
+        group: &AppendGroup,
+        admission: &dyn Guard,
+        callback_failed: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), EventLogError> {
+        let prefix = &self.prefix;
+        let mut projections = SqliteProjections {
+            connection: &mut *connection,
+            verified: &self.verified,
+            blob_prefix: prefix,
+            projection_prefix: prefix,
+            inline: &self.inline_names,
+            tenant: &group.tenant,
+            admission: Some((&self.admission_permit, &group.tenant)),
+            callback_failed: Arc::clone(callback_failed),
+            selected: None,
+        };
+        let result = drive(admission.check(&mut projections));
+        ensure_callback_integrity(callback_failed)?;
+        result
+    }
+
+    /// Append every member in order and record the group's receipt.
+    fn append_members(
+        &self,
+        connection: &mut Connection,
+        group: &AppendGroup,
+        fingerprint: &str,
+        callback_failed: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<AppendGroupResult, EventLogError> {
+        let prefix = &self.prefix;
         let mut appends = Vec::with_capacity(group.appends.len());
         let mut ranges = Vec::with_capacity(group.appends.len());
         #[cfg(test)]
@@ -424,6 +738,89 @@ mod native_group_crash {
 mod tests {
     use super::*;
     use eventlog_core::EventStore;
+
+    fn counted_commits(store: &SqliteEventStore) -> Arc<std::sync::atomic::AtomicU64> {
+        let commits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = Arc::clone(&commits);
+        store
+            .inner
+            .connection
+            .lock()
+            .unwrap()
+            .commit_hook(Some(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            }))
+            .unwrap();
+        commits
+    }
+
+    fn seven_blob_group(key: &str) -> (AppendGroup, Vec<(String, Vec<u8>)>) {
+        let tenant = eventlog_core::TenantId::new("barrier-count").unwrap();
+        let group = AppendGroup {
+            tenant: tenant.clone(),
+            meta: eventlog_conformance::meta(key, &serde_json::json!({})),
+            appends: vec![eventlog_core::StreamAppend {
+                stream: eventlog_core::StreamId::new(tenant, "item", key).unwrap(),
+                expected: eventlog_core::Expected::NoStream,
+                events: vec![eventlog_conformance::event("item.created", 1)],
+            }],
+        };
+        let blobs = (0..7)
+            .map(|index| {
+                (
+                    format!("{key}-{index}"),
+                    format!("{key}-{index}").into_bytes(),
+                )
+            })
+            .collect();
+        (group, blobs)
+    }
+
+    /// Each SQLite commit in WAL mode is one write barrier; this counts commits per call shape.
+    #[tokio::test]
+    async fn a_guarded_group_with_seven_blobs_takes_one_commit_where_seven_puts_took_eight() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("barriers.sqlite3");
+        let store = SqliteEventStore::open(path.to_str().unwrap(), "barriers")
+            .await
+            .unwrap();
+        let commits = counted_commits(&store);
+
+        let (group, blobs) = seven_blob_group("separate");
+        for (digest, bytes) in &blobs {
+            store.put_blob(&group.tenant, digest, bytes).await.unwrap();
+        }
+        store
+            .append_group_guarded(&group, Arc::new(NoGuard))
+            .await
+            .unwrap();
+        let separate = commits.swap(0, std::sync::atomic::Ordering::SeqCst);
+
+        let (group, blobs) = seven_blob_group("batched");
+        let result = store
+            .append_group_guarded_with_blobs(&group, Arc::new(NoGuard), &blobs)
+            .await
+            .unwrap();
+        assert!(!result.deduplicated);
+        let batched = commits.swap(0, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            (separate, batched),
+            (8, 1),
+            "seven put_blob calls and a group, against the group carrying its seven blobs"
+        );
+        for (digest, bytes) in &blobs {
+            assert_eq!(
+                store
+                    .get_blob(&group.tenant, digest)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(bytes)
+            );
+        }
+    }
 
     #[tokio::test]
     async fn atomic_blob_native_commit_failure_is_unknown_and_retry_resolves() {

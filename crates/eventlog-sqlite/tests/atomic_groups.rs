@@ -11,10 +11,29 @@ async fn guarded_group_blobs_contract() {
         .await
         .unwrap();
     assert!(
-        !eventlog_conformance::run_guarded_group_blobs(&store).await,
-        "this provider has not implemented the guarded blob-bearing group and must fail closed; \
-         implementing it means taking the published-nothing guarantee with it"
+        eventlog_conformance::run_guarded_group_blobs(&store).await,
+        "SQLite implements the guarded blob-bearing group in its one BEGIN IMMEDIATE; a refusal \
+         here means the override was lost, and the exercise's other branch would have passed it"
     );
+}
+
+#[tokio::test]
+async fn guarded_group_blobs_contract_on_a_database_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guarded.sqlite3");
+    let store = SqliteEventStore::open(path.to_str().unwrap(), "guarded_group_blobs")
+        .await
+        .unwrap();
+    assert!(
+        eventlog_conformance::run_guarded_group_blobs(&store).await,
+        "a database file takes the same contract as memory: its reads hash, memory's do not"
+    );
+}
+
+#[tokio::test]
+async fn blob_group_retry_identity() {
+    let store = SqliteEventStore::in_memory("retry_identity").await.unwrap();
+    eventlog_conformance::run_blob_group_retry_identity(&store).await;
 }
 
 #[tokio::test]

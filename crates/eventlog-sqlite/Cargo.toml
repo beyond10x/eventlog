@@ -17,7 +17,8 @@ time.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
-rusqlite.workspace = true
+# `hooks` lets a unit test count the commits, and so the WAL barriers, one call takes.
+rusqlite = { workspace = true, features = ["hooks"] }
 eventlog-conformance.workspace = true
 serde.workspace = true
 time.workspace = true

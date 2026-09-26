@@ -12,7 +12,7 @@ All three providers implement the applicable Eventlog contracts. In-memory opera
 | Concurrency | Persistent process lock serializes access | Immediate write transactions | Bounded pool and transactional locks |
 | Atomic append groups | Supported | Supported | Supported |
 | `AtomicBlobEventStore` | Supported | Supported | Supported |
-| `append_group_guarded_with_blobs` | One group durability barrier | Refuses this optional operation | Refuses this optional operation |
+| `append_group_guarded_with_blobs` | One group durability barrier | One group transaction and WAL commit | Refuses this optional operation |
 | Strict `InspectHistory` | Supported | Supported; Linux inspection requires an OFD lock | No shipped inspector |
 | Complete tenant capture | Supported | Supported | Supported |
 | Inline projection rebuild | Supported | Supported | Supported |

@@ -129,7 +129,7 @@ impl Inner {
         preflight(connection, prefix, tenant, &admitted, &budget)?;
         let events = read_events(connection, prefix, tenant, &mut budget)?;
         validate_captured_order(tenant, &events)?;
-        let blobs = read_blobs(connection, prefix, tenant, &mut budget)?;
+        let blobs = read_blobs(connection, &self.verified, prefix, tenant, &mut budget)?;
         let mut captured = Vec::with_capacity(admitted.len());
         for specification in admitted {
             let rows = read_rows(connection, prefix, tenant, specification, &mut budget)?;
@@ -337,6 +337,7 @@ fn read_events(
 
 fn read_blobs(
     connection: &Connection,
+    verified: &crate::verified::VerifiedBlobs,
     prefix: &str,
     tenant: &TenantId,
     budget: &mut CaptureBudget,
@@ -408,7 +409,8 @@ fn read_blobs(
                 .transpose()
                 .map_err(|_| corrupt(CaptureMaterial::Blob))?;
             // The accepted SQL complete-content validator, not a checksum column read back raw.
-            let bytes = crate::checked_blob(connection, bytes, count, hash, edition)
+            let bytes = verified
+                .check(connection, bytes, count, hash, edition)
                 .map_err(|_| corrupt(CaptureMaterial::Blob))?;
             budget.admit_blob(bytes.len() as u64)?;
             after = Some(digest.clone());

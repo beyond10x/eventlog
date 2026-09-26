@@ -198,6 +198,7 @@ impl Inner {
             let mut projections = SqliteProjections {
                 connection: &mut connection,
                 blob_prefix: &self.prefix,
+                verified: &self.verified,
                 projection_prefix: "eventlog_rebuild",
                 inline: &self.inline_names,
                 tenant,
