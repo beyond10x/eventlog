@@ -242,6 +242,46 @@ mod tests {
         );
     }
 
+    /// The characters in `path`, the unit Windows' 260-character `MAX_PATH` counts in.
+    fn length(path: &Path) -> usize {
+        path.to_string_lossy().chars().count()
+    }
+
+    /// A Git checkout of a repository whose planning store is a tree adds each of these paths to
+    /// the checkout prefix, so a layout change that moves one is a change to every consumer's
+    /// Windows path budget (`docs/design/tree-layout-path-length-v0.1.md`). The inputs are the
+    /// longest a planning store holds today: its root, its tenant, a stream type and an
+    /// `sha256:`-prefixed stream id, and full SHA-256 digests.
+    #[test]
+    fn a_planning_store_writes_each_file_kind_at_its_recorded_longest_path_length() {
+        let root = Path::new(".engineering/state");
+        let tenant = "planning";
+        let stream_type = "er.subject";
+        let stream_id = format!("sha256:{}", "f".repeat(64));
+        let digest = "f".repeat(64);
+        let blob_digest = format!("sha256:{digest}");
+        let measured = [
+            ("identity", length(&identity_path(root, tenant))),
+            (
+                "event",
+                length(&event_path(root, tenant, stream_type, &stream_id, &digest)),
+            ),
+            ("group", length(&group_path(root, tenant, &digest))),
+            ("blob", length(&blob_path(root, tenant, &blob_digest))),
+        ];
+        assert_eq!(
+            measured,
+            [
+                ("identity", 49),
+                ("event", 198),
+                ("group", 115),
+                ("blob", 118)
+            ],
+            "a layout function changed a path length: update the budget table in \
+             docs/design/tree-layout-path-length-v0.1.md with these values"
+        );
+    }
+
     #[test]
     fn canonical_json_sorts_keys_at_every_depth() {
         let one = json!({ "b": 1, "a": { "d": [1, { "z": 0, "y": 1 }], "c": "x" } });
