@@ -77,6 +77,19 @@ SQLite keeps its immediate transaction. PostgreSQL keeps the same-statement FOR 
 and retry when a concurrent deletion removes the conflicting row. Deletion/rebinding and tenant
 erasure retain current authority and atomicity; rebinding computes fresh integrity metadata.
 
+SQLite asks this validator once per distinct content on each handle, not once per read. The
+validator is a pure function of the selected row, so a handle keeps each `(integrity_sha256, bytes)`
+pair it has verified, or has hashed itself at write time, holding the exact bytes. A later row is
+accepted without a new SHA256 only when its hash is a remembered key, its bytes are equal in full
+to the remembered bytes, and its byte_count and integrity_v1 pass as above. Any changed byte, hash,
+count or edition misses and is validated in full, so a row altered after a verified read on the same
+handle is still refused. The memory is bounded (32 MiB per handle) and cleared when the handle
+deletes a blob, erases a tenant or returns an error from a write that bound blobs; a guard or
+projector panic after binding skips that clearing. A deletion or erasure through
+another handle does not clear it: those entries are never returned, since a hit needs an identical
+stored row, but stay in that process's memory until one of those events or the handle is dropped. An in-memory database keeps its existing metadata-only check.
+PostgreSQL still hashes on every read.
+
 A callback context carries distinct owner-blob and projection-target coordinates. Ordinary,
 guarded, grouped, inline and catch-up contexts use the actual owner prefix for both. During
 SQLite and PostgreSQL rebuild, the owner-blob prefix remains the original store prefix while the

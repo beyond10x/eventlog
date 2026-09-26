@@ -100,6 +100,12 @@ impl Guard for Refuses {
 /// — but the refusal a caller sees is no longer the guard's, because the guard is never reached
 /// on a provider that does not implement the method. Asserting `GuardRefused` here would have
 /// been asserting the behaviour the finding condemned.
+///
+/// **AMENDED AGAIN BY `EVENTLOG-BLOB-BATCH`.** SQLite now implements the method, inside the one
+/// `BEGIN IMMEDIATE` the group already takes, with admission before the batch is bound. The
+/// refusal is therefore the guard's own again, and the question this case asks — is any blob of a
+/// refused batch published — is asserted exactly as before. What changed is which contract
+/// applies, the same switch `eventlog_conformance::run_guarded_group_blobs` makes by probing.
 #[tokio::test]
 async fn a_refused_guard_publishes_no_blob_of_the_batch() {
     let store = SqliteEventStore::in_memory("port_refused")
@@ -109,11 +115,10 @@ async fn a_refused_guard_publishes_no_blob_of_the_batch() {
     let refused = store
         .append_group_guarded_with_blobs(&group("refused", 2), Arc::new(Refuses), &blobs(0, 4))
         .await
-        .expect_err("a provider that does not implement the method refuses it");
+        .expect_err("the guard refuses");
     assert!(
-        matches!(refused, EventLogError::Invalid(ref message)
-            if message == eventlog_core::UNAVAILABLE),
-        "the refusal is the fail-closed one, named by the port: {refused:?}"
+        matches!(refused, EventLogError::GuardRefused { ref code } if code == "review_two_refused"),
+        "the refusal is the guard's own, reached before any byte of the batch: {refused:?}"
     );
 
     for (digest, _) in blobs(0, 4) {
@@ -121,6 +126,16 @@ async fn a_refused_guard_publishes_no_blob_of_the_batch() {
             store.get_blob(&tenant(), &digest).await.expect("readable"),
             None,
             "{digest}: a refused guard publishes no blob of the batch it refused"
+        );
+    }
+    for index in 0..2 {
+        assert_eq!(
+            store
+                .stream_version(&StreamId::new(tenant(), "item", format!("s{index}")).expect("id"))
+                .await
+                .expect("readable"),
+            None,
+            "s{index}: and appends no member of the group"
         );
     }
 }
@@ -149,6 +164,12 @@ async fn a_refused_guard_publishes_no_blob_of_the_batch() {
 /// `deduplicated: true` over content nothing committed. The original sequence is kept, both calls
 /// and all, so the case still fails if a provider ever starts committing here without
 /// implementing the guarantee.
+///
+/// **AMENDED AGAIN BY `EVENTLOG-BLOB-BATCH`.** SQLite now commits here, so the original question
+/// is live again and is asserted in its original form: the first call commits `d0000` and both
+/// members, and the retry under the same key carrying `d0001` — a batch that commit never bound —
+/// is either refused as the file provider refuses it, publishing nothing, or answered
+/// `deduplicated: false`. SQLite records the sorted digests each commit bound, so it refuses.
 #[tokio::test]
 async fn a_deduplicated_return_is_not_given_over_a_batch_the_commit_never_bound() {
     let store = SqliteEventStore::in_memory("port_dedup")
@@ -158,11 +179,12 @@ async fn a_deduplicated_return_is_not_given_over_a_batch_the_commit_never_bound(
     let first = store
         .append_group_guarded_with_blobs(&group("dedup", 2), Arc::new(NoGuard), &blobs(0, 1))
         .await
-        .expect_err("a provider that does not implement the method commits nothing under the key");
-    assert!(
-        matches!(first, EventLogError::Invalid(ref message)
-            if message == eventlog_core::UNAVAILABLE),
-        "the refusal is the fail-closed one: {first:?}"
+        .expect("the first call commits the group and its batch");
+    assert!(!first.deduplicated, "the first commit is not a retry");
+    assert_eq!(
+        store.get_blob(&tenant(), "d0000").await.expect("readable"),
+        Some(b"bytes-0".to_vec()),
+        "the first commit bound its batch"
     );
 
     let retry = store
@@ -170,8 +192,13 @@ async fn a_deduplicated_return_is_not_given_over_a_batch_the_commit_never_bound(
         .await;
 
     match retry {
-        Err(EventLogError::Invalid(ref message)) if message == eventlog_core::UNAVAILABLE => {}
-        Err(EventLogError::IdempotencyMismatch { .. }) => {}
+        Err(EventLogError::IdempotencyMismatch { .. }) => {
+            assert_eq!(
+                store.get_blob(&tenant(), "d0001").await.expect("readable"),
+                None,
+                "d0001: a refused retry publishes no byte of the batch it carried"
+            );
+        }
         Err(other) => panic!("unexpected refusal: {other:?}"),
         Ok(result) => {
             assert_eq!(
@@ -186,21 +213,14 @@ async fn a_deduplicated_return_is_not_given_over_a_batch_the_commit_never_bound(
         }
     }
 
-    for digest in ["d0000", "d0001"] {
-        assert_eq!(
-            store.get_blob(&tenant(), digest).await.expect("readable"),
-            None,
-            "{digest}: neither call published a byte of the batch it carried"
-        );
-    }
     for index in 0..2 {
         assert_eq!(
             store
                 .stream_version(&StreamId::new(tenant(), "item", format!("s{index}")).expect("id"))
                 .await
                 .expect("readable"),
-            None,
-            "s{index}: and neither call appended a member of the group"
+            Some(1),
+            "s{index}: the first commit appended each member once, and the retry appended nothing"
         );
     }
 }

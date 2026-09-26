@@ -15,6 +15,7 @@ mod atomic_group;
 mod capture;
 mod inline_admin;
 mod inspection;
+mod verified;
 pub use inspection::SqliteHistoryInspector;
 
 use std::{
@@ -60,6 +61,8 @@ struct Inner {
     /// Identities and instants the next appended events take instead of minting their own, in
     /// order. Empty except while [`SqliteEventStore::restore_events`] replays history.
     restored: Mutex<std::collections::VecDeque<RestoredEvent>>,
+    /// Blob rows this handle has already validated; see [`verified`].
+    verified: verified::VerifiedBlobs,
 }
 
 /// The identity and instant one replayed event had when another store first recorded it.
@@ -351,6 +354,7 @@ impl Inner {
             admission_permit: eventlog_core::AdmissionPermit::default(),
             registration: Mutex::new(false),
             restored: Mutex::new(std::collections::VecDeque::new()),
+            verified: verified::VerifiedBlobs::default(),
         }
     }
 
@@ -527,9 +531,11 @@ impl Inner {
                  projection_name TEXT PRIMARY KEY,
                  indexed_fields TEXT NOT NULL
              );
+             {}
              {}",
             atomic_group::ddl(prefix),
-            origins_ddl(prefix)
+            origins_ddl(prefix),
+            atomic_group::batches_ddl(prefix)
         );
         let mut connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
@@ -1591,6 +1597,7 @@ impl Inner {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
                 blob_prefix: prefix,
+                verified: &self.verified,
                 projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
@@ -1727,6 +1734,7 @@ impl Inner {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
                 blob_prefix: prefix,
+                verified: &self.verified,
                 projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
@@ -2119,6 +2127,7 @@ impl Inner {
     fn forget_tenant(&self, tenant: &TenantId) -> Result<(), EventLogError> {
         let prefix = self.prefix.clone();
         let mut guard = self.connection.lock().map_err(poisoned)?;
+        self.verified.forget();
         let transaction = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
@@ -2140,15 +2149,17 @@ impl Inner {
                 )
                 .map_err(backend)?;
         }
-        // An owner provisioned before copies existed has no origin table, and nothing to erase
-        // from it.
-        if has_table(&transaction, &format!("{prefix}_{ORIGINS}"))? {
-            transaction
-                .execute(
-                    &format!("DELETE FROM {prefix}_{ORIGINS} WHERE tenant_id = ?1"),
-                    params![tenant.as_str()],
-                )
-                .map_err(backend)?;
+        // An owner provisioned before copies or guarded blob batches existed has no origin or
+        // batch table, and nothing to erase from it.
+        for table in [ORIGINS, atomic_group::BATCHES] {
+            if has_table(&transaction, &format!("{prefix}_{table}"))? {
+                transaction
+                    .execute(
+                        &format!("DELETE FROM {prefix}_{table} WHERE tenant_id = ?1"),
+                        params![tenant.as_str()],
+                    )
+                    .map_err(backend)?;
+            }
         }
         // Every read model this owner has ever created, not only the ones registered in this
         // process. A projection table left behind after an erasure is the erased tenant, still
@@ -2427,13 +2438,25 @@ impl Inner {
                 },
             )
             .map_err(backend)?;
-        let stored = checked_blob(&transaction, stored.0, stored.1, stored.2, stored.3)?;
-        if stored != bytes {
-            return Err(EventLogError::Invalid(
-                "blob digest already names different content".into(),
-            ));
+        // This handle hashed `bytes` above, so that pair is known; the readback still compares
+        // the stored row against it, and a row that differs is hashed on its own. A put that
+        // does not commit drops what this handle remembers, its own bytes included.
+        self.verified.remember(&integrity_sha256, bytes);
+        let outcome = (|| {
+            let stored =
+                self.verified
+                    .check(&transaction, stored.0, stored.1, stored.2, stored.3)?;
+            if stored != bytes {
+                return Err(EventLogError::Invalid(
+                    "blob digest already names different content".into(),
+                ));
+            }
+            transaction.commit().map_err(backend)
+        })();
+        if outcome.is_err() {
+            self.verified.forget();
         }
-        transaction.commit().map_err(backend)
+        outcome
     }
 
     fn get_blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError> {
@@ -2458,13 +2481,16 @@ impl Inner {
             .optional()
             .map_err(backend)?;
         stored
-            .map(|(bytes, count, hash, version)| checked_blob(&guard, bytes, count, hash, version))
+            .map(|(bytes, count, hash, version)| {
+                self.verified.check(&guard, bytes, count, hash, version)
+            })
             .transpose()
     }
 
     fn delete_blob(&self, tenant: &TenantId, digest: &str) -> Result<(), EventLogError> {
         let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
+        self.verified.forget();
         guard
             .execute(
                 &format!("DELETE FROM {prefix}_blobs WHERE tenant_id = ?1 AND digest = ?2"),
@@ -2622,6 +2648,7 @@ impl Inner {
             let mut projections = SqliteProjections {
                 connection: &mut *connection,
                 blob_prefix: prefix,
+                verified: &self.verified,
                 projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant,
@@ -2702,6 +2729,7 @@ impl Inner {
                 let mut projections = SqliteProjections {
                     connection: &mut *connection,
                     blob_prefix: &self.prefix,
+                    verified: &self.verified,
                     projection_prefix: "eventlog_rebuild",
                     inline: &self.inline_names,
                     tenant,
@@ -2884,6 +2912,7 @@ fn done<'a, T: Send + 'a>(value: T) -> BoxFuture<'a, T> {
 /// future must be `Send`, and a `Transaction` borrows the connection in a way that is not.
 struct SqliteProjections<'a> {
     connection: &'a mut Connection,
+    verified: &'a verified::VerifiedBlobs,
     blob_prefix: &'a str,
     projection_prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
@@ -2923,7 +2952,8 @@ impl ProjectionStore for SqliteProjections<'_> {
                     .map_err(backend)?;
                 stored
                     .map(|(bytes, count, hash, version)| {
-                        checked_blob(self.connection, bytes, count, hash, version)
+                        self.verified
+                            .check(self.connection, bytes, count, hash, version)
                     })
                     .transpose()
             })();

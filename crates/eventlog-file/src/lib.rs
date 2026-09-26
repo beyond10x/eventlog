@@ -309,18 +309,13 @@ impl FileEventStore {
                     .get(&key(&[group.tenant.as_str(), &group.meta.idempotency_key]))
                     .cloned();
                 if let Some((old, ranges, bound)) = committed {
-                    if old != digest {
-                        return Err(EventLogError::IdempotencyMismatch {
-                            key: group.meta.idempotency_key.clone(),
-                        });
-                    }
                     // A retry carrying a batch is answering for that batch, so admission runs
-                    // before anything is said about it. Without this a caller could replay a key
-                    // it once committed and read back whether a digest is bound and whether bytes
-                    // match, with the guard never called. A retry carrying no batch keeps the
-                    // port's contract exactly — "retries return the original result without
-                    // repeating admission or projections"
-                    // (`eventlog-core/src/atomic_group.rs`), which
+                    // before anything is said about it — before either fingerprint is compared.
+                    // Without this a caller could replay a key it once committed and read back
+                    // whether a digest is bound and whether bytes match, with the guard never
+                    // called. A retry carrying no batch keeps the port's contract exactly —
+                    // "retries return the original result without repeating admission or
+                    // projections" (`eventlog-core/src/atomic_group.rs`), which
                     // `eventlog-conformance/src/atomic_group.rs:153` asserts by counting calls.
                     if !blobs.is_empty() {
                         guard
@@ -331,6 +326,19 @@ impl FileEventStore {
                                 tenant: &group.tenant,
                             })
                             .await?;
+                    }
+                    // Committed through `AtomicBlobEventStore`, whose fingerprint binds this
+                    // group, these digests and the SHA-256 of these bytes: the same request.
+                    if old != digest && blob_fingerprint(&group, &blobs).as_deref() == Some(&old) {
+                        return Ok(AppendGroupResult {
+                            appends: ranges.iter().map(|r| tx.result(r, true)).collect(),
+                            deduplicated: true,
+                        });
+                    }
+                    if old != digest {
+                        return Err(EventLogError::IdempotencyMismatch {
+                            key: group.meta.idempotency_key.clone(),
+                        });
                     }
                     tx.verify_batch(&group.tenant, &blobs, &bound, &group.meta.idempotency_key)?;
                     return Ok(AppendGroupResult {
@@ -1112,6 +1120,32 @@ fn verified(root: &Path, bytes: &[u8], recorded: &str) -> Option<()> {
 /// Both the record and the comparison go through this, so a retry that names the same digests in
 /// another order — or names one of them twice, which [`Transaction::bind_blobs`] collapses on the
 /// fresh path — is the same request rather than a different one.
+/// The fingerprint `AtomicBlobEventStore` records for this group and batch, or `None` when the
+/// batch is empty or repeats a digest with other bytes, which that method cannot have recorded.
+fn blob_fingerprint(group: &AppendGroup, blobs: &[(String, Vec<u8>)]) -> Option<String> {
+    let mut unique = std::collections::BTreeMap::new();
+    for (digest, bytes) in blobs {
+        if unique
+            .insert(digest.clone(), bytes)
+            .is_some_and(|earlier| earlier != bytes)
+        {
+            return None;
+        }
+    }
+    eventlog_core::BlobAppendGroup {
+        group: group.clone(),
+        blobs: unique
+            .into_iter()
+            .map(|(digest, bytes)| eventlog_core::BlobWrite {
+                digest,
+                bytes: bytes.clone(),
+            })
+            .collect(),
+    }
+    .fingerprint()
+    .ok()
+}
+
 fn batch(blobs: &[(String, Vec<u8>)]) -> Vec<String> {
     let mut digests: Vec<String> = blobs.iter().map(|(digest, _)| digest.clone()).collect();
     digests.sort();

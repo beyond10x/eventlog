@@ -22,7 +22,7 @@ on File, SQLite and PostgreSQL. Its fingerprint includes the actual content byte
 append rolls tentative publication back.
 
 A second opt-in API, `AtomicEventStore::append_group_guarded_with_blobs`, puts a group's bindings
-under one durability barrier. File implements it; SQLite and PostgreSQL return the trait's refusal.
+under one durability barrier. File and SQLite implement it; PostgreSQL returns the trait's refusal.
 Do not infer this capability from support for `AtomicBlobEventStore`.
 
 File also has an inherent `append_group_with_blobs` method. In 0.3.0, call the portable trait

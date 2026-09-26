@@ -116,6 +116,50 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "ordered_groups_commit_and_rollback_as_one_unit",
         "concurrent_groups_preserve_order_without_partial_commits",
         "group_retry_survives_database_reopen",
+        "guarded_group_blobs_contract",
+        "guarded_group_blobs_contract_on_a_database_file",
+        "blob_group_retry_identity",
+    ));
+    required.extend(
+        cases!("eventlog-sqlite", "test", "guarded_blob_batch_adversary";
+            "two_handles_racing_one_guarded_batch_commit_it_once",
+            "concurrent_existing_owners_create_the_batch_table_lazily_without_refusal",
+            "a_row_rebound_through_another_handle_is_validated_from_what_is_stored_now",
+        ),
+    );
+    required.extend(
+        cases!("eventlog-tree", "test", "guarded_batch_copy_adversary";
+            "a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy",
+        ),
+    );
+    required.extend(cases!("eventlog-file", "test", "conformance";
+        "file_blob_group_retry_identity",
+    ));
+    required.extend(
+        cases!("eventlog-sqlite", "test", "guarded_blob_batch_adversary_two";
+            "a_refused_guarded_retry_of_an_atomic_receipt_is_refused_by_the_guard_not_by_the_bytes",
+        ),
+    );
+    required.extend(cases!("eventlog-file", "test", "guarded_blob_batch_adversary_two";
+        "file_refused_guarded_retry_of_an_atomic_receipt_is_refused_by_the_guard_not_by_the_bytes",
+        "file_atomic_receipt_survives_reopen_and_a_torn_tail_after_it_refuses",
+    ));
+    required.extend(cases!("eventlog-sqlite", "test", "guarded_blob_batch";
+        "a_later_members_conflict_leaves_no_blob_of_the_batch_reachable_after_reopen",
+        "admission_runs_before_the_batch_is_bound",
+        "an_existing_equal_binding_is_reused_and_a_different_one_refuses_the_whole_group",
+        "a_digest_repeated_inside_one_batch_binds_once_and_must_agree_with_itself",
+        "retries_deduplicate_after_reopen_with_or_without_the_batch_and_only_a_batch_readmits",
+        "an_owner_created_before_the_batch_record_gains_it_inside_the_first_batch",
+        "content_tampered_after_a_verified_read_is_refused_on_the_same_handle",
+        "erasing_a_tenant_erases_the_batches_its_groups_recorded",
+    ));
+    required.extend(cases!("eventlog-sqlite", "lib", "eventlog_sqlite";
+        "atomic_group::tests::a_guarded_group_with_seven_blobs_takes_one_commit_where_seven_puts_took_eight",
+        "verified::tests::content_this_handle_wrote_is_not_hashed_again_by_any_read",
+        "verified::tests::a_reopened_handle_hashes_unchanged_content_once",
+        "verified::tests::a_changed_row_is_hashed_and_refused_on_every_read",
+        "verified::tests::a_write_that_does_not_commit_leaves_nothing_remembered",
     ));
     required.extend(cases!("eventlog-postgres", "lib", "eventlog_postgres";
         "atomic_group::native_group_crash::every_native_group_boundary_recovers_one_complete_outcome",

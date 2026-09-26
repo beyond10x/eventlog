@@ -39,6 +39,17 @@ An exact retry returns original event IDs, positions and ranges as deduplicated.
 It repeats neither admission nor projection and does not recreate a blob erased
 after the original success. A changed request under that identity refuses.
 
+One retry identity holds across this capability and
+AtomicEventStore::append_group_guarded_with_blobs. A guarded blob-bearing retry is accepted
+against a receipt recorded here when this format's fingerprint over the same group and the
+retry's distinct sorted blobs matches it; that fingerprint already binds the digests and the
+SHA-256 of their bytes, so no batch record is consulted and no content is read. The guarded retry
+still runs its admission first. This is how a retry through the guarded port deduplicates a group
+that eventlog_tree::copy replayed into SQLite, including copies made before this rule. The reverse
+direction stays a conflict: a guarded receipt records the group fingerprint and digests but not
+the bytes, and this capability's retry runs no admission that could be asked first. File and
+SQLite implement the rule; PostgreSQL refuses the guarded method.
+
 For a new request compare preexisting bindings against actual bytes. Equal bytes
 may be reused; differing bytes refuse. Install tentative blob bindings before
 admission and inline projectors so their tenant-confined get_blob sees the new

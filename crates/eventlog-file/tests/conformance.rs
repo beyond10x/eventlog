@@ -42,6 +42,12 @@ async fn file_guarded_group_blobs_contract() {
     );
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn file_blob_group_retry_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    eventlog_conformance::run_blob_group_retry_identity(&store).await;
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn file_claims_contract() {
     let directory = tempfile::tempdir().unwrap();
     let store = FileEventStore::open(directory.path()).await.unwrap();

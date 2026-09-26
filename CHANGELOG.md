@@ -7,6 +7,24 @@ under bare-version tags such as `0.1.0`.
 
 ### Added
 
+- SQLite implements `AtomicEventStore::append_group_guarded_with_blobs`. A group and its blobs
+  commit in the group's one `BEGIN IMMEDIATE`. Admission runs before any blob is bound. A
+  refused guard, a member conflict or an existing digest bound to other bytes rolls back every
+  binding with the events. Equal existing bindings and equal repeats within a batch are reused.
+  The sorted digests each commit bound are recorded in an additive
+  `<prefix>_group_batches` table. A retry that carries a batch runs admission again and must
+  carry exactly those digests. A retry without a batch is the ordinary group retry. An owner
+  provisioned before the table existed gets it inside its first such group, and erasing a
+  tenant erases its rows. Measured on ext4 under `strace -f -c`: 20 groups of 7 blobs made
+  169 fsyncs as `put_blob` × 7 plus a group, and 29 fsyncs through this method. Opening takes
+  9 either way, so a group falls from 8 fsyncs to 1. Write time fell from 2.4–3.1 s to
+  0.25–0.38 s. PostgreSQL still refuses the method.
+- File and SQLite accept a guarded blob-bearing retry of a group committed through
+  `AtomicBlobEventStore::append_group_with_blobs`, same key, group and bytes. The retry runs
+  admission again and then deduplicates. Before this, the retry was refused as
+  `IdempotencyMismatch`, including on a SQLite copy made by `eventlog_tree::copy`, and the only
+  way forward was a new key that appended the group twice. The reverse direction still
+  conflicts. The shared exercise `run_blob_group_retry_identity` checks both directions.
 - `eventlog_tree::copy` linearizes a tree store into a SQLite store:
   - every committed group is appended in the tree's position order, with its original event
     ids, instants and receipt, so each stream is gapless and a retry of a copied command writes
@@ -22,6 +40,20 @@ under bare-version tags such as `0.1.0`.
   identity without minting one. Erasing a tenant erases its origins. An owner provisioned
   before the table existed reads an empty map, and gains the table inside the first append that
   carries an origin; `open_existing` still creates no table.
+
+### Performance
+
+- A SQLite database file hashes each distinct blob content at most once per handle, instead
+  of on every read. Content the handle wrote is not hashed again at all. A handle remembers
+  each verified `(integrity_sha256, bytes)` pair, up to 32 MiB. A later row is accepted without
+  hashing only if its hash, length and edition match and its bytes are equal in full. Any
+  changed row is validated in full, so tampering after a verified read is still refused on the
+  same handle. The memory is cleared when the handle deletes a blob, erases a tenant or returns
+  an error from a write that bound blobs (a guard or projector panic skips this). A deletion or erasure through another handle does not clear it; such
+  entries are never returned but stay in memory until then.
+  Measured with 50 reads and 5 captures of one blob: 56 hashes fall to 0 on the writing
+  handle, and 55 fall to 1 on a reopened one. Reading 7,000 blobs of 4 KiB took 218–263 ms
+  and now takes 114–116 ms.
 
 ### Fixed
 
