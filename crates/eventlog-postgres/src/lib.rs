@@ -885,22 +885,42 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<String, EventLogError>> {
         self.bounded(async move {
             let prefix = &self.prefix;
-            let identity = new_event_id();
             let mut client = self.pool.acquire().await?;
-            let row = client
-                .query_one(
-                    &format!(
-                        "INSERT INTO {prefix}_identity (tenant_id, stream_identity)
-                         VALUES ($1, $2)
-                         ON CONFLICT (tenant_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
-                         RETURNING stream_identity"
-                    ),
-                    &[&tenant.as_str(), &identity],
-                )
+            // Readers resolve the identity before every resumed page, so an existing identity is
+            // read, never rewritten: an upsert here commits (and flushes) once per page.
+            let select =
+                format!("SELECT stream_identity FROM {prefix}_identity WHERE tenant_id = $1");
+            let existing = client
+                .query_opt(&select, &[&tenant.as_str()])
                 .await
                 .map_err(backend)?;
+            let identity = if let Some(row) = existing {
+                row.get(0)
+            } else {
+                let minted = client
+                    .query_opt(
+                        &format!(
+                            "INSERT INTO {prefix}_identity (tenant_id, stream_identity)
+                             VALUES ($1, $2)
+                             ON CONFLICT (tenant_id) DO NOTHING
+                             RETURNING stream_identity"
+                        ),
+                        &[&tenant.as_str(), &new_event_id()],
+                    )
+                    .await
+                    .map_err(backend)?;
+                match minted {
+                    Some(row) => row.get(0),
+                    // A concurrent first reader committed the identity between our two statements.
+                    None => client
+                        .query_one(&select, &[&tenant.as_str()])
+                        .await
+                        .map_err(backend)?
+                        .get(0),
+                }
+            };
             client.settled();
-            Ok(row.get(0))
+            Ok(identity)
         })
     }
 
