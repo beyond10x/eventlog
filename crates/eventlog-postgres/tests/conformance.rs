@@ -3623,3 +3623,171 @@ async fn review2_postgres_admission_refuses_unenforced_check_and_unmigrated_lega
         .get(0);
     assert_eq!(columns, 5, "refusal leaves the predecessor shape untouched");
 }
+
+/// A reader resolves the identity before every resumed page, so resolving an existing one must
+/// be a read. A write here costs a commit flush per page and serializes readers on the row.
+#[tokio::test]
+async fn resolving_an_existing_stream_identity_writes_nothing() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(store) = store("identity_read").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url().unwrap()).await;
+    let tenant = TenantId::new("identity-reader").unwrap();
+    let minted = store.stream_identity(&tenant).await.unwrap();
+    let version = "SELECT xmin::text || '@' || ctid::text FROM identity_read_identity WHERE tenant_id = 'identity-reader'";
+    let before: String = sql.query_one(version, &[]).await.unwrap().get(0);
+    for _ in 0..3 {
+        assert_eq!(store.stream_identity(&tenant).await.unwrap(), minted);
+    }
+    let after: String = sql.query_one(version, &[]).await.unwrap().get(0);
+    assert_eq!(
+        after, before,
+        "resolving an existing identity rewrote its row"
+    );
+    store.shutdown().await.unwrap();
+}
+
+/// Readers of a fresh tenant race to mint its identity. Every one of them must come back with
+/// the single identity that was stored, and none may fail because another won.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_resolutions_of_a_fresh_tenant_agree_on_one_identity() {
+    const CALLERS: usize = 16;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    store("identity_race")
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let store = Arc::new(
+        PostgresEventStore::connect_local(
+            &url,
+            "identity_race",
+            eventlog_postgres::PoolOptions {
+                max_connections: CALLERS,
+                ..eventlog_postgres::PoolOptions::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let tenant = TenantId::new("identity-race").unwrap();
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS));
+    let callers: Vec<_> = (0..CALLERS)
+        .map(|_| {
+            let (store, tenant, start) = (store.clone(), tenant.clone(), start.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                store.stream_identity(&tenant).await
+            })
+        })
+        .collect();
+    let mut resolved = std::collections::BTreeSet::new();
+    for caller in callers {
+        resolved.insert(
+            caller
+                .await
+                .unwrap()
+                .expect("a racing first resolution failed"),
+        );
+    }
+    let stored: Vec<String> = client(&url)
+        .await
+        .query(
+            "SELECT stream_identity FROM identity_race_identity WHERE tenant_id = 'identity-race'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        resolved.into_iter().collect::<Vec<_>>(),
+        stored,
+        "racing callers must all return the one stored identity"
+    );
+    store.shutdown().await.unwrap();
+}
+
+/// The losing side of the first-resolution race, forced: another session has inserted the
+/// identity and not yet committed, so every resolver misses it on read and then conflicts on
+/// insert. Each must wait for that commit and return the winner's identity rather than its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resolution_that_loses_the_first_insert_returns_the_winners_identity() {
+    const LOSERS: usize = 4;
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    store("identity_loser")
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let store = Arc::new(
+        PostgresEventStore::connect_local(
+            &url,
+            "identity_loser",
+            eventlog_postgres::PoolOptions {
+                max_connections: LOSERS,
+                ..eventlog_postgres::PoolOptions::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let winner = client(&url).await;
+    winner
+        .batch_execute(
+            "BEGIN; INSERT INTO identity_loser_identity (tenant_id, stream_identity)
+             VALUES ('identity-loser', 'winner-identity')",
+        )
+        .await
+        .unwrap();
+    let tenant = TenantId::new("identity-loser").unwrap();
+    let losers: Vec<_> = (0..LOSERS)
+        .map(|_| {
+            let (store, tenant) = (store.clone(), tenant.clone());
+            tokio::spawn(async move { store.stream_identity(&tenant).await })
+        })
+        .collect();
+    let observer = client(&url).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let waiting: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO identity_loser_identity%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if usize::try_from(waiting).unwrap() == LOSERS {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {waiting} of {LOSERS} resolvers reached the conflicting insert"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    winner.batch_execute("COMMIT").await.unwrap();
+    for loser in losers {
+        assert_eq!(
+            loser.await.unwrap().expect("a losing resolution failed"),
+            "winner-identity",
+            "a resolver that lost the insert returned an identity nobody stored"
+        );
+    }
+    store.shutdown().await.unwrap();
+}
