@@ -8,8 +8,15 @@
 //! <root>/tenants/<tenant>/streams/<type>/<id>/<digest>.json    one event per file
 //! <root>/tenants/<tenant>/groups/<kk>/<key-digest>.json        one command per file: the commit point
 //! <root>/tenants/<tenant>/blobs/<kk>/<digest>           content-addressed bytes
+//! <root>/tenants/<tenant>/split-blobs/<kk>/<digest>.json  eventlog-tree/2: a blob as a manifest
+//! <root>/tenants/<tenant>/texts/<hh>/<sha256 hex>       eventlog-tree/2: one text, stored once
 //! <root>/.lock                                          one writer per checkout; not history
 //! ```
+//!
+//! `store.json` names the layout. `eventlog-tree/1` holds raw blob files only. `eventlog-tree/2`,
+//! the layout a new store is created in, may keep a blob that is a JSON document as a manifest
+//! whose long string literals are texts stored once by their SHA-256; a reader serves the exact
+//! bytes either way. [`migrate`] moves an `eventlog-tree/1` store to `eventlog-tree/2`.
 //!
 //! No file describes the whole store, so two branches that wrote different streams merge with no
 //! textual conflict. Two branches that wrote one stream merge too: they added different files, and
@@ -29,9 +36,12 @@ mod copy;
 mod fold;
 mod history;
 mod layout;
+mod migrate;
+mod split;
 mod verify;
 
 pub use copy::{CopyReport, copy};
+pub use migrate::{MigrationMode, MigrationReport, migrate};
 pub use verify::{Finding, verify};
 
 use eventlog_core::{
@@ -46,8 +56,8 @@ use eventlog_core::{
 use eventlog_sqlite::{EventOrigin, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
-    FORMAT, backend, blob_path, canonical, corrupt, event_path, group_path, identity_path,
-    sha256_hex, tenant_dir, write_atomic, write_once,
+    FORMAT, backend, canonical, corrupt, event_path, group_path, identity_path, sha256_hex,
+    tenant_dir, write_atomic, write_once,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -150,14 +160,7 @@ impl TreeEventStore {
     }
 
     fn writer_lock(&self) -> Result<fs::File, EventLogError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.root.join(".lock"))
-            .map_err(backend)?;
-        file.lock().map_err(backend)?;
-        Ok(file)
+        writer_lock(&self.root)
     }
 
     async fn engine(&self) -> Result<Arc<SqliteEventStore>, EventLogError> {
@@ -350,8 +353,9 @@ impl TreeEventStore {
         }
 
         let persisted = (|| {
+            let splits = layout::store_format(&self.root)?.splits();
             for (digest, bytes) in blobs {
-                write_once(&blob_path(&self.root, tenant.as_str(), digest), bytes)?;
+                split::write_blob(&self.root, tenant.as_str(), digest, bytes, splits)?;
             }
             for record in &written {
                 let path = event_path(
@@ -391,6 +395,18 @@ impl TreeEventStore {
     }
 }
 
+/// The one-writer-per-checkout lock, held until the returned file is dropped.
+fn writer_lock(root: &Path) -> Result<fs::File, EventLogError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".lock"))
+        .map_err(backend)?;
+    file.lock().map_err(backend)?;
+    Ok(file)
+}
+
 /// Refuse a directory that holds another kind of store, and create `store.json` in one that
 /// holds none.
 fn prepare(root: &Path) -> Result<(), EventLogError> {
@@ -403,13 +419,8 @@ fn prepare(root: &Path) -> Result<(), EventLogError> {
     fs::create_dir_all(root).map_err(backend)?;
     let manifest = root.join("store.json");
     match fs::read(&manifest) {
-        Ok(bytes) => {
-            let value: Value = serde_json::from_slice(&bytes).map_err(|_| corrupt("store.json"))?;
-            if value.get("format").and_then(Value::as_str) != Some(FORMAT)
-                || value.get("identity").and_then(Value::as_str).is_none()
-            {
-                return Err(corrupt("store.json is not an eventlog-tree store"));
-            }
+        Ok(_) => {
+            layout::store_format(root)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let value = json!({ "format": FORMAT, "identity": eventlog_core::new_event_id() });
@@ -1147,7 +1158,10 @@ impl EventStore for TreeEventStore {
             }
             let _lock = self.writer_lock()?;
             state.engine.put_blob(tenant, digest, bytes).await?;
-            if let Err(error) = write_once(&blob_path(&self.root, tenant.as_str(), digest), bytes) {
+            let written = layout::store_format(&self.root).and_then(|format| {
+                split::write_blob(&self.root, tenant.as_str(), digest, bytes, format.splits())
+            });
+            if let Err(error) = written {
                 state.poisoned = true;
                 return Err(error);
             }
@@ -1175,12 +1189,11 @@ impl EventStore for TreeEventStore {
             }
             let _lock = self.writer_lock()?;
             state.engine.delete_blob(tenant, digest).await?;
-            let path = blob_path(&self.root, tenant.as_str(), digest);
-            if let Err(error) = fs::remove_file(&path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
+            // A split blob takes with it every text no other blob of the tenant names, so a
+            // deleted blob's content is gone from the tree and not only its manifest.
+            if let Err(error) = split::delete_blob(&self.root, tenant.as_str(), digest) {
                 state.poisoned = true;
-                return Err(backend(error));
+                return Err(error);
             }
             Ok(())
         })

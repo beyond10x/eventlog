@@ -12,8 +12,53 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// The format tag in `store.json`.
-pub(crate) const FORMAT: &str = "eventlog-tree/1";
+/// The format tag in `store.json` of a store every blob of which is a raw file.
+pub(crate) const FORMAT_V1: &str = "eventlog-tree/1";
+/// The format tag in `store.json` of a store that may also hold split blobs and texts
+/// (`crate::split`). A new store is created in it.
+pub(crate) const FORMAT: &str = "eventlog-tree/2";
+
+/// Which of the two layouts a store's `store.json` declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreFormat {
+    /// `eventlog-tree/1`: raw blob files only.
+    V1,
+    /// `eventlog-tree/2`: raw blob files, split blobs and texts.
+    V2,
+}
+
+impl StoreFormat {
+    /// The tag `store.json` spells this format with.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::V1 => FORMAT_V1,
+            Self::V2 => FORMAT,
+        }
+    }
+
+    /// Whether a blob may be kept split.
+    pub(crate) fn splits(self) -> bool {
+        self == Self::V2
+    }
+}
+
+/// The format `store.json` under `root` declares.
+///
+/// # Errors
+/// Refuses a `store.json` that is not a tree store's, including one of a format this reader does
+/// not know, by name.
+pub(crate) fn store_format(root: &Path) -> Result<StoreFormat, EventLogError> {
+    let bytes = fs::read(root.join("store.json")).map_err(backend)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| corrupt("store.json"))?;
+    if value.get("identity").and_then(Value::as_str).is_none() {
+        return Err(corrupt("store.json is not an eventlog-tree store"));
+    }
+    match value.get("format").and_then(Value::as_str) {
+        Some(FORMAT_V1) => Ok(StoreFormat::V1),
+        Some(FORMAT) => Ok(StoreFormat::V2),
+        _ => Err(corrupt("store.json is not an eventlog-tree store")),
+    }
+}
 /// The format tag of an event file.
 pub(crate) const EVENT_FORMAT: &str = "eventlog-tree/event/1";
 /// The format tag of a group file.

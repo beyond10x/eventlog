@@ -4,7 +4,8 @@
 //! opened, such as on the checked-out tree of a pull request and its merge base.
 
 use crate::history;
-use crate::layout::{canonical, json_files, subdirectories};
+use crate::layout::{StoreFormat, canonical, json_files, subdirectories};
+use crate::split;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -83,8 +84,10 @@ fn files(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// V1: only the files this store writes, each where it belongs.
+/// V1: only the files this store writes, each where it belongs. Split blobs and texts belong only
+/// to an `eventlog-tree/2` store.
 fn layout(root: &Path, findings: &mut Vec<Finding>) {
+    let splits = crate::layout::store_format(root).is_ok_and(StoreFormat::splits);
     for path in files(root) {
         let parts: Vec<String> = path
             .components()
@@ -102,6 +105,18 @@ fn layout(root: &Path, findings: &mut Vec<Finding>) {
                 shard.len() == 2 && is_json(file) && file.starts_with(*shard)
             }
             ["tenants", _, "blobs", _, file] => !file.starts_with('.'),
+            ["tenants", _, "split-blobs", _, file] => {
+                splits && is_json(file) && !file.starts_with('.')
+            }
+            ["tenants", _, "texts", shard, file] => {
+                splits
+                    && shard.len() == 2
+                    && file.starts_with(*shard)
+                    && file.len() == 64
+                    && file
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            }
             _ => false,
         };
         if !known {
@@ -129,6 +144,9 @@ fn canonical_bytes(root: &Path, findings: &mut Vec<Finding>) {
         for shard in subdirectories(&tenant.join("groups")).unwrap_or_default() {
             directories.push(shard);
         }
+        for shard in subdirectories(&tenant.join("split-blobs")).unwrap_or_default() {
+            directories.push(shard);
+        }
         for kind in subdirectories(&tenant.join("streams")).unwrap_or_default() {
             directories.extend(subdirectories(&kind).unwrap_or_default());
         }
@@ -150,8 +168,14 @@ fn canonical_bytes(root: &Path, findings: &mut Vec<Finding>) {
     }
 }
 
-/// V2: every file the base holds is still here with the same bytes. The one exception is an event
-/// file whose body was redacted: its envelope, and so its digest, must be unchanged.
+/// V2: every file the base holds is still here with the same bytes. The exceptions change no
+/// byte any reader is served:
+///
+/// - an event file whose body was redacted: its envelope, and so its digest, must be unchanged;
+/// - a blob held in the other form: a raw file or a split blob of the base may be gone when the
+///   tree still serves that digest with exactly the base's bytes (the `eventlog-tree/2`
+///   migration);
+/// - `store.json` moving from `eventlog-tree/1` to `eventlog-tree/2` with its identity unchanged.
 fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
     let mut before: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
     for path in files(base) {
@@ -160,6 +184,16 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
         }
     }
     for (path, old) in before {
+        if let Some(same) = blob_served_alike(base, root, &path) {
+            if !same {
+                findings.push(Finding {
+                    rule: "V2",
+                    path,
+                    detail: "a committed blob is no longer served with the same bytes".into(),
+                });
+            }
+            continue;
+        }
         let Ok(new) = fs::read(root.join(&path)) else {
             findings.push(Finding {
                 rule: "V2",
@@ -171,6 +205,9 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
         if new == old {
             continue;
         }
+        if path == Path::new("store.json") && is_format_upgrade(&old, &new) {
+            continue;
+        }
         if !is_redaction(&old, &new) {
             findings.push(Finding {
                 rule: "V2",
@@ -179,6 +216,52 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
             });
         }
     }
+}
+
+/// For a base file that holds a blob — a raw file or a split blob — whether the tree at `root`
+/// still serves that digest with the bytes the base served. `None` for any other file.
+fn blob_served_alike(base: &Path, root: &Path, path: &Path) -> Option<bool> {
+    let parts: Vec<String> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let (tenant, digest) = match parts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["tenants", tenant, "blobs", _, file] => (*tenant, history::unescape(file).ok()?),
+        ["tenants", tenant, "split-blobs", _, file] => (
+            *tenant,
+            history::unescape(file.strip_suffix(".json")?).ok()?,
+        ),
+        _ => return None,
+    };
+    let tenant = history::unescape(tenant).ok()?;
+    let old = split::read_blob(base, &tenant, &digest).ok().flatten();
+    let new = split::read_blob(root, &tenant, &digest).ok().flatten();
+    Some(old.is_some() && old == new)
+}
+
+/// `store.json` changed only from `eventlog-tree/1` to `eventlog-tree/2`, keeping its identity.
+fn is_format_upgrade(old: &[u8], new: &[u8]) -> bool {
+    let (Ok(serde_json::Value::Object(mut old)), Ok(serde_json::Value::Object(mut new))) = (
+        serde_json::from_slice::<serde_json::Value>(old),
+        serde_json::from_slice::<serde_json::Value>(new),
+    ) else {
+        return false;
+    };
+    old.remove("format")
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        == Some(StoreFormat::V1.tag())
+        && new
+            .remove("format")
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            == Some(StoreFormat::V2.tag())
+        && old == new
 }
 
 fn is_redaction(old: &[u8], new: &[u8]) -> bool {

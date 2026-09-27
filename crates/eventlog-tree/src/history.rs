@@ -1,8 +1,8 @@
 //! The two immutable records, reading them back, and the order history is replayed in.
 
 use crate::layout::{
-    EVENT_FORMAT, GROUP_FORMAT, backend, blob_path, canonical, corrupt, group_path, json_files,
-    sha256_hex, subdirectories,
+    EVENT_FORMAT, GROUP_FORMAT, backend, canonical, corrupt, group_path, json_files, sha256_hex,
+    subdirectories,
 };
 use eventlog_core::{CommandMeta, EventLogError, Expected, NewEvent, StreamId, TenantId};
 use serde_json::{Map, Value, json};
@@ -424,9 +424,24 @@ pub(crate) fn group_files(root: &Path) -> Result<BTreeSet<PathBuf>, EventLogErro
 /// event of the same stream, and a cycle.
 pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
     let mut loaded = Loaded::default();
+    // A directory with no `store.json` is read as the first layout, as it always was.
+    let format = if root.join("store.json").exists() {
+        crate::layout::store_format(root)?
+    } else {
+        crate::layout::StoreFormat::V1
+    };
     for tenant_directory in subdirectories(&root.join("tenants"))? {
         let segment_name = tenant_of(&tenant_directory)?;
         let mut history = TenantHistory::default();
+        // A reader of the first layout would serve a split blob's manifest as the blob, so a
+        // store that holds one must say so in `store.json`.
+        if !format.splits() && crate::split::holds_split_files(root, &segment_name) {
+            return Err(corrupt(
+                "an eventlog-tree/1 store holding split blobs or texts",
+            ));
+        }
+        // Every blob, in whichever form it is held.
+        let tenant_blobs = crate::split::tenant_blobs(root, &segment_name)?;
         let identity_file = tenant_directory.join("identity.json");
         if identity_file.exists() {
             let value = read_json(&identity_file)?;
@@ -510,7 +525,12 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
                 }
                 let mut blobs = Vec::new();
                 for digest in &record.blobs {
-                    if let Ok(bytes) = fs::read(blob_path(root, &record.tenant, digest)) {
+                    let held = if record.tenant == segment_name {
+                        tenant_blobs.get(digest).cloned()
+                    } else {
+                        crate::split::read_blob(root, &record.tenant, digest)?
+                    };
+                    if let Some(bytes) = held {
                         blobs.push((digest.clone(), bytes));
                     }
                 }
@@ -551,36 +571,13 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
         }
         history.groups = replay_order(committed, &owner, &events)?;
 
-        for shard in subdirectories(&tenant_directory.join("blobs"))? {
-            let entries = fs::read_dir(&shard).map_err(backend)?;
-            let mut files = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(backend)?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.starts_with('.') && entry.file_type().map_err(backend)?.is_file() {
-                    files.push((name, entry.path()));
-                }
-            }
-            files.sort();
-            for (_, path) in files {
-                let digest = history_blob_digest(&path)?;
-                history
-                    .blobs
-                    .push((digest, fs::read(&path).map_err(backend)?));
-            }
-        }
+        history.blobs = tenant_blobs.into_iter().collect();
+        history
+            .blobs
+            .sort_by_cached_key(|(digest, _)| crate::layout::segment(digest));
         loaded.tenants.insert(segment_name, history);
     }
     Ok(loaded)
-}
-
-fn history_blob_digest(path: &Path) -> Result<String, EventLogError> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| corrupt("blob file"))?
-        .to_string_lossy()
-        .into_owned();
-    unescape(&name)
 }
 
 /// The inverse of [`crate::layout::segment`].
