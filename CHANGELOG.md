@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.6.0 — 2026-09-27
+
 ### Added
 
 - Tree stores keep long text once. A new layout, `eventlog-tree/2`, may keep a blob that is a JSON
