@@ -5,6 +5,32 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- Tree stores keep long text once. A new layout, `eventlog-tree/2`, may keep a blob that is a JSON
+  document (or JSON Lines) as a split blob: a manifest under `split-blobs/` whose string literals
+  of 1,024 bytes or more are texts under `texts/`, each stored once per tenant under its SHA-256.
+  A literal that spells bytes in hexadecimal keeps those bytes once, and JSON inside them is cut
+  the same way. Readers serve exactly the blob's bytes under the same digest and refuse a manifest
+  whose expansion has another length or SHA-256. New stores are created as `eventlog-tree/2`.
+  Design: `docs/design/tree-text-blobs-v0.1.md`.
+- `eventlog_tree::migrate(root, MigrationMode::DryRun | Apply)` moves an `eventlog-tree/1` store
+  to `eventlog-tree/2`. It verifies the store first, converts one blob at a time with a read-back
+  before the raw file goes, then reloads the store and checks every blob, group and event is served
+  as before. It is idempotent and never runs on open. On a copy of a 9,682-blob planning store it
+  cut history bytes from 180,651,308 to 77,406,062 and the largest file from 75,332,948 to
+  5,153,913 bytes.
+
+### Changed
+
+- Every `eventlog-tree/1` store still opens, reads and writes exactly as before. It is refused by
+  name if it holds split-blob or text files. `verify`'s V2 rule accepts the migration commit: a
+  blob file may move between forms when the head serves the same bytes, and `store.json` may move
+  from `eventlog-tree/1` to `eventlog-tree/2` with the same identity.
+- Deleting a blob of an `eventlog-tree/2` store removes every text no other blob names.
+- New and migrated stores are refused by earlier readers, which accept only
+  `eventlog-tree/1`.
+
 ## 0.5.0 — 2026-09-26
 
 ### Added
