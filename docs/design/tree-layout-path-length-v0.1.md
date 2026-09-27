@@ -6,6 +6,11 @@ This document changes no bytes. Every option below changes the on-disk layout th
 several repositories hold, so it is a coordinated migration and needs an Atlas ADR before any of it is
 built.
 
+The tag `eventlog-tree/2` has since been taken by split blobs and texts
+(`tree-text-blobs-v0.1.md`), which change no event path. The stream-directory change proposed here
+is therefore `eventlog-tree/3`, and its migration would be a further step of `eventlog_tree::migrate`.
+The event-path measurements below hold for both existing layouts.
+
 ## The problem
 
 When Git has `core.longpaths` off, it refuses to check out a path of 260 characters or more (`MAX_PATH`).
@@ -22,7 +27,7 @@ Entity Runtime, 188 for a three-letter name.
 Entity Runtime 0.24.0's Windows release build failed on exactly this. 0.24.1 turns on `core.longpaths`
 in CI to get past it.
 
-## Measured budget, current layout (`eventlog-tree/1`)
+## Measured budget, current layout (`eventlog-tree/1` and `eventlog-tree/2`)
 
 The inputs are the longest a planning store holds today: root `.engineering/state`, tenant `planning`,
 stream type `er.subject`, stream id `sha256:<64 hex>`, and full SHA-256 digests. The first four rows are
@@ -99,7 +104,7 @@ use. `segment` escapes `/`, so this key is unambiguous.
 - **Read compatibility.** Every event record already carries `tenant`, `stream_type` and `stream_id`.
   `history.rs` already refuses "an event file outside its stream's directory" by recomputing
   `stream_dir` from the record. So a reader can serve both layouts by choosing the recomputation from
-  `store.json`'s format tag: `eventlog-tree/1` keeps today's function, and `eventlog-tree/2` uses the
+  `store.json`'s format tag: `eventlog-tree/1` keeps today's function, and `eventlog-tree/3` uses the
   hashed one. A store whose files do not match its own tag is refused by name (`verify` V1, and the
   replay's existing path check). Accepting both shapes inside one store is possible but not
   recommended, because it makes "which path is this event's" ambiguous.
@@ -132,7 +137,7 @@ to a registry, which packages only crate directories, is an option; every worksp
 
 Adopt **C**:
 
-- Add a hashed, fixed-length stream directory under a new format tag `eventlog-tree/2`.
+- Add a hashed, fixed-length stream directory under a new format tag `eventlog-tree/3`.
 - Keep a reader for `eventlog-tree/1` indefinitely. Old revisions and AEP's `tree-rendered-by-0-58-0`
   fixture are v1 by design.
 - Migrate with an explicit rename-only command, never implicitly on open.
@@ -145,7 +150,7 @@ leaves every digest in place.
 
 ## What the Atlas ADR must decide
 
-1. **The format.** `eventlog-tree/2` and the exact stream-directory function: the hash input, the
+1. **The format.** `eventlog-tree/3` and the exact stream-directory function: the hash input, the
    truncation length and the fan-out.
 2. **Read policy.** Whether v1 is read forever or until a named release, and whether a store that mixes
    layouts is refused, as recommended here, or normalized.
