@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-16T01:16:57Z",
+  "actor": "human:timo",
+  "artifact": "story:consistent-tenant-capture",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "approval",
+    "source": "Operator approved ESS evolution scope and autonomous implementation; SQL dependency accepted at 8746a693",
+    "reference": "plan:ess-evolution-20260915"
+  }
+}

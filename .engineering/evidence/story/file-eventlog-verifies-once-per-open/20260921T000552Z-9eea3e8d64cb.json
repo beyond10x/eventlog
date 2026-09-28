@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T00:05:52Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "journal.rs:347 mutant warning NEEDS-CHANGE introduced: eleven one-line deletions from this unit's code left all 65 cases green, four of them fail-open (epoch, store, format, and the append.json half of the intent check). Fixed in bot commit db608cd4152e6a2370e8ef0e3a562d7a829cf34a by adopting tests/verify_once_review_two.rs and tests/measure_review_two.rs as written; suite 65 to 84, exit 0, fmt and clippy 0. Two of the seven mutations re-run by the sub-operator before the commit: dropping the store-identity clause turns a_manifest_store_identity_moved_under_unchanged_committed_bytes_is_refused red, dropping the append.json clause turns a_pending_append_intent_is_never_resumed_past red, both green when reverted and the source restored byte-for-byte. M2, M3 and M11 stay unpinned because each is fail-safe",
+    "review": "review-result:verify-once-review-2",
+    "outcome": "fixed"
+  }
+}

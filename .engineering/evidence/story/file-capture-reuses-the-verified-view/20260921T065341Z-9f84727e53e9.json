@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T06:53:41Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "capture.rs:166 mutant note CONFIRMED introduced: the view-retirement filter is pinned by nothing and is a fail-safe second line of defence, as the implementation report itself disclosed. Left standing by instruction",
+    "review": "review-result:capture-verified-review-2",
+    "outcome": "no-op"
+  }
+}

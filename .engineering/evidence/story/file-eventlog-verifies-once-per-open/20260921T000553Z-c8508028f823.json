@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T00:05:53Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "lib.rs:548 judgement note CONFIRMED introduced: the resumed path's clear_snapshots is justified by a cause the crate cannot produce. Not changed in this wave — removing a guard or reaching it needs a design decision, not a correction round. Filed as story:resumed-snapshot-clearing-has-no-reachable-cause (draft), informed_by this review",
+    "review": "review-result:verify-once-review-2",
+    "outcome": "no-op"
+  }
+}

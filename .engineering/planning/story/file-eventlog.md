@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:file-eventlog
 kind: story
 status: implemented
@@ -11,6 +11,10 @@ relations:
 - informed_by: architecture-decision-record:ess-evolution-05-file-and-atomic-groups
 - depends_on: story:atomic-append-groups
 revision: 9
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-10T06:26:26Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-10T06:26:47Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-10T07:38:30Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 ## Context
 The authorized ESS evolution design requires a repository-local Eventlog provider before ER and AEP migration. Existing EventStore, AtomicEventStore, event envelopes and projection ports in crates/eventlog-core define the behavior; this adds a provider and physical encoding, not a product entity. ADR ess-evolution-05-file-and-atomic-groups supersedes the predecessor RFC's two-provider restriction.

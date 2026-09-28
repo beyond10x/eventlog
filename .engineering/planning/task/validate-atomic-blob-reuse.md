@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: task:validate-atomic-blob-reuse
 kind: task
 status: implemented
@@ -10,6 +10,10 @@ relations:
 - serves: vision:O2
 - decomposes: story:atomic-blob-append
 revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-22T10:48:27Z", actor: "agent:codex-ekr-completion-20260922", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-22T10:48:27Z", actor: "agent:codex-ekr-completion-20260922", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-22T11:34:12Z", actor: "agent:codex-ekr-completion-20260922", revision: 6, decided_on: {"recorded":{"test_result":2}}, imported: true}
 ---
 ## Reproduced defect
 

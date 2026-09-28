@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: task:refresh-project-documentation
 kind: task
 status: active
@@ -7,6 +7,9 @@ title: Refresh released documentation and automatic project publication
 relations:
 - serves: vision:O2
 revision: 3
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-22T11:46:41Z", actor: "agent:codex", revision: 2, decided_on: {"recorded":{"test_result":1}}, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-22T11:46:41Z", actor: "agent:codex", revision: 3, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 ## Context
 

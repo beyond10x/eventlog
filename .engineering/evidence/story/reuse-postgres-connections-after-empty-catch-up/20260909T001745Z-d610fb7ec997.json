@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:17:45Z",
+  "actor": "human:timo",
+  "artifact": "story:reuse-postgres-connections-after-empty-catch-up",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "static_analysis",
+    "source": "wave1 gate: cargo fmt --all --check and cargo clippy --workspace --all-targets --locked -- -D warnings; both exit 0",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/wave1-gate.log"
+  }
+}

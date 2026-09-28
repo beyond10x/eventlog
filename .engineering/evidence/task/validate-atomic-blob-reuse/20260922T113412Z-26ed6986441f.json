@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-22T11:34:12Z",
+  "actor": "agent:codex-ekr-completion-20260922",
+  "artifact": "task:validate-atomic-blob-reuse",
+  "kind": "task",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Required real-backend, comparative and restart CI at the reviewed source",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/35720472752"
+  }
+}

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:eventlog-0-1-0-release
 kind: story
 status: implemented
@@ -9,6 +9,10 @@ tags:
 - eventlog
 - release
 revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-01T20:20:50Z", actor: "agent:eventlog-release", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-01T20:20:50Z", actor: "agent:eventlog-release", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-01T20:21:34Z", actor: "agent:eventlog-release", revision: 4, decided_on: {"recorded":{"test_result":2,"static_analysis":1,"verification":1}}, imported: true}
 ---
 ## Intent
 

@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-08T23:14:41Z",
+  "actor": "human:timo",
+  "artifact": "story:the-store-goes-async",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "static_analysis",
+    "source": "Observed production gate: cargo fmt --all --check and cargo clippy --workspace --all-targets --locked -- -D warnings, exit 0",
+    "reference": ".engineering/planning/verification-report/repository-hygiene-and-code-review-20260909.md"
+  }
+}

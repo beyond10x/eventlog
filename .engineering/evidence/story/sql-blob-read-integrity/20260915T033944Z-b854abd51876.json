@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-15T03:39:44Z",
+  "actor": "human:timo",
+  "artifact": "story:sql-blob-read-integrity",
+  "kind": "story",
+  "revision": 21,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "Independent design pass 2 approved with no findings; no implementation or runtime acceptance claimed",
+    "reference": "docs/design/sql-blob-read-integrity.md",
+    "review": "review-result:sql-blob-integrity-design-pass-2",
+    "outcome": "no-op"
+  }
+}

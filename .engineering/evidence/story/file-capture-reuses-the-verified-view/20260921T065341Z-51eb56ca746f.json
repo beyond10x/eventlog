@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T06:53:41Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "journal.rs:411 mutant note INFEASIBLE introduced: the unwrap_or(true) doubt clause on the reserved-intent probe is pinned by nothing and no reachable state was found, because regular(root/writer.lock) fails first. Left standing by instruction; the correction report records it",
+    "review": "review-result:capture-verified-review-2",
+    "outcome": "no-op"
+  }
+}

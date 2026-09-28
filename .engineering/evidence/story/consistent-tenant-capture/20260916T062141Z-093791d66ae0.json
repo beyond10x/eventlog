@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-16T06:21:41Z",
+  "actor": "human:timo",
+  "artifact": "story:consistent-tenant-capture",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "F2: SQLite actual blob lengths before payload caps",
+    "reference": "local-evidence:ess-evolution/waves/0011-provider-capture/source-correction-1/implementation-result.md",
+    "review": "review-result:consistent-tenant-capture-source-pass-1",
+    "outcome": "fixed"
+  }
+}

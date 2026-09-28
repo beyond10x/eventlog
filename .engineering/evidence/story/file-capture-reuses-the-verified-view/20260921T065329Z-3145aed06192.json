@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T06:53:29Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "journal.rs:559 contract-drift blocker NEEDS-CHANGE introduced: same defect as pass 1, reached independently by mv store real plus a symlink while a handle is open. Fixed in bot commit 76aad5e3790e302e6c7f348a4fe4d9229cd17bce; docs/design/file-provider.md:87 stands as written and is true again",
+    "review": "review-result:capture-verified-review-2",
+    "outcome": "fixed"
+  }
+}

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: review-result:capture-verified-review-2
 kind: review-result
 status: active
@@ -7,6 +7,8 @@ title: 'Independent verification pass 2: which lines the unit added can be delet
 relations:
 - reviews: story:file-capture-reuses-the-verified-view
 revision: 2
+transitions:
+- {from: "draft", to: "active", at: "2026-09-21T06:26:20Z", actor: "human:timo", revision: 2, imported: true}
 ---
 unit: story:file-capture-reuses-the-verified-view — commit b5a6e0ae19a5d02616a8c260a1f3d67060317ba3, worktree home-path:sha256:9fb7a0cbaea99ddb6c55d7d287408c61cd17a3710f8df99690692b2a5a614431 (HEAD detached, no tracked file modified)
 verdict: red

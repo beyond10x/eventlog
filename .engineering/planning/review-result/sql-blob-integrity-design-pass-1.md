@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: review-result:sql-blob-integrity-design-pass-1
 kind: review-result
 status: active

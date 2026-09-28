@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:08:35Z",
+  "actor": "human:timo",
+  "artifact": "story:erasure-redaction-and-snapshot-invalidation",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "Legacy done declaration reconciled with exact current main production gate and retained review report",
+    "reference": "docs/stories/EL-005-erasure-redaction-and-snapshot-invalidation.md"
+  }
+}

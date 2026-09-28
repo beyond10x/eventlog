@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:prevent-stale-snapshots-after-redaction
 kind: story
 status: implemented
@@ -35,6 +35,10 @@ scope:
 - confidence: cited
   path: ess/snapshots/system.yaml
 revision: 18
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:17:45Z", actor: "human:timo", revision: 8, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:17:45Z", actor: "human:timo", revision: 9, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T00:47:07Z", actor: "human:timo", revision: 18, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 ## Problem
 

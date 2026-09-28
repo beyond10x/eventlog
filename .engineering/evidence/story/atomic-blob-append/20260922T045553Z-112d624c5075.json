@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-22T04:55:53Z",
+  "actor": "agent:codex-ekr-completion-20260922",
+  "artifact": "story:atomic-blob-append",
+  "kind": "story",
+  "revision": 27,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Integration production proof at 7e442bb: 184 passed, zero failed/skipped; fmt/clippy/complete ESS directory zero",
+    "reference": ".engineering/waves/atomic-content-integration.md"
+  }
+}

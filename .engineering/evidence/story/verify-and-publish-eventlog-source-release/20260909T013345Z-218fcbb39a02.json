@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-09T01:33:45Z",
+  "actor": "human:timo",
+  "artifact": "story:verify-and-publish-eventlog-source-release",
+  "kind": "story",
+  "revision": 13,
+  "change": {
+    "change": "evidence",
+    "kind": "approval",
+    "source": "Operator explicitly approved publishing 0.1.0 in this conversation on 2026-09-09"
+  }
+}

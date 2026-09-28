@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-18T22:12:09Z",
+  "actor": "human:timo",
+  "artifact": "story:inline-projection-administration",
+  "kind": "story",
+  "revision": 17,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:inline-projection-admin-source-pass-1-supplied",
+    "reference": "~/beyond10x/.ess-evolution/waves/0008-eventlog-inline-admin/f1-correction-20260918/coordinator-acceptance.md",
+    "review": "review-result:inline-projection-admin-source-pass-1-supplied",
+    "outcome": "fixed"
+  }
+}

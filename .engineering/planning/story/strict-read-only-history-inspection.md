@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:strict-read-only-history-inspection
 kind: story
 status: implemented
@@ -44,6 +44,10 @@ scope:
 - confidence: cited
   path: ess/inspection/system.yaml
 revision: 20
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-22T02:51:47Z", actor: "agent:codex-ekr-completion-20260922", revision: 4, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-22T02:51:48Z", actor: "agent:codex-ekr-completion-20260922", revision: 5, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-22T04:21:11Z", actor: "agent:codex-ekr-completion-20260922", revision: 20, decided_on: {"recorded":{"test_result":2,"review_outcome":3}}, imported: true}
 ---
 ## Outcome
 

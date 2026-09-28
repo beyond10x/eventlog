@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-22T11:14:38Z",
+  "actor": "agent:codex-ekr-completion-20260922",
+  "artifact": "task:validate-atomic-blob-reuse",
+  "kind": "task",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Independent SQLite package and scoped strict lint checks",
+    "reference": ".engineering/reviews/sqlite-atomic-integrity-review.md"
+  }
+}

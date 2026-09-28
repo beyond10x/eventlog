@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:sql-blob-read-integrity
 kind: story
 status: implemented
@@ -44,6 +44,10 @@ scope:
 - confidence: cited
   path: ess/blob-integrity/system.yaml
 revision: 40
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-15T04:07:38Z", actor: "human:timo", revision: 36, decided_on: {"recorded":{"review_outcome":5}}, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-15T04:07:38Z", actor: "human:timo", revision: 37, decided_on: {"recorded":{"review_outcome":5}}, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-16T01:00:13Z", actor: "human:timo", revision: 40, decided_on: {"recorded":{"test_result":3,"review_outcome":8}}, imported: true}
 ---
 ## Outcome
 

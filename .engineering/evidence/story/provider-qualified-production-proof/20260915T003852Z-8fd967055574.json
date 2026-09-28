@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-15T00:38:52Z",
+  "actor": "human:timo",
+  "artifact": "story:provider-qualified-production-proof",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:provider-proof-adversary-pass-1",
+    "reference": "local-evidence:ess-evolution/waves/0003-eventlog-proof/correction-result.md",
+    "review": "review-result:provider-proof-adversary-pass-1",
+    "outcome": "fixed"
+  }
+}

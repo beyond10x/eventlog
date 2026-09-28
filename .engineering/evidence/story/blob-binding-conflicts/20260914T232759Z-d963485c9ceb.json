@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-14T23:27:59Z",
+  "actor": "human:timo",
+  "artifact": "story:blob-binding-conflicts",
+  "kind": "story",
+  "revision": 13,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "No implementation correction required; five independent review tests retained",
+    "reference": "local-evidence:ess-evolution/waves/0001-eventlog-blob/review-evidence/pass-1.md",
+    "review": "review-result:blob-binding-adversary-pass-1",
+    "outcome": "no-op"
+  }
+}

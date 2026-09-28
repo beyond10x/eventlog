@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-16T07:04:03Z",
+  "actor": "human:timo",
+  "artifact": "story:consistent-tenant-capture",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Exact final File/SQLite/PostgreSQL capture gates and signed common verification",
+    "reference": "local-evidence:ess-evolution/waves/0011-provider-capture/source-correction-2/integration.md"
+  }
+}

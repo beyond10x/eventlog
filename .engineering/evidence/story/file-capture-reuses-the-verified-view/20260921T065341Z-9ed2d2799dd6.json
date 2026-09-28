@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T06:53:41Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "journal.rs:425 mutant note CONFIRMED pre-existing: the manifest.sequence-went-backwards clause is pinned by nothing and is fail-safe — unit 3's second pass reached the same verdict for the same clause inside Journal::resume. Left standing",
+    "review": "review-result:capture-verified-review-2",
+    "outcome": "no-op"
+  }
+}

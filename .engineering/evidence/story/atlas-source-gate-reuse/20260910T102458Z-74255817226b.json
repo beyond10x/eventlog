@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-10T10:24:58Z",
+  "actor": "human:timo",
+  "artifact": "story:atlas-source-gate-reuse",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Persistence proof passed production, comparative and restart lanes on unchanged candidate, attempt 2; attempt 1 laboratory latency failure retained",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/34464623224"
+  }
+}

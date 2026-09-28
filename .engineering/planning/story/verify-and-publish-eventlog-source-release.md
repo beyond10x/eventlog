@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:verify-and-publish-eventlog-source-release
 kind: story
 status: implemented
@@ -27,6 +27,10 @@ scope:
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof.rs
 revision: 15
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T01:00:04Z", actor: "human:timo", revision: 8, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T01:00:05Z", actor: "human:timo", revision: 9, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T01:42:54Z", actor: "human:timo", revision: 15, decided_on: {"recorded":{"test_result":2,"static_analysis":1,"approval":1,"verification":2}}, imported: true}
 ---
 ## Intent and authorization boundary
 

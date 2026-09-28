@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: beyond10x/aep
-          ref: 0.59.2
+          ref: 0.64.0
           path: aep
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -30,12 +30,6 @@ jobs:
         run: cargo build --manifest-path aep/Cargo.toml --locked --release -p aep-cli --bin aep
       - name: Validate the planning store
         working-directory: repository
-        env:
-          BASE_REF: ${{ github.base_ref }}
         run: |
           aep="$GITHUB_WORKSPACE/aep/target/release/aep"
-          if [ -n "$BASE_REF" ] && git cat-file -e "origin/$BASE_REF:.engineering/state/store.json" 2>/dev/null; then
-            "$aep" plan artifact validate --against "origin/$BASE_REF"
-          else
-            "$aep" plan artifact validate
-          fi
+          "$aep" plan artifact validate

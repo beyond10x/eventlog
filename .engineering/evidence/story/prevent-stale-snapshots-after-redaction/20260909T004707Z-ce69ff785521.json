@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:47:07Z",
+  "actor": "human:timo",
+  "artifact": "story:prevent-stale-snapshots-after-redaction",
+  "kind": "story",
+  "revision": 17,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "real SQLite and PostgreSQL17.6/TLS, schema upgrade, permissions, delayed saves and repository cache failures; both stale-predicate mutants fail then byte-identical restore",
+    "reference": "verification-report:snapshot-implementation-20260909"
+  }
+}

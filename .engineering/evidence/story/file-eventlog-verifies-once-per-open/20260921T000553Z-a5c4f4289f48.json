@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-21T00:05:53Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "metric_observation",
+    "source": "Independent re-measurement by pass 2 on its own rebuilt acceptance fixture (1,519,697 bytes, 2,000 frames, 1,000 blobs of 10 KB): 200 read transactions 1,080 / 1,055 / 1,056 ms, 5.28-5.40 ms each. Agrees with the implementor's 1,045 / 1,044 / 1,171 ms within 1-3 percent. Harness committed as tests/measure_review_two.rs, inert unless driven by EL_MEASURE_BUILD / EL_MEASURE_RUN"
+  }
+}

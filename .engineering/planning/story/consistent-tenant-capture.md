@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:consistent-tenant-capture
 kind: story
 status: implemented
@@ -57,6 +57,10 @@ scope:
 - confidence: cited
   path: ess/capture/system.yaml
 revision: 10
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-16T01:16:57Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"approval":1}}, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-16T01:16:57Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"approval":1}}, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-16T07:04:03Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"test_result":3,"approval":1,"review_outcome":9}}, imported: true}
 ---
 ## Outcome
 

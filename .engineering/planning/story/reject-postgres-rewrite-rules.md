@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:reject-postgres-rewrite-rules
 kind: story
 status: implemented
@@ -16,6 +16,10 @@ scope:
 - confidence: cited
   path: crates/eventlog-postgres/tests/conformance.rs
 revision: 7
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:47:08Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:47:08Z", actor: "human:timo", revision: 5, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T01:00:04Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 ## Problem and reachability
 

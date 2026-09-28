@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:00:03Z",
+  "actor": "human:timo",
+  "artifact": "story:validate-public-append-inputs",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "real SQLite and PostgreSQL17.6 verified TLS/application-role fixtures; retained red regressions and guard mutation failures; independent bounded review reports found no additional defect",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/final-integration-gate.log"
+  }
+}

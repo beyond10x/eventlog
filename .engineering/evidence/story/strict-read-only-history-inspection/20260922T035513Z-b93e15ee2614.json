@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-22T03:55:13Z",
+  "actor": "agent:codex-ekr-completion-20260922",
+  "artifact": "story:strict-read-only-history-inspection",
+  "kind": "story",
+  "revision": 16,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof",
+    "reference": ".engineering/reviews/strict-inspection-integration.md"
+  }
+}

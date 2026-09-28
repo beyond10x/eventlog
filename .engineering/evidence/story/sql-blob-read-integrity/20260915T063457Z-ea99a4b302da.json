@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-15T06:34:57Z",
+  "actor": "human:timo",
+  "artifact": "story:sql-blob-read-integrity",
+  "kind": "story",
+  "revision": 37,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof after both SQLite corrections; exit 0; 165 passed, 0 failed, 0 skipped; PostgreSQL 17.6 and hosted TLS; required cases complete; workspace fmt and strict Clippy pass",
+    "reference": "local-evidence:ess-evolution/waves/0006-eventlog-sql-integrity/correction-pass-1-evidence/production-proof-gate.log"
+  }
+}

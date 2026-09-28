@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-21T06:53:29Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "capture.rs:251 concurrency warning CONFIRMED introduced: the lock could be released before observe() read the content it hands out, unpinned by all 90 shipped cases and all six of pass 2's. Fixed in 76aad5e3790e302e6c7f348a4fe4d9229cd17bce structurally, not by a test: into_parts replaced by read_under_lock(self, read), so the read is an argument of the value owning the lock and the defect needs an added line rather than a deleted one; a deterministic probe with no sleep covers it",
+    "review": "review-result:capture-verified-review-2",
+    "outcome": "fixed"
+  }
+}

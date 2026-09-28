@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-20T23:33:09Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "F3 journal.rs:334 acceptance blocker NEEDS-CHANGE introduced: decode_chain matched the tail's previous against the observed digest as a string without recomputing the prefix. Fixed in bot commit 9f234c5d09b234cf207d5d8a311ac8a642c6bc69 by the same prefix hash; case a_rewritten_prefix_does_not_extend_the_head_an_open_handle_observed green. Mutation watched: the prefix check stubbed to false turns all four cases red",
+    "review": "review-result:verify-once-review-1",
+    "outcome": "fixed"
+  }
+}

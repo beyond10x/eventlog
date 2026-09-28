@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:47:07Z",
+  "actor": "human:timo",
+  "artifact": "story:prevent-stale-snapshots-after-redaction",
+  "kind": "story",
+  "revision": 17,
+  "change": {
+    "change": "evidence",
+    "kind": "static_analysis",
+    "source": "snapshot integration cargo fmt and workspace clippy both exit0",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/snapshot-integration-gate.log"
+  }
+}

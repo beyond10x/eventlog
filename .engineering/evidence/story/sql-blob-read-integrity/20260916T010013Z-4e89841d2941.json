@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-16T01:00:13Z",
+  "actor": "human:timo",
+  "artifact": "story:sql-blob-read-integrity",
+  "kind": "story",
+  "revision": 39,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:sql-blob-integrity-code-pass-2-supplied",
+    "reference": "ESS evolution wave0006/correction-pass-2-evidence/coordinator/",
+    "review": "review-result:sql-blob-integrity-code-pass-2-supplied",
+    "outcome": "fixed"
+  }
+}

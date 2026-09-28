@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:inline-projection-administration
 kind: story
 status: implemented
@@ -58,6 +58,10 @@ scope:
 - confidence: cited
   path: ess/inline-admin/system.yaml
 revision: 20
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-16T07:06:59Z", actor: "human:timo", revision: 12, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-16T07:06:59Z", actor: "human:timo", revision: 13, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-18T22:35:56Z", actor: "human:timo", revision: 20, decided_on: {"recorded":{"test_result":2,"review_outcome":2}}, imported: true}
 ---
 ## Outcome
 

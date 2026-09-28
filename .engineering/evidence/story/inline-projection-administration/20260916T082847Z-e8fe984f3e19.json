@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-16T08:28:47Z",
+  "actor": "human:timo",
+  "artifact": "story:inline-projection-administration",
+  "kind": "story",
+  "revision": 14,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "43ceaa09: both provider gates exit0, PostgreSQL17.6/TLS244passed, four causal controls red101/restored0",
+    "reference": "local-evidence:ess-evolution/waves/0008-eventlog-inline-admin/implementation/implementation-result.md"
+  }
+}

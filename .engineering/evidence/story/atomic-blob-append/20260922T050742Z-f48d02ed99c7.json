@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-22T05:07:42Z",
+  "actor": "agent:codex-ekr-completion-20260922",
+  "artifact": "story:atomic-blob-append",
+  "kind": "story",
+  "revision": 28,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Exact source 4ee3dc2 required real-backends CI: production, comparative envelope and restart replay all succeeded",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/35688825492"
+  }
+}
