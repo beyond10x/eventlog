@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-08T23:14:41Z",
+  "actor": "human:timo",
+  "artifact": "story:the-log-and-its-two-backends",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Observed production gate: 73 passed, 0 failed, 0 skipped at 734047203ce112b21ad5b9e3ea67fdacb8835def",
+    "reference": ".engineering/planning/verification-report/repository-hygiene-and-code-review-20260909.md"
+  }
+}

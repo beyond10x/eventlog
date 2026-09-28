@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-14T23:06:43Z",
+  "actor": "human:timo",
+  "artifact": "story:blob-binding-conflicts",
+  "kind": "story",
+  "revision": 13,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "PostgreSQL production proof: 136 passed, 0 failed, 0 skipped; containing full gate exited 0",
+    "reference": "local-evidence:ess-evolution/waves/0001-eventlog-blob/evidence/production-proof.json"
+  }
+}

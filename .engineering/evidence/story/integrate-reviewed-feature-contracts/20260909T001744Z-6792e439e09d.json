@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:17:44Z",
+  "actor": "human:timo",
+  "artifact": "story:integrate-reviewed-feature-contracts",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof; exit 0; 81 passed, 0 failed, 0 skipped; source699c0e15a2c3669d88329543f113e6302ba9dc7e plus planning-only diff",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/wave1-production-proof.json"
+  }
+}

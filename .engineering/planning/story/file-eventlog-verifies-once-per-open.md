@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:file-eventlog-verifies-once-per-open
 kind: story
 status: implemented
@@ -23,6 +23,10 @@ scope:
 - confidence: cited
   path: docs/design/file-provider.md
 revision: 7
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-20T22:02:16Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-20T22:02:16Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-23T21:42:42Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":1,"metric_observation":2,"review_outcome":9}}, imported: true}
 ---
 ## Outcome
 

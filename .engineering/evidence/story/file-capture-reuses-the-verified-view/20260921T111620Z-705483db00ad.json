@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-21T11:16:20Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Correction round 1 gate under the CI fixture conditions on bot commit 76aad5e3790e302e6c7f348a4fe4d9229cd17bce: scripts gate exit 0, gate green, 312 passed, 0 failed, 84 s. Package lane 90 to 105 cases; workspace 192 to 208 excluding eventlog-postgres; eleven mutations each red on its own case. Evidence: waves/0005-aep-migration/wave-validate-v2-20260920/unit-6-capture-verified/gate-correction-tls/"
+  }
+}

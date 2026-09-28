@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: verification-report:planning-consolidation-20260909
 kind: verification-report
 status: draft

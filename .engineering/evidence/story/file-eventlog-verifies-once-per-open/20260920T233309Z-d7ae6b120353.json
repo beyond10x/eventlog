@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-20T23:33:09Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "metric_observation",
+    "source": "Story fixture, 200 read transactions after open: 18.6-25.6 s at f802eb8, 7 ms at c698923, 1,045/1,044/1,171 ms at 9f234c5d09b234cf207d5d8a311ac8a642c6bc69. The prefix hash costs about 5.2 ms per transaction over a 1.51 MB history (302,158,800 bytes read per 200 transactions; the host CPU has no SHA-NI); blob reads stay 0. Extrapolated to the story's 218-transaction 3.2 MB store: about 2.4 s against 79.7 s. Source: unit-3-eventlog-verify-once/correction-1-report.md"
+  }
+}

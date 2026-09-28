@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T22:48:37Z",
+  "actor": "human:timo",
+  "artifact": "story:atomic-append-groups",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof; exit 0; 104 passed; no skips",
+    "reference": "verification-report:atomic-groups-20260910"
+  }
+}

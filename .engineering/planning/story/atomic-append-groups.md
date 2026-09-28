@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:atomic-append-groups
 kind: story
 status: implemented
@@ -10,6 +10,10 @@ refs:
 relations:
 - informed_by: architecture-decision-record:ess-evolution-05-file-and-atomic-groups
 revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T22:48:37Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T22:48:37Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T22:48:37Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 ## Context
 EventStore currently appends one stream per transaction. ER requires ordered multi-entity atomic recording. Existing StreamId, Expected, NewEvent, CommandMeta, AppendResult and Guard semantics are declared in crates/eventlog-core/src/lib.rs; this work adds a storage operation over them, not a product entity.

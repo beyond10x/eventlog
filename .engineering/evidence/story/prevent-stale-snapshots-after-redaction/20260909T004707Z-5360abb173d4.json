@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:47:07Z",
+  "actor": "human:timo",
+  "artifact": "story:prevent-stale-snapshots-after-redaction",
+  "kind": "story",
+  "revision": 17,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "snapshot integration production gate exit0;88 passed0failed0skipped; exact5c1ff2690f07ec0b91f14cce307fff2a6b65ddca",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/snapshot-integration-production.json"
+  }
+}

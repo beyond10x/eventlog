@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:resumed-snapshot-clearing-has-no-reachable-cause
 kind: story
 status: draft

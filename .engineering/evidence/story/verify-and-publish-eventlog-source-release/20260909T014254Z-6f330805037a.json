@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:42:54Z",
+  "actor": "human:timo",
+  "artifact": "story:verify-and-publish-eventlog-source-release",
+  "kind": "story",
+  "revision": 14,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Exact release CI: 98 passed, zero failures/skips, 12 capacity configurations, 2 restarts",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/34299824161"
+  }
+}

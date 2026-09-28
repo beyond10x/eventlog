@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-10T10:24:58Z",
+  "actor": "human:timo",
+  "artifact": "story:atlas-source-gate-reuse",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "Pinned common workflow verified signed local evidence with evidence_reused=true and scanner_invocations=0; required common and real-backend checks enabled",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/34465803776"
+  }
+}

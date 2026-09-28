@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:incremental-history-digest-for-a-resumed-handle
 kind: story
 status: draft

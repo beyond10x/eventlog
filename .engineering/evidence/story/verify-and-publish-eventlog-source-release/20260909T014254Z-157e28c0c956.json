@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:42:54Z",
+  "actor": "human:timo",
+  "artifact": "story:verify-and-publish-eventlog-source-release",
+  "kind": "story",
+  "revision": 14,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "Verified annotated remote tag, bot-authored published GitHub Release and matching source archive",
+    "reference": "https://github.com/beyond10x/eventlog/releases/tag/0.1.0"
+  }
+}

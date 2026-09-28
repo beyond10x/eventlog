@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-20T22:59:38Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "finding crates/eventlog-file/src/state.rs:124 judgement note CONFIRMED introduced: state.rs was outside the cited Scope; added with aep artifact scope --add",
+    "review": "review-result:verify-once-review-1",
+    "outcome": "fixed"
+  }
+}

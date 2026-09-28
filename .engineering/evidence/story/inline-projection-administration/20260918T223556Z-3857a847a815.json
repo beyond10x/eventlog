@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-18T22:35:56Z",
+  "actor": "human:timo",
+  "artifact": "story:inline-projection-administration",
+  "kind": "story",
+  "revision": 18,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Final composed full gate and actual PostgreSQL production proof at daf6b814",
+    "reference": "~/beyond10x/.ess-evolution/waves/0008-eventlog-inline-admin/f1-correction-20260918/report.md"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-21T01:26:47Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "metric_observation",
+    "source": "Baseline before the unit, one migrated copy (events.jsonl 3,273,126 bytes, 1,116 files, 64 artifacts), both qualified binaries interleaved: plan artifact list 92.4/97.7/98.5 s old vs 93.5/93.7/92.1 s new; history 91.1 s vs 93.9 s; verify 2.60 s vs 2.69 s. One list opens events.jsonl 222 times and makes 244,864 blob opens under the old binary, 222 and 244,862 under the new one. Identical. Evidence: evidence/pin-cost-ab-20260921.md"
+  }
+}

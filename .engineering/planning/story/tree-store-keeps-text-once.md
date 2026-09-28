@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:tree-store-keeps-text-once
 kind: story
 status: draft

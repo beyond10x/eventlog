@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:postgres-crash-recovery-test-under-parallel-threads
 kind: story
 status: draft

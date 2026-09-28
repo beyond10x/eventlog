@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:erasure-redaction-and-snapshot-invalidation
 kind: story
 status: implemented
@@ -9,6 +9,10 @@ tags:
 relations:
 - depends_on: story:aggregates-repository-and-snapshots
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:08:36Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:08:36Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T00:08:36Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 
 # EL-005 — Erasure, redaction and snapshot invalidation

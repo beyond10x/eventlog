@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:00:04Z",
+  "actor": "human:timo",
+  "artifact": "story:reject-postgres-rewrite-rules",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "static_analysis",
+    "source": "combined integration cargo fmt and workspace clippy both exit0",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/final-integration-gate.log"
+  }
+}

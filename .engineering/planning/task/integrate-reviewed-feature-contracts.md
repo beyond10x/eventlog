@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: task:integrate-reviewed-feature-contracts
 kind: task
 status: implemented
@@ -8,6 +8,10 @@ relations:
 - informed_by: story:eventlog-0-1-0-release
 - decomposes: story:integrate-reviewed-feature-contracts
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:05:11Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:05:11Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T00:17:45Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 ## Acceptance
 

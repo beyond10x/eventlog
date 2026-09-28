@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-16T01:00:13Z",
+  "actor": "human:timo",
+  "artifact": "story:sql-blob-read-integrity",
+  "kind": "story",
+  "revision": 39,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh and --production-proof: exit0; actual PostgreSQL17.6/TLS; no skipped or missing required cases; source before/after identical",
+    "reference": "ESS evolution wave0006/correction-pass-2-evidence/coordinator/production-proof.json"
+  }
+}

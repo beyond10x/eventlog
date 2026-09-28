@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T00:08:36Z",
+  "actor": "human:timo",
+  "artifact": "story:the-store-goes-async",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "Legacy done declaration reconciled with exact current main production gate and retained review report",
+    "reference": "docs/stories/EL-006-the-store-goes-async.md"
+  }
+}

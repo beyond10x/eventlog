@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-15T06:34:58Z",
+  "actor": "human:timo",
+  "artifact": "story:sql-blob-read-integrity",
+  "kind": "story",
+  "revision": 37,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:sql-blob-integrity-code-pass-1-execution",
+    "reference": "local-evidence:ess-evolution/waves/0006-eventlog-sql-integrity/correction-pass-1-evidence/schema-case-green.log",
+    "review": "review-result:sql-blob-integrity-code-pass-1-execution",
+    "outcome": "fixed"
+  }
+}

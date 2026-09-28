@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: blocker:inline-admin-source-review-restriction
 kind: blocker
 status: cleared
@@ -7,6 +7,8 @@ title: Platform restriction interrupted administration source review
 relations:
 - blocks: story:inline-projection-administration
 revision: 2
+transitions:
+- {from: "open", to: "cleared", at: "2026-09-23T21:45:24Z", actor: "human:timo", revision: 2, imported: true}
 ---
 ## Approved requirement blocked
 

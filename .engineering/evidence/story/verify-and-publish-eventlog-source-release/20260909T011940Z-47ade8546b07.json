@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:19:40Z",
+  "actor": "human:timo",
+  "artifact": "story:verify-and-publish-eventlog-source-release",
+  "kind": "story",
+  "revision": 11,
+  "change": {
+    "change": "evidence",
+    "kind": "static_analysis",
+    "source": "Frozen cargo fmt and clippy both exit 0",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/frozen-gate.log"
+  }
+}

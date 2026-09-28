@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:00:03Z",
+  "actor": "human:timo",
+  "artifact": "story:validate-public-append-inputs",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "combined production gate exit0;98 passed0failed0skipped, no missing required cases; clean09c71ec3165e187f7baf6277ffa40079d863f3cd",
+    "reference": "~/.cache/eventlog-complete-20260909/evidence/final-integration-production.json"
+  }
+}

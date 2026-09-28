@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-16T06:21:42Z",
+  "actor": "human:timo",
+  "artifact": "story:consistent-tenant-capture",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "F5: untested PostgreSQL18 hypothesis; accepted17.6 actual shape test passes, no expansion",
+    "reference": "local-evidence:ess-evolution/waves/0011-provider-capture/source-correction-1/implementation-result.md",
+    "review": "review-result:consistent-tenant-capture-source-pass-1",
+    "outcome": "no-op"
+  }
+}

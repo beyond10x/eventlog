@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:integrate-reviewed-feature-contracts
 kind: story
 status: implemented
@@ -18,6 +18,10 @@ scope:
 - confidence: inferred
   path: ess/effects/system.yaml
 revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:05:10Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:05:10Z", actor: "human:timo", revision: 5, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T00:17:44Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 ## Acceptance
 

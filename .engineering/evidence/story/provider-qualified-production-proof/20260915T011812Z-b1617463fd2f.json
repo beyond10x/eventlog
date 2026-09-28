@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-15T01:18:12Z",
+  "actor": "human:timo",
+  "artifact": "story:provider-qualified-production-proof",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof; exit 0; 152 passed, 0 failed, 0 skipped; PostgreSQL 17.6 and hosted TLS; fmt and strict workspace Clippy passed",
+    "reference": "ess-evolution-20260915/waves/0003-eventlog-proof/full-gate/production-proof.json"
+  }
+}

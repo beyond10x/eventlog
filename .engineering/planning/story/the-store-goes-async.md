@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:the-store-goes-async
 kind: story
 status: implemented
@@ -9,6 +9,10 @@ tags:
 relations:
 - depends_on: story:the-log-and-its-two-backends
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:08:36Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:08:37Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T00:08:37Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 
 # EL-006 — The store goes async

@@ -1,0 +1,15 @@
+{
+  "at": "2026-09-22T03:50:03Z",
+  "actor": "agent:codex-ekr-completion-20260922",
+  "artifact": "story:strict-read-only-history-inspection",
+  "kind": "story",
+  "revision": 16,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:strict-inspection-adversary",
+    "reference": "crates/eventlog-file/src/inspection.rs",
+    "review": "review-result:strict-inspection-adversary",
+    "outcome": "fixed"
+  }
+}

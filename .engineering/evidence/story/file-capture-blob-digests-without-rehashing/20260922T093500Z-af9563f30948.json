@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-22T09:35:00Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-blob-digests-without-rehashing",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "eventlog 0.3.0 release gate: bash scripts/gate.sh --production-proof exit 0, 408 passed / 0 failed / 0 skipped, PostgreSQL 17.6 (CHECKPOINT 2026-09-22 11:35)",
+    "reference": "git:beyond10x/eventlog@ac6b1731"
+  }
+}

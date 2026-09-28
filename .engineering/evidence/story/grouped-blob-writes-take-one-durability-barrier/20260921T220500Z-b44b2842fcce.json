@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-21T22:05:00Z",
+  "actor": "human:timo",
+  "artifact": "story:grouped-blob-writes-take-one-durability-barrier",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "evidence/eventlog-tls-gate.sh on integrate/ess-evolution-eventlog-20260915 at 7fbd37cf: exit 0, 337 passed, 0 failed, 53 lanes",
+    "reference": "git:beyond10x/eventlog@7fbd37cf"
+  }
+}

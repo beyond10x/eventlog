@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-01T20:20:50Z",
+  "actor": "agent:eventlog-release",
+  "artifact": "story:eventlog-0-1-0-release",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "guard threshold mutant killed; exact refusal-code and rollback conformance restored green",
+    "reference": "crates/eventlog-conformance/src/lib.rs"
+  }
+}

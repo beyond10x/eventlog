@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: dependency-blocker:sql-integrity-independent-review
 kind: dependency-blocker
 status: cleared
@@ -7,6 +7,8 @@ title: Second SQL integrity code examination is incomplete after platform interr
 relations:
 - blocks: story:sql-blob-read-integrity
 revision: 3
+transitions:
+- {from: "open", to: "cleared", at: "2026-09-16T00:29:49Z", actor: "human:timo", revision: 3, imported: true}
 ---
 ## Withheld work
 

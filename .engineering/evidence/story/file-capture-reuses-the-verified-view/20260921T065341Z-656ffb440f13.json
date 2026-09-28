@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-21T06:53:41Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-reuses-the-verified-view",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "metric_observation",
+    "source": "After correction round 1 (bot commit 76aad5e): suite 90 to 105, workspace 192 to 208, eleven mutations each red on its own case. Gate under the CI fixture conditions exit 0, 312 passed, 0 failed, 84 s. The pre-existing lock-probe case flaked 3 of 45 lib-lane runs (story:strict-reader-lock-case-races-a-forked-crash-child, same inherited-descriptor mechanism, now measured); the new A3 probe failed 0 of 45"
+  }
+}

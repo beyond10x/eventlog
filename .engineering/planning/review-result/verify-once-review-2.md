@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: review-result:verify-once-review-2
 kind: review-result
 status: active
@@ -7,6 +7,8 @@ title: 'Independent verification pass 2: the resumed-handle gate holds, and noth
 relations:
 - reviews: story:file-eventlog-verifies-once-per-open
 revision: 2
+transitions:
+- {from: "draft", to: "active", at: "2026-09-21T00:05:26Z", actor: "human:timo", revision: 2, imported: true}
 ---
 unit: story:file-eventlog-verifies-once-per-open — commit 9f234c5d09b234cf207d5d8a311ac8a642c6bc69, worktree home-path:sha256:c6f7196df0de052f1281caadc0abc05ee2a917544fba7002b8322fdacc393934 (HEAD detached, no tracked file modified)
 verdict: green

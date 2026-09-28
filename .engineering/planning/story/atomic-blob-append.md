@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:atomic-blob-append
 kind: story
 status: implemented
@@ -44,6 +44,10 @@ scope:
 - confidence: cited
   path: ess/atomic-content/domains/atomic-content.yaml
 revision: 31
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-22T03:52:22Z", actor: "agent:codex-ekr-completion-20260922", revision: 18, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-22T03:52:22Z", actor: "agent:codex-ekr-completion-20260922", revision: 19, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-22T05:07:42Z", actor: "agent:codex-ekr-completion-20260922", revision: 29, decided_on: {"recorded":{"test_result":2,"review_outcome":1}}, imported: true}
 ---
 # Atomic blob binding and event append
 

@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-16T02:11:18Z",
+  "actor": "human:timo",
+  "artifact": "story:consistent-tenant-capture",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Capture implementation final restored source: normal and production gates exit0; actual PostgreSQL17.6,200pass0failed0skipped, no missing cases;11 behavioral fault controls with documented C11 equivalent-fault limit; source examinations pending",
+    "reference": "local-evidence:ess-evolution/waves/0011-provider-capture/implementation/implementation-result.md"
+  }
+}

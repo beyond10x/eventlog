@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-01T20:20:50Z",
+  "actor": "agent:eventlog-release",
+  "artifact": "story:eventlog-0-1-0-release",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p eventlog-sqlite --test conformance the_inline_projection_exercise_passes_in_memory --locked (>= mutated to >; exit 101; restored; exit 0)",
+    "reference": "crates/eventlog-conformance/src/lib.rs"
+  }
+}

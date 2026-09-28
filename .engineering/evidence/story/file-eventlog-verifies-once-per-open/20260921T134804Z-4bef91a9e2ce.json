@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-21T13:48:04Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-verifies-once-per-open",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Bot commit db608cd4152e6a2370e8ef0e3a562d7a829cf34a merged to integrate/ess-evolution-eventlog-20260915; gate under the CI fixture conditions exit 0, gate green, 290 passed, 0 failed. Two independent passes; ledger carried 0, new 3, resolved 6. Evidence: waves/0005-aep-migration/wave-validate-v2-20260920/unit-3-eventlog-verify-once/gate-db608cd-tls/"
+  }
+}

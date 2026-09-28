@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/2
+format: aep.planning-md/3
 id: story:validate-public-append-inputs
 kind: story
 status: implemented
@@ -20,6 +20,10 @@ scope:
 - confidence: cited
   path: crates/eventlog-sqlite/tests/input_validation_review.rs
 revision: 10
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-09T00:47:07Z", actor: "human:timo", revision: 6, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-09T00:47:07Z", actor: "human:timo", revision: 7, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-09T01:00:03Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"test_result":1,"static_analysis":1,"verification":1}}, imported: true}
 ---
 ## Problem and reachability
 

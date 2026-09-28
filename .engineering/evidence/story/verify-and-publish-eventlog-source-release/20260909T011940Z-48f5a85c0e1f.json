@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T01:19:40Z",
+  "actor": "human:timo",
+  "artifact": "story:verify-and-publish-eventlog-source-release",
+  "kind": "story",
+  "revision": 11,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "Frozen comparative proof: 12 valid configurations, 2 valid restarts; exit 0",
+    "reference": "~/.cache/eventlog-complete-20260909/comparative-fresh/proof.json"
+  }
+}
