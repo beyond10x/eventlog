@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-03T16:28:40Z",
+  "actor": "human:timo",
+  "artifact": "story:sqlite-tracked-capture",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Final workspace gate and required PostgreSQL17.6/TLS production-proof gate exit0;545 passed;0failed;0skipped;no missing required cases",
+    "reference": "docs/evidence/sqlite-tracked-capture/production-proof.json"
+  }
+}

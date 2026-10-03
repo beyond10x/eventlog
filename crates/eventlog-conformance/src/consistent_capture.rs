@@ -131,8 +131,8 @@ async fn identity_decides_before_history(
         .expect("an empty provisioned tenant is a valid capture");
     assert_eq!(value.tenant, provisioned);
     assert_eq!(value.stream_identity, first);
-    assert!(value.events.is_empty());
-    assert!(value.blobs.is_empty());
+    assert_eq!(value.events, [] as [eventlog_core::RecordedEvent; 0]);
+    assert_eq!(value.blobs, [] as [eventlog_core::CapturedBlob; 0]);
     assert!(
         value.projections.is_empty(),
         "an empty projection request asserts nothing about unrequested tables"
@@ -341,7 +341,10 @@ async fn complete_content_in_order(
         .await
         .expect("an empty projection request is valid");
     assert_eq!(bare.events, value.events);
-    assert!(bare.projections.is_empty());
+    assert_eq!(
+        bare.projections,
+        [] as [eventlog_core::CapturedProjection; 0]
+    );
     owner
 }
 

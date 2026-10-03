@@ -133,7 +133,7 @@ async fn adversary_file_empty_identity_refuses_and_zero_result_caps_allow_absenc
         .inspect_history(&TenantId::new("inspection-absent").unwrap(), zero)
         .await
         .unwrap();
-    assert!(absent.events.is_empty());
+    assert_eq!(absent.events, [] as [eventlog_core::RecordedEvent; 0]);
     assert_eq!(absent.stream_identity, None);
     let mut changed = 0;
     mutate(directory.path(), |operation| {

@@ -295,5 +295,8 @@ async fn a_zero_cap_names_the_resource_the_tenant_actually_holds() {
         .await
         .expect("nothing fits in nothing");
     assert!(empty.events.is_empty() && empty.blobs.is_empty());
-    assert!(empty.projections.is_empty());
+    assert_eq!(
+        empty.projections,
+        [] as [eventlog_core::CapturedProjection; 0]
+    );
 }

@@ -259,3 +259,215 @@ base does not accept it. Preserve both planning lineages and compose through gov
 No SQL DDL, file format change, Eventlog receipt export, owner schema, new runtime, migration
 cutover, source publication or release is included. Provider crash/group qualification, the
 consumer adapter and explicit synchronous bridge, and the one AEP migration owner remain required.
+
+## Retained capture continuity
+
+Status: accepted contract for the bounded warm-capture work. The existing complete capture remains
+the baseline contract; implementation and conformance evidence are tracked separately.
+
+An owner may retain a fully verified complete capture and ask its provider what changed. A provider
+can answer cheaply only when it proves continuity from that exact observation. Initial open and
+reopen require a complete capture and consumer verification. The SQLite warm guarantee covers SQL
+changes through the provider and through other connections, including other processes. Direct
+modification of database or WAL bytes outside SQLite while a handle remains open is outside this
+warm guarantee. Complete capture retains its existing validation behavior.
+
+The additive object-safe method and transient values are:
+
+```rust
+fn capture_tenant_since<'a>(
+    &'a self,
+    tenant: &'a TenantId,
+    projections: &'a [ProjectionSpec],
+    limits: CaptureLimits,
+    previous: Option<&'a CaptureCheckpoint>,
+) -> BoxFuture<'a, Result<TenantCaptureUpdate, CaptureError>>;
+
+pub enum TenantCaptureUpdate {
+    Complete {
+        capture: TenantCapture,
+        checkpoint: Option<CaptureCheckpoint>,
+    },
+    Unchanged {
+        checkpoint: CaptureCheckpoint,
+    },
+    AppendDelta {
+        checkpoint: CaptureCheckpoint,
+        delta: TenantCaptureDelta,
+    },
+}
+
+pub struct TenantCaptureDelta {
+    pub tenant: TenantId,
+    pub stream_identity: String,
+    pub events: Vec<RecordedEvent>,
+    pub blobs: Vec<CapturedBlob>,
+    pub projections: Vec<CapturedProjectionDelta>,
+    pub resulting_usage: CaptureUsage,
+}
+
+pub struct CapturedProjectionDelta {
+    pub specification: ProjectionSpec,
+    pub rows: Vec<CapturedRowChange>,
+}
+
+pub struct CapturedRowChange {
+    pub key: String,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+}
+
+pub struct CaptureUsage {
+    pub events: u64,
+    pub blobs: u64,
+    pub projection_rows: u64,
+    pub payload_bytes: u64,
+}
+```
+
+The default method ignores `previous`, calls `capture_tenant` and returns
+`Complete { capture, checkpoint: None }`. Existing providers and callers continue to work.
+`None` is no continuity capability; it never permits an unchanged answer. The existing eager and
+deferred capture methods keep their contracts. This method does not defer blob validation.
+
+`CaptureCheckpoint` is an immutable, cloneable, nonserializable type-erased capability. Its public
+`new<T: Any + Send + Sync>(value: T)` constructor and `downcast_ref<T: Any>() -> Option<&T>`
+accessor permit independent provider implementations. Its field remains private and `Debug`
+reveals no stamp. SQLite accepts only its private checkpoint payload type carrying an `Arc` issuer
+identity retained by the exact provider connection. A caller can wrap arbitrary data but cannot
+construct that private payload or its issuer. Cloning an issued checkpoint preserves authority;
+copying numeric counters, a path, database identity or scope does not. Old checkpoints never mutate
+when the journal advances. They may become too old for the journal and then require a new complete
+capture. Reopening the same file creates a different issuer.
+
+The private payload binds the exact tenant and stream identity, the ordered requested projection
+specifications including indexed-field order, all four exact limits, the SQLite observation stamp,
+its complete usage totals and a journal position. Projection declarations have no invented version.
+A request with another scope, another limit set or an unrecognized checkpoint receives a complete
+capture under the new request, with all its normal errors. The diagnostic ESS types under
+`ess/capture/` describe update alternatives, accounting and scope facts; they are not a wire
+representation from which a checkpoint can be forged.
+
+`Unchanged` means every captured event, bound blob and requested projection row remains the same
+at the returned observation. It is not merely unchanged stream head, count or timestamp.
+`AppendDelta` means the provider proves the old captured prefix was unchanged and supplies every
+addition and projection mutation required to obtain the new complete capture. Its events are the
+complete suffix in ascending tenant `global_seq`, with complete acknowledged append groups. Its
+blobs are every newly bound blob, including orphan bindings; a blob already bound in the base is
+not returned again. Projection results preserve request order. Rows and blob digests are in
+bytewise order. Each requested projection appears even when its change list is empty. Each changed
+row key appears once: `before` is its value in the base and `after` its final value. Absence is
+`None`; present JSON null is `Some(Value::Null)`. A key changed and restored may be retained with
+equal before/after values. Blob deletion/replacement and event rewrites require complete capture,
+not a delta which silently omits them.
+
+A consumer accepts a checkpoint only after validating the complete value or delta accompanying
+it. It retains the exact base until a delta is validated and installed; the provider does not
+validate the consumer's domain semantics. Failed consumer verification must not advance its
+checkpoint. Concurrent consumer refreshes compare their own generation before installing a new
+model/checkpoint pair. The capture makes no freshness promise after its observation boundary.
+
+### SQLite consistency and journal
+
+All continuity state is in memory; no column, trigger, event, format or stored identity is added.
+The existing connection mutex protects the connection and orders access to a private journal. If
+a separate mutex holds journal metadata, every access takes the connection lock first. Issuer
+state cannot be shared across independently opened connections.
+
+After acquiring the connection mutex, begin `BEGIN IMMEDIATE` before reading a stamp. Inside that
+transaction read `PRAGMA main.data_version`, the connection's 64-bit total-change counter and
+both `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`. The first detects other
+connections' SQL commits; the second detects
+this connection's DML; schema observation covers DDL that does not increment row changes. This
+comparison is valid only on the same connection. SQLite documents these boundaries in
+[PRAGMA data_version](https://www.sqlite.org/pragma.html#pragma_data_version) and
+[total_changes64](https://www.sqlite.org/c3ref/total_changes.html).
+
+First validate the request. Then, inside the native transaction, either return unchanged, assemble
+an uninterrupted retained journal suffix, or run the existing full `observe` path. Every full
+capture retains existing identity, redaction, physical projection shape, event, blob and limit
+validation. An empty/missing checkpoint always chooses full observation. No callback runs while
+capturing; no connection handle escapes. Failed commit/rollback/read returns no update token.
+
+Every establishment of continuity also checks the main and temporary schema catalogs for triggers
+and foreign keys. Their implicit side effects could mutate previously captured rows outside the
+provider's journal instrumentation. If either schema contains any trigger or foreign-key reference,
+complete capture still works but returns `checkpoint: None`. This deliberately conservative
+eligibility rule includes unrelated tables. Later main or temporary schema changes invalidate
+existing checkpoints. No trigger or schema change is introduced by this check.
+
+Only acknowledged `append_group_guarded`, `append_group_guarded_with_blobs` and
+`append_group_with_blobs_guarded` transactions may
+extend continuity in the initial implementation. Record the starting stamp after `BEGIN IMMEDIATE`
+and before any blob insert, admission callback or projector write. It must match the known journal
+end exactly. Gather complete returned events, actually new blob bindings, and every projection
+mutation through the provider-controlled projection write interface. Read each touched key's
+initial value before its first mutation and retain its final value after all callbacks complete.
+The journal records generic storage values, never consumer batch or record concepts.
+
+A fresh acknowledged group has one journal entry. Publish it only after successful `COMMIT`, while
+still holding the connection mutex. The external-write stamp retained for that entry is the one
+observed while the transaction excluded external writers; do not adopt a post-commit data_version,
+which could hide an external commit arriving between COMMIT and journal publication. Total changes
+at the completed local transaction boundary account for its own writes. If schema changed, or any
+local write was not accounted for, discard continuity. A deduplicated group with no physical
+mutation leaves the boundary unchanged and creates no fictitious appended event.
+
+External SQL writes, local unjournaled writes, redaction, erasure/reprovisioning, projection
+administration, snapshots, standalone blob mutation, failed transaction, uncertain commit, worker
+panic/poison, sequence exhaustion and journal eviction force the next relevant request through
+complete observation. It is safe to invalidate for unrelated tenant changes. A confirmed rollback
+may therefore cause unnecessary work but never an unchanged claim based on uncertain state.
+Direct legacy `append` and administrative paths do not acquire accidental delta eligibility.
+
+The initial journal retains at most 128 committed groups and 16 MiB of accounted retained content
+(event data and envelope strings, blob bytes, row keys and before/after JSON bytes). These are
+internal retention bounds, not caller capture limits and not a process peak-memory guarantee. An
+entry exceeding either bound is not retained; older entries are evicted whole. Any request whose
+chain is missing takes the full path. Arithmetic overflow invalidates retention. Every fresh
+complete capture establishes an independent base; old checkpoints can still use an uninterrupted
+retained suffix and otherwise fall back. Issuer/epoch rollover invalidates old checkpoints.
+
+### Cumulative limits and integrity
+
+`resulting_usage` counts the whole observation after applying the delta, using the original exact
+capture accounting. Add every suffix event and newly bound blob, and subtract/add compact JSON
+sizes for projection before/after values. Insert/delete changes row counts; update does not.
+Checked arithmetic refuses overflow. The resulting totals must fit all four bound request limits;
+checking only delta size is invalid. Retained checkpoint accounting is never supplied or changed by
+a caller. Changed limits force full observation rather than silently inheriting old admission.
+
+The journal's old row values and resulting counters let consumers update retained models without
+rescanning the old capture. Consumers still validate every new event, blob and row against their
+own contract and refuse a row delta whose before-value differs from their base. Complete provider
+continuity cannot replace that validation. An external SQL mutation breaks continuity even if it
+preserves event count/head, uses a valid JSON value, or changes blob content without changing its
+stored length. A full capture then applies existing provider validation and the consumer verifies
+its record/materialization agreement.
+
+This extension does not add an append precondition asserting that the entire previous capture is
+still current when a later append starts. Existing optimistic guards remain unchanged. Mutation
+between a successful capture and a later append can still lead to an acknowledged append followed
+by failed verification; a broken journal chain must force complete post-append verification so that
+this cannot become silent cached success.
+
+### Required verification
+
+The Rust capture exercise covers default full fallback, exact update accounting and reconstruction
+of a complete value by applying a delta. SQLite regressions cover:
+
+- initial open/reopen full capture; unchanged performs no event/blob/projection scan;
+- one and several complete guarded groups; duplicate group retry; orphan and repeated blobs;
+- projection insertion/update/deletion, present null, repeated keys and returned-to-base values;
+- all four cumulative limits, zero limits, changed limits and checked overflow;
+- foreign provider token, tenant/identity/projection mismatch, stale journal and retention bounds;
+- group refusal/rollback/uncertain commit and unjournaled local write fallback;
+- external connection event/blob/projection/identity/schema mutation, including unchanged heads;
+- writer interleaving before BEGIN, during the held transaction and after COMMIT before publication;
+- no incomplete group or partially published checkpoint escapes cancellation or worker failure.
+
+Run compile-valid controls that bypass external stamp comparison, omit a row mutation, omit a blob
+binding and account only delta size. Each dedicated regression must fail before restoration.
+Existing complete capture and atomic group suites remain unchanged. Record exact command exit
+statuses and runner counts. Provider improvement alone does not establish any consumer end-to-end
+latency claim; the consumer's actual workload and flat-cost threshold are separate acceptance.

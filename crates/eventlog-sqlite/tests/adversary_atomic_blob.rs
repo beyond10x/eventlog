@@ -64,13 +64,13 @@ async fn collision_rolls_back(store: &dyn AtomicBlobEventStore) {
             .unwrap(),
         Some(b"AAAA".to_vec())
     );
-    assert!(
+    assert_eq!(
         store
             .read_stream(&attempt.group.appends[0].stream, 0, 10)
             .await
             .unwrap()
-            .events
-            .is_empty()
+            .events,
+        [] as [eventlog_core::RecordedEvent; 0]
     );
 
     // Equal length is not equal content, and the refused attempt did not consume its receipt.
@@ -141,13 +141,13 @@ async fn rebound_retry(writer: &dyn AtomicBlobEventStore, other: &dyn AtomicBlob
         other.append_group_with_blobs(&fresh).await,
         Err(EventLogError::Invalid(_))
     ));
-    assert!(
+    assert_eq!(
         other
             .read_stream(&fresh.group.appends[0].stream, 0, 10)
             .await
             .unwrap()
-            .events
-            .is_empty()
+            .events,
+        [] as [eventlog_core::RecordedEvent; 0]
     );
     assert_eq!(
         writer

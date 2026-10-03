@@ -11,6 +11,7 @@
 //! and the projection vocabulary remains [`ProjectionSpec`].
 
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
@@ -32,6 +33,82 @@ pub struct CaptureLimits {
     pub max_blobs: u64,
     pub max_projection_rows: u64,
     pub max_payload_bytes: u64,
+}
+
+/// Exact resource usage of a complete capture, including an incrementally reconstructed one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureUsage {
+    pub events: u64,
+    pub blobs: u64,
+    pub projection_rows: u64,
+    pub payload_bytes: u64,
+}
+
+/// An immutable provider-issued observation capability, never a persisted or caller-made cursor.
+///
+/// Each provider accepts only its private payload type and exact connection issuer identity.
+/// Wrapping an arbitrary value does not grant authority to reuse any provider's observation.
+#[derive(Clone)]
+pub struct CaptureCheckpoint(Arc<dyn Any + Send + Sync>);
+
+impl CaptureCheckpoint {
+    /// Wrap a provider's private, immutable checkpoint payload.
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+
+    /// Inspect the private payload type owned by the provider validating this checkpoint.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for CaptureCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CaptureCheckpoint(..)")
+    }
+}
+
+/// A complete observation or a provider-proven continuation of the supplied exact observation.
+#[derive(Clone, Debug)]
+pub enum TenantCaptureUpdate {
+    Complete {
+        capture: TenantCapture,
+        checkpoint: Option<CaptureCheckpoint>,
+    },
+    Unchanged {
+        checkpoint: CaptureCheckpoint,
+    },
+    AppendDelta {
+        checkpoint: CaptureCheckpoint,
+        delta: TenantCaptureDelta,
+    },
+}
+
+/// Complete additions and projection changes since the supplied checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantCaptureDelta {
+    pub tenant: TenantId,
+    pub stream_identity: String,
+    pub events: Vec<RecordedEvent>,
+    pub blobs: Vec<CapturedBlob>,
+    pub projections: Vec<CapturedProjectionDelta>,
+    pub resulting_usage: CaptureUsage,
+}
+
+/// One requested projection's changed rows, in bytewise key order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedProjectionDelta {
+    pub specification: ProjectionSpec,
+    pub rows: Vec<CapturedRowChange>,
+}
+
+/// The original and final value of one changed row; absence differs from present JSON null.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedRowChange {
+    pub key: String,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
 }
 
 /// One tenant's history, live bound content and requested materializations, observed together.
@@ -274,6 +351,30 @@ pub enum CaptureError {
 /// a provider that does not implement it refuses at capability selection rather than answering
 /// with a plausible empty result.
 pub trait ConsistentTenantCapture: Send + Sync + 'static {
+    /// Observe changes since a provider-issued checkpoint, or fall back to complete capture.
+    ///
+    /// A first call, unsupported provider, incompatible scope, expired history or unaccounted
+    /// mutation returns `Complete`. Limits always apply to the resulting complete observation.
+    /// Accept a returned checkpoint only after validating its associated value. This default
+    /// preserves eager complete validation and issues no continuity capability.
+    ///
+    /// # Errors
+    /// The same refusals as [`Self::capture_tenant`]; no partial update is returned.
+    fn capture_tenant_since<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        projections: &'a [ProjectionSpec],
+        limits: CaptureLimits,
+        _previous: Option<&'a CaptureCheckpoint>,
+    ) -> BoxFuture<'a, Result<TenantCaptureUpdate, CaptureError>> {
+        Box::pin(async move {
+            Ok(TenantCaptureUpdate::Complete {
+                capture: self.capture_tenant(tenant, projections, limits).await?,
+                checkpoint: None,
+            })
+        })
+    }
+
     /// Observe one tenant's history, bound content and requested materializations together.
     ///
     /// # Errors
@@ -384,6 +485,17 @@ pub struct CaptureBudget {
 }
 
 impl CaptureBudget {
+    /// The exact complete content admitted so far.
+    #[must_use]
+    pub const fn usage(&self) -> CaptureUsage {
+        CaptureUsage {
+            events: self.events,
+            blobs: self.blobs,
+            projection_rows: self.rows,
+            payload_bytes: self.payload,
+        }
+    }
+
     #[must_use]
     pub const fn new(limits: CaptureLimits) -> Self {
         Self {

@@ -21,11 +21,13 @@ pub use inspection::{HistoryInspection, InspectHistory, InspectionError, Inspect
 mod projection;
 
 pub use capture::{
-    BoundBlobs, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CaptureRequestRefusal,
-    CaptureResource, CapturedBlob, CapturedProjection, ConsistentTenantCapture, DeferredBlob,
-    DeferredTenantCapture, ProjectionCaptureRefusal, TenantCapture, order_blobs,
-    order_deferred_blobs, order_rows, validate_capture_request, validate_captured_branchable_order,
-    validate_captured_digest, validate_captured_event, validate_captured_order,
+    BoundBlobs, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
+    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection,
+    CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture, DeferredBlob,
+    DeferredTenantCapture, ProjectionCaptureRefusal, TenantCapture, TenantCaptureDelta,
+    TenantCaptureUpdate, order_blobs, order_deferred_blobs, order_rows, validate_capture_request,
+    validate_captured_branchable_order, validate_captured_digest, validate_captured_event,
+    validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 

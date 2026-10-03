@@ -65,7 +65,7 @@ pub async fn run_history_inspection(inspector: &dyn InspectHistory, expected: &[
         )
         .await
         .unwrap();
-    assert!(empty.events.is_empty());
+    assert_eq!(empty.events, [] as [eventlog_core::RecordedEvent; 0]);
     assert_eq!(empty.stream_identity, None);
     let envelope_bytes = expected
         .iter()

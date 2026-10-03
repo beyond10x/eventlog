@@ -303,13 +303,9 @@ async fn sqlite_callback_blob_corruption_poison_rolls_back_every_owner() {
                 .await,
             Err(EventLogError::Backend(_))
         ));
-        assert!(
-            store
-                .read_stream(&stream, 0, 10)
-                .await
-                .unwrap()
-                .events
-                .is_empty()
+        assert_eq!(
+            store.read_stream(&stream, 0, 10).await.unwrap().events,
+            [] as [eventlog_core::RecordedEvent; 0]
         );
         assert!(
             store
@@ -352,13 +348,9 @@ async fn sqlite_callback_blob_corruption_poison_rolls_back_every_owner() {
             .await,
         Err(EventLogError::Backend(_))
     ));
-    assert!(
-        store
-            .read_stream(&guarded, 0, 10)
-            .await
-            .unwrap()
-            .events
-            .is_empty()
+    assert_eq!(
+        store.read_stream(&guarded, 0, 10).await.unwrap().events,
+        [] as [eventlog_core::RecordedEvent; 0]
     );
 
     let group_stream = StreamId::new(tenant.clone(), "item", "grouped").unwrap();
@@ -392,13 +384,13 @@ async fn sqlite_callback_blob_corruption_poison_rolls_back_every_owner() {
             .await,
         Err(EventLogError::Backend(_))
     ));
-    assert!(
+    assert_eq!(
         store
             .read_stream(&group_stream, 0, 10)
             .await
             .unwrap()
-            .events
-            .is_empty()
+            .events,
+        [] as [eventlog_core::RecordedEvent; 0]
     );
     let catch_up = Arc::new(eventlog_conformance::BlobReadingProjector {
         driver_name: "blob_integrity_catchup",

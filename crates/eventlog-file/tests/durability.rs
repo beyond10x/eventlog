@@ -189,13 +189,9 @@ async fn privacy_removes_active_bytes_and_never_reuses_feed_positions() {
     );
     drop(store);
     let store = FileEventStore::open(directory.path()).await.unwrap();
-    assert!(
-        store
-            .read_feed(&tenant(), 0, 100)
-            .await
-            .unwrap()
-            .events
-            .is_empty()
+    assert_eq!(
+        store.read_feed(&tenant(), 0, 100).await.unwrap().events,
+        [] as [eventlog_core::RecordedEvent; 0]
     );
     assert!(
         store

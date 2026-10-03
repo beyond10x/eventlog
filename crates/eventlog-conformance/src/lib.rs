@@ -489,7 +489,7 @@ async fn a_stream_identity_is_stable(store: &dyn EventStore, tenant: &TenantId, 
         first, again,
         "an identity a reader pins must not move under it"
     );
-    assert!(!first.is_empty());
+    assert_ne!(first, "");
     assert_ne!(
         first,
         store.stream_identity(other).await.expect("readable"),
@@ -2109,13 +2109,13 @@ pub async fn run_inline_failure_atomicity(
             ),
             "failed or unauthorized projector must refuse"
         );
-        assert!(
+        assert_eq!(
             store
                 .read_stream(&stream, 0, 10)
                 .await
                 .expect("events")
-                .events
-                .is_empty()
+                .events,
+            [] as [eventlog_core::RecordedEvent; 0]
         );
         assert!(
             store
@@ -2484,13 +2484,9 @@ pub async fn run_public_input_validation(store: &std::sync::Arc<dyn EventStore>)
                 .is_none()
         );
     }
-    assert!(
-        store
-            .read_feed(&tenant, 0, 100)
-            .await
-            .expect("feed")
-            .events
-            .is_empty()
+    assert_eq!(
+        store.read_feed(&tenant, 0, 100).await.expect("feed").events,
+        [] as [eventlog_core::RecordedEvent; 0]
     );
 
     // The private identifier fields remain invalid-proof even through serde's public boundary.

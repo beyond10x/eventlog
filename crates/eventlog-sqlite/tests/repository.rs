@@ -190,7 +190,7 @@ async fn a_command_that_decided_nothing_writes_nothing() {
         .handle(&tenant, "c-1", &Command::Nothing, &meta("k-2"))
         .await
         .expect("handled");
-    assert!(outcome.events.is_empty());
+    assert_eq!(outcome.events, [] as [eventlog_core::RecordedEvent; 0]);
     assert_eq!(outcome.version, 1, "the stream did not move");
 }
 
