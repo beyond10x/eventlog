@@ -256,7 +256,7 @@ async fn a_raw_blob_merged_into_a_v2_store_reads_and_is_split_by_the_next_migrat
     fs::write(shard.join("sha256%3Alate"), &bytes).unwrap();
     assert_eq!(served(root, "sha256:late").await, Some(bytes.clone()));
     assert_eq!(migrate(root, MigrationMode::Apply).unwrap().blobs_split, 1);
-    assert!(files_under(root, "blobs").is_empty());
+    assert_eq!(files_under(root, "blobs"), [] as [std::path::PathBuf; 0]);
     assert_eq!(served(root, "sha256:late").await, Some(bytes));
 }
 

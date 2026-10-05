@@ -1414,7 +1414,7 @@ mod tests {
         let same = Journal::resume(root.path(), &observed, &observed_content)
             .unwrap()
             .unwrap();
-        assert!(same.fresh.is_empty());
+        assert_eq!(same.fresh, [] as [serde_json::Value; 0]);
         assert_eq!(same.manifest, observed);
         drop(same);
         let mut journal = Journal::open(root.path()).unwrap();

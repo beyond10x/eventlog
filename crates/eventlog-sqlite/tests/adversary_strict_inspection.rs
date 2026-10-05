@@ -133,7 +133,7 @@ async fn adversary_sqlite_empty_identity_and_exact_source_cap() {
         .await
         .unwrap();
     assert_eq!(empty.stream_identity, None);
-    assert!(empty.events.is_empty());
+    assert_eq!(empty.events, [] as [eventlog_core::RecordedEvent; 0]);
     assert_eq!(inventory(directory.path()), before);
     Connection::open(&path)
         .unwrap()
