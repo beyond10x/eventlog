@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.7.0 — 2026-10-07
+
 ### Added
 
 - Optional provider-owned capture checkpoints distinguish complete observations, unchanged state
