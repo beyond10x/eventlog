@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.JournaledRowChange",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:3581ac2cb1963ac37033a5b5c702b2ac2687c5cbe2413032c1847a16d43756eb",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CapturedProjectionScope": {
+      "title": "CapturedProjectionScope",
+      "x-ess-name": "eventlog.capture.CapturedProjectionScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "indexed_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "indexed_fields"
+      ],
+      "additionalProperties": false
+    },
+    "eventlog.capture.JournaledRowChange": {
+      "title": "JournaledRowChange",
+      "x-ess-name": "eventlog.capture.JournaledRowChange",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "projection": {
+          "$ref": "#/$defs/eventlog.capture.CapturedProjectionScope"
+        },
+        "key": {
+          "type": "string"
+        },
+        "before": {},
+        "after": {}
+      },
+      "required": [
+        "projection",
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

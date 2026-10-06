@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.CaptureScope",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:725fcc4c10937aeb3b92666d3e1b8e1f5c6b970a7ab4d6c1a8eec3c424ad0ae1",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CaptureScope": {
+      "title": "CaptureScope",
+      "x-ess-name": "eventlog.capture.CaptureScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "tenant_id": {
+          "type": "string"
+        },
+        "stream_identity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "stream_identity"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

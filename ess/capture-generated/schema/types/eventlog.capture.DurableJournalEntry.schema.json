@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.DurableJournalEntry",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:31bf070c138bcefbac9aa73214ca6737f602b5ca5a16b4d55062fb8ce8a31f20",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CaptureContinuityMark": {
+      "title": "CaptureContinuityMark",
+      "x-ess-name": "eventlog.capture.CaptureContinuityMark",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "epoch",
+        "token"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "epoch >= 0"
+      ]
+    },
+    "eventlog.capture.CapturedProjectionScope": {
+      "title": "CapturedProjectionScope",
+      "x-ess-name": "eventlog.capture.CapturedProjectionScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "indexed_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "indexed_fields"
+      ],
+      "additionalProperties": false
+    },
+    "eventlog.capture.DurableJournalEntry": {
+      "title": "DurableJournalEntry",
+      "x-ess-name": "eventlog.capture.DurableJournalEntry",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "position": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "from": {
+          "$ref": "#/$defs/eventlog.capture.CaptureContinuityMark"
+        },
+        "to": {
+          "$ref": "#/$defs/eventlog.capture.CaptureContinuityMark"
+        },
+        "event_positions": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "blobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/eventlog.capture.JournaledRowChange"
+          }
+        }
+      },
+      "required": [
+        "position",
+        "tenant_id",
+        "from",
+        "to",
+        "event_positions",
+        "blobs",
+        "rows"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "position >= 1"
+      ]
+    },
+    "eventlog.capture.JournaledRowChange": {
+      "title": "JournaledRowChange",
+      "x-ess-name": "eventlog.capture.JournaledRowChange",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "projection": {
+          "$ref": "#/$defs/eventlog.capture.CapturedProjectionScope"
+        },
+        "key": {
+          "type": "string"
+        },
+        "before": {},
+        "after": {}
+      },
+      "required": [
+        "projection",
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

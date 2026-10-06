@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.CaptureContinuityMark",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:e8e114e45965238752577d4657948910b6bd55445e9456cc29bc868dbb1ba8e4",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CaptureContinuityMark": {
+      "title": "CaptureContinuityMark",
+      "x-ess-name": "eventlog.capture.CaptureContinuityMark",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "epoch",
+        "token"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "epoch >= 0"
+      ]
+    }
+  }
+}

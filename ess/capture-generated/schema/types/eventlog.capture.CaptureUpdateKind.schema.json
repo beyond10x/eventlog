@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.CaptureUpdateKind",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:e36224e33ad5c15a01f107e50e2ac693a4b4f72f49aacbe45cb50677f9f532b4",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CaptureUpdateKind": {
+      "title": "CaptureUpdateKind",
+      "x-ess-name": "eventlog.capture.CaptureUpdateKind",
+      "x-ess-kind": "enum",
+      "type": "string",
+      "enum": [
+        "Complete",
+        "Unchanged",
+        "AppendDelta"
+      ]
+    }
+  }
+}
