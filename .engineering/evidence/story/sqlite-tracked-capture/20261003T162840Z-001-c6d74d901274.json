@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-03T16:28:40Z",
+  "actor": "human:timo",
+  "artifact": "story:sqlite-tracked-capture",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "static_analysis",
+    "source": "Rust1.99 cargo fmt --all --check and strict cargo clippy --workspace --all-targets --locked exit0",
+    "reference": "docs/evidence/sqlite-tracked-capture/source.sha256"
+  }
+}

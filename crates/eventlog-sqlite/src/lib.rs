@@ -15,6 +15,7 @@ mod atomic_group;
 mod capture;
 mod inline_admin;
 mod inspection;
+mod tracked_capture;
 mod verified;
 pub use inspection::SqliteHistoryInspector;
 
@@ -63,6 +64,7 @@ struct Inner {
     restored: Mutex<std::collections::VecDeque<RestoredEvent>>,
     /// Blob rows this handle has already validated; see [`verified`].
     verified: verified::VerifiedBlobs,
+    tracked: tracked_capture::TrackedCapture,
 }
 
 /// The identity and instant one replayed event had when another store first recorded it.
@@ -355,6 +357,7 @@ impl Inner {
             registration: Mutex::new(false),
             restored: Mutex::new(std::collections::VecDeque::new()),
             verified: verified::VerifiedBlobs::default(),
+            tracked: tracked_capture::TrackedCapture::default(),
         }
     }
 
@@ -1598,6 +1601,7 @@ impl Inner {
                 connection: &mut *connection,
                 blob_prefix: prefix,
                 verified: &self.verified,
+                tracked: &self.tracked,
                 projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
@@ -1735,6 +1739,7 @@ impl Inner {
                 connection: &mut *connection,
                 blob_prefix: prefix,
                 verified: &self.verified,
+                tracked: &self.tracked,
                 projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant: stream.tenant(),
@@ -2649,6 +2654,7 @@ impl Inner {
                 connection: &mut *connection,
                 blob_prefix: prefix,
                 verified: &self.verified,
+                tracked: &self.tracked,
                 projection_prefix: prefix,
                 inline: &self.inline_names,
                 tenant,
@@ -2730,6 +2736,7 @@ impl Inner {
                     connection: &mut *connection,
                     blob_prefix: &self.prefix,
                     verified: &self.verified,
+                    tracked: &self.tracked,
                     projection_prefix: "eventlog_rebuild",
                     inline: &self.inline_names,
                     tenant,
@@ -2913,6 +2920,7 @@ fn done<'a, T: Send + 'a>(value: T) -> BoxFuture<'a, T> {
 struct SqliteProjections<'a> {
     connection: &'a mut Connection,
     verified: &'a verified::VerifiedBlobs,
+    tracked: &'a tracked_capture::TrackedCapture,
     blob_prefix: &'a str,
     projection_prefix: &'a str,
     inline: &'a Mutex<BTreeSet<String>>,
@@ -3106,6 +3114,7 @@ impl SqliteProjections<'_> {
             ));
         }
         projection.validate()?;
+        let before = self.tracked_before(projection, tenant, key);
         let table = projection_table(self.projection_prefix, projection.name);
         let columns: String = joined(projection.indexed.len(), |position| {
             format!(", idx_{position}")
@@ -3133,8 +3142,10 @@ impl SqliteProjections<'_> {
             values.iter().map(std::convert::AsRef::as_ref).collect();
         self.connection
             .execute(&statement, borrowed.as_slice())
-            .map(|_| ())
-            .map_err(backend)
+            .map_err(backend)?;
+        self.tracked
+            .row(tenant, *projection, key, before, Some(body.clone()));
+        Ok(())
     }
 
     fn delete_now(
@@ -3150,14 +3161,33 @@ impl SqliteProjections<'_> {
             ));
         }
         projection.validate()?;
+        let before = self.tracked_before(projection, tenant, key);
         let table = projection_table(self.projection_prefix, projection.name);
         self.connection
             .execute(
                 &format!("DELETE FROM {table} WHERE tenant_id = ?1 AND row_key = ?2"),
                 params![tenant.as_str(), key],
             )
-            .map(|_| ())
-            .map_err(backend)
+            .map_err(backend)?;
+        self.tracked.row(tenant, *projection, key, before, None);
+        Ok(())
+    }
+
+    fn tracked_before(
+        &mut self,
+        projection: &ProjectionSpec,
+        tenant: &TenantId,
+        key: &str,
+    ) -> Option<Value> {
+        if !self.tracked.active() {
+            return None;
+        }
+        if let Ok(value) = self.get_now(projection, tenant, key) {
+            value
+        } else {
+            self.tracked.invalidate();
+            None
+        }
     }
 
     fn get_now(

@@ -113,6 +113,7 @@ impl AtomicEventStore for SqliteEventStore {
             inner.keeping_restored_on_refusal(|| {
                 let mut connection = inner.connection.lock().map_err(poisoned)?;
                 begin_immediate(&connection)?;
+                inner.tracked.begin(&connection, &group.tenant);
                 let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = inner.group_in_transaction(
                     &mut connection,
@@ -126,7 +127,9 @@ impl AtomicEventStore for SqliteEventStore {
                 if result.is_ok() {
                     checkpoint("group-precommit");
                 }
+                inner.tracked.seal(&connection, &result);
                 let result = finish_transaction(&connection, result);
+                inner.tracked.finish(result.is_ok());
                 #[cfg(test)]
                 if result.is_ok() {
                     checkpoint("group-postcommit");
@@ -163,6 +166,7 @@ impl AtomicEventStore for SqliteEventStore {
             inner.keeping_restored_on_refusal(|| {
                 let mut connection = inner.connection.lock().map_err(poisoned)?;
                 begin_immediate(&connection)?;
+                inner.tracked.begin(&connection, &group.tenant);
                 let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = inner.guarded_batch_in_transaction(
                     &mut connection,
@@ -172,7 +176,8 @@ impl AtomicEventStore for SqliteEventStore {
                     admission.as_ref(),
                     &callback_failed,
                 );
-                match result {
+                inner.tracked.seal(&connection, &result);
+                let settled = match result {
                     // A deduplicated answer wrote nothing, and commits nothing its re-run
                     // admission may have staged.
                     Ok(result) if result.deduplicated => {
@@ -186,7 +191,9 @@ impl AtomicEventStore for SqliteEventStore {
                         }
                         result
                     }
-                }
+                };
+                inner.tracked.finish(settled.is_ok());
+                settled
             })
         }))
     }
@@ -207,6 +214,7 @@ impl AtomicBlobEventStore for SqliteEventStore {
             inner.keeping_restored_on_refusal(|| {
                 let mut connection = inner.connection.lock().map_err(poisoned)?;
                 begin_immediate(&connection)?;
+                inner.tracked.begin(&connection, &request.group.tenant);
                 let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = inner.group_in_transaction(
                     &mut connection,
@@ -219,7 +227,9 @@ impl AtomicBlobEventStore for SqliteEventStore {
                     admission.as_ref(),
                     &callback_failed,
                 );
+                inner.tracked.seal(&connection, &result);
                 let result = finish_blob_transaction(&connection, result);
+                inner.tracked.finish(result.is_ok());
                 // Tentative bindings, and anything a callback read from them, rolled back.
                 if result.is_err() {
                     inner.verified.forget();
@@ -504,6 +514,7 @@ impl Inner {
                     params![tenant.as_str(),blob.digest,blob.bytes,to_i64(byte_count)?,super::format_time(time::OffsetDateTime::now_utc())?,integrity_sha256],
                 ).map_err(backend)?;
                 self.verified.remember(&integrity_sha256, &blob.bytes);
+                self.tracked.blob(tenant, &blob.digest, &blob.bytes);
             }
         }
         Ok(())
@@ -521,6 +532,7 @@ impl Inner {
         let mut projections = SqliteProjections {
             connection: &mut *connection,
             verified: &self.verified,
+            tracked: &self.tracked,
             blob_prefix: prefix,
             projection_prefix: prefix,
             inline: &self.inline_names,

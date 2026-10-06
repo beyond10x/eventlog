@@ -10,10 +10,11 @@
 use std::sync::Arc;
 
 use eventlog_core::{
-    BoxFuture, CaptureBudget, CaptureError, CaptureLimits, CaptureMaterial, CaptureResource,
-    CapturedBlob, CapturedProjection, ConsistentTenantCapture, EventLogError,
-    ProjectionCaptureRefusal, ProjectionSpec, RecordedEvent, TenantCapture, TenantId, order_blobs,
-    order_rows, validate_capture_request, validate_captured_digest, validate_captured_order,
+    BoxFuture, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
+    CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection, ConsistentTenantCapture,
+    EventLogError, ProjectionCaptureRefusal, ProjectionSpec, RecordedEvent, TenantCapture,
+    TenantCaptureUpdate, TenantId, order_blobs, order_rows, validate_capture_request,
+    validate_captured_digest, validate_captured_order,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde_json::Value;
@@ -39,6 +40,30 @@ fn corrupt(material: CaptureMaterial) -> CaptureError {
 }
 
 impl ConsistentTenantCapture for SqliteEventStore {
+    fn capture_tenant_since<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        projections: &'a [ProjectionSpec],
+        limits: CaptureLimits,
+        previous: Option<&'a CaptureCheckpoint>,
+    ) -> BoxFuture<'a, Result<TenantCaptureUpdate, CaptureError>> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let projections = projections.to_vec();
+        let previous = previous.cloned();
+        Box::pin(async move {
+            validate_capture_request(&tenant, &projections)?;
+            tokio::task::spawn_blocking(move || {
+                inner.capture_since(&tenant, &projections, limits, previous.as_ref())
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(CaptureError::Store(EventLogError::Backend(
+                    "the store's blocking worker panicked".into(),
+                )))
+            })
+        })
+    }
     fn capture_tenant<'a>(
         &'a self,
         tenant: &'a TenantId,
@@ -77,7 +102,9 @@ impl Inner {
             .map_err(|error| CaptureError::Store(poisoned(error)))?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
-        let result = self.observe(connection, tenant, projections, limits);
+        let result = self
+            .observe(connection, tenant, projections, limits)
+            .map(|(capture, _)| capture);
         // There is no DML and no DDL in this transaction; it ends only to release the writer.
         match result {
             Ok(value) => match connection.execute_batch("COMMIT") {
@@ -94,13 +121,81 @@ impl Inner {
         }
     }
 
+    fn capture_since(
+        &self,
+        tenant: &TenantId,
+        projections: &[ProjectionSpec],
+        limits: CaptureLimits,
+        previous: Option<&CaptureCheckpoint>,
+    ) -> Result<TenantCaptureUpdate, CaptureError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|e| CaptureError::Store(poisoned(e)))?;
+        begin_immediate(&connection)?;
+        let result = (|| {
+            let stamp = crate::tracked_capture::Stamp::read(&connection)?;
+            if let Some(previous) = previous
+                && let Some(update) =
+                    self.tracked
+                        .since(stamp, tenant, projections, limits, previous)?
+            {
+                return Ok(update);
+            }
+            let (capture, usage) = self.observe(&connection, tenant, projections, limits)?;
+            // A trigger or cascading foreign key can write captured rows outside our closed
+            // provider write interface. Such schemas remain capturable but cannot issue proof
+            // that an append changed only what our journal observed.
+            let indirect: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='trigger')
+                     OR EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type='trigger')
+                     OR EXISTS(SELECT 1 FROM main.sqlite_schema AS s,
+                         pragma_foreign_key_list(s.name,'main') WHERE s.type='table')
+                     OR EXISTS(SELECT 1 FROM temp.sqlite_schema AS s,
+                         pragma_foreign_key_list(s.name,'temp') WHERE s.type='table')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(operational)?;
+            let checkpoint = if indirect {
+                None
+            } else {
+                self.tracked.complete(stamp, &capture, limits, usage)
+            };
+            Ok(TenantCaptureUpdate::Complete {
+                capture,
+                checkpoint,
+            })
+        })();
+        match result {
+            Ok(value) => match connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    self.tracked.invalidate();
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(operational(error))
+                }
+            },
+            Err(error) => {
+                self.tracked.invalidate();
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     fn observe(
         &self,
         connection: &Connection,
         tenant: &TenantId,
         projections: &[ProjectionSpec],
         limits: CaptureLimits,
-    ) -> Result<TenantCapture, CaptureError> {
+    ) -> Result<(TenantCapture, CaptureUsage), CaptureError> {
+        #[cfg(test)]
+        self.tracked
+            .full_observations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let prefix = &self.prefix;
         let identity = stored_identity(connection, prefix, tenant)?;
         let redacted: bool = connection
@@ -138,13 +233,16 @@ impl Inner {
                 rows,
             });
         }
-        Ok(TenantCapture {
-            tenant: tenant.clone(),
-            stream_identity: identity,
-            events,
-            blobs,
-            projections: captured,
-        })
+        Ok((
+            TenantCapture {
+                tenant: tenant.clone(),
+                stream_identity: identity,
+                events,
+                blobs,
+                projections: captured,
+            },
+            budget.usage(),
+        ))
     }
 }
 

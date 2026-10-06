@@ -199,6 +199,7 @@ impl Inner {
                 connection: &mut connection,
                 blob_prefix: &self.prefix,
                 verified: &self.verified,
+                tracked: &self.tracked,
                 projection_prefix: "eventlog_rebuild",
                 inline: &self.inline_names,
                 tenant,

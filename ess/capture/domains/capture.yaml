@@ -30,3 +30,47 @@ types:
       - max_payload_bytes >= 0
     # Rust refines each count to u64 with checked arithmetic. Zero is a cap, not a default.
     # The design defines payload bytes exactly and does not claim a process peak-memory limit.
+  - name: eventlog.capture.CaptureUsage
+    kind: struct
+    fields:
+      - name: events
+        type: Integer
+      - name: blobs
+        type: Integer
+      - name: projection_rows
+        type: Integer
+      - name: payload_bytes
+        type: Integer
+    invariants:
+      - events >= 0
+      - blobs >= 0
+      - projection_rows >= 0
+      - payload_bytes >= 0
+    # Exact complete-observation totals, not the size of an incremental response.
+    # Rust refines to u64, checked arithmetic and the existing CaptureLimits accounting.
+  - name: eventlog.capture.CaptureUpdateKind
+    kind: enum
+    variants: [Complete, Unchanged, AppendDelta]
+    # Semantic alternatives, not a serde wire enum. Payloads remain the existing Rust
+    # RecordedEvent, CapturedBlob and projection Value types; no JSON bag is introduced.
+  - name: eventlog.capture.CapturedProjectionScope
+    kind: struct
+    fields:
+      - name: name
+        type: String
+      - name: indexed_fields
+        type: List<String>
+    # Exact requested declaration and indexed-field order; no new projection version exists.
+  - name: eventlog.capture.CaptureCheckpointScope
+    kind: struct
+    fields:
+      - name: capture
+        type: eventlog.capture.CaptureScope
+      - name: projections
+        type: List<eventlog.capture.CapturedProjectionScope>
+      - name: limits
+        type: eventlog.capture.CaptureLimits
+    # These are the request facts a private provider checkpoint binds, not a checkpoint's
+    # representation. A connection issuer identity and immutable observation position are
+    # Rust-owned nonserializable capabilities. Supplying these fields cannot mint one.
+    # A scope mismatch causes complete capture, not re-use of proof under different limits.

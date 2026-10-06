@@ -5,6 +5,20 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.7.0 — 2026-10-07
+
+### Added
+
+- Optional provider-owned capture checkpoints distinguish complete observations, unchanged state
+  and acknowledged append deltas. SQLite tracks SQL-visible changes across connections and retains
+  a bounded journal, with exact cumulative capture limits and complete fallback after uncertainty.
+  Checkpoints are transient and cannot be transferred between provider instances or request scopes.
+  Raw database-file writes bypassing SQLite are outside this optional warm-read guarantee.
+
+### Changed
+
+- Update existing empty-value assertions for the Rust 1.99 strict lint gate.
+
 ## 0.6.0 — 2026-09-27
 
 ### Added
