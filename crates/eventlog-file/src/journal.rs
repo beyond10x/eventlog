@@ -29,6 +29,10 @@ pub(crate) fn checkpoint(name: &str) {
 #[cfg(not(test))]
 pub(crate) fn checkpoint(_: &str) {}
 
+#[cfg(test)]
+#[path = "adversary_compare_once.rs"]
+mod adversary_compare_once;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
@@ -88,7 +92,7 @@ pub(crate) struct Journal {
 ///
 /// The bytes live in a [`Retained`] buffer and this is a view of its first `length` bytes, so a
 /// clone costs a reference count and the writer's and the reader's views of one handle can hold
-/// one copy between them ([`Content::share`]). Nothing here is persisted.
+/// one copy between them ([`Content::adopt`]). Nothing here is persisted.
 #[derive(Clone)]
 pub(crate) struct Content {
     retained: Arc<Retained>,
@@ -119,7 +123,12 @@ impl Retained {
 }
 
 impl Content {
-    fn of(bytes: Vec<u8>) -> Self {
+    /// A view of all of `bytes`, kept at their committed size. Every buffer starts here, so none
+    /// starts with the slack of however it was read or built: a buffer grown by doubling would
+    /// otherwise hold up to twice the committed bytes for as long as the handle keeps it. Only
+    /// appends grow it afterwards ([`Content::absorb`]).
+    fn of(mut bytes: Vec<u8>) -> Self {
+        bytes.shrink_to_fit();
         Self {
             length: bytes.len(),
             retained: Arc::new(Retained(Mutex::new(bytes))),
@@ -166,50 +175,65 @@ impl Content {
         self
     }
 
-    /// Hold the bytes `self` and `other` verified once between them, when one view's bytes begin
-    /// the other's: the shorter view is pointed at the longer one's buffer.
+    /// Move this view onto `other`'s buffer when the bytes one of them verified begin the other's,
+    /// and answer whether the two now share one buffer.
     ///
-    /// Two views of one handle reach the same bytes by separate reads — a writer's open and a
-    /// capture's strict read each read the whole file — and this is where the second copy is
-    /// dropped. Only storage moves: each view still holds exactly the bytes it verified, its own
-    /// length and its own stamp, which is why nothing is trusted that was not before. Views whose
-    /// bytes differ are left as they are; one of them is stale, and its own next resume finds out.
-    pub(crate) fn share(&mut self, other: &mut Self) {
-        if Arc::ptr_eq(&self.retained, &other.retained) {
-            return;
+    /// Two views of one handle reach the same bytes by separate reads — a writer's complete reread
+    /// and a capture's strict read each read the whole file — and this is where the second copy is
+    /// dropped. A view shorter than `other` points at `other`'s buffer; a longer one continues
+    /// that buffer with the bytes it has past `other`'s, in place when the buffer ends where
+    /// `other` does. Only storage moves: this view still holds exactly the bytes it verified, its
+    /// own length and its own stamp, which is why nothing is trusted that was not before. When the
+    /// bytes differ, or the buffer already continues differently, this view keeps its own buffer
+    /// and the answer is `false`; the caller then drops `other`, which is stale.
+    ///
+    /// It compares up to the shorter view's length, so callers run it inside their blocking file
+    /// work, never on the async executor; [`Content::shares_bytes_with`] is the O(1) question for
+    /// there.
+    pub(crate) fn adopt(&mut self, other: &Self) -> bool {
+        if self.shares_bytes_with(other) {
+            return true;
         }
-        let (short, long) = if self.length <= other.length {
-            (self, other)
-        } else {
-            (other, self)
-        };
-        let length = short.length;
+        let common = self.length.min(other.length);
         // A view of no bytes has nothing to save, and every other view shares only a buffer whose
         // bytes it verified itself. That keeps views of two epochs apart: every frame carries its
         // epoch, so the first frames already differ, and only an empty history — one an erasure
         // emptied — could otherwise end up keeping the buffer of the bytes it erased.
-        if length == 0 {
-            return;
+        if common == 0 {
+            return false;
         }
         let same = {
-            // Both buffers hold at least `length` bytes, so the order they are locked in is free:
+            // Both buffers hold at least `common` bytes, so the order they are locked in is free:
             // address order, so that two calls can never wait on each other.
-            let (low, high) = if Arc::as_ptr(&short.retained) < Arc::as_ptr(&long.retained) {
-                (&short.retained, &long.retained)
+            let (low, high) = if Arc::as_ptr(&self.retained) < Arc::as_ptr(&other.retained) {
+                (&self.retained, &other.retained)
             } else {
-                (&long.retained, &short.retained)
+                (&other.retained, &self.retained)
             };
             let low = low.bytes();
             let high = high.bytes();
-            low[..length] == high[..length]
+            low[..common] == high[..common]
         };
-        if same {
-            short.retained = Arc::clone(&long.retained);
+        if !same {
+            return false;
         }
+        // Only the bytes past `other`'s view are copied, and only to continue its buffer with them.
+        let rest = self.retained.bytes()[common..self.length].to_vec();
+        let mut adopted = Self {
+            retained: Arc::clone(&other.retained),
+            length: common,
+            stamp: None,
+        };
+        adopted.absorb(&rest);
+        if !adopted.shares_bytes_with(other) {
+            return false;
+        }
+        adopted.stamp = self.stamp;
+        *self = adopted;
+        true
     }
 
-    /// Whether two views keep their bytes in one buffer.
-    #[cfg(test)]
+    /// Whether two views keep their bytes in one buffer. A pointer comparison: it reads no byte.
     pub(crate) fn shares_bytes_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.retained, &other.retained)
     }
@@ -546,7 +570,8 @@ impl Journal {
         }
         let started = now_ns();
         let before = Stamp::of(&events);
-        let mut committed = Vec::new();
+        // Sized from the committed length: this vector becomes the handle's kept bytes.
+        let mut committed = Vec::with_capacity(usize::try_from(manifest.length).map_err(backend)?);
         (&mut events)
             .take(manifest.length)
             .read_to_end(&mut committed)
@@ -627,6 +652,18 @@ impl Journal {
     #[cfg(test)]
     pub fn content(&self) -> Content {
         self.content.clone()
+    }
+
+    /// Keep this journal's committed bytes in `reader`'s buffer when the two agree
+    /// ([`Content::adopt`]); `false` when they do not, or there is no reader. Compares bytes:
+    /// blocking work only.
+    pub(crate) fn adopt(&mut self, reader: Option<&Content>) -> bool {
+        reader.is_some_and(|reader| self.content.adopt(reader))
+    }
+
+    /// Whether this journal keeps its committed bytes in `content`'s buffer. Reads no byte.
+    pub(crate) fn shares_bytes_with(&self, content: &Content) -> bool {
+        self.content.shares_bytes_with(content)
     }
 
     pub fn extends(&self, observed: &Manifest) -> Result<bool, EventLogError> {
@@ -1625,6 +1662,33 @@ mod tests {
         );
     }
 
+    /// Every buffer a view starts from is held at its committed size, whichever way its bytes were
+    /// read or built — a complete open, a privacy rewrite, a strict read — so what a handle keeps
+    /// is the committed size of `events.jsonl` until its own appends grow it.
+    #[test]
+    fn every_new_buffer_starts_at_its_committed_size() {
+        let root = tempfile::tempdir().unwrap();
+        let held = |content: &Content| (content.retained.bytes().capacity(), content.length);
+        {
+            let mut journal = Journal::open(root.path()).unwrap();
+            for index in 0..40 {
+                journal
+                    .append(json!({ "index": index, "pad": "x".repeat(3_000) }))
+                    .unwrap();
+            }
+        }
+        let mut journal = Journal::open(root.path()).unwrap();
+        let (capacity, length) = held(&journal.content);
+        assert_eq!(capacity, length, "a complete open keeps slack");
+        journal.privacy(journal.transactions.clone()).unwrap();
+        let (capacity, length) = held(&journal.content);
+        assert_eq!(capacity, length, "a privacy rewrite keeps slack");
+        drop(journal);
+        let strict = open_strict(root.path()).unwrap();
+        let (capacity, length) = held(&strict.content);
+        assert_eq!(capacity, length, "a strict read keeps slack");
+    }
+
     /// A journal's own appends extend the committed-bytes buffer in place while another view of
     /// the same handle holds it: no append copies the history before it.
     #[test]
@@ -1652,7 +1716,8 @@ mod tests {
 
     /// Two views of one buffer each keep exactly the bytes they verified. A view continued with
     /// the bytes the buffer already holds shares them; one continued with different bytes gets a
-    /// buffer of its own and leaves the other's untouched.
+    /// buffer of its own and leaves the other's untouched. A view adopts another's buffer only
+    /// where their bytes agree, and never as a view of no bytes.
     #[test]
     fn views_of_one_buffer_keep_their_own_bytes() {
         let mut first = Content::of(b"prefix|".to_vec());
@@ -1669,7 +1734,10 @@ mod tests {
             "a longer continuation copied"
         );
         let mut third = Content::of(b"prefix|".to_vec());
-        third.share(&mut first);
+        assert!(
+            third.adopt(&first),
+            "a shorter view whose bytes agree was not moved"
+        );
         assert!(
             third.shares_bytes_with(&first),
             "equal bytes were not shared"
@@ -1683,14 +1751,31 @@ mod tests {
         assert_eq!(bytes(&first), b"prefix|left|");
         assert_eq!(bytes(&second), b"prefix|left|more");
         assert_eq!(bytes(&third), b"prefix|right|");
+        let mut longer = Content::of(b"prefix|left|more|tail".to_vec());
+        assert!(
+            longer.adopt(&first),
+            "a longer view whose bytes agree was not moved"
+        );
+        assert!(
+            longer.shares_bytes_with(&first),
+            "a longer view kept its own copy"
+        );
+        assert_eq!(bytes(&longer), b"prefix|left|more|tail");
+        assert_eq!(bytes(&second), b"prefix|left|more");
+        let mut diverging = Content::of(b"prefix|left|less".to_vec());
+        assert!(
+            !diverging.adopt(&first),
+            "a view was moved onto a buffer that continues with other bytes"
+        );
+        assert_eq!(bytes(&diverging), b"prefix|left|less");
         let mut stale = Content::of(b"prefiX|".to_vec());
-        stale.share(&mut first);
+        assert!(!stale.adopt(&first), "different bytes were adopted");
         assert!(
             !stale.shares_bytes_with(&first),
             "different bytes were shared"
         );
         let mut emptied = Content::of(Vec::new());
-        emptied.share(&mut first);
+        assert!(!emptied.adopt(&first), "a view of no bytes was moved");
         assert!(
             !emptied.shares_bytes_with(&first),
             "a view of no bytes kept another view's buffer alive"

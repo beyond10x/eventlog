@@ -20,8 +20,8 @@ Test recovery on a disposable copy.
 File's manifest selects the committed journal prefix. Opening verifies the history and active
 blobs; later operations re-read the committed prefix and compare it byte for byte with the bytes
 they verified before reusing verified state, unless the file has held still for two seconds. A
-handle keeps those bytes in memory: budget about the committed size of `events.jsonl` per open
-handle.
+handle keeps those bytes in memory, once: budget the committed size of `events.jsonl` per open
+handle after open, and up to about twice that as the handle's own appends grow the buffer.
 A valid recovery intent is handled by an authorized opener. Inspectors refuse pending recovery
 rather than carrying it out. Never delete a manifest or truncate a journal to clear a refusal.
 

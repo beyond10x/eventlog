@@ -104,17 +104,23 @@ What a resumed handle reads, keeps and trusts:
 | decides by | comparing every committed byte with the bytes it kept, then chaining the bytes past them from its observed digest | comparing the stamp and the manifest with the ones it kept |
 | trusts | nothing it has not just compared or chained | that a file with an unchanged stamp holds unchanged bytes, within the table below |
 
-The bytes a handle keeps are the committed prefix of `events.jsonl` as it last verified it: about
-the file's committed size, beside the decoded frames and the fold it already keeps. One handle
-keeps them once. The writer's view and a capture's view of the same `FileEventStore` share one
-buffer: a capture that built its view from a strict read of the whole file drops that copy when
-it finishes, and the handle's own appends extend the buffer in place rather than copying it. A
-writer that rereads everything — after a privacy rewrite, a refusal that wrote, or a head a
-capture moved — reads into a buffer of its own until the next capture shares them again. A
+The bytes a handle keeps are the committed prefix of `events.jsonl` as it last verified it,
+beside the decoded frames and the fold it already keeps. Every buffer starts at exactly the
+committed size — a complete open, a strict read and a privacy rewrite each keep the bytes they
+read or built and no slack — and the handle's own appends then extend it in place, growing it by
+doubling. So budget the committed size per handle after open, and up to about twice that as
+appends grow the buffer.
+
+One handle keeps those bytes once. Whichever of the writer's view and a capture's view of the
+same `FileEventStore` was rebuilt last — by a capture's strict read or a writer's complete reread —
+moves onto the other's buffer wherever their bytes agree, comparing them inside the operation's
+blocking file work. A view whose bytes do not agree with the ones the operation has just verified
+is dropped when the operation ends rather than kept beside them: it names a history that is no
+longer committed, or a head the operation moved past, and could not be resumed from anyway. A
 `FileTenantCapture` keeps one view. Views of two epochs never share a buffer, so a privacy
-rewrite's new history never keeps the bytes it removed alive; a view of the old epoch keeps them,
-as it keeps its decoded frames and fold, until that view's next operation replaces it. Nothing of
-this is persisted, and `eventlog-file/1` is unchanged.
+rewrite's new history never keeps the bytes it removed alive; a capture view of the old epoch keeps
+them, as it keeps its decoded fold, until this handle's next transaction drops it or its next
+capture replaces it. Nothing of this is persisted, and `eventlog-file/1` is unchanged.
 
 What the stamp detects, and what it does not:
 
@@ -315,10 +321,12 @@ history. A separate suite checks the same damage against an open handle's reads,
 history whose observed prefix was rewritten under a genuine tail. A capture unit test counts the
 frames a handle decodes, re-encodes and folds and the objects it hashes, and requires ten captures
 with no write between them to verify the committed history once and the content they hand out
-every time; a second requires a handle's writer and capture views to hold their committed bytes
-in one buffer, across the handle's own appends, and journal unit tests require an append to
-extend that buffer in place and each view of it to keep exactly the bytes it verified;
-`tests/consistent_capture.rs` checks that a capture reusing a view still folds what
+every time; others require a handle's writer and capture views to hold their committed bytes in
+one buffer, across the handle's own appends and after a writer rereads everything, and a view
+neither can share — one from before a privacy rewrite, or an empty writer's — to be dropped by
+the next operation; journal unit tests require an append to extend that buffer in place, each
+view of it to keep exactly the bytes it verified, and every new buffer to start at its committed
+size; `tests/consistent_capture.rs` checks that a capture reusing a view still folds what
 another writer committed, that a committed frame damaged in place afterwards refuses through the
 strict reader without changing a file, that damaged content still refuses the next capture, that a
 writers' lock that is no longer a regular file refuses one, and that a reserved recovery entry

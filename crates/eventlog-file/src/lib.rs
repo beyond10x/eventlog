@@ -67,8 +67,9 @@ struct Verified {
     /// The committed bytes these frames were decoded from. A resumed transaction re-reads the
     /// file's committed prefix, compares it with them byte for byte and refuses to reuse the view
     /// when it is not them, so a committed frame damaged in place after `open` is never served and
-    /// never appended onto. The buffer is shared with the reader's view in `captured` once a
-    /// capture has run ([`journal::Content::share`]), so a handle keeps these bytes once.
+    /// never appended onto. Whichever of this view and the reader's view in `captured` was built
+    /// last keeps its bytes in the other's buffer when they agree, and the other is dropped when
+    /// they do not ([`journal::Content::adopt`]), so a handle keeps these bytes once.
     content: journal::Content,
 }
 struct Transaction {
@@ -159,8 +160,19 @@ impl FileEventStore {
             .filter(|verified| Some(&verified.manifest) == observed.as_ref());
         let inline = runtime.inline.clone();
         let permit = self.permit.clone();
-        let mut tx =
-            blocking(move || enter(&path, observed.as_ref(), verified, inline, permit)).await?;
+        let reader = capture::reader_bytes(runtime.captured.as_ref());
+        let mut tx = blocking(move || {
+            enter(
+                &path,
+                observed.as_ref(),
+                verified,
+                reader.as_ref(),
+                inline,
+                permit,
+            )
+        })
+        .await?;
+        capture::keep_reader_once(&mut runtime.captured, &tx.journal);
         let outcome = work(&mut tx).await;
         let result = match outcome {
             Ok(result) => result,
@@ -988,10 +1000,16 @@ impl Transaction {
 /// seeks to the committed length and writes, so a transaction that were handed append authority
 /// over a prefix nobody re-read could commit a valid frame after a damaged one and leave a history
 /// no opener accepts. Every resumed transaction passes that check before this function returns.
+///
+/// Either way the journal then keeps its committed bytes in the buffer of `reader`, the capture
+/// view of the same handle, wherever the two agree ([`Journal::adopt`]): a complete reread would
+/// otherwise hold a second copy beside that view. It compares bytes, so it belongs here, in the
+/// blocking work; the caller then drops a reader view that still keeps a buffer of its own.
 fn enter(
     root: &Path,
     observed: Option<&journal::Manifest>,
     verified: Option<Verified>,
+    reader: Option<&journal::Content>,
     inline: Vec<Arc<dyn Projector>>,
     permit: AdmissionPermit,
 ) -> Result<Transaction, EventLogError> {
@@ -1004,8 +1022,10 @@ fn enter(
             bound.extend(state.fold(transaction)?);
         }
         let advanced = !resumed.fresh.is_empty();
+        let mut journal = resumed.into_journal(root, verified.transactions);
+        journal.adopt(reader);
         let tx = Transaction {
-            journal: resumed.into_journal(root, verified.transactions),
+            journal,
             state,
             pending: Vec::new(),
             inline,
@@ -1026,7 +1046,7 @@ fn enter(
         }
         return Ok(tx);
     }
-    let journal = Journal::open_existing(root)?;
+    let mut journal = Journal::open_existing(root)?;
     if let Some(observed) = observed
         && !journal.extends(observed)?
     {
@@ -1034,6 +1054,7 @@ fn enter(
             "file history diverged from this handle's observed history",
         ));
     }
+    journal.adopt(reader);
     let tx = Transaction {
         state: State::replay(&journal.transactions)?,
         journal,
@@ -2540,9 +2561,11 @@ mod stamped_resume_cost {
     }
 
     /// Inside the window both resumes re-read the whole committed prefix and compare it with the
-    /// bytes the handle verified; neither hashes any of it. The writer's resume is the read after
-    /// this handle's own append, the reader's is the second of two captures. Neither can trust a
-    /// stamp: an append clears the writer's, and a strict read keeps none.
+    /// bytes the handle verified. The writer's resume is the read after this handle's own append,
+    /// the reader's is the second of two captures. Neither can trust a stamp: an append clears the
+    /// writer's, and a strict read keeps none. Nothing on either path hashes the prefix, so no
+    /// hashing count is left to hold at zero (`cost::every_counter_is_charged`); this case failed
+    /// at the base on the count the hash then charged, and the compared count carries the claim.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_in_window_resume_compares_the_prefix_and_hashes_none_of_it() {
         use eventlog_core::ConsistentTenantCapture as _;
@@ -2567,10 +2590,6 @@ mod stamped_resume_cost {
         let writer = crate::cost::of(root) - before;
         assert_eq!(writer.resumes_trusted, 0, "the writer trusted: {writer:?}");
         assert_eq!(
-            writer.prefix_bytes_hashed, 0,
-            "the writer's resume hashed the prefix: {writer:?}"
-        );
-        assert_eq!(
             writer.prefix_bytes_compared, committed,
             "the writer's resume did not compare the whole prefix: {writer:?}"
         );
@@ -2584,10 +2603,6 @@ mod stamped_resume_cost {
             "the capture did not resume: {reader:?}"
         );
         assert_eq!(reader.resumes_trusted, 0, "the reader trusted: {reader:?}");
-        assert_eq!(
-            reader.prefix_bytes_hashed, 0,
-            "the reader's resume hashed the prefix: {reader:?}"
-        );
         assert_eq!(
             reader.prefix_bytes_compared, committed,
             "the reader's resume did not compare the whole prefix: {reader:?}"
@@ -2625,10 +2640,6 @@ mod stamped_resume_cost {
             store.read_stream(&stream(), 0, 100).await.unwrap();
         }
         let spent = crate::cost::of(root) - before;
-        assert_eq!(
-            spent.prefix_bytes_hashed, 0,
-            "an unchanged file was re-hashed: {spent:?}"
-        );
         assert_eq!(
             spent.prefix_bytes_compared, 0,
             "an unchanged file was re-read: {spent:?}"

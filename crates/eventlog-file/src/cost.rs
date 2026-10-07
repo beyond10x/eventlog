@@ -1,9 +1,15 @@
 //! What a handle actually verified, counted per store root. Test-only scaffolding.
 //!
 //! A resumed reader and a strict one read the same bytes of `events.jsonl`, so no damage a case
-//! can do to a store tells them apart: what differs is the frames one of them decodes, chains,
-//! re-encodes and folds, and the objects it hashes. Those are counted here, because a case that
-//! asserts "this handle paid for what changed" has nothing else to assert against.
+//! can do to a store tells them apart: what differs is the work. Counted here, one field each: the
+//! frames a handle decodes and chains, re-encodes and folds; the committed prefix bytes a resume
+//! re-reads and finds equal to the bytes it verified, and the resumes that trusted a stamp and
+//! read none; the objects it hashes and finds to be their record; and the barriers and object
+//! synchronizations a write takes. A case that asserts "this handle paid for what changed" has
+//! nothing else to assert against.
+//!
+//! Every field is charged somewhere outside this file, and `every_counter_is_charged` holds that:
+//! an assertion against a number nothing moves cannot fail, so it asserts nothing.
 //!
 //! The tally is keyed by store root. A process-wide counter would be measuring the whole suite:
 //! these cases run in the same binary, at the same time, as every other case in the crate.
@@ -23,12 +29,6 @@ pub(crate) struct Cost {
     pub frames_reencoded: u64,
     /// Committed transactions deserialized into operations and folded into state.
     pub frames_folded: u64,
-    /// Bytes of an already verified committed prefix re-read and hashed without decoding it.
-    ///
-    /// No path charges this any more: a resume compares the prefix instead
-    /// (`prefix_bytes_compared`). It stays so that a case can assert a resume hashed nothing, and
-    /// so that a hash put back on that path has a number to move.
-    pub prefix_bytes_hashed: u64,
     /// Bytes of an already verified committed prefix re-read and found, byte for byte, to be the
     /// bytes the handle verified.
     ///
@@ -69,7 +69,6 @@ impl std::ops::Sub for Cost {
             frames_chained: self.frames_chained - earlier.frames_chained,
             frames_reencoded: self.frames_reencoded - earlier.frames_reencoded,
             frames_folded: self.frames_folded - earlier.frames_folded,
-            prefix_bytes_hashed: self.prefix_bytes_hashed - earlier.prefix_bytes_hashed,
             prefix_bytes_compared: self.prefix_bytes_compared - earlier.prefix_bytes_compared,
             resumes_trusted: self.resumes_trusted - earlier.resumes_trusted,
             blobs_hashed: self.blobs_hashed - earlier.blobs_hashed,
@@ -98,4 +97,46 @@ pub(crate) fn of(root: &Path) -> Cost {
         .get(root)
         .copied()
         .unwrap_or_default()
+}
+
+/// Every counter is charged somewhere outside this file.
+///
+/// A field nothing charges reads zero forever, so `assert_eq!(spent.field, 0)` passes whatever the
+/// code does. That happened once: the resume stopped hashing its prefix and `prefix_bytes_hashed`
+/// stayed behind, asserted zero by three cases that could no longer fail. The fields are read from
+/// this file's own declaration, so a new one is covered without touching this case.
+#[test]
+fn every_counter_is_charged() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let own = std::fs::read_to_string(source_root.join("cost.rs")).expect("readable cost.rs");
+    let declaration = own
+        .split("pub(crate) struct Cost {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("the Cost declaration");
+    let fields: Vec<&str> = declaration
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub "))
+        .filter_map(|line| line.split(':').next())
+        .collect();
+    assert!(
+        fields.len() >= 8,
+        "the declaration was not read: {fields:?}"
+    );
+    let mut elsewhere = String::new();
+    for entry in std::fs::read_dir(&source_root).expect("readable source directory") {
+        let file = entry.expect("readable entry").path();
+        if file.extension().is_some_and(|kind| kind == "rs") && !file.ends_with("cost.rs") {
+            elsewhere.push_str(&std::fs::read_to_string(&file).expect("readable source file"));
+        }
+    }
+    let collapsed = elsewhere.split_whitespace().collect::<Vec<_>>().join(" ");
+    let uncharged: Vec<&&str> = fields
+        .iter()
+        .filter(|field| !collapsed.contains(&format!("cost.{field} +=")))
+        .collect();
+    assert!(
+        uncharged.is_empty(),
+        "counters no code charges, so every assertion against them passes: {uncharged:?}"
+    );
 }

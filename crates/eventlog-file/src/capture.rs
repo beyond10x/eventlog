@@ -45,7 +45,8 @@ pub(crate) struct Observed {
     /// The committed bytes the fold was built from. A resumed reader re-reads the file's committed
     /// prefix, compares it with them byte for byte and refuses to reuse the view when it is not
     /// them, so a committed frame damaged in place after a capture is never served from memory.
-    /// On a [`FileEventStore`] the buffer is shared with the writer's view ([`retain_once`]).
+    /// On a [`FileEventStore`] the buffer is the writer's view's wherever the two agree
+    /// ([`retain_once`]).
     content: journal::Content,
 }
 
@@ -160,7 +161,7 @@ impl ConsistentTenantCapture for FileEventStore {
                 observe,
             )
             .await;
-            retain_once(runtime);
+            retain_once(runtime).await;
             outcome
         })
     }
@@ -183,22 +184,69 @@ impl ConsistentTenantCapture for FileEventStore {
                 observe_deferred,
             )
             .await;
-            retain_once(runtime);
+            retain_once(runtime).await;
             outcome
         })
     }
 }
 
-/// Keep one handle's committed bytes once: the writer's view and the reader's view of a
-/// [`FileEventStore`] reach the same bytes by separate reads, and this points them at one buffer.
+/// Keep one handle's committed bytes once, after a capture.
 ///
-/// It runs after every capture, the one entry point that holds both slots: whether the capture
-/// read the whole file strictly or the writer reread everything since the last capture, one of
-/// the two copies is dropped here. Only storage moves: each view keeps exactly the bytes, length
-/// and stamp it verified ([`journal::Content::share`]).
-fn retain_once(runtime: &mut crate::Runtime) {
-    if let (Some(verified), Some(captured)) = (&mut runtime.verified, &mut runtime.captured) {
-        captured.content.share(&mut verified.content);
+/// The writer's view and the reader's view of a [`FileEventStore`] reach the same bytes by
+/// separate reads. When they do not already share a buffer, the capture's view is moved onto the
+/// writer's wherever the two agree ([`journal::Content::adopt`]). That compares bytes, so it runs
+/// on the blocking pool like the capture's own read, and only then: a capture that resumed onto a
+/// shared view, the usual case, costs a pointer comparison here and nothing else on the executor.
+/// A writer's view that still keeps a buffer of its own disagrees with the bytes the capture has
+/// just verified under the writers' lock, or names a head the capture has just moved past: either
+/// way the next transaction cannot resume from it, so it is dropped rather than kept beside the
+/// capture's as a second copy.
+async fn retain_once(runtime: &mut crate::Runtime) {
+    let writer = match (&runtime.verified, &runtime.captured) {
+        (Some(verified), Some(captured))
+            if !verified.content.shares_bytes_with(&captured.content) =>
+        {
+            verified.content.clone()
+        }
+        _ => return,
+    };
+    if let Some(captured) = runtime.captured.as_mut() {
+        let mut content = captured.content.clone();
+        if let Ok(content) = blocking(move || {
+            content.adopt(&writer);
+            Ok(content)
+        })
+        .await
+        {
+            captured.content = content;
+        }
+    }
+    if let (Some(verified), Some(captured)) = (&runtime.verified, &runtime.captured)
+        && !verified.content.shares_bytes_with(&captured.content)
+    {
+        runtime.verified = None;
+    }
+}
+
+/// The reader's committed bytes on a [`FileEventStore`], for a transaction's blocking work to keep
+/// its own in ([`journal::Journal::adopt`]). A clone of the view: a reference count, no bytes.
+pub(crate) fn reader_bytes(captured: Option<&Observed>) -> Option<journal::Content> {
+    captured.map(|view| view.content.clone())
+}
+
+/// Keep one handle's committed bytes once, after a transaction entered.
+///
+/// The transaction has already moved its bytes onto the reader's buffer, inside its blocking work,
+/// wherever the two agree. A reader's view that still keeps a buffer of its own disagrees with the
+/// bytes the writer has just verified under the writers' lock — a history it observed is no longer
+/// the committed one — so it is dropped rather than kept as a second copy. A pointer comparison:
+/// this runs on the async executor and reads no byte.
+pub(crate) fn keep_reader_once(captured: &mut Option<Observed>, writer: &journal::Journal) {
+    if captured
+        .as_ref()
+        .is_some_and(|view| !writer.shares_bytes_with(&view.content))
+    {
+        *captured = None;
     }
 }
 
@@ -1194,6 +1242,84 @@ mod tests {
         assert!(
             shared(&store).await,
             "a capture after the writer moved kept its own copy"
+        );
+    }
+
+    /// A reader's view the writer cannot share is dropped by the next transaction rather than kept
+    /// beside the writer's as a second copy. A privacy rewrite is the case where they cannot: the
+    /// capture's view holds the epoch before it, every frame of which differs from the new one, and
+    /// those are the bytes the rewrite removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_view_from_before_a_privacy_rewrite_is_dropped_by_the_next_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("reader-dropped-owner").unwrap();
+        let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.stream_identity(&tenant).await.unwrap();
+        for index in 0..2_u64 {
+            store
+                .append(
+                    &stream,
+                    if index == 0 {
+                        Expected::NoStream
+                    } else {
+                        Expected::Exact(index)
+                    },
+                    &[eventlog_conformance::event(
+                        "item.changed",
+                        i64::try_from(index).unwrap(),
+                    )],
+                    &eventlog_conformance::meta(&format!("before-{index}"), &json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        store.redact(&stream, 1, "privacy").await.unwrap();
+        assert!(
+            store.runtime.lock().await.captured.is_some(),
+            "the control: the rewrite itself leaves the reader's view where it was"
+        );
+        store.read_stream(&stream, 0, 10).await.unwrap();
+        let runtime = store.runtime.lock().await;
+        assert!(
+            runtime.verified.is_some(),
+            "the fixture needs the writer's view"
+        );
+        assert!(
+            runtime.captured.is_none(),
+            "a reader's view of the epoch before a rewrite was kept beside the writer's"
+        );
+    }
+
+    /// The capture-side half of the same rule: a writer's view the capture cannot share is dropped
+    /// rather than kept as a second copy. A writer that observed the store empty and a capture that
+    /// reads what another handle committed since cannot share a buffer, because a view of no bytes
+    /// never adopts one; and the writer's view names a head the capture has moved past.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_writer_view_the_capture_cannot_share_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("writer-dropped-owner").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        assert!(
+            store.runtime.lock().await.verified.is_some(),
+            "the control: the open keeps the writer's view"
+        );
+        {
+            let other = FileEventStore::open(root).await.unwrap();
+            other.stream_identity(&tenant).await.unwrap();
+        }
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        let runtime = store.runtime.lock().await;
+        assert!(
+            runtime.captured.is_some(),
+            "the fixture needs the reader's view"
+        );
+        assert!(
+            runtime.verified.is_none(),
+            "a writer's view the capture could not share was kept beside the capture's"
         );
     }
 }
