@@ -12,6 +12,8 @@ publish.workspace = true
 eventlog-core.workspace = true
 # `serialize` writes and reads a whole in-memory database, so a tree store reopens without a replay.
 rusqlite = { workspace = true, features = ["serialize"] }
+# Derives the JSON encoding of durable capture checkpoints and journal entries.
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt"] }

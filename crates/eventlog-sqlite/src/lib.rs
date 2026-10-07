@@ -13,6 +13,7 @@
 
 mod atomic_group;
 mod capture;
+mod durable_capture;
 mod inline_admin;
 mod inspection;
 mod tracked_capture;
@@ -316,6 +317,7 @@ impl Inner {
             .map_err(backend)?;
         let inner = Self::new(connection, prefix);
         inner.require_existing_schema()?;
+        inner.refresh_durable_instance();
         Ok(inner)
     }
 
@@ -344,6 +346,7 @@ impl Inner {
             .map_err(backend)?;
         let store = Self::new(connection, prefix);
         let report = store.create_tables(migration)?;
+        store.refresh_durable_instance();
         Ok((store, report))
     }
 
@@ -950,14 +953,11 @@ fn sqlite_blob_shape(
             "incompatible SQLite blob relation".into(),
         ));
     }
-    let hidden_objects: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE tbl_name=?1 AND type='trigger'",
-            params![table],
-            |row| row.get(0),
-        )
-        .map_err(backend)?;
-    if hidden_objects != 0 || sql.contains("WITHOUT ROWID") || sql.contains("STRICT") {
+    // Durable capture continuity's own triggers are admitted by exact name and text; any other
+    // trigger is a hidden writer, as it always was.
+    let hidden_objects =
+        durable_capture::foreign_triggers_on(connection, prefix, &table).map_err(backend)?;
+    if hidden_objects || sql.contains("WITHOUT ROWID") || sql.contains("STRICT") {
         return Err(EventLogError::Invalid(
             "unsupported SQLite blob trigger or table behavior".into(),
         ));
@@ -2024,6 +2024,8 @@ impl Inner {
                 ],
             )
             .map_err(backend)?;
+        // Durable journal entries hold copies of projection row values; none survive this.
+        durable_capture::clear_journal(&transaction, &prefix)?;
         let mut events = select_versions(
             &transaction,
             &prefix,
@@ -2041,11 +2043,28 @@ impl Inner {
         let transaction = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
+        let before = tracked_capture::Stamp::read(&transaction).ok();
         transaction.execute(&format!("INSERT INTO {prefix}_snapshot_generations (tenant_id,stream_type,stream_id,generation) VALUES (?1,?2,?3,?4) ON CONFLICT (tenant_id,stream_type,stream_id) DO NOTHING"), params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),eventlog_core::new_event_id()]).map_err(backend)?;
         let generation: String = transaction.query_row(&format!("SELECT generation FROM {prefix}_snapshot_generations WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3"), params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id()], |row| row.get(0)).map_err(backend)?;
         let generation = generation.parse::<SnapshotGeneration>()?;
+        let after = tracked_capture::Stamp::read(&transaction).ok();
         transaction.commit().map_err(backend)?;
+        self.carry_continuity(before, after);
         Ok(generation)
+    }
+
+    /// A snapshot table is not captured material: the provider's own write to one keeps
+    /// in-process continuity, and moves no durable mark.
+    fn carry_continuity(
+        &self,
+        before: Option<tracked_capture::Stamp>,
+        after: Option<tracked_capture::Stamp>,
+    ) {
+        if let (Some(before), Some(after)) = (before, after) {
+            self.tracked.neutral(before, after);
+        } else {
+            self.tracked.invalidate();
+        }
     }
 
     fn save_snapshot_checked(
@@ -2059,6 +2078,7 @@ impl Inner {
         let transaction = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
+        let before = tracked_capture::Stamp::read(&transaction).ok();
         let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation.as_uuid().to_string()]).map_err(backend)?;
         if accepted == 0 {
             transaction.rollback().map_err(backend)?;
@@ -2088,7 +2108,9 @@ impl Inner {
                 ],
             )
             .map_err(backend)?;
+        let after = tracked_capture::Stamp::read(&transaction).ok();
         transaction.commit().map_err(backend)?;
+        self.carry_continuity(before, after);
         Ok(true)
     }
 
@@ -2258,6 +2280,8 @@ impl Inner {
                 params![coordinate_prefix],
             )
             .map_err(backend)?;
+        // Durable journal entries hold copies of projection row values; none survive this.
+        durable_capture::clear_journal(&transaction, &prefix)?;
         transaction.commit().map_err(backend)
     }
 
@@ -2505,37 +2529,47 @@ impl Inner {
             .map_err(backend)
     }
 
+    /// Create each projection's table and registry row in one transaction. On an owner with
+    /// durable capture continuity, each table gets the provider's triggers in that same
+    /// transaction, so no write to it can ever leave the durable mark where it was.
     fn create_projections(&self, projector: &dyn Projector) -> Result<(), EventLogError> {
         let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
         for spec in projector.projections() {
             spec.validate()?;
-            let table = projection_table(prefix, spec.name);
-            let body = projection_table_body(spec.indexed.len());
-            let indexes: String = joined(spec.indexed.len(), |position| {
-                let index = projection_index(&table, position);
-                format!(
-                    "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
-                )
-            });
-            guard
-                .execute_batch(&format!(
-                    "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
-                ))
-                .map_err(backend)?;
         }
-        for spec in projector.projections() {
-            let indexed = serde_json::to_string(spec.indexed)
-                .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
-            guard.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES(?1,?2) ON CONFLICT(projection_name) DO NOTHING"),params![spec.name,&indexed]).map_err(backend)?;
-            let recorded:String=guard.query_row(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"),params![spec.name],|row|row.get(0)).map_err(backend)?;
-            if recorded != indexed {
-                return Err(EventLogError::Invalid(
-                    "projection registration shape changed".into(),
-                ));
+        let guard = self.connection.lock().map_err(poisoned)?;
+        begin_immediate(&guard)?;
+        let result = (|| {
+            for spec in projector.projections() {
+                let table = projection_table(prefix, spec.name);
+                let body = projection_table_body(spec.indexed.len());
+                let indexes: String = joined(spec.indexed.len(), |position| {
+                    let index = projection_index(&table, position);
+                    format!(
+                        "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
+                    )
+                });
+                guard
+                    .execute_batch(&format!(
+                        "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
+                    ))
+                    .map_err(backend)?;
+                durable_capture::cover_projection(&guard, prefix, &table)?;
             }
-        }
-        Ok(())
+            for spec in projector.projections() {
+                let indexed = serde_json::to_string(spec.indexed)
+                    .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+                guard.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES(?1,?2) ON CONFLICT(projection_name) DO NOTHING"),params![spec.name,&indexed]).map_err(backend)?;
+                let recorded:String=guard.query_row(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"),params![spec.name],|row|row.get(0)).map_err(backend)?;
+                if recorded != indexed {
+                    return Err(EventLogError::Invalid(
+                        "projection registration shape changed".into(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        finish_transaction(&guard, result)
     }
 
     fn register_inline(&self, projector: Arc<dyn Projector>) -> Result<(), EventLogError> {
@@ -3185,7 +3219,7 @@ impl SqliteProjections<'_> {
         if let Ok(value) = self.get_now(projection, tenant, key) {
             value
         } else {
-            self.tracked.invalidate();
+            self.tracked.unknown_before();
             None
         }
     }

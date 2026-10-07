@@ -5,6 +5,26 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- Durable capture continuity on SQLite: a capture checkpoint a later process can continue from.
+  `ConsistentTenantCapture` gains `durable_checkpoint`, `restore_checkpoint` and
+  `checkpoint_usage`, default methods returning `None`, so every provider compiles unchanged and
+  PostgreSQL, File and Tree keep complete capture. `DurableCaptureCheckpoint` holds the provider's
+  bytes and prints only their length. `SqliteEventStore::enable_durable_continuity` installs, in
+  one transaction, a `<prefix>_capture_continuity` row (store instance, epoch, random token), a
+  `<prefix>_capture_journal` kept within 128 entries and 16 MiB, and provider triggers on the
+  events, blobs, identity and registered projection tables; `create_projections` gives each table
+  it creates the same triggers. Each acknowledged atomic group writes one journal entry in its own
+  transaction. A restored checkpoint continues as `Unchanged` or `AppendDelta` only through an
+  unbroken chain of such entries; any other write, a dropped or altered trigger, a pruned entry or
+  an older copy of the file gives `Complete`. Standalone `append`, `put_blob` and `delete_blob`
+  are not journaled, and redaction and tenant erasure delete every entry. The provider's own
+  snapshot writes no longer end in-process continuity. Design:
+  `docs/design/durable-capture-continuity.md`. **One-way for older readers:** Eventlog 0.7.0 and
+  earlier refuse a store carrying the provider triggers; `disable_durable_continuity` drops them
+  and both tables, after which those versions open and attach the store as before.
+
 ## 0.7.0 — 2026-10-07
 
 ### Added

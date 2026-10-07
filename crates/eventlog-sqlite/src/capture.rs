@@ -12,17 +12,19 @@ use std::sync::Arc;
 use eventlog_core::{
     BoxFuture, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
     CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection, ConsistentTenantCapture,
-    EventLogError, ProjectionCaptureRefusal, ProjectionSpec, RecordedEvent, TenantCapture,
-    TenantCaptureUpdate, TenantId, order_blobs, order_rows, validate_capture_request,
-    validate_captured_digest, validate_captured_order,
+    DurableCaptureCheckpoint, EventLogError, ProjectionCaptureRefusal, ProjectionSpec,
+    RecordedEvent, TenantCapture, TenantCaptureUpdate, TenantId, order_blobs, order_rows,
+    validate_capture_request, validate_captured_digest, validate_captured_order,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde_json::Value;
 
 use crate::{
-    COLUMNS, Inner, SqliteEventStore, backend, begin_immediate, poisoned, projection_index,
-    projection_table, projection_table_body, read_event, sqlite_schema_tokens,
-    sqlite_table_body_tokens, to_i64, to_u64,
+    COLUMNS, Inner, SqliteEventStore, backend, begin_immediate,
+    durable_capture::{self, Continued},
+    poisoned, projection_index, projection_table, projection_table_body, read_event,
+    sqlite_schema_tokens, sqlite_table_body_tokens, to_i64, to_u64,
+    tracked_capture::{Checkpoint, Scope, Stamp},
 };
 
 /// How many rows one bounded read retains at a time inside the capture transaction.
@@ -63,6 +65,29 @@ impl ConsistentTenantCapture for SqliteEventStore {
                 )))
             })
         })
+    }
+    /// The durable values read inside the capture that issued `checkpoint`, as JSON; `None`
+    /// unless durable continuity was enabled then and every captured table of the request
+    /// carried exactly the provider's triggers.
+    fn durable_checkpoint(
+        &self,
+        checkpoint: &CaptureCheckpoint,
+    ) -> Option<DurableCaptureCheckpoint> {
+        let held = checkpoint.downcast_ref::<Checkpoint>()?;
+        durable_capture::encode(held, &self.inner.prefix).map(DurableCaptureCheckpoint::from_bytes)
+    }
+    /// `None` for bytes of another format, version, prefix or store instance, and for bytes that
+    /// do not decode; the next capture is then complete. The instance compared here is the one
+    /// this handle last read; a capture compares the stored one inside its own transaction.
+    fn restore_checkpoint(&self, durable: &DurableCaptureCheckpoint) -> Option<CaptureCheckpoint> {
+        let instance = self.inner.tracked.instance()?;
+        durable_capture::decode(durable.as_bytes(), &self.inner.prefix, &instance)
+            .map(CaptureCheckpoint::new)
+    }
+    fn checkpoint_usage(&self, checkpoint: &CaptureCheckpoint) -> Option<CaptureUsage> {
+        checkpoint
+            .downcast_ref::<Checkpoint>()
+            .map(|held| held.usage)
     }
     fn capture_tenant<'a>(
         &'a self,
@@ -134,35 +159,42 @@ impl Inner {
             .map_err(|e| CaptureError::Store(poisoned(e)))?;
         begin_immediate(&connection)?;
         let result = (|| {
-            let stamp = crate::tracked_capture::Stamp::read(&connection)?;
-            if let Some(previous) = previous
-                && let Some(update) =
-                    self.tracked
-                        .since(stamp, tenant, projections, limits, previous)?
-            {
-                return Ok(update);
+            let stamp = Stamp::read(&connection)?;
+            if let Some(previous) = previous {
+                let mut durable = || self.durable_binding(&connection, projections, stamp.schema());
+                if let Some(update) = self.tracked.since(
+                    stamp,
+                    tenant,
+                    projections,
+                    limits,
+                    previous,
+                    &mut durable,
+                )? {
+                    return Ok(update);
+                }
+                if let Some(update) =
+                    self.durable_since(&connection, stamp, tenant, projections, limits, previous)?
+                {
+                    return Ok(update);
+                }
             }
             let (capture, usage) = self.observe(&connection, tenant, projections, limits)?;
             // A trigger or cascading foreign key can write captured rows outside our closed
             // provider write interface. Such schemas remain capturable but cannot issue proof
-            // that an append changed only what our journal observed.
-            let indirect: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='trigger')
-                     OR EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type='trigger')
-                     OR EXISTS(SELECT 1 FROM main.sqlite_schema AS s,
-                         pragma_foreign_key_list(s.name,'main') WHERE s.type='table')
-                     OR EXISTS(SELECT 1 FROM temp.sqlite_schema AS s,
-                         pragma_foreign_key_list(s.name,'temp') WHERE s.type='table')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(operational)?;
-            let checkpoint = if indirect {
-                None
-            } else {
-                self.tracked.complete(stamp, &capture, limits, usage)
-            };
+            // that an append changed only what our journal observed. Durable continuity's own
+            // triggers write only their owner's continuity row, and are admitted by exact text.
+            let checkpoint =
+                if durable_capture::indirect_writers(&connection).map_err(operational)? {
+                    None
+                } else {
+                    let durable = self.durable_binding(&connection, projections, stamp.schema())?;
+                    self.tracked.issue(
+                        stamp,
+                        Scope::of(tenant, &capture.stream_identity, projections, limits),
+                        usage,
+                        durable,
+                    )
+                };
             Ok(TenantCaptureUpdate::Complete {
                 capture,
                 checkpoint,
@@ -183,6 +215,52 @@ impl Inner {
                 Err(error)
             }
         }
+    }
+
+    /// Continue from a checkpoint's durable values, whichever process or handle issued it.
+    ///
+    /// The returned checkpoint carries this handle's in-process authority as well, so the next
+    /// capture in this process continues through the in-process journal.
+    fn durable_since(
+        &self,
+        connection: &Connection,
+        stamp: Stamp,
+        tenant: &TenantId,
+        projections: &[ProjectionSpec],
+        limits: CaptureLimits,
+        previous: &CaptureCheckpoint,
+    ) -> Result<Option<TenantCaptureUpdate>, CaptureError> {
+        let Some(old) = previous.downcast_ref::<Checkpoint>() else {
+            return Ok(None);
+        };
+        if old.durable.is_none() || !old.scope.matches(tenant, projections, limits) {
+            return Ok(None);
+        }
+        if durable_capture::indirect_writers(connection).map_err(operational)? {
+            return Ok(None);
+        }
+        let Some(now) = self.durable_binding(connection, projections, stamp.schema())? else {
+            return Ok(None);
+        };
+        let Some(continued) =
+            self.continue_durably(connection, tenant, projections, limits, old, &now)?
+        else {
+            return Ok(None);
+        };
+        let (usage, delta) = match continued {
+            Continued::Unchanged => (old.usage, None),
+            Continued::Delta(delta) => (delta.resulting_usage, Some(delta)),
+        };
+        let Some(checkpoint) = self
+            .tracked
+            .issue(stamp, old.scope.clone(), usage, Some(now))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match delta {
+            None => TenantCaptureUpdate::Unchanged { checkpoint },
+            Some(delta) => TenantCaptureUpdate::AppendDelta { checkpoint, delta },
+        }))
     }
 
     fn observe(
@@ -636,14 +714,10 @@ pub(crate) fn admit_projection(
     let Some((kind, Some(sql))) = relation else {
         return Err(refuse(ProjectionCaptureRefusal::PhysicalShapeMismatch));
     };
-    let triggers: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE tbl_name=?1 AND type='trigger'",
-            params![table],
-            |row| row.get(0),
-        )
-        .map_err(operational)?;
-    if kind != "table" || triggers != 0 || sql.contains("WITHOUT ROWID") || sql.contains("STRICT") {
+    // Only durable continuity's own triggers, by exact name and text, may sit on the table.
+    let triggers =
+        durable_capture::foreign_triggers_on(connection, prefix, &table).map_err(operational)?;
+    if kind != "table" || triggers || sql.contains("WITHOUT ROWID") || sql.contains("STRICT") {
         return Err(refuse(ProjectionCaptureRefusal::PhysicalShapeMismatch));
     }
     let body = projection_table_body(specification.indexed.len());
