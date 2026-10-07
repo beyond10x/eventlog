@@ -6,10 +6,14 @@ status: draft
 title: A resumed handle proves its prefix without reading all of it
 summary: replace the whole-prefix re-hash with an incremental or block-wise digest; target 7 ms
 owner: eventlog
+refs:
+- provider: github
+  reference: beyond10x/eventlog#42
 relations:
 - informed_by: story:file-eventlog-verifies-once-per-open
 - informed_by: review-result:verify-once-review-1
-revision: 1
+- serves: vision:O2
+revision: 3
 ---
 ## Outcome
 
@@ -54,3 +58,26 @@ extrapolates to about 2.4 s against 79.7 s — a large win, and still O(store by
 - `docs/design/file-provider.md` states what a resumed handle reads and what it trusts, and the
   safety envelope reads no weaker than it does at 9f234c5.
 - No refusal is traded for the speed. A design that reaches 7 ms by trusting more is not this story.
+
+## Finding: the window
+
+Recorded 2026-10-07 by the coordinator of the file-provider-cost wave, from the `story-scoper`
+report at `de30462b`. Inferred, level 3 (walked, not run).
+
+- Since 3ae11c01 a resume over an unchanged file whose stamp is at least 2 s old reads 0 prefix
+  bytes (`crates/eventlog-file/src/journal.rs:656-662`). The whole-prefix read (:665-676) remains
+  inside 2 s of any change, the handle's own writes included (`absorb` clears the stamp,
+  :107-111), and after another writer appends (:656 requires `manifest == *observed`).
+- Inside the window no digest, in memory or on disk, removes the read: the refusal cases damage
+  `events.jsonl` in place at the same length microseconds after a write
+  (`tests/verify_once_review.rs:22-37`), the handle holds no trusted stamp then (:107-111,
+  :175-184), and the damaged bytes are the only evidence.
+- `Manifest`, `Frame` and the intents are `deny_unknown_fields` (:32, :43, :55, :63) and `format`
+  must equal `eventlog-file/1` (:12), so a persisted digest is a format change.
+- The 1,045 ms baseline in `## Why` may not reproduce at `de30462b`: `measure_review_two.rs`
+  builds and reads in separate runs, so its reads likely take the trusted stamp path.
+
+Consequence: this story's acceptance (no whole-prefix read, no added trust) is reachable only with a
+layout whose sealed parts age past the window, such as a segmented journal, which is a new format.
+story:file-eventlog-rechecks-its-prefix-by-comparison takes the reachable part: the read stays and
+the SHA-256 goes.
