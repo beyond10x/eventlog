@@ -82,8 +82,11 @@ this provider issued or restored: the counts a complete capture of that observat
 
 `restore_checkpoint` returns `None` for truncated, malformed, foreign-provider, other-prefix,
 other-store-instance and newer-version bytes, never an error. It is synchronous and compares the
-store instance this handle last read; a capture compares the stored instance again inside its
-transaction, so bytes from before a disable and re-enable by another process give `Complete`.
+store instance this handle last read. A handle that has not yet seen continuity enabled accepts
+well-formed bytes for its prefix and leaves the comparison to the capture. A capture compares the
+stored instance again inside its transaction, so bytes from before a disable and re-enable by
+another process give `Complete`. `checkpoint_usage` of a restored checkpoint is `None` until a
+capture has validated it.
 `durable_checkpoint` returns `None` on a store where `enable_durable_continuity` has not run, and
 for a checkpoint taken while a requested projection table carried no provider trigger.
 
@@ -132,7 +135,15 @@ A deduplicated group with no physical write writes no entry. A refused or rolled
 nothing. Standalone `append`, `put_blob`, `delete_blob`, projection administration and every other
 write path are not journaled: they move the mark without an entry, so the next restored checkpoint
 returns `Complete`. `redact` and tenant erasure also delete every journal entry in their own
-transaction, because entries hold copies of projection row values.
+transaction, because entries hold copies of projection row values. A later group for a tenant with
+redacted history writes an entry that keeps the chain (tenant, `from`, `to`) and carries no event
+positions, blob digests or row values: every capture of that tenant refuses with
+`RedactedHistory`, and a redacted value must not outlive its row in the journal.
+
+Row values in both journals are the stored body text, parsed by the same function a complete
+capture uses. A value is never parsed and re-serialized on its way into an entry, so a float
+`serde_json` does not round-trip arrives in a delta exactly as a complete capture reads it, and
+usage is measured on the stored text.
 
 The provider's own snapshot writes touch no captured table and so end neither durable continuity
 nor, after this change, in-process continuity: the snapshot write path re-synchronizes the
@@ -148,8 +159,10 @@ transaction. The in-process checkpoint carries these values when durable continu
 
 `capture_tenant_since` with a restored checkpoint, inside one `BEGIN IMMEDIATE` transaction:
 
-1. validates the request scope against the checkpoint scope exactly, as for an in-process one;
-2. reads instance, mark, schema version and the newest journal position;
+1. validates the request scope against the checkpoint scope exactly, as for an in-process one, and
+   runs the projection admission a complete capture runs;
+2. reads instance, mark, schema version, the newest journal position and the tenant's stored
+   stream identity, which must equal the checkpoint's;
 3. checks that events, blobs, identity and every requested projection table carry exactly the
    provider's triggers, by name and SQL text, and that no foreign trigger or foreign key exists;
 4. returns `Unchanged` when instance, schema version, mark and position all equal the
@@ -160,7 +173,16 @@ transaction. The in-process checkpoint carries these values when durable continu
    read back by global position; blobs by digest. Usage is accumulated with the existing checked
    accounting and the request's limits apply to the resulting whole observation;
 6. returns `Complete` otherwise: a foreign write breaks the chain, a pruned entry leaves a gap, a
-   dropped or altered trigger changes the schema version, re-enabling mints a new instance.
+   dropped or altered trigger changes the schema version, re-enabling mints a new instance. A
+   limit the continued observation would exceed also gives `Complete`, never `LimitExceeded`: the
+   usage came from caller-held bytes, and the complete path applies the limits to the real
+   observation.
+
+Table names in every trigger check are compared case-insensitively, as SQLite resolves them.
+
+Any DDL in the file, by any owner sharing it, moves `PRAGMA main.schema_version`; every owner's
+next restored capture is then `Complete`. Owners stay independent in what they store, not in this
+cost.
 
 A file restored from an older copy and written as many times as the groups it lost carries the
 same epoch and position as a newer checkpoint; the random token makes that coincidence a 128-bit
@@ -168,8 +190,9 @@ collision.
 
 ## Out of scope
 
-Raw file edits that bypass SQLite; a connection that disables triggers or rewrites the continuity
-tables consistently; durable continuity for PostgreSQL, File and Tree.
+Raw file edits that bypass SQLite; incremental BLOB I/O (`sqlite3_blob_write`), which writes a
+column in place and fires no trigger; a connection that disables triggers or rewrites the
+continuity tables consistently; durable continuity for PostgreSQL, File and Tree.
 
 ## Acceptance
 

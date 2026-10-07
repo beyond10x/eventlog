@@ -17,7 +17,7 @@ story:generate-capture-types-from-ess stays draft and outside the wave: it waits
 | role | branch | managed id / tree | build | scratch | stage |
 |---|---|---|---|---|---|
 | integration | `wave/durable-capture-continuity` | `wave-durable` | tree `target/` | `~/.cache/eventlog-dsp15/wave` | opened at `0b96dd51` (plan `4496d9ae` + main `cf7f61e1`) |
-| unit | `feat/durable-capture-continuity` | `durable-continuity` | tree `target/` | `~/.cache/eventlog-dsp15` | unit commit `d9a07279`; implementor green (228 passed, package-scoped); `aep:adversary` and `aep:security-reviewer` running |
+| unit | `feat/durable-capture-continuity` | `durable-continuity` | tree `target/` | `~/.cache/eventlog-dsp15` | unit commit `d9a07279`; review round 1 NEEDS-CHANGE (adversary 6 red, security 5 red); implementor fixing |
 
 The unit tree was opened on the plan commit before the wave shape was set; it is the unit's branch.
 Only the coordinator writes the planning store, in the integration tree.
@@ -45,3 +45,5 @@ PostgreSQL 17.6 with verified TLS, per-step output kept under the scratch root.
 | agent | tokens | tool uses | wall |
 |---|---|---|---|
 | `aep:implementor` | 557,859 | 162 | 66 min |
+| `aep:adversary` pass 1 | 313,481 | 57 | 20 min |
+| `aep:security-reviewer` pass 1 | 285,039 | 86 | 22 min |
