@@ -6,9 +6,11 @@
 //! together. The provider supplies the whole thing under one native boundary instead, or it
 //! supplies nothing.
 //!
-//! Nothing here is persisted. These are transient values at a read boundary: no wire contract, no
-//! stored identity, no format version. The envelope a fact is recorded in remains [`RecordedEvent`]
-//! and the projection vocabulary remains [`ProjectionSpec`].
+//! Nothing here is persisted by this crate. These are transient values at a read boundary: no wire
+//! contract, no stored identity, no format version. The envelope a fact is recorded in remains
+//! [`RecordedEvent`] and the projection vocabulary remains [`ProjectionSpec`]. The one value a
+//! consumer may keep is [`DurableCaptureCheckpoint`], whose bytes and format belong to the provider
+//! that encoded them.
 
 use std::{
     any::Any,
@@ -47,7 +49,10 @@ pub struct CaptureUsage {
 /// An immutable provider-issued observation capability, never a persisted or caller-made cursor.
 ///
 /// Each provider accepts only its private payload type and exact connection issuer identity.
-/// Wrapping an arbitrary value does not grant authority to reuse any provider's observation.
+/// Wrapping an arbitrary value does not grant authority to reuse any provider's observation. A
+/// provider that can prove continuity across processes offers a persistable form through
+/// [`ConsistentTenantCapture::durable_checkpoint`] and accepts it back through
+/// [`ConsistentTenantCapture::restore_checkpoint`].
 #[derive(Clone)]
 pub struct CaptureCheckpoint(Arc<dyn Any + Send + Sync>);
 
@@ -66,6 +71,39 @@ impl CaptureCheckpoint {
 impl std::fmt::Debug for CaptureCheckpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CaptureCheckpoint(..)")
+    }
+}
+
+/// Provider-encoded bytes naming one observation a later process may continue from.
+///
+/// Opaque to consumers: a consumer keeps the bytes and hands them back, nothing else. The
+/// provider's encoding names its own kind and format version, so bytes from another provider,
+/// another store or a newer format restore to nothing rather than to a wrong answer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DurableCaptureCheckpoint(Vec<u8>);
+
+impl DurableCaptureCheckpoint {
+    /// Wrap bytes a provider encoded, or bytes a consumer kept and now hands back.
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// The bytes to keep.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DurableCaptureCheckpoint {
+    /// The length only: the bytes carry scope coordinates a log line has no business holding.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "DurableCaptureCheckpoint({} bytes)",
+            self.0.len()
+        )
     }
 }
 
@@ -373,6 +411,34 @@ pub trait ConsistentTenantCapture: Send + Sync + 'static {
                 checkpoint: None,
             })
         })
+    }
+
+    /// The persistable form of `checkpoint`, if this provider can later prove continuity from its
+    /// observation after the issuing process and connection are gone.
+    ///
+    /// The bytes encode what the provider read inside the capture that issued `checkpoint`, never
+    /// what it would read now, so a write between that capture and this call is reported by the
+    /// next capture rather than absorbed into the checkpoint. The default has no durable form.
+    fn durable_checkpoint(
+        &self,
+        _checkpoint: &CaptureCheckpoint,
+    ) -> Option<DurableCaptureCheckpoint> {
+        None
+    }
+
+    /// A checkpoint [`Self::capture_tenant_since`] accepts in place of the one `durable` was made
+    /// from.
+    ///
+    /// Unknown, foreign, malformed or newer-format bytes give `None`, never an error; the next
+    /// capture is then complete. The default restores nothing.
+    fn restore_checkpoint(&self, _durable: &DurableCaptureCheckpoint) -> Option<CaptureCheckpoint> {
+        None
+    }
+
+    /// The usage this provider bound to `checkpoint`'s observation: the counts a complete capture
+    /// of that observation reports. `None` for a checkpoint it did not issue or restore.
+    fn checkpoint_usage(&self, _checkpoint: &CaptureCheckpoint) -> Option<CaptureUsage> {
+        None
     }
 
     /// Observe one tenant's history, bound content and requested materializations together.
@@ -882,6 +948,35 @@ mod tests {
             eager,
             "the default read in full is the value capture_tenant returned"
         );
+    }
+
+    /// A durable checkpoint carries tenant and stream coordinates; a log line gets its length.
+    #[test]
+    fn a_durable_checkpoint_shows_its_length_and_never_its_bytes() {
+        let durable = DurableCaptureCheckpoint::from_bytes(b"tenant-coordinates".to_vec());
+        assert_eq!(format!("{durable:?}"), "DurableCaptureCheckpoint(18 bytes)");
+        assert_eq!(durable.as_bytes(), b"tenant-coordinates");
+        assert_eq!(durable.clone(), durable);
+    }
+
+    /// Every provider that does not override them compiles unchanged and promises nothing.
+    #[test]
+    fn a_provider_without_durable_continuity_offers_restores_and_binds_nothing() {
+        let provider = Recorded(TenantCapture {
+            tenant: TenantId::new("tenant-1").unwrap(),
+            stream_identity: "identity-1".to_owned(),
+            events: Vec::new(),
+            blobs: Vec::new(),
+            projections: Vec::new(),
+        });
+        let checkpoint = CaptureCheckpoint::new(7_u64);
+        assert_eq!(provider.durable_checkpoint(&checkpoint), None);
+        assert!(
+            provider
+                .restore_checkpoint(&DurableCaptureCheckpoint::from_bytes(vec![1, 2, 3]))
+                .is_none()
+        );
+        assert_eq!(provider.checkpoint_usage(&checkpoint), None);
     }
 
     fn recorded(global_seq: u64, version: u64, stream_id: &str) -> RecordedEvent {

@@ -347,15 +347,11 @@ mod linux {
             if kind != "table" || compact(&sql) != compact(&expected_sql) {
                 return Err(InspectionError::UnsupportedSource);
             }
-            // `rusqlite` 0.40 reads SQLite integers as `i64`; `u64` has no `FromSql`.
-            let triggers: i64 = connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1",
-                    [&name],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if triggers != 0 {
+            // Durable capture continuity's own triggers, by exact name and text, only advance
+            // their owner's continuity row; every other trigger is refused as before.
+            if super::super::durable_capture::foreign_triggers_on(connection, prefix, &name)
+                .map_err(sql_error)?
+            {
                 return Err(InspectionError::UnsupportedSource);
             }
         }

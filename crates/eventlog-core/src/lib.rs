@@ -24,10 +24,10 @@ pub use capture::{
     BoundBlobs, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
     CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection,
     CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture, DeferredBlob,
-    DeferredTenantCapture, ProjectionCaptureRefusal, TenantCapture, TenantCaptureDelta,
-    TenantCaptureUpdate, order_blobs, order_deferred_blobs, order_rows, validate_capture_request,
-    validate_captured_branchable_order, validate_captured_digest, validate_captured_event,
-    validate_captured_order,
+    DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal, TenantCapture,
+    TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs, order_rows,
+    validate_capture_request, validate_captured_branchable_order, validate_captured_digest,
+    validate_captured_event, validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 
@@ -1289,6 +1289,23 @@ mod tests {
             "heads that concatenate alike were not told apart"
         );
         assert_eq!(one.to_hex().len(), 64);
+    }
+
+    /// Every stored idempotency hash is this function's output, so its bytes are a stored format.
+    ///
+    /// The body is parsed from text because that is where `serde_json/arbitrary_precision`, which
+    /// a generated ESS Rust crate enables and Cargo would unify into this one, changes the answer:
+    /// it keeps `1.50` as written where the default reads the double `1.5`.
+    #[test]
+    fn request_hash_of_a_body_holding_one_point_five_zero_is_pinned() {
+        let body: Value =
+            serde_json::from_str(r#"{"amount":1.50,"currency":"EUR","lines":[{"quantity":2}]}"#)
+                .unwrap();
+        assert_eq!(
+            request_hash(&body).unwrap(),
+            "0fe57c7f338081f1d52407f140f38919a5d9b96dc2c5234ab63f32c423217849",
+            "the stored hash of {{\"amount\":1.5,...}}; 1.50 kept as written hashes otherwise"
+        );
     }
 
     fn meta() -> CommandMeta {
