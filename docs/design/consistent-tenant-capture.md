@@ -369,8 +369,10 @@ model/checkpoint pair. The capture makes no freshness promise after its observat
 
 ### SQLite consistency and journal
 
-All continuity state is in memory; no column, trigger, event, format or stored identity is added.
-The existing connection mutex protects the connection and orders access to a private journal. If
+In-process continuity state is in memory; it adds no column, trigger, event, format or stored
+identity. Durable continuity (`docs/design/durable-capture-continuity.md`) is a separate,
+explicitly enabled and reversible opt-in that adds provider triggers, a continuity row and a
+journal table; the rules below hold with or without it. The existing connection mutex protects the connection and orders access to a private journal. If
 a separate mutex holds journal metadata, every access takes the connection lock first. Issuer
 state cannot be shared across independently opened connections.
 
@@ -391,10 +393,11 @@ capturing; no connection handle escapes. Failed commit/rollback/read returns no 
 
 Every establishment of continuity also checks the main and temporary schema catalogs for triggers
 and foreign keys. Their implicit side effects could mutate previously captured rows outside the
-provider's journal instrumentation. If either schema contains any trigger or foreign-key reference,
-complete capture still works but returns `checkpoint: None`. This deliberately conservative
-eligibility rule includes unrelated tables. Later main or temporary schema changes invalidate
-existing checkpoints. No trigger or schema change is introduced by this check.
+provider's journal instrumentation. If either schema contains any trigger other than a durable
+continuity trigger the provider generates (compared by name and SQL text), or any foreign-key
+reference, complete capture still works but returns `checkpoint: None`. This deliberately
+conservative eligibility rule includes unrelated tables. Later main or temporary schema changes
+invalidate existing checkpoints. No trigger or schema change is introduced by this check.
 
 Only acknowledged `append_group_guarded`, `append_group_guarded_with_blobs` and
 `append_group_with_blobs_guarded` transactions may
@@ -414,9 +417,10 @@ local write was not accounted for, discard continuity. A deduplicated group with
 mutation leaves the boundary unchanged and creates no fictitious appended event.
 
 External SQL writes, local unjournaled writes, redaction, erasure/reprovisioning, projection
-administration, snapshots, standalone blob mutation, failed transaction, uncertain commit, worker
+administration, standalone blob mutation, failed transaction, uncertain commit, worker
 panic/poison, sequence exhaustion and journal eviction force the next relevant request through
-complete observation. It is safe to invalidate for unrelated tenant changes. A confirmed rollback
+complete observation. The provider's own snapshot writes touch no captured table; their
+transaction re-synchronizes the stamp, so they keep continuity. It is safe to invalidate for unrelated tenant changes. A confirmed rollback
 may therefore cause unnecessary work but never an unchanged claim based on uncertain state.
 Direct legacy `append` and administrative paths do not acquire accidental delta eligibility.
 

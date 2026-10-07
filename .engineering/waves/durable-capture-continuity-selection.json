@@ -1,0 +1,38 @@
+{
+  "waves": [
+    {
+      "wave": 1,
+      "artifacts": [
+        {
+          "id": "story:durable-capture-continuity",
+          "inferred": true,
+          "scope": [
+            {
+              "confidence": "inferred",
+              "path": "CHANGELOG.md"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-core/src/capture.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-core/src/lib.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-sqlite/src"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-sqlite/tests"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "collisions": [],
+  "unassessed": [],
+  "cycles": []
+}

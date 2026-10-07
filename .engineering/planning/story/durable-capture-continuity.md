@@ -9,7 +9,18 @@ refs:
   reference: beyond10x/eventlog#39
 relations:
 - serves: vision:O2
-revision: 3
+scope:
+- confidence: inferred
+  path: CHANGELOG.md
+- confidence: inferred
+  path: crates/eventlog-core/src/capture.rs
+- confidence: inferred
+  path: crates/eventlog-core/src/lib.rs
+- confidence: inferred
+  path: crates/eventlog-sqlite/src
+- confidence: inferred
+  path: crates/eventlog-sqlite/tests
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-06T23:36:25Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-06T23:36:25Z", actor: "human:timo", revision: 3}

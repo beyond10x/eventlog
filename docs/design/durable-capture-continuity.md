@@ -81,9 +81,11 @@ again eligible for `durable_checkpoint`. `checkpoint_usage` returns the usage bo
 this provider issued or restored: the counts a complete capture of that observation reports.
 
 `restore_checkpoint` returns `None` for truncated, malformed, foreign-provider, other-prefix,
-other-store-instance and newer-version bytes, never an error. `durable_checkpoint` returns `None`
-on a store where `enable_durable_continuity` has not run, and for a checkpoint taken while a
-requested projection table carried no provider trigger.
+other-store-instance and newer-version bytes, never an error. It is synchronous and compares the
+store instance this handle last read; a capture compares the stored instance again inside its
+transaction, so bytes from before a disable and re-enable by another process give `Complete`.
+`durable_checkpoint` returns `None` on a store where `enable_durable_continuity` has not run, and
+for a checkpoint taken while a requested projection table carried no provider trigger.
 
 PostgreSQL, File and Tree keep the defaults (`None`, hence `Complete`).
 
@@ -95,7 +97,7 @@ All names carry the store's table prefix, so owners sharing one file stay indepe
 |---|---|
 | `{prefix}_capture_continuity` | one row: `instance TEXT` (32 lower-case hex, minted at enable), `epoch INTEGER`, `token TEXT` (32 lower-case hex) |
 | `{prefix}_capture_journal` | `position INTEGER PRIMARY KEY`, `tenant_id TEXT`, `from_epoch`, `from_token`, `to_epoch`, `to_token`, `entry TEXT` (a `DurableJournalEntry` as JSON), `bytes INTEGER` |
-| trigger per captured table and operation | `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` on `{prefix}_events`, `{prefix}_blobs`, `{prefix}_identity` and every `{prefix}_p_*` projection table, each running `UPDATE {prefix}_capture_continuity SET epoch = epoch + 1, token = lower(hex(randomblob(16)))` |
+| trigger per captured table and operation | `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` on `{prefix}_events`, `{prefix}_blobs`, `{prefix}_identity` and every registered projection table of this owner (a table matching `{prefix}_p_*` that belongs to another owner whose prefix extends this one is not this owner's), each running `UPDATE {prefix}_capture_continuity SET epoch = epoch + 1, token = lower(hex(randomblob(16)))` |
 
 Trigger names and SQL text are produced by one function; every admission check compares both
 exactly. Snapshot, snapshot-generation, command, claim, counter, cursor and registry tables carry
@@ -148,7 +150,8 @@ transaction. The in-process checkpoint carries these values when durable continu
 
 1. validates the request scope against the checkpoint scope exactly, as for an in-process one;
 2. reads instance, mark, schema version and the newest journal position;
-3. checks every requested projection table carries the provider's triggers, by name and SQL text;
+3. checks that events, blobs, identity and every requested projection table carry exactly the
+   provider's triggers, by name and SQL text, and that no foreign trigger or foreign key exists;
 4. returns `Unchanged` when instance, schema version, mark and position all equal the
    checkpoint's;
 5. returns `AppendDelta` when the journal entries after the checkpoint's position start at its mark,
