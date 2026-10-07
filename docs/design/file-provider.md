@@ -116,8 +116,11 @@ same `FileEventStore` was rebuilt last — by a capture's strict read or a write
 moves onto the other's buffer wherever their bytes agree, comparing them inside the operation's
 blocking file work. A view whose bytes do not agree with the ones the operation has just verified
 is dropped when the operation ends rather than kept beside them: it names a history that is no
-longer committed, or a head the operation moved past, and could not be resumed from anyway. A
-`FileTenantCapture` keeps one view. Views of two epochs never share a buffer, so a privacy
+longer committed, or a head the operation moved past, and could not be resumed from anyway. No
+await separates the adoption from that drop, for a writer or a capture: the capture adopts in the
+blocking work that read the file and drops in the poll that stores its view, so a capture its
+caller cancels stores no view and leaves the writer's as it was. A `FileTenantCapture` keeps one
+view. Views of two epochs never share a buffer, so a privacy
 rewrite's new history never keeps the bytes it removed alive; a capture view of the old epoch keeps
 them, as it keeps its decoded fold, until this handle's next transaction drops it or its next
 capture replaces it. Nothing of this is persisted, and `eventlog-file/1` is unchanged.
@@ -134,8 +137,9 @@ What the stamp detects, and what it does not:
 `tests/stamped_resume.rs` damages a file after its stamp is trusted and checks that nothing is
 appended onto the damage. The unit cases in `src/lib.rs` (`stamped_resume_cost`) count what a
 resume re-reads. Two hundred reads over an unchanged file re-read nothing, and inside the window
-the writer's resume and the reader's resume each compare the whole committed prefix and hash none
-of it.
+the writer's resume and the reader's resume each compare the whole committed prefix and hash no
+journal byte. That count is taken inside the crate's one SHA-256 function, charged to the store
+whose journal operation called it, and a resume onto a new tail is the control that it moves.
 
 `EventStore::read_many` answers a batch of stream and blob reads inside one transaction: one
 resume and one lock hold for the batch. A caller that loads a whole history object by object uses

@@ -30,6 +30,9 @@ pub(crate) fn checkpoint(name: &str) {
 pub(crate) fn checkpoint(_: &str) {}
 
 #[cfg(test)]
+#[path = "adversary2_compare_once.rs"]
+mod adversary2_compare_once;
+#[cfg(test)]
 #[path = "adversary_compare_once.rs"]
 mod adversary_compare_once;
 
@@ -338,6 +341,8 @@ pub(crate) struct InspectedJournal {
 
 /// Source bytes count the manifest and journal, the only files decoded here.
 pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal, InspectionError> {
+    #[cfg(test)]
+    let _hashing = crate::cost::hashing_for(root);
     // The one predicate, not a second copy of the decision: an inspection that read a link as a
     // store is the same defect the write paths already refuse.
     if !physical_directory(root).map_err(inspection_io)? {
@@ -432,8 +437,18 @@ pub(crate) fn backend(error: impl std::fmt::Display) -> EventLogError {
 fn corrupt() -> EventLogError {
     EventLogError::Backend("file journal integrity check failed; no history was repaired".into())
 }
+/// SHA-256 of `bytes`, as lowercase hex: every digest this crate computes goes through here.
+///
+/// In tests the bytes are charged as `journal_bytes_hashed` to the root whose journal operation
+/// is running on this thread (`crate::cost::hashing_for`); hashing outside any journal operation,
+/// as of blob content, charges nothing here.
 pub(crate) fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    #[cfg(test)]
+    crate::cost::charge_hashing(|cost| {
+        cost.journal_bytes_hashed += bytes.len() as u64;
+    });
+    digest
 }
 fn sync_dir(root: &Path) -> Result<(), EventLogError> {
     File::open(root)
@@ -494,6 +509,8 @@ impl Journal {
     }
 
     fn open_with_creation(root: &Path, create: bool) -> Result<Self, EventLogError> {
+        #[cfg(test)]
+        let _hashing = crate::cost::hashing_for(root);
         // A tree store keeps its history as one file per event under `store.json`. Opening one
         // here would write a journal beside it, which neither store could then read.
         if root.join("store.json").exists() {
@@ -597,6 +614,8 @@ impl Journal {
     }
 
     pub fn append(&mut self, transaction: Value) -> Result<(), EventLogError> {
+        #[cfg(test)]
+        let _hashing = crate::cost::hashing_for(&self.root);
         let sequence = self.manifest.sequence.checked_add(1).ok_or_else(corrupt)?;
         let (line, digest) = encode(
             &self.manifest,
@@ -667,6 +686,8 @@ impl Journal {
     }
 
     pub fn extends(&self, observed: &Manifest) -> Result<bool, EventLogError> {
+        #[cfg(test)]
+        let _hashing = crate::cost::hashing_for(&self.root);
         extends_observed(&self.manifest, &self.transactions, observed)
     }
 
@@ -695,6 +716,8 @@ impl Journal {
         observed: &Manifest,
         content: &Content,
     ) -> Result<Option<Resumed>, EventLogError> {
+        #[cfg(test)]
+        let _hashing = crate::cost::hashing_for(root);
         if !physical_directory(root).map_err(backend)? {
             return Err(corrupt());
         }
@@ -724,6 +747,8 @@ impl Journal {
 
     /// Privacy is the only rewrite path. The caller supplies history with only erased data removed.
     pub fn privacy(&mut self, transactions: Vec<Value>) -> Result<(), EventLogError> {
+        #[cfg(test)]
+        let _hashing = crate::cost::hashing_for(&self.root);
         let mut next = self.manifest.clone();
         next.epoch = next.epoch.checked_add(1).ok_or_else(corrupt)?;
         next.sequence = 0;
@@ -949,6 +974,8 @@ pub(crate) fn resume_strict(
     observed: &Manifest,
     content: &Content,
 ) -> Option<StrictResumed> {
+    #[cfg(test)]
+    let _hashing = crate::cost::hashing_for(root);
     // The member of this class that was missing, and an absence no mutation of present code
     // could reach: every check below follows a link in a path component, so a root that is not a
     // physical directory has to be refused before any of them. `None`, so `open_strict` makes
@@ -1035,6 +1062,8 @@ fn damaged() -> CaptureError {
 /// rather than an invitation to make one; a pending durable intent is somebody else's recovery;
 /// and damage is refused with the evidence left exactly where it was found.
 pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
+    #[cfg(test)]
+    let _hashing = crate::cost::hashing_for(root);
     if !physical_directory(root).map_err(|_| unavailable("file store root is not present"))? {
         return Err(unavailable("file store root is not a physical directory"));
     }

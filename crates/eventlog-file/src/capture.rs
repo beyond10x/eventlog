@@ -107,8 +107,11 @@ impl ConsistentTenantCapture for FileTenantCapture {
             let observation = &mut *self.observation.lock().await;
             capture(
                 &self.root,
-                &mut observation.observed,
-                &mut observation.view,
+                Slots {
+                    observed: &mut observation.observed,
+                    view: &mut observation.view,
+                    writer: None,
+                },
                 tenant,
                 projections,
                 limits,
@@ -128,8 +131,11 @@ impl ConsistentTenantCapture for FileTenantCapture {
             let observation = &mut *self.observation.lock().await;
             capture(
                 &self.root,
-                &mut observation.observed,
-                &mut observation.view,
+                Slots {
+                    observed: &mut observation.observed,
+                    view: &mut observation.view,
+                    writer: None,
+                },
                 tenant,
                 projections,
                 limits,
@@ -151,18 +157,19 @@ impl ConsistentTenantCapture for FileEventStore {
             // The same runtime mutex every ordinary operation takes, then the same interprocess
             // lock, then the same read: one implementation serves both entry points.
             let runtime = &mut *self.runtime.lock().await;
-            let outcome = capture(
+            capture(
                 &self.root,
-                &mut runtime.observed,
-                &mut runtime.captured,
+                Slots {
+                    observed: &mut runtime.observed,
+                    view: &mut runtime.captured,
+                    writer: Some(&mut runtime.verified),
+                },
                 tenant,
                 projections,
                 limits,
                 observe,
             )
-            .await;
-            retain_once(runtime).await;
-            outcome
+            .await
         })
     }
 
@@ -174,57 +181,50 @@ impl ConsistentTenantCapture for FileEventStore {
     ) -> BoxFuture<'a, Result<DeferredTenantCapture, CaptureError>> {
         Box::pin(async move {
             let runtime = &mut *self.runtime.lock().await;
-            let outcome = capture(
+            capture(
                 &self.root,
-                &mut runtime.observed,
-                &mut runtime.captured,
+                Slots {
+                    observed: &mut runtime.observed,
+                    view: &mut runtime.captured,
+                    writer: Some(&mut runtime.verified),
+                },
                 tenant,
                 projections,
                 limits,
                 observe_deferred,
             )
-            .await;
-            retain_once(runtime).await;
-            outcome
+            .await
         })
     }
 }
 
-/// Keep one handle's committed bytes once, after a capture.
+/// What one capture reads and moves: the head this handle observed and its reader's view, and on a
+/// [`FileEventStore`] the writer's view too, which the capture keeps its committed bytes once with.
+struct Slots<'a> {
+    observed: &'a mut Option<Manifest>,
+    view: &'a mut Option<Observed>,
+    writer: Option<&'a mut Option<crate::Verified>>,
+}
+
+/// Keep one handle's committed bytes once, as a capture stores its view.
 ///
 /// The writer's view and the reader's view of a [`FileEventStore`] reach the same bytes by
-/// separate reads. When they do not already share a buffer, the capture's view is moved onto the
-/// writer's wherever the two agree ([`journal::Content::adopt`]). That compares bytes, so it runs
-/// on the blocking pool like the capture's own read, and only then: a capture that resumed onto a
-/// shared view, the usual case, costs a pointer comparison here and nothing else on the executor.
-/// A writer's view that still keeps a buffer of its own disagrees with the bytes the capture has
-/// just verified under the writers' lock, or names a head the capture has just moved past: either
-/// way the next transaction cannot resume from it, so it is dropped rather than kept beside the
-/// capture's as a second copy.
-async fn retain_once(runtime: &mut crate::Runtime) {
-    let writer = match (&runtime.verified, &runtime.captured) {
-        (Some(verified), Some(captured))
-            if !verified.content.shares_bytes_with(&captured.content) =>
-        {
-            verified.content.clone()
-        }
-        _ => return,
-    };
-    if let Some(captured) = runtime.captured.as_mut() {
-        let mut content = captured.content.clone();
-        if let Ok(content) = blocking(move || {
-            content.adopt(&writer);
-            Ok(content)
-        })
-        .await
-        {
-            captured.content = content;
-        }
-    }
-    if let (Some(verified), Some(captured)) = (&runtime.verified, &runtime.captured)
-        && !verified.content.shares_bytes_with(&captured.content)
+/// separate reads. The capture has already moved its view onto the writer's buffer wherever the
+/// two agree, inside the blocking work that read it ([`capture`]). A writer's view that still
+/// keeps a buffer of its own disagrees with the bytes the capture has just verified under the
+/// writers' lock, or names a head the capture has just moved past: either way the next
+/// transaction cannot resume from it, so it is dropped rather than kept beside the capture's as a
+/// second copy.
+///
+/// Synchronous, and called in the same poll that stores the view: no await sits between the
+/// adoption and this, so a capture dropped by its caller either stores nothing or stores a view
+/// this has already been applied to. A pointer comparison: it reads no byte on the executor.
+fn retain_once(writer: &mut Option<crate::Verified>, reader: &Observed) {
+    if writer
+        .as_ref()
+        .is_some_and(|verified| !verified.content.shares_bytes_with(&reader.content))
     {
-        runtime.verified = None;
+        *writer = None;
     }
 }
 
@@ -271,16 +271,26 @@ type Observe<T> =
 
 async fn capture<T: Send + 'static>(
     root: &Path,
-    observed: &mut Option<Manifest>,
-    view: &mut Option<Observed>,
+    slots: Slots<'_>,
     tenant: &TenantId,
     projections: &[ProjectionSpec],
     limits: CaptureLimits,
     observe: Observe<T>,
 ) -> Result<T, CaptureError> {
+    let Slots {
+        observed,
+        view,
+        writer,
+    } = slots;
     validate_capture_request(tenant, projections)?;
     let root = root.to_owned();
     let previous = observed.clone();
+    // A clone of the writer's view, so the blocking work below can keep this capture's bytes in
+    // its buffer: a reference count, no bytes.
+    let writer_bytes = writer
+        .as_deref()
+        .and_then(Option::as_ref)
+        .map(|verified| verified.content.clone());
     // Taken, not borrowed, and filtered against the head this handle actually holds: a capture
     // that refuses leaves no view behind, so the next one reads everything again rather than
     // trusting a view assembled beside a refusal; and any entry point that moved the observed head
@@ -292,7 +302,7 @@ async fn capture<T: Send + 'static>(
     let owner = tenant.clone();
     let requested = projections.to_vec();
     let (manifest, extended, verified, outcome) = blocking(move || {
-        observed_history(
+        let (manifest, extended, mut verified, outcome) = observed_history(
             &root,
             previous.as_ref(),
             reusable,
@@ -300,7 +310,13 @@ async fn capture<T: Send + 'static>(
             &requested,
             limits,
             observe,
-        )
+        )?;
+        // Comparing bytes is file-sized work, so it is done here with the read, as `enter` does
+        // it for a writer ([`journal::Content::adopt`]).
+        if let Some(writer) = &writer_bytes {
+            verified.content.adopt(writer);
+        }
+        Ok((manifest, extended, verified, outcome))
     })
     .await?;
     // The design names exactly two refusals that may be answered from validated state ahead of the
@@ -324,6 +340,9 @@ async fn capture<T: Send + 'static>(
     }
     let value = outcome?;
     *observed = Some(manifest);
+    if let Some(writer) = writer {
+        retain_once(writer, &verified);
+    }
     *view = Some(verified);
     Ok(value)
 }
@@ -390,6 +409,9 @@ fn observed_history<T>(
             crate::cost::charge(root, |cost| {
                 cost.frames_reencoded += previous.sequence;
             });
+            // Re-encoding hashes every frame it re-encodes; that is this root's journal work.
+            #[cfg(test)]
+            let _hashing = crate::cost::hashing_for(root);
             journal::extends_observed(&strict.manifest, &strict.transactions, previous)?
         }
         None => true,
