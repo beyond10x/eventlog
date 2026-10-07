@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:durable-capture-continuity
 kind: story
-status: active
+status: implemented
 title: A later process continues capture from a persisted SQLite checkpoint
 refs:
 - provider: github
@@ -10,20 +10,67 @@ refs:
 relations:
 - serves: vision:O2
 scope:
-- confidence: inferred
+- confidence: cited
   path: CHANGELOG.md
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-core/src/capture.rs
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-core/src/lib.rs
-- confidence: inferred
-  path: crates/eventlog-sqlite/src
-- confidence: inferred
-  path: crates/eventlog-sqlite/tests
-revision: 4
+- confidence: cited
+  path: crates/eventlog-sqlite/Cargo.toml
+- confidence: cited
+  path: crates/eventlog-sqlite/src/atomic_group.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/src/capture.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/src/durable_capture.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/src/inspection.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/src/lib.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/src/tracked_capture.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/tests/durable_capture.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/tests/durable_capture_adversary.rs
+- confidence: cited
+  path: crates/eventlog-sqlite/tests/durable_capture_security.rs
+- confidence: cited
+  path: docs/design/consistent-tenant-capture.md
+- confidence: cited
+  path: docs/design/durable-capture-continuity.md
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CaptureCheckpointScope.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CaptureContinuityMark.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CaptureLimits.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CaptureScope.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CaptureUpdateKind.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CaptureUsage.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.CapturedProjectionScope.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.DurableCaptureCheckpoint.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.DurableJournalEntry.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.JournaledRowChange.schema.json
+- confidence: cited
+  path: ess/capture-generated/schema/types/eventlog.capture.SqliteDurableCheckpoint.schema.json
+- confidence: cited
+  path: ess/capture/domains/capture.yaml
+- confidence: cited
+  path: ess/capture/system.yaml
+revision: 7
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-06T23:36:25Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-06T23:36:25Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-07T01:43:39Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":1,"review_outcome":2}}}
 ---
 ## Context
 

@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-07T01:43:39Z",
+  "actor": "human:timo",
+  "artifact": "story:durable-capture-continuity",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked -p eventlog-sqlite --test durable_capture --test durable_capture_adversary --test durable_capture_security at d1a3b7a7: exit 0, 30+17+13 passed, 0 failed"
+  }
+}
