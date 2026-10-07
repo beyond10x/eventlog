@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-07T20:51:27Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "coordinator: F1 CHANGELOG.md:18; the per-append bar was replaced in story revision 12 before this pass returned (CPU and in-window read bars, growth bar)",
+    "reference": "F1 CHANGELOG.md:18",
+    "review": "review-result:adversary-file-eventlog-rechecks-its-prefix-pass-1",
+    "outcome": "no-op"
+  }
+}

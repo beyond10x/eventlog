@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T20:57:24Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-indexes-streams",
+  "kind": "story",
+  "revision": 15,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "cargo test --locked -p eventlog-file --lib state::tests -- --test-threads=1: at 32168648 + the new cases, red (stream_version visited 160 of 160 events, a retried receipt 162, expected 0 and 2); at 609ab0a4 green; package suite 180 passed 0 failed. VERIFIED: new behaviour the base cannot show. Probe 2,000 events/40 streams, base and unit back to back under load: per append 89.24/87.42 vs 84.51/81.45 ms (no regression).",
+    "reference": "impl/file-eventlog-indexes-streams 609ab0a4 vs wave/file-provider-cost 32168648"
+  }
+}

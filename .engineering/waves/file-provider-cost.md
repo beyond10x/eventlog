@@ -50,9 +50,9 @@ Build directories are each tree's own `target/`. Trees live under the worktree p
 
 | role | branch | managed id | scratch | stage |
 | --- | --- | --- | --- | --- |
-| integration | `wave/file-provider-cost` | `wave-file-cost` | `~/.cache/eventlog-el42/wave` | opened on `de30462b` |
-| unit | `impl/file-eventlog-indexes-streams` | `el42-index` | `~/.cache/eventlog-el42/index` | planned |
-| unit | `impl/file-eventlog-rechecks-its-prefix-by-comparison` | `el42-compare` | `~/.cache/eventlog-el42/compare` | planned |
+| integration | `wave/file-provider-cost` | `wave-file-cost` | `~/.cache/eventlog-el42/wave` | opening commit `32168648` on `de30462b`; both units merged (`8655c670`, `1ba2af2f`); closing store commit follows |
+| unit | `impl/file-eventlog-indexes-streams` | `el42-index` | `~/.cache/eventlog-el42/index` | merged as `8655c670` (unit head `0ca549f4`); adversary pass 1: 2 introduced, both fixed in `609ab0a4` with red-then-green cases and mutation controls; pass 2 not run: the correction changed `README.md` and test code only |
+| unit | `impl/file-eventlog-rechecks-its-prefix-by-comparison` | `el42-compare` | `~/.cache/eventlog-el42/compare` | merged as `1ba2af2f` (unit head `2aaac6b7`); acceptance bar corrected (story revision 12); adversary pass 1 (4 introduced, 1 pre-existing filed as story:file-capture-after-a-write-resumes), security pass 1 (invariant held; 4 introduced) and adversary pass 2 (invariant held; 3 introduced, 0 carried) all fixed; correction 2 read by the coordinator: no assertion dropped, the pass-2 case's precondition re-pinned to the fixed state and its assertion kept |
 
 Only the coordinator writes the planning store, in the integration tree.
 
@@ -66,16 +66,50 @@ merged after CI. No tag and no release.
 ## Agents
 
 `aep:implementor` per unit, then `aep:adversary` per green unit. The compare unit changes the
-check that refuses a damaged journal, so it also gets `aep:security-reviewer`.
+check that refuses a damaged journal, so it also got `aep:security-reviewer`.
 
 ## Gate
 
-`bash scripts/gate.sh --production-proof` once on the integration branch against a disposable
-`postgres:17.6-alpine3.22` with the `production-fixture` TLS setup, per-step output under the
-wave scratch root.
+Package-scoped on the merged integration tree `1ba2af2f` (operator, 2026-10-07: no full local gate;
+the pull request's CI runs the full gate and the persistence proof):
+
+| step | exit | output |
+| --- | --- | --- |
+| `cargo test --locked -p eventlog-file --no-fail-fast -- --test-threads=1` | 0 | 30 lanes, 204 passed, 0 failed, 0 ignored (171 at base + 9 index + 24 compare) |
+| `cargo clippy --locked -p eventlog-file --all-targets -- -D warnings` | 0 | |
+| `cargo fmt --all --check` | 0 | |
+| `cargo check --locked --workspace --all-targets` | 0 | |
+
+## Verification
+
+| unit | claim | base `32168648` | unit | verdict |
+| --- | --- | --- | --- | --- |
+| index | a head lookup visits no event, a window its events plus one | 160 of 160 visited; receipt 162 | 0; 2 | VERIFIED (counter test red at base) |
+| compare | user CPU, 2,000 events | 20.77 / 20.56 s | 0.95 / 1.27 s | VERIFIED |
+| compare | read of every stream inside the window, 2,000 events | 1,382 / 1,425 ms | 56 / 172 ms | VERIFIED |
+| compare | per append, 200 → 2,000 events | ×1.37 | ×0.82 | VERIFIED |
+
+Throwaway probe outside the repository, alternating base and unit, 2 rounds, load average 7-13.
+
+## Cost
+
+| agent | tokens | tool uses | wall |
+| --- | --- | --- | --- |
+| `aep:story-scoper` index | 89,389 | 24 | 2.5 min |
+| `aep:story-scoper` digest | 122,610 | 39 | 4.9 min |
+| `aep:implementor` index | 212,326 | 132 | 37 min |
+| `aep:adversary` index pass 1 | 166,002 | 74 | 19 min |
+| `aep:implementor` index correction 1 | 272,136 | 24 | 7.5 min |
+| `aep:implementor` compare | 249,330 | 127 | 38 min |
+| `aep:adversary` compare pass 1 | 222,527 | 59 | 20 min |
+| `aep:security-reviewer` compare pass 1 | 234,109 | 75 | 25 min |
+| `aep:implementor` compare correction 1 | 385,610 | 88 | 23 min |
+| `aep:adversary` compare pass 2 (after one HTTP 429; the first attempt's usage was not reported) | 222,223 | 20 | 3.1 min |
+| `aep:implementor` compare correction 2 | 474,886 | 58 | 39 min |
+
+Token figures for a resumed agent are as the harness reported them at each completion.
 
 ## Pre-flight
-
 | check | read |
 | --- | --- |
 | primary checkout | clean, on `main` at `de30462b` |
@@ -83,3 +117,9 @@ wave scratch root.
 | free disk on `/` | 13G before the first tree |
 | one build | `cargo test -p eventlog-file --no-run`: 10 s, 945M; workspace `--no-run`: 23 s, 3.7G (discarded) |
 | compiler cache | `sccache` present, not used: its cache is on the same disk |
+
+## Merge dry run
+
+`git merge-tree --write-tree --merge-base=32168648` of `d01992d0` and `9920a7db`: exit 0, tree
+`601e8816`. No call in that tree uses a `State::events` method the index unit removed.
+

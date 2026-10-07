@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:file-eventlog-rechecks-its-prefix-by-comparison
 kind: story
-status: active
+status: implemented
 title: A resumed file Eventlog re-checks its prefix by comparison, not SHA-256
 summary: in-window resume compares the verified bytes instead of re-hashing them
 owner: eventlog
@@ -13,9 +13,9 @@ relations:
 - serves: vision:O2
 - informed_by: story:incremental-history-digest-for-a-resumed-handle
 scope:
-- confidence: inferred
+- confidence: cited
   path: CHANGELOG.md
-- confidence: inferred
+- confidence: cited
   path: crates/eventlog-file/src/capture.rs
 - confidence: cited
   path: crates/eventlog-file/src/cost.rs
@@ -24,13 +24,16 @@ scope:
 - confidence: cited
   path: crates/eventlog-file/src/lib.rs
 - confidence: cited
+  path: crates/eventlog-file/tests/security_compare_prefix.rs
+- confidence: cited
   path: docs/design/file-provider.md
-- confidence: inferred
+- confidence: cited
   path: website/docs/operations.md
-revision: 11
+revision: 21
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T19:49:26Z", actor: "human:timo", revision: 10}
 - {from: "proposed", to: "active", at: "2026-10-07T19:49:26Z", actor: "human:timo", revision: 11}
+- {from: "active", to: "implemented", at: "2026-10-07T23:50:42Z", actor: "human:timo", revision: 21, decided_on: {"recorded":{"test_result":1,"review_outcome":9,"verification":1}}}
 ---
 ## Outcome
 
@@ -76,8 +79,18 @@ the hash goes.
   `verify_once_review_two.rs`, `durability.rs`, `stamped_resume.rs` and `consistent_capture.rs`
   still refuses, and each refusal is shown to fail against a comparison stubbed to `true`
   (AGENTS.md invariant 5: mutation applied, watched, reverted).
-- Measured with the same probe before and after: per append and in-window read time at 2,000
-  events. The bar is per append at most one fifth of 27.21 ms on the same machine.
+- ~~Measured with the same probe before and after: per append and in-window read time at 2,000
+  events. The bar is per append at most one fifth of 27.21 ms on the same machine.~~
+  Coordinator correction, 2026-10-07: that bar came from an on-CPU `perf` profile, which cannot
+  see the time an append spends blocked in the commit's synchronizations. The implementor derived
+  about 16 of the base's 26.23 ms per append as that blocked time (wall minus CPU, under load;
+  inferred, not measured on an idle machine), so no change to the re-check can reach it. Replaced
+  by the two bars below.
+- Measured with the same probe, base and treatment alternating on one machine: user CPU for the
+  2,000-event run at most one fifth of the base's, and the read of every stream inside the window
+  at most one fifth of the base's.
+- Per-append wall time no longer grows with the store: the probe's per-append time at 2,000 events
+  is no more than 1.2 times its time at 200 events, where the base's grows by more than that.
 
 ## Scope
 
@@ -108,3 +121,14 @@ wrong).
   `Clone` (`journal.rs:86-87`), held in `Verified` (`lib.rs:70`) and `Observed` (`capture.rs:48`),
   neither serialized; on-disk digests hash re-serialized frames (:1044, :1080), not raw bytes. So
   replacing the re-hash with a comparison changes no persisted byte — level 2, unproven
+
+- **Implementor confirmation, 2026-10-07/08 (units `9920a7db`, `f6f43177`, `2aaac6b7`):**
+  - `capture.rs`: checked, and wider than inferred: the `FileEventStore` capture impl (:141-185)
+    and `retain_once` changed too.
+  - `lib.rs`: one hunk landed outside the split, `transaction()` at :157, which drops a capture
+    view that does not share the writer's buffer; the merge with the index unit applied cleanly.
+  - `website/docs/operations.md` :20-23 and `CHANGELOG.md`: checked.
+  - Safety fact, corrected: the raw-prefix digest was in memory only, but
+    `PrivacyIntent.replacement_digest` (`journal.rs` :589, :1101, :1106) is a persisted SHA-256
+    over raw replacement bytes. It does not go through `Content` and is unchanged;
+    `tests/security_compare_persisted.rs` recomputes it.

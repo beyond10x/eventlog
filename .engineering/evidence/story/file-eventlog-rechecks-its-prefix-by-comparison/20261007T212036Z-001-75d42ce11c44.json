@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-07T21:20:36Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "coordinator: F3 website/docs/operations.md:23 fixed in f6f43177",
+    "reference": "F3 website/docs/operations.md:23",
+    "review": "review-result:adversary-file-eventlog-rechecks-its-prefix-pass-1",
+    "outcome": "fixed"
+  }
+}

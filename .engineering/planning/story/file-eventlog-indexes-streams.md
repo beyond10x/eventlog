@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:file-eventlog-indexes-streams
 kind: story
-status: active
+status: implemented
 title: A file Eventlog finds a stream's events without scanning the store
 summary: per-stream index for State::head, slice and the per-stream lookups
 owner: eventlog
@@ -14,6 +14,8 @@ relations:
 - informed_by: story:file-eventlog-verifies-once-per-open
 scope:
 - confidence: cited
+  path: CHANGELOG.md
+- confidence: cited
   path: README.md
 - confidence: cited
   path: crates/eventlog-file/src/lib.rs
@@ -21,10 +23,11 @@ scope:
   path: crates/eventlog-file/src/state.rs
 - confidence: cited
   path: website/docs/providers.md
-revision: 15
+revision: 18
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T19:49:26Z", actor: "human:timo", revision: 14}
 - {from: "proposed", to: "active", at: "2026-10-07T19:49:26Z", actor: "human:timo", revision: 15}
+- {from: "active", to: "implemented", at: "2026-10-07T23:50:41Z", actor: "human:timo", revision: 18, decided_on: {"recorded":{"test_result":1,"review_outcome":2,"verification":1}}}
 ---
 ## Outcome
 
@@ -104,3 +107,10 @@ or the tree) or **inferred** (a reading that could be wrong).
   1753-1759) also grow with the store and are outside this story.
 
 - **Coordinator correction, 2026-10-07:** the counter lives in `state.rs` (not `cost.rs`), and `CHANGELOG.md` and `docs/design/file-provider.md` belong to story:file-eventlog-rechecks-its-prefix-by-comparison in this wave; the entries were removed so the wave can be derived. `lib.rs` stays shared, split by symbol: this story owns `Transaction::result` (478-495), `slice` (1272-1288), the find in `redact` (1602-1628) and the import at line 24.
+
+- **Implementor confirmation, 2026-10-07 (unit `d01992d0`):** every inferred line checked. The
+  `matches_stream` import and function are removed (no other users); the order check in `apply`
+  made a full replay quadratic, measured 12,720 = N(N-1)/2 visits at N=160, now 0; insertion is
+  only through the new `Events` type in `state.rs`, so the safety fact is now held by the compiler.
+  `lib.rs` hunks landed at 21, 482, 1273 and 1608, inside the split. Correction 1 (`609ab0a4`)
+  touched only `README.md` and test code in `state.rs`.

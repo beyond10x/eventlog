@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-07T20:57:24Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-indexes-streams",
+  "kind": "story",
+  "revision": 15,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "coordinator: F2 state.rs:706 tautology replaced in 609ab0a4 by a resumed-view vs replay case, red under mutation MB",
+    "reference": "F2 crates/eventlog-file/src/state.rs:706",
+    "review": "review-result:adversary-file-eventlog-indexes-streams-pass-1",
+    "outcome": "fixed"
+  }
+}
