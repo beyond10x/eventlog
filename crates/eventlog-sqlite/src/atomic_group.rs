@@ -306,6 +306,13 @@ impl Inner {
         let appended = result?;
         let draft = self.tracked.take_draft();
         if let Some(from) = from {
+            // No journal of an owner with durable continuity keeps the content of a group whose
+            // tenant has redacted history: only its link in the chain.
+            let withheld = !appended.deduplicated
+                && durable_capture::redacted(connection, &self.prefix, tenant)?;
+            if withheld {
+                self.tracked.withhold();
+            }
             durable_capture::journal_group(
                 connection,
                 &self.prefix,
@@ -313,6 +320,7 @@ impl Inner {
                 tenant,
                 &appended,
                 draft,
+                withheld,
             )?;
         }
         Ok(appended)

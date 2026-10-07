@@ -23,7 +23,7 @@ use crate::{
     COLUMNS, Inner, SqliteEventStore, backend, begin_immediate,
     durable_capture::{self, Continued},
     poisoned, projection_index, projection_table, projection_table_body, read_event,
-    sqlite_schema_tokens, sqlite_table_body_tokens, to_i64, to_u64,
+    sqlite_schema_tokens, sqlite_table_body_tokens, stored_json, to_i64, to_u64,
     tracked_capture::{Checkpoint, Scope, Stamp},
 };
 
@@ -76,14 +76,19 @@ impl ConsistentTenantCapture for SqliteEventStore {
         let held = checkpoint.downcast_ref::<Checkpoint>()?;
         durable_capture::encode(held, &self.inner.prefix).map(DurableCaptureCheckpoint::from_bytes)
     }
-    /// `None` for bytes of another format, version, prefix or store instance, and for bytes that
-    /// do not decode; the next capture is then complete. The instance compared here is the one
-    /// this handle last read; a capture compares the stored one inside its own transaction.
+    /// `None` for bytes of another format, version or prefix, for bytes that do not decode, and
+    /// for bytes of a store instance other than the one this handle last read; the next capture
+    /// is then complete. A handle that has never read an instance, because continuity was
+    /// enabled by another handle after it opened, leaves the comparison to the capture, which
+    /// compares the stored instance inside its own transaction either way.
     fn restore_checkpoint(&self, durable: &DurableCaptureCheckpoint) -> Option<CaptureCheckpoint> {
-        let instance = self.inner.tracked.instance()?;
-        durable_capture::decode(durable.as_bytes(), &self.inner.prefix, &instance)
+        let instance = self.inner.tracked.instance();
+        durable_capture::decode(durable.as_bytes(), &self.inner.prefix, instance.as_deref())
             .map(CaptureCheckpoint::new)
     }
+    /// The usage bound to `checkpoint`: by the capture that issued it, or for a restored one, the
+    /// usage decoded from the bytes this provider wrote for it. A continued capture never takes a
+    /// decoded usage as proof of a crossed cap: a cap it crosses gives a complete capture.
     fn checkpoint_usage(&self, checkpoint: &CaptureCheckpoint) -> Option<CaptureUsage> {
         checkpoint
             .downcast_ref::<Checkpoint>()
@@ -237,6 +242,20 @@ impl Inner {
             return Ok(None);
         }
         if durable_capture::indirect_writers(connection).map_err(operational)? {
+            return Ok(None);
+        }
+        // What a complete capture checks first, it checks here too: the stored identity the
+        // checkpoint names (caller-held bytes may name another), redacted history, and each
+        // requested projection against the registry and the stored schema. Any refusal is the
+        // complete capture's to give.
+        if stored_identity(connection, &self.prefix, tenant)
+            .ok()
+            .is_none_or(|stored| stored != old.scope.identity)
+            || durable_capture::redacted(connection, &self.prefix, tenant)?
+            || projections.iter().any(|specification| {
+                admit_projection(connection, &self.prefix, specification).is_err()
+            })
+        {
             return Ok(None);
         }
         let Some(now) = self.durable_binding(connection, projections, stamp.schema())? else {
@@ -659,7 +678,7 @@ fn read_rows(
             // Every byte a writer here admitted comes back: no grammar, no normalization.
             let key = String::from_utf8(key).map_err(|_| corrupt(CaptureMaterial::Projection))?;
             let body: Value =
-                serde_json::from_slice(&body).map_err(|_| corrupt(CaptureMaterial::Projection))?;
+                stored_json(&body).map_err(|_| corrupt(CaptureMaterial::Projection))?;
             budget.admit_projection_row(&body)?;
             after = Some(key.clone());
             rows.push((key, body));

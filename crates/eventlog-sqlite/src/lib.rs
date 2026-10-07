@@ -3159,10 +3159,12 @@ impl SqliteProjections<'_> {
         let updates: String = joined(projection.indexed.len(), |position| {
             format!(", idx_{position} = excluded.idx_{position}")
         });
+        // The exact text the row will hold: what a capture reads, and what both journals record.
+        let text = body.to_string();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant.as_str().to_owned()),
             Box::new(key.to_owned()),
-            Box::new(body.to_string()),
+            Box::new(text.clone()),
         ];
         for field in projection.indexed {
             values.push(Box::new(indexed_value(body, field)));
@@ -3178,7 +3180,7 @@ impl SqliteProjections<'_> {
             .execute(&statement, borrowed.as_slice())
             .map_err(backend)?;
         self.tracked
-            .row(tenant, *projection, key, before, Some(body.clone()));
+            .row(tenant, *projection, key, before, Some(text));
         Ok(())
     }
 
@@ -3207,17 +3209,32 @@ impl SqliteProjections<'_> {
         Ok(())
     }
 
+    /// The exact text the row holds before this write, read as a capture reads it, while a group
+    /// is being recorded. A read that fails leaves the write undescribed in both journals.
     fn tracked_before(
         &mut self,
         projection: &ProjectionSpec,
         tenant: &TenantId,
         key: &str,
-    ) -> Option<Value> {
+    ) -> Option<String> {
         if !self.tracked.active() {
             return None;
         }
-        if let Ok(value) = self.get_now(projection, tenant, key) {
-            value
+        let table = projection_table(self.projection_prefix, projection.name);
+        let text = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT CAST(body AS BLOB) FROM {table} WHERE tenant_id = ?1 AND row_key = ?2"
+                ),
+                params![tenant.as_str(), key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(backend)
+            .and_then(|bytes| bytes.map(String::from_utf8).transpose().map_err(backend));
+        if let Ok(text) = text {
+            text
         } else {
             self.tracked.unknown_before();
             None
@@ -3400,6 +3417,16 @@ fn select_versions(
     Ok(events)
 }
 
+/// The one parser a stored JSON body is read with.
+///
+/// A complete capture reads event and projection bodies through it, and both capture journals
+/// hold stored bodies read through it, so every value a delta carries is the value a complete
+/// capture of the same row reads. A value handed to a write is not that value: the stored text
+/// is its serialization, and parsing it again need not give back the same number.
+pub(crate) fn stored_json(text: &[u8]) -> serde_json::Result<Value> {
+    serde_json::from_slice(text)
+}
+
 fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RecordedEvent, EventLogError>> {
     let global_seq: i64 = row.get(0)?;
     let tenant: String = row.get(1)?;
@@ -3480,7 +3507,7 @@ fn build_event(
         causation_id,
         causation_depth: to_u32(causation_depth)?,
         redacted_at: redacted_at.map(parse_time).transpose()?,
-        data: serde_json::from_str(data)
+        data: stored_json(data.as_bytes())
             .map_err(|error| EventLogError::Backend(format!("stored body is not JSON: {error}")))?,
         digest: None,
         parents: Vec::new(),

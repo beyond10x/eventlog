@@ -465,7 +465,7 @@ async fn a_restored_checkpoint_on_an_untouched_store_is_unchanged_with_complete_
     assert_eq!(
         store.checkpoint_usage(&restored),
         Some(usage(&capture)),
-        "a restored checkpoint binds the same usage"
+        "a restored checkpoint binds the usage its bytes carry"
     );
     let update = store
         .capture_tenant_since(&tenant(), &[ROWS], limits(), Some(&restored))
@@ -951,7 +951,20 @@ async fn a_store_never_enabled_offers_no_durable_checkpoint() {
         Some(usage(&capture)),
         "in-process continuity is unaffected"
     );
-    assert!(store.restore_checkpoint(&saved).is_none());
+    // A handle that has never read a store instance leaves the instance to the capture, which
+    // finds no continuity here and so captures completely.
+    let restored = store
+        .restore_checkpoint(&saved)
+        .expect("well-formed bytes of this prefix restore on a handle without an instance");
+    let update = store
+        .capture_tenant_since(&tenant(), &[ROWS], limits(), Some(&restored))
+        .await
+        .unwrap();
+    assert!(
+        matches!(update, TenantCaptureUpdate::Complete { .. }),
+        "another file's checkpoint on a store never enabled: {}",
+        kind(&update)
+    );
 }
 
 #[tokio::test]
@@ -1533,6 +1546,322 @@ async fn owners_sharing_one_file_enable_and_continue_independently() {
         panic!("the neighbour's own group gave {}", kind(&update));
     };
     assert_eq!(delta.events.len(), 1);
+}
+
+#[tokio::test]
+async fn a_redacted_tenants_group_keeps_the_chain_for_every_other_tenant() {
+    let file = provisioned().await;
+    {
+        let store = file.open().await;
+        store
+            .append_group(&group(
+                &neighbour(),
+                "n-seed",
+                &[json!({ "key": "n", "value": 1 })],
+            ))
+            .await
+            .unwrap();
+        store
+            .redact(
+                &StreamId::new(tenant(), "item", "seed").unwrap(),
+                1,
+                "erasure request",
+            )
+            .await
+            .unwrap();
+    }
+    let neighbours = || async {
+        let store = file.open().await;
+        let update = store
+            .capture_tenant_since(&neighbour(), &[ROWS], limits(), None)
+            .await
+            .unwrap();
+        let TenantCaptureUpdate::Complete {
+            checkpoint: Some(checkpoint),
+            ..
+        } = update
+        else {
+            panic!(
+                "the neighbour's capture issues a checkpoint: {}",
+                kind(&update)
+            );
+        };
+        store.durable_checkpoint(&checkpoint).expect("enabled")
+    };
+    let saved = neighbours().await;
+    {
+        let store = file.open().await;
+        store
+            .append_group(&changed(
+                "after-redaction",
+                "a",
+                &json!("replaces a derived row"),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_group(&group(
+                &neighbour(),
+                "n-next",
+                &[json!({ "key": "n", "value": 2 })],
+            ))
+            .await
+            .unwrap();
+    }
+    let entries: Vec<(String, String)> = {
+        let raw = file.raw();
+        let mut statement = raw
+            .prepare(&format!(
+                "SELECT tenant_id, entry FROM {JOURNAL} ORDER BY position"
+            ))
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let withheld: Vec<Value> = entries
+        .iter()
+        .filter(|(owner, _)| owner == tenant().as_str())
+        .map(|(_, entry)| serde_json::from_str(entry).unwrap())
+        .collect();
+    assert_eq!(withheld.len(), 1, "the redacted tenant's group is one link");
+    for member in ["event_positions", "blobs", "rows"] {
+        assert_eq!(
+            withheld[0][member],
+            json!([]),
+            "{member} of a withheld entry"
+        );
+    }
+
+    let store = file.open().await;
+    assert!(
+        matches!(
+            store.capture_tenant(&tenant(), &[ROWS], limits()).await,
+            Err(CaptureError::RedactedHistory)
+        ),
+        "control: the redacted tenant refuses capture"
+    );
+    let restored = store.restore_checkpoint(&saved).expect("its own bytes");
+    let update = store
+        .capture_tenant_since(&neighbour(), &[ROWS], limits(), Some(&restored))
+        .await
+        .unwrap();
+    let TenantCaptureUpdate::AppendDelta { delta, .. } = update else {
+        panic!("the neighbour across a withheld entry: {}", kind(&update));
+    };
+    assert_eq!(delta.events.len(), 1);
+    assert!(delta.events.iter().all(|event| event.tenant == neighbour()));
+    drop(store);
+
+    // Bytes naming the redacted tenant at the current mark still meet the redaction.
+    let mut forged: Value = serde_json::from_slice(neighbours().await.as_bytes()).unwrap();
+    let identity = file
+        .open()
+        .await
+        .stored_stream_identity(&tenant())
+        .await
+        .unwrap()
+        .unwrap();
+    forged["scope"]["capture"] =
+        json!({ "tenant_id": tenant().as_str(), "stream_identity": identity });
+    let store = file.open().await;
+    let restored = store
+        .restore_checkpoint(&DurableCaptureCheckpoint::from_bytes(
+            serde_json::to_vec(&forged).unwrap(),
+        ))
+        .expect("well-formed bytes");
+    let update = store
+        .capture_tenant_since(&tenant(), &[ROWS], limits(), Some(&restored))
+        .await;
+    assert!(
+        matches!(update, Err(CaptureError::RedactedHistory)),
+        "a redacted tenant continued: {:?}",
+        update.as_ref().map(kind)
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_trigger_naming_a_captured_table_in_upper_case_is_refused_by_every_check() {
+    let upper = |table: &str| {
+        format!(
+            "CREATE TRIGGER hidden_writer AFTER INSERT ON {}
+             BEGIN UPDATE {table} SET rowid = rowid WHERE rowid = NEW.rowid; END",
+            table.to_ascii_uppercase()
+        )
+    };
+
+    let file = provisioned().await;
+    file.raw().execute_batch(&upper(BLOBS)).unwrap();
+    assert!(
+        SqliteEventStore::open(file.name(), PREFIX).await.is_err(),
+        "the blob table check at open"
+    );
+    assert!(
+        SqliteEventStore::open_existing(file.name(), PREFIX)
+            .await
+            .is_err(),
+        "the blob table check at open_existing"
+    );
+
+    let file = provisioned().await;
+    file.raw().execute_batch(&upper(ROW_TABLE)).unwrap();
+    let existing = SqliteEventStore::open_existing(file.name(), PREFIX)
+        .await
+        .unwrap();
+    assert!(
+        existing
+            .attach_inline_existing(Arc::new(Rows))
+            .await
+            .is_err(),
+        "the projection table check at attach"
+    );
+    assert!(
+        matches!(
+            existing.capture_tenant(&tenant(), &[ROWS], limits()).await,
+            Err(CaptureError::ProjectionUnavailable {
+                reason: ProjectionCaptureRefusal::PhysicalShapeMismatch,
+                ..
+            })
+        ),
+        "the projection table check at capture"
+    );
+    drop(existing);
+
+    let file = provisioned().await;
+    file.raw().execute_batch(&upper(IDENTITY)).unwrap();
+    let store = file.open().await;
+    assert!(
+        matches!(
+            store
+                .capture_tenant_since(&tenant(), &[ROWS], limits(), None)
+                .await
+                .unwrap(),
+            TenantCaptureUpdate::Complete {
+                checkpoint: None,
+                ..
+            }
+        ),
+        "continuity eligibility"
+    );
+    assert!(
+        matches!(
+            store.enable_durable_continuity().await,
+            Err(EventLogError::Invalid(_))
+        ),
+        "enable"
+    );
+    drop(store);
+
+    #[cfg(target_os = "linux")]
+    {
+        use eventlog_core::{InspectHistory, InspectionError};
+        let file = provisioned().await;
+        file.raw().execute_batch(&upper(EVENTS)).unwrap();
+        file.raw()
+            .execute_batch("PRAGMA journal_mode=DELETE")
+            .unwrap();
+        assert_eq!(
+            eventlog_sqlite::SqliteHistoryInspector::new(&file.path, PREFIX)
+                .inspect_history(&tenant(), eventlog_conformance::INSPECTION_LIMITS)
+                .await
+                .map(|history| history.events.len()),
+            Err(InspectionError::UnsupportedSource),
+            "strict inspection of the events table"
+        );
+    }
+}
+
+/// What a JSON number becomes after the store writes it as text and reads the text back.
+fn reread(value: f64) -> f64 {
+    serde_json::from_str::<Value>(&Value::from(value).to_string())
+        .unwrap()
+        .as_f64()
+        .unwrap()
+}
+
+/// The first value of a fixed xorshift sequence over `f64` bit patterns that satisfies `wanted`.
+fn float_where(wanted: impl Fn(f64) -> bool) -> f64 {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..5_000_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let value = f64::from_bits(state);
+        if value.is_normal() && value.abs() > 1e-100 && value.abs() < 1e100 && wanted(value) {
+            return value;
+        }
+    }
+    panic!("no such value in the sequence");
+}
+
+/// The bytes of a checkpoint an in-process delta issued carry the usage a complete capture of
+/// its observation reports, observed through the checkpoint a capture from them returns.
+#[tokio::test]
+async fn a_checkpoint_from_an_in_process_delta_continues_with_the_complete_usage() {
+    let length = |value: f64| Value::from(value).to_string().len();
+    let x = float_where(|x| length(x) != length(reread(x)));
+    let file = provisioned().await;
+    let saved = {
+        let store = file.open().await;
+        let (_, local) = complete(&store, &[ROWS]).await;
+        store
+            .append_group(&changed("float", "g", &json!(x)))
+            .await
+            .unwrap();
+        let update = store
+            .capture_tenant_since(&tenant(), &[ROWS], limits(), Some(&local))
+            .await
+            .unwrap();
+        let TenantCaptureUpdate::AppendDelta { checkpoint, .. } = update else {
+            panic!("in-process control: {}", kind(&update));
+        };
+        store.durable_checkpoint(&checkpoint).expect("eligible")
+    };
+    let store = file.open().await;
+    let update = resume(&store, &saved, &[ROWS]).await;
+    let TenantCaptureUpdate::Unchanged { checkpoint } = update else {
+        panic!("an untouched store gave {}", kind(&update));
+    };
+    let full = store
+        .capture_tenant(&tenant(), &[ROWS], limits())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.checkpoint_usage(&checkpoint),
+        Some(usage(&full)),
+        "x = {x:e}, bits {:#x}",
+        x.to_bits()
+    );
+}
+
+/// A restored usage over the request's caps proves no crossed cap on an untouched store either.
+#[tokio::test]
+async fn a_restored_usage_over_the_caps_on_an_untouched_store_gives_complete() {
+    let file = provisioned().await;
+    let (_, saved) = durable(&file.open().await, &[ROWS]).await;
+    let mut value: Value = serde_json::from_slice(saved.as_bytes()).unwrap();
+    value["usage"]["events"] = json!(limits().max_events + 1);
+    let store = file.open().await;
+    let restored = store
+        .restore_checkpoint(&DurableCaptureCheckpoint::from_bytes(
+            serde_json::to_vec(&value).unwrap(),
+        ))
+        .expect("well-formed bytes");
+    let update = store
+        .capture_tenant_since(&tenant(), &[ROWS], limits(), Some(&restored))
+        .await
+        .unwrap();
+    let TenantCaptureUpdate::Complete { capture, .. } = update else {
+        panic!("a usage over the caps continued as {}", kind(&update));
+    };
+    assert_eq!(
+        store.checkpoint_usage(&restored).map(|usage| usage.events),
+        Some(limits().max_events + 1),
+        "the usage decoded from the bytes, which no capture took as a crossed cap"
+    );
+    assert!(usage(&capture).events < limits().max_events);
 }
 
 /// Resolve a committed schema by its ESS type name.

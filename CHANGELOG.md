@@ -13,17 +13,32 @@ under bare-version tags such as `0.1.0`.
   PostgreSQL, File and Tree keep complete capture. `DurableCaptureCheckpoint` holds the provider's
   bytes and prints only their length. `SqliteEventStore::enable_durable_continuity` installs, in
   one transaction, a `<prefix>_capture_continuity` row (store instance, epoch, random token), a
-  `<prefix>_capture_journal` kept within 128 entries and 16 MiB, and provider triggers on the
-  events, blobs, identity and registered projection tables; `create_projections` gives each table
-  it creates the same triggers. Each acknowledged atomic group writes one journal entry in its own
-  transaction. A restored checkpoint continues as `Unchanged` or `AppendDelta` only through an
-  unbroken chain of such entries; any other write, a dropped or altered trigger, a pruned entry or
-  an older copy of the file gives `Complete`. Standalone `append`, `put_blob` and `delete_blob`
-  are not journaled, and redaction and tenant erasure delete every entry. The provider's own
-  snapshot writes no longer end in-process continuity. Design:
+  `<prefix>_capture_journal` kept within 128 entries and 16 MiB, a partial index of redacted
+  events, and provider triggers on the events, blobs, identity and registered projection tables;
+  `create_projections` gives each table it creates the same triggers. Each acknowledged atomic
+  group writes one journal entry in its own transaction, holding each row value as the exact text
+  the row held; a group of a tenant with redacted history writes only its link in the chain. A
+  restored checkpoint continues as `Unchanged` or `AppendDelta` only through an unbroken chain of
+  such entries, and only when its stream identity is the stored one, the tenant has no redacted
+  history, each requested projection passes the complete capture's admission and the result fits
+  the request's caps; otherwise the capture is complete. Any other write, a dropped or altered
+  trigger, a pruned entry or an older copy of the file gives `Complete`. A cap that a restored
+  checkpoint's decoded usage crosses gives `Complete`, never a limit refusal. Standalone `append`,
+  `put_blob` and `delete_blob` are not journaled, and redaction and tenant erasure delete every
+  entry. The provider's own snapshot writes no longer end in-process continuity. Design:
   `docs/design/durable-capture-continuity.md`. **One-way for older readers:** Eventlog 0.7.0 and
-  earlier refuse a store carrying the provider triggers; `disable_durable_continuity` drops them
-  and both tables, after which those versions open and attach the store as before.
+  earlier refuse a store carrying the provider triggers; `disable_durable_continuity` drops them,
+  both tables and the index, after which those versions open and attach the store as before.
+
+### Fixed
+
+- SQLite in-process capture deltas carry event bodies and projection row values as a complete
+  capture reads them: the stored text, parsed by the capture's own parser, not the value handed
+  to the write. A number whose text does not parse back to itself made base plus delta differ
+  from a complete capture, and `resulting_usage` differ from its counts.
+- SQLite's trigger checks at open, `open_existing`, inline attach, capture admission and strict
+  inspection match a trigger's table without regard to case, as SQLite resolves it. A foreign
+  trigger that spelled a captured table in another case was admitted.
 
 ## 0.7.0 — 2026-10-07
 

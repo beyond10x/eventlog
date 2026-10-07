@@ -16,7 +16,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::durable_capture::DurableBinding;
+use crate::{durable_capture::DurableBinding, stored_json};
 
 const MAX_GROUPS: usize = 128;
 const MAX_BYTES: usize = 16 << 20;
@@ -96,8 +96,10 @@ struct Pending {
     tenant: Option<TenantId>,
     events: Vec<RecordedEvent>,
     blobs: BTreeMap<String, CapturedBlob>,
-    rows: BTreeMap<(String, String), (ProjectionSpec, CapturedRowChange)>,
+    rows: RowChanges<Value>,
     bytes: usize,
+    /// The group's tenant has redacted history: the entry links the chain and carries nothing.
+    withheld: bool,
 }
 struct Entry {
     from: u64,
@@ -105,11 +107,22 @@ struct Entry {
     pending: Pending,
 }
 
-/// The blob digests an open group newly bound and its projection row changes, coalesced per key.
+/// One row's first value before and last value after, in one group or one chain of groups.
+pub(crate) struct RowChange<V> {
+    pub(crate) key: String,
+    pub(crate) before: Option<V>,
+    pub(crate) after: Option<V>,
+}
+
+/// Row changes by projection name and key, with the declaration they were written under.
+pub(crate) type RowChanges<V> = BTreeMap<(String, String), (ProjectionSpec, RowChange<V>)>;
+
+/// The blob digests an open group newly bound and its projection row changes, coalesced per key,
+/// each value the exact text the store holds.
 pub(crate) struct Draft {
     pub(crate) tenant: TenantId,
     pub(crate) blobs: BTreeSet<String>,
-    pub(crate) rows: BTreeMap<(String, String), (ProjectionSpec, CapturedRowChange)>,
+    pub(crate) rows: RowChanges<String>,
     bytes: usize,
     /// Something the entry would need was not recorded; the group then writes no entry.
     pub(crate) broken: bool,
@@ -188,6 +201,8 @@ pub(crate) struct Checkpoint {
     /// Same-connection authority; absent on a checkpoint restored from durable bytes.
     local: Option<Local>,
     pub(crate) scope: Scope,
+    /// Bound by the capture that issued this checkpoint, or decoded from the bytes the provider
+    /// wrote for it. A continued capture never treats a decoded usage as proof of a crossed cap.
     pub(crate) usage: CaptureUsage,
     /// The durable values read inside the issuing capture's transaction; absent when durable
     /// continuity was not enabled then, or a captured table lacked the provider's triggers.
@@ -294,7 +309,22 @@ impl TrackedCapture {
             blobs: BTreeMap::new(),
             rows: BTreeMap::new(),
             bytes: 0,
+            withheld: false,
         });
+    }
+    /// The open group's tenant has redacted history. Its in-process entry keeps the chain and
+    /// drops every event, blob and row value, and no capture of that tenant continues through it.
+    pub(crate) fn withhold(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(active) = state.active.as_mut() {
+            active.withheld = true;
+            active.events.clear();
+            active.blobs.clear();
+            active.rows.clear();
+            active.bytes = 0;
+        }
     }
     /// Whether a projection write must read its row's value before it changes it.
     pub(crate) fn active(&self) -> bool {
@@ -351,13 +381,16 @@ impl TrackedCapture {
             },
         );
     }
+    /// Record one projection row write, `before` and `after` as the exact text the row held and
+    /// now holds. Both journals keep what a complete capture would read: the in-process one
+    /// parses the text with the capture's own parser, the durable one keeps the text itself.
     pub(crate) fn row(
         &self,
         tenant: &TenantId,
         projection: ProjectionSpec,
         key: &str,
-        before: Option<Value>,
-        after: Option<Value>,
+        before: Option<String>,
+        after: Option<String>,
     ) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -365,9 +398,12 @@ impl TrackedCapture {
         let size = (|| {
             key.len()
                 .checked_add(projection.name.len())?
-                .checked_add(before.as_ref().map_or(Some(0), json_size)?)?
-                .checked_add(after.as_ref().map_or(Some(0), json_size)?)
+                .checked_add(before.as_ref().map_or(0, String::len))?
+                .checked_add(after.as_ref().map_or(0, String::len))
         })();
+        // What a complete capture reads from that text, for the in-process journal.
+        let parse = |text: Option<&str>| text.map(|text| stored_json(text.as_bytes())).transpose();
+        let parsed = (parse(before.as_deref()), parse(after.as_deref()));
         if let Some(draft) = state.draft.as_mut() {
             if tenant != &draft.tenant {
                 draft.broken = true;
@@ -377,14 +413,18 @@ impl TrackedCapture {
                     &mut draft.rows,
                     projection,
                     key,
-                    before.clone(),
-                    after.clone(),
+                    before,
+                    after,
                     &mut mismatch,
                 );
                 draft.broken |= mismatch;
             }
         }
         let Some(active) = state.active.as_mut() else {
+            return;
+        };
+        let (Ok(before), Ok(after)) = parsed else {
+            state.invalidate();
             return;
         };
         let held = size.and_then(|n| active.bytes.checked_add(n));
@@ -440,8 +480,24 @@ impl TrackedCapture {
             state.active = None;
             return;
         }
-        for event in result.appends.iter().flat_map(|append| &append.events) {
-            let Some(size) = serde_json::to_vec(event)
+        let withheld = active.withheld;
+        for event in result
+            .appends
+            .iter()
+            .flat_map(|append| &append.events)
+            .filter(|_| !withheld)
+        {
+            // The event as a complete capture reads it back: its body is the stored text, parsed
+            // by the capture's own parser, not the value the caller handed in.
+            let Ok(data) = stored_json(event.data.to_string().as_bytes()) else {
+                state.invalidate();
+                return;
+            };
+            let event = RecordedEvent {
+                data,
+                ..event.clone()
+            };
+            let Some(size) = serde_json::to_vec(&event)
                 .ok()
                 .and_then(|v| active.bytes.checked_add(v.len()))
             else {
@@ -453,7 +509,7 @@ impl TrackedCapture {
                 return;
             }
             active.bytes = size;
-            active.events.push(event.clone());
+            active.events.push(event);
         }
         active.events.sort_by_key(|event| event.global_seq);
         active.after = Some(stamp);
@@ -540,6 +596,7 @@ impl TrackedCapture {
                 blobs: BTreeMap::new(),
                 rows: BTreeMap::new(),
                 bytes: 0,
+                withheld: false,
             },
         });
     }
@@ -607,9 +664,11 @@ impl TrackedCapture {
             .filter(|entry| entry.to > local.position)
         {
             let p = &entry.pending;
+            // A withheld entry is this tenant's only after redaction, which no capture continues.
             if entry.from != position
                 || p.before != prior_stamp
                 || p.tenant.as_ref().is_some_and(|held| held != tenant)
+                || p.withheld
             {
                 return Ok(None);
             }
@@ -639,7 +698,17 @@ impl TrackedCapture {
                     }
                     held.after.clone_from(&row.after);
                 } else {
-                    rows.insert(key.clone(), (*spec, row.clone()));
+                    rows.insert(
+                        key.clone(),
+                        (
+                            *spec,
+                            CapturedRowChange {
+                                key: row.key.clone(),
+                                before: row.before.clone(),
+                                after: row.after.clone(),
+                            },
+                        ),
+                    );
                 }
             }
             position = entry.to;
@@ -697,12 +766,12 @@ impl TrackedCapture {
 
 /// Record one row change, keeping the first `before` and the last `after` per projection and key.
 /// A second declaration of the same table under one key is a write neither journal can describe.
-fn coalesce(
-    rows: &mut BTreeMap<(String, String), (ProjectionSpec, CapturedRowChange)>,
+fn coalesce<V>(
+    rows: &mut RowChanges<V>,
     projection: ProjectionSpec,
     key: &str,
-    before: Option<Value>,
-    after: Option<Value>,
+    before: Option<V>,
+    after: Option<V>,
     mismatch: &mut bool,
 ) {
     let entry = rows
@@ -710,7 +779,7 @@ fn coalesce(
         .or_insert_with(|| {
             (
                 projection,
-                CapturedRowChange {
+                RowChange {
                     key: key.to_owned(),
                     before,
                     after: None,

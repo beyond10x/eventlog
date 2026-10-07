@@ -22,17 +22,18 @@ use std::{
 };
 
 use eventlog_core::{
-    AppendGroupResult, CaptureError, CaptureLimits, CapturedBlob, CapturedProjectionDelta,
-    CapturedRowChange, EventLogError, MAX_INDEXED_FIELDS, ProjectionSpec, RecordedEvent,
-    TenantCaptureDelta, TenantId, validate_captured_digest, validate_captured_event,
+    AppendGroupResult, CaptureError, CaptureLimits, CaptureUsage, CapturedBlob,
+    CapturedProjectionDelta, CapturedRowChange, EventLogError, MAX_INDEXED_FIELDS, ProjectionSpec,
+    RecordedEvent, TenantCaptureDelta, TenantId, validate_captured_digest, validate_captured_event,
     validate_identifier,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
+use serde_json::value::RawValue;
 
 use crate::{
     COLUMNS, Inner, SqliteEventStore, backend, begin_immediate, finish_transaction, has_table,
     poisoned, projection_table, read_event, run_blocking, sqlite_schema_tokens,
-    sqlite_table_body_tokens, to_i64, to_u64,
+    sqlite_table_body_tokens, stored_json, to_i64, to_u64,
     tracked_capture::{Checkpoint, Draft, Scope, ScopedProjection, advanced_usage},
     validate_prefix,
 };
@@ -57,6 +58,15 @@ fn continuity_table(prefix: &str) -> String {
 
 fn journal_table(prefix: &str) -> String {
     format!("{prefix}_capture_journal")
+}
+
+/// The partial index of redacted events by tenant, which keeps the redacted-history check of
+/// every journaled group to the redacted events of its tenant.
+fn redacted_index(prefix: &str) -> (String, String) {
+    let name = format!("{prefix}_capture_redacted");
+    let sql =
+        format!("CREATE INDEX {name} ON {prefix}_events (tenant_id) WHERE redacted_at IS NOT NULL");
+    (name, sql)
 }
 
 fn operational(error: rusqlite::Error) -> CaptureError {
@@ -139,14 +149,18 @@ fn any_owners(trigger: &Trigger) -> bool {
 ///
 /// The blob table at open, a projection table at attach and capture, and strict inspection each
 /// refused every trigger before durable continuity existed. They still refuse every other one.
+/// SQLite resolves a trigger's target table without regard to case and records `tbl_name` as the
+/// statement spelled it, so the target is matched without regard to case too.
 pub(crate) fn foreign_triggers_on(
     connection: &Connection,
     prefix: &str,
     table: &str,
 ) -> rusqlite::Result<bool> {
     let expected = provider_triggers(prefix, table);
-    let mut statement = connection
-        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1")?;
+    let mut statement = connection.prepare(
+        "SELECT name, sql FROM sqlite_master
+         WHERE type = 'trigger' AND tbl_name = ?1 COLLATE NOCASE",
+    )?;
     let found = statement.query_map([table], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     })?;
@@ -273,7 +287,7 @@ fn carry_provider_triggers(
     Ok(tables.iter().all(|table| {
         let mut found: Vec<(&str, &str)> = held
             .iter()
-            .filter(|trigger| trigger.table == *table)
+            .filter(|trigger| trigger.table.eq_ignore_ascii_case(table))
             .map(|trigger| (trigger.name.as_str(), trigger.sql.as_str()))
             .collect();
         found.sort_unstable();
@@ -311,7 +325,7 @@ fn install_triggers(
     for (name, sql) in provider_triggers(prefix, table) {
         let stored: Option<Option<String>> = connection
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1 COLLATE NOCASE",
                 [&name],
                 |row| row.get(0),
             )
@@ -365,11 +379,36 @@ pub(crate) fn group_start(connection: &Connection, prefix: &str) -> Option<Captu
         .map(|(_, mark)| mark)
 }
 
+/// Whether `tenant` has redacted history. Served by the partial index enable creates, so a group
+/// pays for the redacted events of its tenant, not for its whole history.
+pub(crate) fn redacted(
+    connection: &Connection,
+    prefix: &str,
+    tenant: &TenantId,
+) -> Result<bool, EventLogError> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {prefix}_events
+                 WHERE tenant_id = ?1 AND redacted_at IS NOT NULL)"
+            ),
+            params![tenant.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+}
+
+/// The journal's copy of one stored row body: the exact text, never a re-serialized value.
+fn stored_text(text: Option<String>) -> serde_json::Result<Option<Box<RawValue>>> {
+    text.map(RawValue::from_string).transpose()
+}
+
 /// Record an acknowledged group's journal entry inside its transaction, then prune the journal.
 ///
 /// A deduplicated group, a draft that missed something, and an entry over the byte bound write
 /// nothing: the group's writes then move the mark without an entry, and the next restored
-/// checkpoint gives a complete capture.
+/// checkpoint gives a complete capture. A `withheld` group, whose tenant has redacted history,
+/// writes an entry that links the chain and carries no event position, digest or row value.
 pub(crate) fn journal_group(
     connection: &Connection,
     prefix: &str,
@@ -377,11 +416,12 @@ pub(crate) fn journal_group(
     tenant: &TenantId,
     appended: &AppendGroupResult,
     draft: Option<Draft>,
+    withheld: bool,
 ) -> Result<(), EventLogError> {
     let Some(draft) = draft else {
         return Ok(());
     };
-    if appended.deduplicated || draft.broken || &draft.tenant != tenant {
+    if appended.deduplicated || &draft.tenant != tenant || (draft.broken && !withheld) {
         return Ok(());
     }
     let Some((_, to)) = state(connection, prefix)? else {
@@ -395,31 +435,38 @@ pub(crate) fn journal_group(
             |row| row.get(0),
         )
         .map_err(backend)?;
-    let mut event_positions: Vec<u64> = appended
-        .appends
-        .iter()
-        .flat_map(|append| &append.events)
-        .map(|event| event.global_seq)
-        .collect();
-    event_positions.sort_unstable();
-    let entry = wire::DurableJournalEntry {
+    let mut entry = wire::DurableJournalEntry {
         position: to_u64(position)?,
         tenant_id: tenant.as_str().to_owned(),
         from,
         to,
-        event_positions,
-        blobs: draft.blobs.into_iter().collect(),
-        rows: draft
-            .rows
-            .into_values()
-            .map(|(specification, row)| wire::JournaledRowChange {
+        event_positions: Vec::new(),
+        blobs: Vec::new(),
+        rows: Vec::new(),
+    };
+    // A tenant with redacted history gets a link and nothing else: a row this group replaced may
+    // hold a value derived from the redacted event, and the journal must not outlive it.
+    if !withheld {
+        entry.event_positions = appended
+            .appends
+            .iter()
+            .flat_map(|append| &append.events)
+            .map(|event| event.global_seq)
+            .collect();
+        entry.event_positions.sort_unstable();
+        entry.blobs = draft.blobs.into_iter().collect();
+        for (specification, row) in draft.rows.into_values() {
+            let (Ok(before), Ok(after)) = (stored_text(row.before), stored_text(row.after)) else {
+                return Ok(());
+            };
+            entry.rows.push(wire::JournaledRowChange {
                 projection: wire::CapturedProjectionScope::of(&specification),
                 key: row.key,
-                before: row.before,
-                after: row.after,
-            })
-            .collect(),
-    };
+                before,
+                after,
+            });
+        }
+    }
     let text = serde_json::to_string(&entry).map_err(backend)?;
     let bytes = i64::try_from(text.len()).map_err(backend)?;
     if bytes > MAX_BYTES {
@@ -497,13 +544,14 @@ pub(crate) fn encode(checkpoint: &Checkpoint, prefix: &str) -> Option<Vec<u8>> {
     .ok()
 }
 
-/// A checkpoint restored from bytes `encode` wrote for this prefix and store instance, or `None`.
-pub(crate) fn decode(bytes: &[u8], prefix: &str, instance: &str) -> Option<Checkpoint> {
+/// A checkpoint restored from bytes `encode` wrote for this prefix, or `None`. `instance` is the
+/// store instance the restoring handle last read, when it has read one.
+pub(crate) fn decode(bytes: &[u8], prefix: &str, instance: Option<&str>) -> Option<Checkpoint> {
     let wire: wire::SqliteDurableCheckpoint = serde_json::from_slice(bytes).ok()?;
     if wire.format != FORMAT
         || wire.version != VERSION
         || wire.prefix != prefix
-        || wire.store_instance != instance
+        || instance.is_some_and(|instance| wire.store_instance != instance)
         || !hex32(&wire.store_instance)
         || !hex32(&wire.mark.token)
     {
@@ -551,6 +599,14 @@ pub(crate) fn decode(bytes: &[u8], prefix: &str, instance: &str) -> Option<Check
             position: wire.position,
         },
     ))
+}
+
+/// Whether `usage` fits every cap of `limits`.
+fn within(usage: CaptureUsage, limits: CaptureLimits) -> bool {
+    usage.events <= limits.max_events
+        && usage.blobs <= limits.max_blobs
+        && usage.projection_rows <= limits.max_projection_rows
+        && usage.payload_bytes <= limits.max_payload_bytes
 }
 
 /// How a restored checkpoint continues.
@@ -632,12 +688,23 @@ fn walk(
             || entry.tenant_id != owner
             || !entry.from.same(&from)
             || !entry.to.same(&walk.end)
+            || entry.event_positions.is_empty()
         {
+            // Every acknowledged group appends an event: an entry of this tenant without one is
+            // withheld after redaction, and nothing of this tenant continues past it.
             return None;
         }
         walk.positions.extend(entry.event_positions);
         walk.blobs.extend(entry.blobs);
         for change in entry.rows {
+            // The value a complete capture reads: the stored text, parsed by its own parser.
+            let parse = |text: Option<Box<RawValue>>| {
+                text.map(|text| stored_json(text.get().as_bytes()))
+                    .transpose()
+            };
+            let (Ok(before), Ok(after)) = (parse(change.before), parse(change.after)) else {
+                return None;
+            };
             let Some(specification) = projections
                 .iter()
                 .find(|requested| requested.name == change.projection.name)
@@ -654,18 +721,18 @@ fn walk(
                 .get_mut(&(change.projection.name.clone(), change.key.clone()))
             {
                 Some(held) => {
-                    if held.after != change.before {
+                    if held.after != before {
                         return None;
                     }
-                    held.after = change.after;
+                    held.after = after;
                 }
                 None => {
                     walk.rows.insert(
                         (change.projection.name, change.key.clone()),
                         CapturedRowChange {
                             key: change.key,
-                            before: change.before,
-                            after: change.after,
+                            before,
+                            after,
                         },
                     );
                 }
@@ -828,7 +895,9 @@ impl Inner {
             return Ok(None);
         }
         if then.mark.same(&now.mark) && then.position == now.position {
-            return Ok(Some(Continued::Unchanged));
+            // The usage is decoded, not counted: one over the request's caps is no proof of a
+            // crossed cap, so the complete capture decides instead.
+            return Ok(within(old.usage, limits).then_some(Continued::Unchanged));
         }
         let Some(walk) = walk(connection, &self.prefix, tenant, projections, then) else {
             return Ok(None);
@@ -868,12 +937,13 @@ impl Inner {
                 .collect(),
             resulting_usage: old.usage,
         };
-        // A usage the delta cannot be applied to is bytes nobody can vouch for, not a refusal.
-        delta.resulting_usage = match advanced_usage(old.usage, &delta, limits) {
-            Ok(usage) => usage,
-            Err(CaptureError::Corrupt { .. }) => return Ok(None),
-            Err(other) => return Err(other),
+        // The base usage is decoded from bytes, not counted. A cap it crosses, or a delta it cannot
+        // be applied to, is no proof about the observation: the complete capture decides, and
+        // reports a cap only when the real content crosses it.
+        let Ok(usage) = advanced_usage(old.usage, &delta, limits) else {
+            return Ok(None);
         };
+        delta.resulting_usage = usage;
         Ok(Some(Continued::Delta(delta)))
     }
 
@@ -940,6 +1010,20 @@ impl Inner {
         for table in self.captured_tables(connection)? {
             install_triggers(connection, prefix, &table)?;
         }
+        let (index, sql) = redacted_index(prefix);
+        let stored: Option<Option<String>> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1 COLLATE NOCASE",
+                [&index],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        match stored {
+            None => connection.execute_batch(&sql).map_err(backend)?,
+            Some(Some(stored)) if stored == sql => {}
+            Some(_) => return Err(not_the_providers()),
+        }
         let (instance, _) = state(connection, prefix)?.ok_or_else(not_the_providers)?;
         Ok(instance)
     }
@@ -989,7 +1073,8 @@ impl Inner {
             }
             connection
                 .execute_batch(&format!(
-                    "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};",
+                    "DROP INDEX IF EXISTS {}; DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};",
+                    redacted_index(prefix).0,
                     journal_table(prefix),
                     continuity_table(prefix)
                 ))
@@ -1008,8 +1093,9 @@ impl SqliteEventStore {
     /// Creates `{prefix}_capture_continuity`, which mints this store's instance, the bounded
     /// `{prefix}_capture_journal`, and an `AFTER INSERT`, `AFTER UPDATE` and `AFTER DELETE`
     /// trigger on the events, blobs and identity tables and on every registered projection
-    /// table. Idempotent: a second call on an enabled store changes nothing, the instance
-    /// included. **Eventlog 0.7.0 and earlier refuse a store carrying these triggers**;
+    /// table, and a partial index of redacted events by tenant, which keeps the redacted-history
+    /// check of every journaled group cheap. Idempotent: a second call on an enabled store
+    /// changes nothing, the instance included. **Eventlog 0.7.0 and earlier refuse a store carrying these triggers**;
     /// [`Self::disable_durable_continuity`] makes it theirs again.
     ///
     /// # Errors
@@ -1036,7 +1122,7 @@ impl SqliteEventStore {
 /// The JSON encodings, by the names of the ESS types they encode.
 mod wire {
     use serde::{Deserialize, Deserializer, Serialize};
-    use serde_json::Value;
+    use serde_json::value::RawValue;
 
     use super::CaptureContinuityMark;
 
@@ -1163,7 +1249,9 @@ mod wire {
         pub(super) mark: CaptureContinuityMark,
     }
 
-    /// Absent is no row; a present JSON `null` is a row whose value is null.
+    /// Absent is no row; a present JSON `null` is a row whose value is null. A present value is
+    /// the exact text the row held, embedded as JSON: re-serializing a parsed value would hand a
+    /// later reader a number the row never held.
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(super) struct JournaledRowChange {
@@ -1174,13 +1262,13 @@ mod wire {
             skip_serializing_if = "Option::is_none",
             deserialize_with = "present"
         )]
-        pub(super) before: Option<Value>,
+        pub(super) before: Option<Box<RawValue>>,
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
             deserialize_with = "present"
         )]
-        pub(super) after: Option<Value>,
+        pub(super) after: Option<Box<RawValue>>,
     }
 
     /// One acknowledged atomic group, written in the group's own transaction.
@@ -1197,7 +1285,9 @@ mod wire {
     }
 
     /// A member that is present, JSON `null` included, is `Some`: only absence is `None`.
-    fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
-        Value::deserialize(deserializer).map(Some)
+    fn present<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Box<RawValue>>, D::Error> {
+        Box::<RawValue>::deserialize(deserializer).map(Some)
     }
 }

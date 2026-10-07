@@ -14,7 +14,9 @@ eventlog-core.workspace = true
 rusqlite = { workspace = true, features = ["serialize"] }
 # Derives the JSON encoding of durable capture checkpoints and journal entries.
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value` keeps a journaled row body as the exact text the row held. Additive: it changes
+# neither parsing nor serialization of any other value.
+serde_json = { workspace = true, features = ["raw_value"] }
 time.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
