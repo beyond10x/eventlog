@@ -21,7 +21,7 @@ use eventlog_core::{
 };
 use journal::{Journal, backend, hash};
 use serde_json::Value;
-use state::{Blob, Op, State, key, matches_stream, stream_key};
+use state::{Blob, Op, State, key, stream_key};
 use std::{
     collections::BTreeSet,
     fs,
@@ -482,12 +482,7 @@ impl Transaction {
             events: self
                 .state
                 .events
-                .values()
-                .filter(|e| {
-                    matches_stream(e, &range.stream)
-                        && e.version >= range.first_version
-                        && e.version <= range.last_version
-                })
+                .of_stream(&range.stream, range.first_version..=range.last_version)
                 .cloned()
                 .collect(),
             deduplicated,
@@ -1273,8 +1268,10 @@ impl FileEventStore {
 fn slice(state: &State, stream: &StreamId, after: u64, limit: usize) -> StreamSlice {
     let mut events: Vec<_> = state
         .events
-        .values()
-        .filter(|e| matches_stream(e, stream) && e.version > after)
+        .of_stream(
+            stream,
+            (std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded),
+        )
         .take(bounded_limit(limit) + 1)
         .cloned()
         .collect();
@@ -1608,7 +1605,7 @@ impl EventStore for FileEventStore {
         let (stream, reason) = (stream.clone(), reason.to_owned());
         Box::pin(self.transaction(move |tx| Box::pin(async move {
             validate_field("redaction reason", &reason)?;
-            let mut event = tx.state.events.values().find(|e| matches_stream(e, &stream) && e.version == version).cloned().ok_or(EventLogError::NotFound)?;
+            let mut event = tx.state.events.of_stream(&stream, version..=version).next().cloned().ok_or(EventLogError::NotFound)?;
             event.data = redaction_tombstone(&reason); event.redacted_at = Some(OffsetDateTime::now_utc());
             for transaction in &mut tx.journal.transactions {
                 let mut ops: Vec<Op> = serde_json::from_value(transaction.clone()).map_err(backend)?;
