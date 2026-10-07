@@ -64,9 +64,12 @@ struct Verified {
     manifest: journal::Manifest,
     transactions: Vec<Value>,
     state: State,
-    /// The hash of the committed bytes these frames were decoded from. A resumed transaction
-    /// re-reads exactly those bytes and refuses to reuse the view when they are not them, so a
-    /// committed frame damaged in place after `open` is never served and never appended onto.
+    /// The committed bytes these frames were decoded from. A resumed transaction re-reads the
+    /// file's committed prefix, compares it with them byte for byte and refuses to reuse the view
+    /// when it is not them, so a committed frame damaged in place after `open` is never served and
+    /// never appended onto. Whichever of this view and the reader's view in `captured` was built
+    /// last keeps its bytes in the other's buffer when they agree, and the other is dropped when
+    /// they do not ([`journal::Content::adopt`]), so a handle keeps these bytes once.
     content: journal::Content,
 }
 struct Transaction {
@@ -157,8 +160,19 @@ impl FileEventStore {
             .filter(|verified| Some(&verified.manifest) == observed.as_ref());
         let inline = runtime.inline.clone();
         let permit = self.permit.clone();
-        let mut tx =
-            blocking(move || enter(&path, observed.as_ref(), verified, inline, permit)).await?;
+        let reader = capture::reader_bytes(runtime.captured.as_ref());
+        let mut tx = blocking(move || {
+            enter(
+                &path,
+                observed.as_ref(),
+                verified,
+                reader.as_ref(),
+                inline,
+                permit,
+            )
+        })
+        .await?;
+        capture::keep_reader_once(&mut runtime.captured, &tx.journal);
         let outcome = work(&mut tx).await;
         let result = match outcome {
             Ok(result) => result,
@@ -967,8 +981,9 @@ impl Transaction {
 /// Take the process lock and produce the transaction's journal and folded state.
 ///
 /// With a verified view of `observed` in hand, [`Journal::resume`] compares `manifest.json` with
-/// it and re-hashes the committed bytes behind it: identical history costs the lock, that
-/// comparison and one raw pass over the committed prefix; an extended history costs the same pass
+/// it and re-reads the committed bytes behind it, comparing them with the bytes the view kept:
+/// identical history costs the lock, that comparison and one raw pass over the committed prefix
+/// (none while the file's stamp is trusted); an extended history costs the same pass
 /// plus the frames past the observed length, chained from the observed digest, folded onto the
 /// cached state, and the objects those frames bind. Anything else — no cached view, a pending
 /// recovery intent, a new epoch, a shorter or unchained file, or a committed prefix that is no
@@ -976,14 +991,20 @@ impl Transaction {
 /// rechains the whole history, refuses one that does not extend what this handle observed, hashes
 /// every active object and disposes of snapshots and objects nothing references.
 ///
-/// The prefix hash is what makes the resumed path safe to *write* from: `Journal::append` seeks to
-/// the committed length and writes, so a transaction that were handed append authority over a
-/// prefix nobody re-read could commit a valid frame after a damaged one and leave a history no
-/// opener accepts. Every resumed transaction passes that check before this function returns.
+/// The prefix comparison is what makes the resumed path safe to *write* from: `Journal::append`
+/// seeks to the committed length and writes, so a transaction that were handed append authority
+/// over a prefix nobody re-read could commit a valid frame after a damaged one and leave a history
+/// no opener accepts. Every resumed transaction passes that check before this function returns.
+///
+/// Either way the journal then keeps its committed bytes in the buffer of `reader`, the capture
+/// view of the same handle, wherever the two agree ([`Journal::adopt`]): a complete reread would
+/// otherwise hold a second copy beside that view. It compares bytes, so it belongs here, in the
+/// blocking work; the caller then drops a reader view that still keeps a buffer of its own.
 fn enter(
     root: &Path,
     observed: Option<&journal::Manifest>,
     verified: Option<Verified>,
+    reader: Option<&journal::Content>,
     inline: Vec<Arc<dyn Projector>>,
     permit: AdmissionPermit,
 ) -> Result<Transaction, EventLogError> {
@@ -996,8 +1017,10 @@ fn enter(
             bound.extend(state.fold(transaction)?);
         }
         let advanced = !resumed.fresh.is_empty();
+        let mut journal = resumed.into_journal(root, verified.transactions);
+        journal.adopt(reader);
         let tx = Transaction {
-            journal: resumed.into_journal(root, verified.transactions),
+            journal,
             state,
             pending: Vec::new(),
             inline,
@@ -1018,7 +1041,7 @@ fn enter(
         }
         return Ok(tx);
     }
-    let journal = Journal::open_existing(root)?;
+    let mut journal = Journal::open_existing(root)?;
     if let Some(observed) = observed
         && !journal.extends(observed)?
     {
@@ -1026,6 +1049,7 @@ fn enter(
             "file history diverged from this handle's observed history",
         ));
     }
+    journal.adopt(reader);
     let tx = Transaction {
         state: State::replay(&journal.transactions)?,
         journal,
@@ -2478,7 +2502,8 @@ mod stamped_resume_cost {
     }
 
     /// Fifty reads in one batch resume the store once; fifty separate reads resume it fifty times.
-    /// Inside the untrusted window every resume hashes the prefix, so the hashed bytes count them.
+    /// Inside the untrusted window every resume compares the prefix, so the compared bytes count
+    /// them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_batch_of_reads_resumes_the_store_once() {
         let directory = tempfile::tempdir().unwrap();
@@ -2509,18 +2534,233 @@ mod stamped_resume_cost {
         }
         let separate = crate::cost::of(root) - before;
         assert!(
-            batch.prefix_bytes_hashed > 0,
-            "the fixture did not hash at all: {batch:?}"
+            batch.prefix_bytes_compared > 0,
+            "the fixture did not compare at all: {batch:?}"
         );
         assert_eq!(
-            separate.prefix_bytes_hashed,
-            50 * batch.prefix_bytes_hashed,
+            separate.prefix_bytes_compared,
+            50 * batch.prefix_bytes_compared,
             "the batch did not resume once: batch {batch:?}, separate {separate:?}"
         );
     }
 
     fn stream() -> StreamId {
         StreamId::new(TenantId::new("stamp-cost").unwrap(), "item", "one").unwrap()
+    }
+
+    fn limits() -> eventlog_core::CaptureLimits {
+        eventlog_core::CaptureLimits {
+            max_events: 64,
+            max_blobs: 64,
+            max_projection_rows: 64,
+            max_payload_bytes: 65_536,
+        }
+    }
+
+    /// Inside the window both resumes re-read the whole committed prefix and compare it with the
+    /// bytes the handle verified. The writer's resume is the read after this handle's own append,
+    /// the reader's is the second of two captures. Neither can trust a stamp: an append clears the
+    /// writer's, and a strict read keeps none. With no new tail, neither hashes any journal byte:
+    /// `journal_bytes_hashed` is charged inside `journal::hash` itself, so a SHA-256 put back on
+    /// either path moves it, and the append before them is the control that it can move at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_window_resume_compares_the_prefix_and_hashes_none_of_it() {
+        use eventlog_core::ConsistentTenantCapture as _;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        let tenant = stream().tenant().clone();
+        store.stream_identity(&tenant).await.unwrap();
+        let before = crate::cost::of(root);
+        store
+            .append(
+                &stream(),
+                Expected::NoStream,
+                &[event("item.changed", 1)],
+                &meta("one", &serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        let committed = fs::metadata(root.join("events.jsonl")).unwrap().len();
+        let appended = crate::cost::of(root) - before;
+        assert!(
+            appended.journal_bytes_hashed > 0,
+            "the control: an append hashes its frame, and none of it reached this root: \
+             {appended:?}"
+        );
+
+        let before = crate::cost::of(root);
+        store.read_stream(&stream(), 0, 10).await.unwrap();
+        let writer = crate::cost::of(root) - before;
+        assert_eq!(writer.resumes_trusted, 0, "the writer trusted: {writer:?}");
+        assert_eq!(
+            writer.journal_bytes_hashed, 0,
+            "the writer's resume hashed journal bytes: {writer:?}"
+        );
+        assert_eq!(
+            writer.prefix_bytes_compared, committed,
+            "the writer's resume did not compare the whole prefix: {writer:?}"
+        );
+
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        let before = crate::cost::of(root);
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        let reader = crate::cost::of(root) - before;
+        assert_eq!(
+            reader.frames_chained, 0,
+            "the capture did not resume: {reader:?}"
+        );
+        assert_eq!(reader.resumes_trusted, 0, "the reader trusted: {reader:?}");
+        assert_eq!(
+            reader.journal_bytes_hashed, 0,
+            "the reader's resume hashed journal bytes: {reader:?}"
+        );
+        assert_eq!(
+            reader.prefix_bytes_compared, committed,
+            "the reader's resume did not compare the whole prefix: {reader:?}"
+        );
+    }
+
+    /// The control for every zero above: both resumes run inside a journal operation whose hashing
+    /// reaches this root. Each resumes onto a tail another handle committed, decodes and chains it,
+    /// and the frame digests that checks are charged — so a resume that hashed its prefix would be
+    /// charged too, and `an_in_window_resume_compares_the_prefix_and_hashes_none_of_it` would see
+    /// it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_onto_a_new_tail_charges_the_tail_it_hashes() {
+        use eventlog_core::ConsistentTenantCapture as _;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        let tenant = stream().tenant().clone();
+        store.stream_identity(&tenant).await.unwrap();
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        {
+            let other = FileEventStore::open(root).await.unwrap();
+            other
+                .append(
+                    &stream(),
+                    Expected::NoStream,
+                    &[event("item.changed", 1)],
+                    &meta("other", &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        let before = crate::cost::of(root);
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        let reader = crate::cost::of(root) - before;
+        assert_eq!(
+            reader.frames_chained, 1,
+            "the capture did not resume onto the tail: {reader:?}"
+        );
+        assert!(
+            reader.journal_bytes_hashed > 0,
+            "the reader's resume chained a tail and charged no hashing: {reader:?}"
+        );
+        {
+            let other = FileEventStore::open(root).await.unwrap();
+            other
+                .append(
+                    &stream(),
+                    Expected::Exact(1),
+                    &[event("item.changed", 2)],
+                    &meta("other-2", &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        // The capture moved the observed head, so the writer rereads once and then resumes.
+        store.read_stream(&stream(), 0, 10).await.unwrap();
+        {
+            let other = FileEventStore::open(root).await.unwrap();
+            other
+                .append(
+                    &stream(),
+                    Expected::Exact(2),
+                    &[event("item.changed", 3)],
+                    &meta("other-3", &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        let before = crate::cost::of(root);
+        store.read_stream(&stream(), 0, 10).await.unwrap();
+        let writer = crate::cost::of(root) - before;
+        assert_eq!(
+            writer.frames_chained, 1,
+            "the writer did not resume onto the tail: {writer:?}"
+        );
+        assert!(
+            writer.journal_bytes_hashed > 0,
+            "the writer's resume chained a tail and charged no hashing: {writer:?}"
+        );
+    }
+
+    /// A capture its caller drops — a `tokio::time::timeout` or a `select!` around it — leaves the
+    /// handle's committed bytes in one buffer wherever it was waiting: it has stored no view, or
+    /// stored one already moved onto the writer's buffer. Each run is a fresh store whose capture
+    /// reads the whole file, polled by hand and dropped after one poll, then two, four and so on,
+    /// until a run completes undisturbed and keeps both views in one buffer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_dropped_wherever_it_waits_leaves_one_buffer() {
+        use eventlog_core::ConsistentTenantCapture as _;
+        use std::{
+            future::Future as _,
+            task::{Context, Poll, Waker},
+        };
+        let tenant = stream().tenant().clone();
+        let mut drop_after = 1_usize;
+        loop {
+            let directory = tempfile::tempdir().unwrap();
+            let store = FileEventStore::open(directory.path()).await.unwrap();
+            store.stream_identity(&tenant).await.unwrap();
+            store
+                .append(
+                    &stream(),
+                    Expected::NoStream,
+                    &[event("item.changed", 1)],
+                    &meta("one", &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+            let mut capture = Box::pin(store.capture_tenant(&tenant, &[], limits()));
+            let mut context = Context::from_waker(Waker::noop());
+            let mut polls = 0;
+            let finished = loop {
+                match capture.as_mut().poll(&mut context) {
+                    Poll::Ready(outcome) => {
+                        outcome.unwrap();
+                        break true;
+                    }
+                    Poll::Pending => {
+                        polls += 1;
+                        if polls == drop_after {
+                            break false;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            };
+            drop(capture);
+            let runtime = store.runtime.lock().await;
+            let writer = runtime.verified.as_ref().map(|view| &view.content);
+            let reader = capture::reader_bytes(runtime.captured.as_ref());
+            if let (Some(writer), Some(reader)) = (writer, reader.as_ref()) {
+                assert!(
+                    writer.shares_bytes_with(reader),
+                    "a capture dropped after {polls} polls left two buffers"
+                );
+            }
+            if finished {
+                assert!(
+                    writer.is_some() && reader.is_some(),
+                    "an undisturbed capture keeps both views"
+                );
+                break;
+            }
+            drop_after *= 2;
+        }
     }
 
     /// Two hundred reads over an unchanged file, from a handle whose stamp is trusted, hash no
@@ -2555,8 +2795,12 @@ mod stamped_resume_cost {
         }
         let spent = crate::cost::of(root) - before;
         assert_eq!(
-            spent.prefix_bytes_hashed, 0,
-            "an unchanged file was re-hashed: {spent:?}"
+            spent.prefix_bytes_compared, 0,
+            "an unchanged file was re-read: {spent:?}"
+        );
+        assert_eq!(
+            spent.journal_bytes_hashed, 0,
+            "reads over an unchanged file hashed journal bytes: {spent:?}"
         );
         assert_eq!(
             spent.resumes_trusted, 200,
@@ -2581,7 +2825,7 @@ mod stamped_resume_cost {
             .await
             .unwrap();
         let before = crate::cost::of(root);
-        // The second read must re-hash too: the file changed inside the window.
+        // The second read must re-read too: the file changed inside the window.
         store.read_stream(&stream(), 0, 100).await.unwrap();
         store.read_stream(&stream(), 0, 100).await.unwrap();
         let spent = crate::cost::of(root) - before;
@@ -2590,7 +2834,7 @@ mod stamped_resume_cost {
             "a fresh write was trusted: {spent:?}"
         );
         assert!(
-            spent.prefix_bytes_hashed > 0,
+            spent.prefix_bytes_compared > 0,
             "a fresh write was not re-read: {spent:?}"
         );
     }
