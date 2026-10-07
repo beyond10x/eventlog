@@ -27,6 +27,11 @@ capacity are outside the established proof.
 Keep the complete store together. `manifest.json` and the committed prefix of `events.jsonl`
 are authority, alongside referenced content. A manifest cannot be recreated from a guess.
 
+Each handle indexes the events it has folded by stream. Within a call, a `stream_version` head
+lookup reads no event and a `read_stream` window reads the events it returns plus one, however
+many events other streams hold; feed, catch-up and projection rebuild reads walk the store in
+global order.
+
 ## SQLite
 
 Use a database file for persistence and `:memory:` for disposable state. The provider bundles

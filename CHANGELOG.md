@@ -5,6 +5,17 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Performance
+
+- File: `stream_version`, `read_stream`, the receipt a retried command or group returns and the
+  event `redact` rewrites are found through a per-stream index kept beside the events, so each
+  reads only the stream asked about (a head lookup reads no event, a window the events it returns
+  plus one) instead of every event in the store. Folding history no longer rescans the store for
+  each event's order check, which made replay quadratic: 160 events took 12,720 reads, now 0, and
+  a complete open of 5,191 events fell from 674 ms to 288 ms (median, one machine). Feed, catch-up
+  and projection rebuild still walk the store in global order. `eventlog-file/1` is unchanged.
+  https://github.com/beyond10x/eventlog/issues/42
+
 ## 0.8.0 — 2026-10-07
 
 ### Added
