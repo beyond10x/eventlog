@@ -85,8 +85,8 @@ other-store-instance and newer-version bytes, never an error. It is synchronous 
 store instance this handle last read. A handle that has not yet seen continuity enabled accepts
 well-formed bytes for its prefix and leaves the comparison to the capture. A capture compares the
 stored instance again inside its transaction, so bytes from before a disable and re-enable by
-another process give `Complete`. `checkpoint_usage` of a restored checkpoint is `None` until a
-capture has validated it.
+another process give `Complete`. `checkpoint_usage` of a restored checkpoint is the usage decoded
+from its bytes, which the provider wrote when it issued them.
 `durable_checkpoint` returns `None` on a store where `enable_durable_continuity` has not run, and
 for a checkpoint taken while a requested projection table carried no provider trigger.
 
@@ -99,6 +99,7 @@ All names carry the store's table prefix, so owners sharing one file stay indepe
 | Object | Shape |
 |---|---|
 | `{prefix}_capture_continuity` | one row: `instance TEXT` (32 lower-case hex, minted at enable), `epoch INTEGER`, `token TEXT` (32 lower-case hex) |
+| `{prefix}_capture_redacted` | partial index on `{prefix}_events(tenant_id) WHERE redacted_at IS NOT NULL`, so a group finds a tenant's redacted history without scanning it |
 | `{prefix}_capture_journal` | `position INTEGER PRIMARY KEY`, `tenant_id TEXT`, `from_epoch`, `from_token`, `to_epoch`, `to_token`, `entry TEXT` (a `DurableJournalEntry` as JSON), `bytes INTEGER` |
 | trigger per captured table and operation | `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` on `{prefix}_events`, `{prefix}_blobs`, `{prefix}_identity` and every registered projection table of this owner (a table matching `{prefix}_p_*` that belongs to another owner whose prefix extends this one is not this owner's), each running `UPDATE {prefix}_capture_continuity SET epoch = epoch + 1, token = lower(hex(randomblob(16)))` |
 
@@ -106,11 +107,11 @@ Trigger names and SQL text are produced by one function; every admission check c
 exactly. Snapshot, snapshot-generation, command, claim, counter, cursor and registry tables carry
 no trigger: they are not captured material.
 
-`enable_durable_continuity` creates the two tables and every trigger in one transaction. It is
+`enable_durable_continuity` creates the two tables, the index and every trigger in one transaction. It is
 idempotent: a second call on an enabled store changes nothing, including the instance. It refuses
 a store carrying any trigger the provider does not own. `create_projections` on an enabled store
 installs the triggers on each table it creates, in the same transaction. `disable_durable_continuity`
-drops every provider trigger and both tables in one transaction; Eventlog 0.7.0 then opens and
+drops every provider trigger, the index and both tables in one transaction; Eventlog 0.7.0 then opens and
 attaches the store as before. `open_existing` never creates any of these objects, and provisioning
 does not install them.
 
