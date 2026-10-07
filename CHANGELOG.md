@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.8.0 — 2026-10-07
+
 ### Added
 
 - Durable capture continuity on SQLite: a capture checkpoint a later process can continue from.
