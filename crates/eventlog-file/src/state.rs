@@ -425,7 +425,7 @@ impl Op {
 #[cfg(test)]
 mod tests {
     use super::{Events, State, stream_key, visits};
-    use crate::{FileEventStore, journal::Journal};
+    use crate::{FileEventStore, cost, journal::Journal};
     use eventlog_conformance::{event, meta};
     use eventlog_core::{
         AppendGroup, AtomicEventStore, EventStore, Expected, RecordedEvent, StreamAppend, StreamId,
@@ -689,9 +689,9 @@ mod tests {
         );
         drop(reopened);
 
-        // The same history, folded one frame at a time as a resumed handle folds what it has not
-        // seen, and replayed at once as an opener does: after every frame the index is exactly its
-        // events regrouped, and both ends hold the same index.
+        // After every frame of that history the index is exactly its events regrouped by an
+        // independent walk. Whether a *resumed* view agrees with a replay is the next case's
+        // question: here both sides come from the same fold.
         let journal = Journal::open(root.path()).unwrap();
         let mut folded = State::default();
         for (frame, transaction) in journal.transactions.iter().enumerate() {
@@ -702,11 +702,92 @@ mod tests {
                 "frame {frame}"
             );
         }
-        let replayed = State::replay(&journal.transactions).unwrap();
-        assert_eq!(replayed.events.by_stream, folded.events.by_stream);
-        assert_eq!(
-            replayed.events.by_position.len(),
-            folded.events.by_position.len()
-        );
+    }
+
+    /// The events and index a handle's next transaction starts from, read inside that transaction.
+    async fn view(
+        store: &FileEventStore,
+    ) -> (
+        BTreeMap<String, BTreeMap<u64, u64>>,
+        BTreeMap<u64, RecordedEvent>,
+    ) {
+        store
+            .transaction(|tx| {
+                Box::pin(async move {
+                    Ok((
+                        tx.state.events.by_stream.clone(),
+                        tx.state.events.by_position.clone(),
+                    ))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The view a writing handle actually serves from is not a replay. It is built by its own
+    /// in-transaction `record` calls, kept across calls, and resumed onto the frames another
+    /// handle committed (`enter`, which folds only those frames onto the cached state). Two
+    /// handles take turns; after each turn the one that did not write reads, and the events and
+    /// index its resumed view holds must be what a fresh replay of the whole journal holds.
+    ///
+    /// Each turn also refuses a group after its first member was recorded. Nothing of it is
+    /// committed, so a view that kept it would hold an event no replay has; the stream it names
+    /// is never written again, so nothing but this comparison could see it.
+    #[tokio::test]
+    async fn a_resumed_view_holds_the_events_and_index_a_fresh_replay_builds() {
+        let root = tempfile::tempdir().unwrap();
+        let tenant = tenant("resumed");
+        let handles = [
+            FileEventStore::open(root.path()).await.unwrap(),
+            FileEventStore::open(root.path()).await.unwrap(),
+        ];
+        for turn in 0..ROUNDS {
+            let writer = &handles[usize::from(turn % 2 == 1)];
+            let reader = &handles[usize::from(turn % 2 == 0)];
+            let refused = AppendGroup {
+                tenant: tenant.clone(),
+                meta: meta(&format!("refused-{turn}"), &json!({ "refused": turn })),
+                appends: vec![
+                    StreamAppend {
+                        stream: StreamId::new(tenant.clone(), "refused", format!("r{turn}"))
+                            .unwrap(),
+                        expected: Expected::NoStream,
+                        events: vec![event("item.changed", 3)],
+                    },
+                    StreamAppend {
+                        stream: stream(&tenant, 1),
+                        expected: Expected::Exact(u64::MAX),
+                        events: vec![event("item.changed", 4)],
+                    },
+                ],
+            };
+            writer.append_group(&refused).await.unwrap_err();
+            // Two frames the reader has not seen: a group over every stream, and one append.
+            writer.append_group(&round(&tenant, turn)).await.unwrap();
+            writer
+                .append(
+                    &stream(&tenant, turn),
+                    Expected::Any,
+                    &[event("item.changed", 2)],
+                    &meta(&format!("single-{turn}"), &json!({ "turn": turn })),
+                )
+                .await
+                .unwrap();
+
+            let before = cost::of(root.path()).frames_chained;
+            let (index, events) = view(reader).await;
+            assert_eq!(
+                cost::of(root.path()).frames_chained - before,
+                2,
+                "turn {turn}: the reader resumed onto the writer's two frames, not a complete open"
+            );
+            let replayed =
+                State::replay(&Journal::open(root.path()).unwrap().transactions).unwrap();
+            assert_eq!(index, replayed.events.by_stream, "turn {turn}: the index");
+            assert_eq!(
+                events, replayed.events.by_position,
+                "turn {turn}: the events"
+            );
+        }
     }
 }

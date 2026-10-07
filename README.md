@@ -13,9 +13,9 @@ Consumed as a library, with File, SQLite and PostgreSQL providers. In-memory ope
 
 ## Status
 
-Version **0.8.0**, under [Apache-2.0](LICENSE). Pin the bare Git tag `0.8.0`.
-[Release highlights](website/docs/releases.md) summarize the
-[authoritative release notes](https://github.com/beyond10x/eventlog/releases/tag/0.8.0).
+Version **0.8.0**, under [Apache-2.0](LICENSE). Pin the bare Git tag `0.8.0`. What changed is
+recorded in the [release notes](https://github.com/beyond10x/eventlog/releases/tag/0.8.0) and in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Build, test, run
 
