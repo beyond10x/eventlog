@@ -7,6 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 const FORMAT: &str = "eventlog-file/1";
@@ -76,46 +77,168 @@ pub(crate) struct Journal {
     content: Content,
 }
 
-/// A running SHA-256 over the committed bytes of `events.jsonl`, to the committed length.
+/// The committed bytes of `events.jsonl` one handle verified, to the committed length.
 ///
 /// A handle that resumes onto a head it already chained trusts committed bytes it is not decoding
-/// again. This carries what those bytes were when it verified them, so [`Journal::resume`] can
-/// re-read exactly them and hand a history whose committed prefix is no longer the one this handle
-/// verified to the complete opener, which refuses it. Without it, damage inside the committed
-/// prefix is invisible to every later transaction, including the one that appends onto it.
+/// again. This keeps those bytes as it verified them, so [`Journal::resume`] can re-read the
+/// file's committed prefix, compare it with them byte for byte, and hand a history whose committed
+/// prefix is no longer the one this handle verified to the complete opener, which refuses it.
+/// Without it, damage inside the committed prefix is invisible to every later transaction,
+/// including the one that appends onto it.
+///
+/// The bytes live in a [`Retained`] buffer and this is a view of its first `length` bytes, so a
+/// clone costs a reference count and the writer's and the reader's views of one handle can hold
+/// one copy between them ([`Content::share`]). Nothing here is persisted.
 #[derive(Clone)]
 pub(crate) struct Content {
-    hash: Sha256,
+    retained: Arc<Retained>,
+    /// How many leading bytes of `retained` this view verified. Bytes past it, if any, were added
+    /// by another view of the same buffer and are nothing this one vouches for.
+    length: usize,
     /// The inode metadata `events.jsonl` had while these bytes were read from it, when it held
     /// still for the whole read and was last changed well before it began. While the file still
     /// carries exactly this stamp, its bytes are these bytes, and a resume need not read them.
     stamp: Option<Stamp>,
 }
 
+/// One append-only buffer of committed bytes, shared by the views of one handle.
+///
+/// Bytes are only ever added at the end; none is changed or removed while the buffer lives. That
+/// is what lets two views share it: a view's bytes are the first `length` of these, and nothing
+/// another view does can change them. A view that would continue the buffer differently from what
+/// it already holds gets a buffer of its own instead ([`Content::absorb`]).
+struct Retained(Mutex<Vec<u8>>);
+
+impl Retained {
+    fn bytes(&self) -> MutexGuard<'_, Vec<u8>> {
+        // A panic while the lock was held cannot have left a byte changed: the only writer is
+        // `extend_from_slice`, which reserves before it copies, so a capacity overflow panics
+        // before a byte moves and an allocation failure aborts the process.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl Content {
-    fn empty() -> Self {
+    fn of(bytes: Vec<u8>) -> Self {
         Self {
-            hash: Sha256::new(),
+            length: bytes.len(),
+            retained: Arc::new(Retained(Mutex::new(bytes))),
             stamp: None,
         }
     }
-    fn of(bytes: &[u8]) -> Self {
-        let mut content = Self::empty();
-        content.absorb(bytes);
-        content
-    }
+
+    /// Extend this view by `bytes`, which this handle has just verified follow it.
+    ///
+    /// When this view ends where the buffer does, the bytes are appended in place, so a handle's
+    /// own append costs the frame it appends and not the history before it. When another view of
+    /// the buffer already went further, its bytes are compared with these: a buffer that already
+    /// continues with them is shared, and one that continues with anything else is left to that
+    /// view while this one copies its own prefix into a buffer of its own.
     fn absorb(&mut self, bytes: &[u8]) {
-        self.hash.update(bytes);
         // Bytes appended after the stamp was taken are not what the stamp describes.
         self.stamp = None;
+        let end = self.length + bytes.len();
+        let own = {
+            let mut retained = self.retained.bytes();
+            let ahead = (retained.len() - self.length).min(bytes.len());
+            if retained[self.length..self.length + ahead] == bytes[..ahead] {
+                retained.extend_from_slice(&bytes[ahead..]);
+                None
+            } else {
+                let mut own = Vec::with_capacity(end);
+                own.extend_from_slice(&retained[..self.length]);
+                own.extend_from_slice(bytes);
+                Some(own)
+            }
+        };
+        if let Some(own) = own {
+            self.retained = Arc::new(Retained(Mutex::new(own)));
+        }
+        self.length = end;
     }
-    fn digest(&self) -> String {
-        format!("{:x}", self.hash.clone().finalize())
+
+    fn length(&self) -> u64 {
+        self.length as u64
     }
+
     fn stamped(mut self, stamp: Option<Stamp>) -> Self {
         self.stamp = stamp;
         self
     }
+
+    /// Hold the bytes `self` and `other` verified once between them, when one view's bytes begin
+    /// the other's: the shorter view is pointed at the longer one's buffer.
+    ///
+    /// Two views of one handle reach the same bytes by separate reads — a writer's open and a
+    /// capture's strict read each read the whole file — and this is where the second copy is
+    /// dropped. Only storage moves: each view still holds exactly the bytes it verified, its own
+    /// length and its own stamp, which is why nothing is trusted that was not before. Views whose
+    /// bytes differ are left as they are; one of them is stale, and its own next resume finds out.
+    pub(crate) fn share(&mut self, other: &mut Self) {
+        if Arc::ptr_eq(&self.retained, &other.retained) {
+            return;
+        }
+        let (short, long) = if self.length <= other.length {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let length = short.length;
+        // A view of no bytes has nothing to save, and every other view shares only a buffer whose
+        // bytes it verified itself. That keeps views of two epochs apart: every frame carries its
+        // epoch, so the first frames already differ, and only an empty history — one an erasure
+        // emptied — could otherwise end up keeping the buffer of the bytes it erased.
+        if length == 0 {
+            return;
+        }
+        let same = {
+            // Both buffers hold at least `length` bytes, so the order they are locked in is free:
+            // address order, so that two calls can never wait on each other.
+            let (low, high) = if Arc::as_ptr(&short.retained) < Arc::as_ptr(&long.retained) {
+                (&short.retained, &long.retained)
+            } else {
+                (&long.retained, &short.retained)
+            };
+            let low = low.bytes();
+            let high = high.bytes();
+            low[..length] == high[..length]
+        };
+        if same {
+            short.retained = Arc::clone(&long.retained);
+        }
+    }
+
+    /// Whether two views keep their bytes in one buffer.
+    #[cfg(test)]
+    pub(crate) fn shares_bytes_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.retained, &other.retained)
+    }
+}
+
+/// Whether the next `content.length` bytes of `events` are, byte for byte, the bytes `content`
+/// verified. Reading stops at the first difference.
+///
+/// The cost is charged here, by the comparison, and only once every byte has matched.
+fn same_prefix(root: &Path, events: &mut File, content: &Content) -> Result<bool, EventLogError> {
+    let retained = content.retained.bytes();
+    let verified = &retained[..content.length];
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut compared = 0;
+    while compared < verified.len() {
+        let want = (verified.len() - compared).min(buffer.len());
+        let read = events.read(&mut buffer[..want]).map_err(backend)?;
+        if read == 0 || buffer[..read] != verified[compared..compared + read] {
+            return Ok(false);
+        }
+        compared += read;
+    }
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        cost.prefix_bytes_compared += compared as u64;
+    });
+    #[cfg(not(test))]
+    let _ = root;
+    Ok(true)
 }
 
 /// The inode metadata the kernel moves whenever a file's bytes change through the filesystem.
@@ -436,7 +559,7 @@ impl Journal {
         if events.metadata().map_err(backend)?.len() > manifest.length {
             return Err(corrupt());
         }
-        let content = Content::of(&committed).stamped(trusted(before, Stamp::of(&events), started));
+        let content = Content::of(committed).stamped(trusted(before, Stamp::of(&events), started));
         sweep_unselected(root)?;
         sync_dir(root)?;
         Ok(Self {
@@ -500,7 +623,7 @@ impl Journal {
         Ok(())
     }
 
-    /// The hash of the committed bytes this journal decoded, for a test that resumes onto them.
+    /// The committed bytes this journal decoded, for a test that resumes onto them.
     #[cfg(test)]
     pub fn content(&self) -> Content {
         self.content.clone()
@@ -511,7 +634,7 @@ impl Journal {
     }
 
     /// Release the lock and keep what it protected: the manifest, the verified frames, and the
-    /// hash of the committed bytes those frames were decoded from.
+    /// committed bytes those frames were decoded from.
     pub fn into_parts(self) -> (Manifest, Vec<Value>, Content) {
         (self.manifest, self.transactions, self.content)
     }
@@ -520,7 +643,7 @@ impl Journal {
     /// `observed` or extends it, reading and verifying only the frames past `observed.length`,
     /// chained from `observed.digest` to the new manifest digest.
     ///
-    /// The committed bytes behind `observed` are re-read and hashed against `content` before any
+    /// The committed bytes behind `observed` are re-read and compared with `content` before any
     /// of them is trusted, so a frame damaged in place after this handle verified it is never
     /// served, folded onto, or appended after: it is handed to the complete opener, which refuses
     /// it before the caller can write.
@@ -597,7 +720,7 @@ impl Journal {
             cost.durability_barriers += 1;
         });
         self.transactions = transactions;
-        self.content = Content::of(&bytes);
+        self.content = Content::of(bytes);
         Ok(())
     }
 }
@@ -660,27 +783,15 @@ fn resumed_committed(
         });
         return Ok(Some((manifest, Vec::new(), content.clone())));
     }
-    // Otherwise the committed prefix is re-read as raw bytes and hashed: cheaper than decoding and
-    // rechaining it, and the only way a handle can tell that what it verified is still there.
-    let mut observed_content = Content::empty();
-    let mut remaining = observed.length;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    while remaining > 0 {
-        let want = usize::try_from(remaining.min(buffer.len() as u64)).map_err(backend)?;
-        let read = events.read(&mut buffer[..want]).map_err(backend)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        observed_content.absorb(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    #[cfg(test)]
-    crate::cost::charge(root, |cost| {
-        cost.prefix_bytes_hashed += observed.length;
-    });
-    if observed_content.digest() != content.digest() {
+    // Otherwise the committed prefix is re-read as raw bytes and compared with the bytes this
+    // handle verified: cheaper than decoding and rechaining it, cheaper than hashing it, and the
+    // only way a handle can tell that what it verified is still there. Any difference — a byte,
+    // or a length the view does not have — is the same answer a different digest was.
+    if content.length() != observed.length || !same_prefix(root, &mut events, content)? {
         return Ok(None);
     }
+    // The bytes just matched are the view's own; carrying it costs a reference count.
+    let mut observed_content = content.clone();
     // Past the prefix: an unchanged head reads nothing more.
     let fresh = if manifest == *observed {
         Vec::new()
@@ -730,8 +841,8 @@ pub(crate) fn extends_observed(
     Ok(previous == observed.digest)
 }
 
-/// The lock, the committed manifest, the frames a handle has not verified yet, and the hash of
-/// the committed bytes this resume re-read and validated.
+/// The lock, the committed manifest, the frames a handle has not verified yet, and the committed
+/// bytes this resume re-read and validated.
 pub(crate) struct Resumed {
     lock: File,
     pub manifest: Manifest,
@@ -769,8 +880,8 @@ pub(crate) struct StrictResumed {
 
 impl StrictResumed {
     /// Run `read` with the lock still held, then release it and keep what it protected: the
-    /// committed head, the frames past the head the handle observed, and the hash of the
-    /// committed bytes this resume validated.
+    /// committed head, the frames past the head the handle observed, and the committed bytes this
+    /// resume validated.
     ///
     /// The read is an argument rather than the caller's next statement on purpose. The rule is
     /// that the bytes a reader hands out are read under the writers' lock, and while the caller
@@ -841,8 +952,8 @@ pub(crate) struct Strict {
 
 impl Strict {
     /// Run `read` with the lock still held, then release it and keep what it protected: the
-    /// committed head, the verified frames, and the hash of the committed bytes those frames
-    /// were decoded from.
+    /// committed head, the verified frames, and the committed bytes those frames were decoded
+    /// from.
     ///
     /// The reader's half of the same rule [`StrictResumed::read_under_lock`] states, on the path
     /// that rereads everything. Both paths hand blob objects to a caller and both read them here.
@@ -942,7 +1053,7 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
     crate::cost::charge(root, |cost| {
         cost.frames_chained += transactions.len() as u64;
     });
-    let content = Content::of(&committed);
+    let content = Content::of(committed);
     Ok(Strict {
         lock,
         manifest,
@@ -1449,8 +1560,8 @@ mod tests {
                 .is_none()
         );
         // The observed prefix left exactly as this handle verified it, and one more frame that
-        // does not chain from the observed digest: the prefix hash passes and the chain check is
-        // what refuses.
+        // does not chain from the observed digest: the prefix comparison passes and the chain check
+        // is what refuses.
         let mut unchained = head.clone();
         let (line, digest) = encode(&unchained, 4, ZERO, json!({"value": 11})).unwrap();
         let mut rebuilt = bytes.clone();
@@ -1501,7 +1612,7 @@ mod tests {
         let sanitized_content = journal.content();
         drop(journal);
         assert!(
-            Journal::resume(root.path(), &fork, &Content::of(&forked))
+            Journal::resume(root.path(), &fork, &Content::of(forked))
                 .unwrap()
                 .is_none()
         );
@@ -1511,6 +1622,78 @@ mod tests {
                 .unwrap()
                 .manifest,
             sanitized
+        );
+    }
+
+    /// A journal's own appends extend the committed-bytes buffer in place while another view of
+    /// the same handle holds it: no append copies the history before it.
+    #[test]
+    fn appends_extend_shared_committed_bytes_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(json!({"value": 0})).unwrap();
+        let other = journal.content();
+        let held = journal.manifest.clone();
+        for value in 1..=50 {
+            journal.append(json!({ "value": value })).unwrap();
+            assert!(
+                journal.content.shares_bytes_with(&other),
+                "append {value} copied the committed bytes"
+            );
+        }
+        // The other view still holds exactly what it verified, and still resumes.
+        assert_eq!(other.length(), held.length);
+        drop(journal);
+        let resumed = Journal::resume(root.path(), &held, &other)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.fresh.len(), 50);
+    }
+
+    /// Two views of one buffer each keep exactly the bytes they verified. A view continued with
+    /// the bytes the buffer already holds shares them; one continued with different bytes gets a
+    /// buffer of its own and leaves the other's untouched.
+    #[test]
+    fn views_of_one_buffer_keep_their_own_bytes() {
+        let mut first = Content::of(b"prefix|".to_vec());
+        let mut second = first.clone();
+        first.absorb(b"left|");
+        second.absorb(b"le");
+        assert!(
+            second.shares_bytes_with(&first),
+            "a matching continuation copied"
+        );
+        second.absorb(b"ft|more");
+        assert!(
+            second.shares_bytes_with(&first),
+            "a longer continuation copied"
+        );
+        let mut third = Content::of(b"prefix|".to_vec());
+        third.share(&mut first);
+        assert!(
+            third.shares_bytes_with(&first),
+            "equal bytes were not shared"
+        );
+        third.absorb(b"right|");
+        assert!(
+            !third.shares_bytes_with(&first),
+            "a different continuation was shared"
+        );
+        let bytes = |content: &Content| content.retained.bytes()[..content.length].to_vec();
+        assert_eq!(bytes(&first), b"prefix|left|");
+        assert_eq!(bytes(&second), b"prefix|left|more");
+        assert_eq!(bytes(&third), b"prefix|right|");
+        let mut stale = Content::of(b"prefiX|".to_vec());
+        stale.share(&mut first);
+        assert!(
+            !stale.shares_bytes_with(&first),
+            "different bytes were shared"
+        );
+        let mut emptied = Content::of(Vec::new());
+        emptied.share(&mut first);
+        assert!(
+            !emptied.shares_bytes_with(&first),
+            "a view of no bytes kept another view's buffer alive"
         );
     }
 

@@ -24,7 +24,17 @@ pub(crate) struct Cost {
     /// Committed transactions deserialized into operations and folded into state.
     pub frames_folded: u64,
     /// Bytes of an already verified committed prefix re-read and hashed without decoding it.
+    ///
+    /// No path charges this any more: a resume compares the prefix instead
+    /// (`prefix_bytes_compared`). It stays so that a case can assert a resume hashed nothing, and
+    /// so that a hash put back on that path has a number to move.
     pub prefix_bytes_hashed: u64,
+    /// Bytes of an already verified committed prefix re-read and found, byte for byte, to be the
+    /// bytes the handle verified.
+    ///
+    /// Charged by the comparison, the rule `blobs_hashed` states below: a resume whose prefix
+    /// differs adds nothing, and so does one that skips the comparison.
+    pub prefix_bytes_compared: u64,
     /// Resumes that trusted an unchanged file stamp and read no prefix byte.
     pub resumes_trusted: u64,
     /// Blob objects read, hashed against the hash the committed history recorded for them, and
@@ -60,6 +70,7 @@ impl std::ops::Sub for Cost {
             frames_reencoded: self.frames_reencoded - earlier.frames_reencoded,
             frames_folded: self.frames_folded - earlier.frames_folded,
             prefix_bytes_hashed: self.prefix_bytes_hashed - earlier.prefix_bytes_hashed,
+            prefix_bytes_compared: self.prefix_bytes_compared - earlier.prefix_bytes_compared,
             resumes_trusted: self.resumes_trusted - earlier.resumes_trusted,
             blobs_hashed: self.blobs_hashed - earlier.blobs_hashed,
             durability_barriers: self.durability_barriers - earlier.durability_barriers,

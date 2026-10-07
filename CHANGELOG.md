@@ -5,6 +5,18 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Performance
+
+- File: a resumed handle whose journal changed in the last two seconds re-checks the committed
+  prefix by comparing it byte for byte with the bytes it verified, instead of hashing it with
+  SHA-256. Every refusal stands; the read stays and the hash goes. A handle now keeps its
+  committed prefix in memory, once, shared between its writer and capture views; nothing persisted
+  and `eventlog-file/1` are unchanged. On the probe in
+  https://github.com/beyond10x/eventlog/issues/42 (2,000 one-event appends, 4.8 MB journal),
+  reading 40 streams inside the window fell from about 1.4 s to about 60 ms and the run's CPU time
+  from about 21 s to 1 s. Per-append wall time is bound by the commit's synchronizations and did
+  not move measurably.
+
 ## 0.8.0 — 2026-10-07
 
 ### Added
