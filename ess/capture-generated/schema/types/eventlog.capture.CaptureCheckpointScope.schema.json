@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.CaptureCheckpointScope",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:6d55f26b343859c2b102103b4d4ef4dc1fef7bfa449f51ea2331b85254dfee70",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CaptureCheckpointScope": {
+      "title": "CaptureCheckpointScope",
+      "x-ess-name": "eventlog.capture.CaptureCheckpointScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "capture": {
+          "$ref": "#/$defs/eventlog.capture.CaptureScope"
+        },
+        "projections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/eventlog.capture.CapturedProjectionScope"
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/eventlog.capture.CaptureLimits"
+        }
+      },
+      "required": [
+        "capture",
+        "projections",
+        "limits"
+      ],
+      "additionalProperties": false
+    },
+    "eventlog.capture.CaptureLimits": {
+      "title": "CaptureLimits",
+      "x-ess-name": "eventlog.capture.CaptureLimits",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "max_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_blobs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_projection_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_payload_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_events",
+        "max_blobs",
+        "max_projection_rows",
+        "max_payload_bytes"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "max_events >= 0",
+        "max_blobs >= 0",
+        "max_projection_rows >= 0",
+        "max_payload_bytes >= 0"
+      ]
+    },
+    "eventlog.capture.CaptureScope": {
+      "title": "CaptureScope",
+      "x-ess-name": "eventlog.capture.CaptureScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "tenant_id": {
+          "type": "string"
+        },
+        "stream_identity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "stream_identity"
+      ],
+      "additionalProperties": false
+    },
+    "eventlog.capture.CapturedProjectionScope": {
+      "title": "CapturedProjectionScope",
+      "x-ess-name": "eventlog.capture.CapturedProjectionScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "indexed_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "indexed_fields"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

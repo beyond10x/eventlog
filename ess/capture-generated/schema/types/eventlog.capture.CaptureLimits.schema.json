@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.CaptureLimits",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:7c10203bae9670d42020977b1a7024880375b834c4716c5b02b41c9d6d31ed35",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CaptureLimits": {
+      "title": "CaptureLimits",
+      "x-ess-name": "eventlog.capture.CaptureLimits",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "max_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_blobs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_projection_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_payload_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_events",
+        "max_blobs",
+        "max_projection_rows",
+        "max_payload_bytes"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "max_events >= 0",
+        "max_blobs >= 0",
+        "max_projection_rows >= 0",
+        "max_payload_bytes >= 0"
+      ]
+    }
+  }
+}

@@ -74,3 +74,80 @@ types:
     # representation. A connection issuer identity and immutable observation position are
     # Rust-owned nonserializable capabilities. Supplying these fields cannot mint one.
     # A scope mismatch causes complete capture, not re-use of proof under different limits.
+  - name: eventlog.capture.DurableCaptureCheckpoint
+    kind: newtype
+    of: Bytes
+    # Provider-encoded and opaque to consumers. Restoring unknown, foreign, malformed or
+    # newer-format bytes yields no checkpoint, never an error; the next capture is complete.
+  - name: eventlog.capture.CaptureContinuityMark
+    kind: struct
+    fields:
+      - name: epoch
+        type: Integer
+      - name: token
+        type: String
+    invariants:
+      - epoch >= 0
+    # The durable mutation epoch and the random token every write to captured material replaces
+    # in the same statement. token is 32 lower-case hexadecimal digits (16 random bytes).
+  - name: eventlog.capture.SqliteDurableCheckpoint
+    kind: struct
+    fields:
+      - name: format
+        type: String
+      - name: version
+        type: Integer
+      - name: store_instance
+        type: String
+      - name: prefix
+        type: String
+      - name: scope
+        type: eventlog.capture.CaptureCheckpointScope
+      - name: usage
+        type: eventlog.capture.CaptureUsage
+      - name: position
+        type: Integer
+      - name: schema_version
+        type: Integer
+      - name: mark
+        type: eventlog.capture.CaptureContinuityMark
+    invariants:
+      - version >= 1
+      - position >= 0
+    # The SQLite encoding of DurableCaptureCheckpoint, version 1: format is
+    # "eventlog-sqlite/durable-capture-checkpoint". Every value is the one read inside the
+    # transaction of the capture that issued the in-process checkpoint, never at encoding time.
+  - name: eventlog.capture.JournaledRowChange
+    kind: struct
+    fields:
+      - name: projection
+        type: eventlog.capture.CapturedProjectionScope
+      - name: key
+        type: String
+      - name: before
+        type: Optional<Json>
+      - name: after
+        type: Optional<Json>
+    # Absent is no row; a present JSON null is a row whose value is null.
+  - name: eventlog.capture.DurableJournalEntry
+    kind: struct
+    fields:
+      - name: position
+        type: Integer
+      - name: tenant_id
+        type: String
+      - name: from
+        type: eventlog.capture.CaptureContinuityMark
+      - name: to
+        type: eventlog.capture.CaptureContinuityMark
+      - name: event_positions
+        type: List<Integer>
+      - name: blobs
+        type: List<String>
+      - name: rows
+        type: List<eventlog.capture.JournaledRowChange>
+    invariants:
+      - position >= 1
+    # One acknowledged atomic group, written in the group's transaction. Events are referenced
+    # by global position and read back from the event table; blobs by digest. Redaction and
+    # tenant erasure delete journal entries in their own transaction.

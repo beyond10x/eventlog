@@ -1,7 +1,7 @@
 //! One BEGIN IMMEDIATE owns the complete group, including inline projectors and admission.
 use super::{
     AppendResult, Arc, BoxFuture, Connection, EventLogError, Guard, Inner, NoGuard,
-    SqliteEventStore, SqliteProjections, backend, begin_immediate, drive,
+    SqliteEventStore, SqliteProjections, backend, begin_immediate, drive, durable_capture,
     ensure_callback_integrity, finish_transaction, params, poisoned, run_blocking, select_versions,
     to_i64,
 };
@@ -113,7 +113,7 @@ impl AtomicEventStore for SqliteEventStore {
             inner.keeping_restored_on_refusal(|| {
                 let mut connection = inner.connection.lock().map_err(poisoned)?;
                 begin_immediate(&connection)?;
-                inner.tracked.begin(&connection, &group.tenant);
+                let from = inner.begin_recording(&connection, &group.tenant);
                 let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = inner.group_in_transaction(
                     &mut connection,
@@ -123,6 +123,7 @@ impl AtomicEventStore for SqliteEventStore {
                     admission.as_ref(),
                     &callback_failed,
                 );
+                let result = inner.journal_group(&connection, from, &group.tenant, result);
                 #[cfg(test)]
                 if result.is_ok() {
                     checkpoint("group-precommit");
@@ -166,7 +167,7 @@ impl AtomicEventStore for SqliteEventStore {
             inner.keeping_restored_on_refusal(|| {
                 let mut connection = inner.connection.lock().map_err(poisoned)?;
                 begin_immediate(&connection)?;
-                inner.tracked.begin(&connection, &group.tenant);
+                let from = inner.begin_recording(&connection, &group.tenant);
                 let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = inner.guarded_batch_in_transaction(
                     &mut connection,
@@ -176,6 +177,7 @@ impl AtomicEventStore for SqliteEventStore {
                     admission.as_ref(),
                     &callback_failed,
                 );
+                let result = inner.journal_group(&connection, from, &group.tenant, result);
                 inner.tracked.seal(&connection, &result);
                 let settled = match result {
                     // A deduplicated answer wrote nothing, and commits nothing its re-run
@@ -214,7 +216,7 @@ impl AtomicBlobEventStore for SqliteEventStore {
             inner.keeping_restored_on_refusal(|| {
                 let mut connection = inner.connection.lock().map_err(poisoned)?;
                 begin_immediate(&connection)?;
-                inner.tracked.begin(&connection, &request.group.tenant);
+                let from = inner.begin_recording(&connection, &request.group.tenant);
                 let callback_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = inner.group_in_transaction(
                     &mut connection,
@@ -227,6 +229,7 @@ impl AtomicBlobEventStore for SqliteEventStore {
                     admission.as_ref(),
                     &callback_failed,
                 );
+                let result = inner.journal_group(&connection, from, &request.group.tenant, result);
                 inner.tracked.seal(&connection, &result);
                 let result = finish_blob_transaction(&connection, result);
                 inner.tracked.finish(result.is_ok());
@@ -278,6 +281,51 @@ impl GroupBlobs<'_> {
 }
 
 impl Inner {
+    /// Start recording an acknowledged group, right after `BEGIN IMMEDIATE` and before any
+    /// write: the in-process stamp and, on an owner with durable capture continuity, the mark the
+    /// group's journal entry starts from.
+    fn begin_recording(
+        &self,
+        connection: &Connection,
+        tenant: &eventlog_core::TenantId,
+    ) -> Option<durable_capture::CaptureContinuityMark> {
+        let from = durable_capture::group_start(connection, &self.prefix);
+        self.tracked.begin(connection, tenant, from.is_some());
+        from
+    }
+
+    /// Write the group's durable journal entry inside its transaction, after every write the
+    /// group makes and before its end stamp is sealed. A failure refuses the group.
+    fn journal_group(
+        &self,
+        connection: &Connection,
+        from: Option<durable_capture::CaptureContinuityMark>,
+        tenant: &eventlog_core::TenantId,
+        result: Result<AppendGroupResult, EventLogError>,
+    ) -> Result<AppendGroupResult, EventLogError> {
+        let appended = result?;
+        let draft = self.tracked.take_draft();
+        if let Some(from) = from {
+            // No journal of an owner with durable continuity keeps the content of a group whose
+            // tenant has redacted history: only its link in the chain.
+            let withheld = !appended.deduplicated
+                && durable_capture::redacted(connection, &self.prefix, tenant)?;
+            if withheld {
+                self.tracked.withhold();
+            }
+            durable_capture::journal_group(
+                connection,
+                &self.prefix,
+                from,
+                tenant,
+                &appended,
+                draft,
+                withheld,
+            )?;
+        }
+        Ok(appended)
+    }
+
     fn group_in_transaction(
         &self,
         connection: &mut Connection,

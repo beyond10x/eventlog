@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.capture.CapturedProjectionScope",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "contract_digest": "slice-sha256/2:74ff11faf1ca64acb15b883d18e2a7427a4860e63e993c272ae7a7df24d4e53a",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.capture.CapturedProjectionScope": {
+      "title": "CapturedProjectionScope",
+      "x-ess-name": "eventlog.capture.CapturedProjectionScope",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "indexed_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "indexed_fields"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
