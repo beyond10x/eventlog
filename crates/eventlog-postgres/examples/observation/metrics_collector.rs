@@ -24,6 +24,8 @@ pub struct MetricsConfig {
     pub query_timeout: Duration,
     /// A sample counting more connections than this records each counted backend.
     pub attribute_connections_above: u64,
+    /// The `application_name` that marks the workload's own backends; never retained.
+    pub workload_application_name: String,
 }
 
 struct Observer {
@@ -121,9 +123,16 @@ async fn connect(config: &Config, timeout: Duration) -> Result<Observer, &'stati
     Ok(Observer { client, driver })
 }
 
-async fn sample_postgres(client: &Client, timeout: Duration) -> Result<Value, &'static str> {
+async fn sample_postgres(
+    client: &Client,
+    workload_application_name: &str,
+    timeout: Duration,
+) -> Result<Value, &'static str> {
     // No query text, addresses, usernames, application names, database names or row values.
     // The activity population is all client backends on this isolated server except this probe.
+    // `workload_connections` counts only those carrying the workload's application_name, which
+    // is compared on the server and never returned: other clients of the same server, such as a
+    // health check's short-lived `pg_isready` backends, stay in `connections` only.
     // max_query_age of lock waiters is an upper bound on lock wait, not the wait itself.
     // `backends` identifies each counted backend by pid and timestamps only; the collector keeps
     // it in a record only for a sample over the attribution threshold.
@@ -131,6 +140,7 @@ async fn sample_postgres(client: &Client, timeout: Duration) -> Result<Value, &'
         SELECT jsonb_build_object(
           'observed_at', clock_timestamp(),
           'connections', count(*),
+          'workload_connections', count(*) FILTER (WHERE application_name = $1),
           'backends', COALESCE(jsonb_agg(jsonb_build_object(
             'pid', pid, 'backend_start', backend_start, 'state', state,
             'state_change', state_change, 'xact_start', xact_start) ORDER BY pid), '[]'::jsonb),
@@ -143,10 +153,13 @@ async fn sample_postgres(client: &Client, timeout: Duration) -> Result<Value, &'
         ) FROM pg_stat_activity
         WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
     ";
-    let row = tokio::time::timeout(timeout, client.query_one(query, &[]))
-        .await
-        .map_err(|_| "observer_query_timeout")?
-        .map_err(|_| "observer_query_failed")?;
+    let row = tokio::time::timeout(
+        timeout,
+        client.query_one(query, &[&workload_application_name]),
+    )
+    .await
+    .map_err(|_| "observer_query_timeout")?
+    .map_err(|_| "observer_query_failed")?;
     row.try_get(0).map_err(|_| "observer_result_decode_failed")
 }
 
@@ -300,6 +313,7 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     let mut cgroup_failures = 0_u64;
     let mut postgres_failures = 0_u64;
     let mut connections_max = 0_u64;
+    let mut workload_connections_max = 0_u64;
     let mut memory_max = 0_u64;
     let mut lock_waiters_max = 0_u64;
     let mut previous_tick = None;
@@ -342,7 +356,14 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
             None
         };
         let observation = match &observer {
-            Some(connected) => sample_postgres(&connected.client, config.query_timeout).await,
+            Some(connected) => {
+                sample_postgres(
+                    &connected.client,
+                    &config.workload_application_name,
+                    config.query_timeout,
+                )
+                .await
+            }
             None => Err(connect_error.unwrap_or("observer_unavailable")),
         };
         let sample = samples + 1;
@@ -375,6 +396,8 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
                     occupancy_lock_backend_ms += u128::from(previous) * gap;
                 }
                 connections_max = connections_max.max(connections);
+                workload_connections_max = workload_connections_max
+                    .max(value["workload_connections"].as_u64().unwrap_or(0));
                 lock_waiters_max = lock_waiters_max.max(waiters);
                 previous_lock_waiters = Some(waiters);
                 previous_pg_success = true;
@@ -431,6 +454,7 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
         "cgroup_failures": cgroup_failures, "postgres_failures": postgres_failures,
         "sample_gap_max_ms": maximum_gap_ms,
         "connections_max_excluding_observer": connections_max,
+        "workload_connections_max": workload_connections_max,
         "connection_attribution_threshold": config.attribute_connections_above,
         "over_threshold_samples": attributed,
         "observer_connections_additional": 1,
