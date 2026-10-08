@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-07T21:20:36Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "coordinator: F5 crates/eventlog-file/src/lib.rs:2570 fixed in f6f43177",
+    "reference": "F5 crates/eventlog-file/src/lib.rs:2570",
+    "review": "review-result:adversary-file-eventlog-rechecks-its-prefix-pass-1",
+    "outcome": "fixed"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-07T21:20:36Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "coordinator: B crates/eventlog-file/src/journal.rs:230 (closed by tests/security_compare_prefix.rs) fixed in f6f43177",
+    "reference": "B crates/eventlog-file/src/journal.rs:230 (closed by tests/security_compare_prefix.rs)",
+    "review": "review-result:security-file-eventlog-rechecks-its-prefix-pass-1",
+    "outcome": "fixed"
+  }
+}

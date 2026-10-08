@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T21:24:37Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "throwaway probe (one event per append transaction, 1.4 KB payload, 40 streams, release), base 32168648 and unit f6f43177 alternating, 2 rounds, load 7-13. User CPU at 2,000 events: base 20.77/20.56 s, unit 0.95/1.27 s. Read of every stream inside the window at 2,000: base 1,382/1,425 ms, unit 56/172 ms. Per append 200 -> 2,000 events: base 23.89/18.55 -> 28.98/29.30 ms (x1.37), unit 24.13/21.38 -> 19.09/18.52 ms (x0.82). VERIFIED against the revision 12 bars.",
+    "reference": "impl/file-eventlog-rechecks-its-prefix-by-comparison f6f43177 vs wave/file-provider-cost 32168648"
+  }
+}

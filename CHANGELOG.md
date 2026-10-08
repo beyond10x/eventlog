@@ -5,6 +5,28 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Performance
+
+- File: a resumed handle whose journal changed in the last two seconds re-checks the committed
+  prefix by comparing it byte for byte with the bytes it verified, instead of hashing it with
+  SHA-256. Every refusal stands; the read stays and the hash goes. A handle now keeps its
+  committed prefix in memory, once, shared between its writer and capture views: the committed
+  size of `events.jsonl` after open, up to about twice that as its own appends grow the buffer.
+  Nothing persisted and `eventlog-file/1` are unchanged. On the probe in
+  https://github.com/beyond10x/eventlog/issues/42 (2,000 one-event appends, 4.8 MB journal),
+  reading 40 streams inside the window fell from about 1.4 s to about 60 ms and the run's CPU time
+  from about 21 s to 1 s. Per-append wall time is bound by the commit's synchronizations and no
+  longer grows with the journal: from 200 to 2,000 events it rose about 1.4 times before and did
+  not rise after.
+- File: `stream_version`, `read_stream`, the receipt a retried command or group returns and the
+  event `redact` rewrites are found through a per-stream index kept beside the events, so each
+  reads only the stream asked about (a head lookup reads no event, a window the events it returns
+  plus one) instead of every event in the store. Folding history no longer rescans the store for
+  each event's order check, which made replay quadratic: 160 events took 12,720 reads, now 0, and
+  a complete open of 5,191 events fell from 674 ms to 288 ms (median, one machine). Feed, catch-up
+  and projection rebuild still walk the store in global order. `eventlog-file/1` is unchanged.
+  https://github.com/beyond10x/eventlog/issues/42
+
 ## 0.8.0 — 2026-10-07
 
 ### Added

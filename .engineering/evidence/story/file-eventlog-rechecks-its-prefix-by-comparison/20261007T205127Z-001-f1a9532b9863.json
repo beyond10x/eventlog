@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-07T20:51:27Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "coordinator: F4 pre-existing, filed as story:file-capture-after-a-write-resumes",
+    "reference": "F4 crates/eventlog-file/src/adversary_compare_once.rs:115",
+    "review": "review-result:adversary-file-eventlog-rechecks-its-prefix-pass-1",
+    "outcome": "no-op"
+  }
+}

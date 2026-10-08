@@ -60,24 +60,26 @@ They are never a substitute for history and unproven snapshot writes refuse.
 
 A handle verifies the complete history and every active blob once, when the store is opened: every
 frame is rechained from the zero digest to the manifest digest, every active object is read and
-hashed, and stale snapshots and unreferenced objects are disposed of. The opener also keeps a
-SHA-256 over the raw committed bytes it read. Each later operation takes the lock, reads
-`manifest.json`, and re-reads the committed bytes behind the head it observed and hashes them
-against that value. That raw pass is what makes it safe for a handle to trust frames it is not
-decoding again: a committed frame damaged in place after the handle verified it fails the
-comparison, so the handle neither serves it nor appends after it. When the manifest names the same
-store, epoch, sequence, byte length and digest the handle observed and the committed bytes are
-still the bytes it verified, the handle reuses the frames and the fold it already has, decoding no
-frame and reading no blob. When it names a longer history on the same store and epoch, the handle
-reads only the bytes past its observed length, chains them from its observed digest to the new
-manifest digest, folds those frames onto the state it had, verifies the objects those frames bind,
-and disposes of snapshots they retired. A resumed operation also removes the staging names no
-durable intent selected, as a complete open does. Anything else — a new epoch, a pending recovery
-intent, a shorter or unchained file, a byte length that disagrees with the manifest, a committed
-prefix that is not the bytes this handle verified, or a head this handle never folded — falls back
-to the complete reread, which refuses a history that does not extend the observed head exactly as
-before. So an operation costs one raw pass over the committed bytes plus what the file gained
-since the handle last looked: no frame is decoded twice and no object is read twice.
+hashed, and stale snapshots and unreferenced objects are disposed of. The opener also keeps the
+raw committed bytes it read, in memory. Each later operation takes the lock, reads
+`manifest.json`, re-reads the committed bytes behind the head it observed and compares them byte
+for byte with the bytes it kept. That raw pass is what makes it safe for a handle to trust frames
+it is not decoding again: a committed frame damaged in place after the handle verified it fails the
+comparison, so the handle neither serves it nor appends after it. The comparison is exact: it
+refuses every prefix the SHA-256 it replaced refused, without resting on that hash having no
+collision. When the manifest names the same store, epoch, sequence, byte length and digest the
+handle observed and the committed bytes are still the bytes it verified, the handle reuses the
+frames and the fold it already has, decoding no frame and reading no blob. When it names a longer
+history on the same store and epoch, the handle reads only the bytes past its observed length,
+chains them from its observed digest to the new manifest digest, folds those frames onto the state
+it had, verifies the objects those frames bind, and disposes of snapshots they retired. A resumed
+operation also removes the staging names no durable intent selected, as a complete open does.
+Anything else — a new epoch, a pending recovery intent, a shorter or unchained file, a byte length
+that disagrees with the manifest, a committed prefix that is not the bytes this handle verified,
+or a head this handle never folded — falls back to the complete reread, which refuses a history
+that does not extend the observed head exactly as before. So an operation costs one raw pass over
+the committed bytes plus what the file gained since the handle last looked: no frame is decoded
+twice and no object is read twice.
 
 The raw pass is skipped while the file provably holds still. When a read of `events.jsonl`
 verifies its bytes, the handle also keeps the file's inode stamp: device, inode, length, `mtime`
@@ -90,9 +92,38 @@ A later operation that finds the same stamp and an unchanged manifest reads no c
 
 The two seconds are one second of filesystem timestamp granularity plus the coarse clock tick.
 A file changed inside that window can carry the same timestamps as the change that follows it, so
-it is re-read and hashed on every operation until the window has passed. This includes the
+it is re-read and compared on every operation until the window has passed. This includes the
 handle's own writes: a same-length edit microseconds after a commit can land in the same tick
 (`tests/verify_once_review.rs`).
+
+What a resumed handle reads, keeps and trusts:
+
+| | inside the window, or once the file changed | outside the window, stamp and manifest unchanged |
+| --- | --- | --- |
+| reads | `manifest.json`, every committed byte it verified, and the bytes past them | `manifest.json` and the file's inode stamp; no committed byte |
+| decides by | comparing every committed byte with the bytes it kept, then chaining the bytes past them from its observed digest | comparing the stamp and the manifest with the ones it kept |
+| trusts | nothing it has not just compared or chained | that a file with an unchanged stamp holds unchanged bytes, within the table below |
+
+The bytes a handle keeps are the committed prefix of `events.jsonl` as it last verified it,
+beside the decoded frames and the fold it already keeps. Every buffer starts at exactly the
+committed size — a complete open, a strict read and a privacy rewrite each keep the bytes they
+read or built and no slack — and the handle's own appends then extend it in place, growing it by
+doubling. So budget the committed size per handle after open, and up to about twice that as
+appends grow the buffer.
+
+One handle keeps those bytes once. Whichever of the writer's view and a capture's view of the
+same `FileEventStore` was rebuilt last — by a capture's strict read or a writer's complete reread —
+moves onto the other's buffer wherever their bytes agree, comparing them inside the operation's
+blocking file work. A view whose bytes do not agree with the ones the operation has just verified
+is dropped when the operation ends rather than kept beside them: it names a history that is no
+longer committed, or a head the operation moved past, and could not be resumed from anyway. No
+await separates the adoption from that drop, for a writer or a capture: the capture adopts in the
+blocking work that read the file and drops in the poll that stores its view, so a capture its
+caller cancels stores no view and leaves the writer's as it was. A `FileTenantCapture` keeps one
+view. Views of two epochs never share a buffer, so a privacy
+rewrite's new history never keeps the bytes it removed alive; a capture view of the old epoch keeps
+them, as it keeps its decoded fold, until this handle's next transaction drops it or its next
+capture replaces it. Nothing of this is persisted, and `eventlog-file/1` is unchanged.
 
 What the stamp detects, and what it does not:
 
@@ -105,7 +136,10 @@ What the stamp detects, and what it does not:
 
 `tests/stamped_resume.rs` damages a file after its stamp is trusted and checks that nothing is
 appended onto the damage. The unit cases in `src/lib.rs` (`stamped_resume_cost`) count what a
-resume re-reads. Two hundred reads over an unchanged file re-read nothing.
+resume re-reads. Two hundred reads over an unchanged file re-read nothing, and inside the window
+the writer's resume and the reader's resume each compare the whole committed prefix and hash no
+journal byte. That count is taken inside the crate's one SHA-256 function, charged to the store
+whose journal operation called it, and a resume onto a new tail is the control that it moves.
 
 `EventStore::read_many` answers a batch of stream and blob reads inside one transaction: one
 resume and one lock hold for the batch. A caller that loads a whole history object by object uses
@@ -116,10 +150,10 @@ version, keeps the verified view instead of discarding it. So the next operation
 not open from scratch.
 
 A consistent tenant capture reuses the same verified history, under the same rules and one
-restriction. A handle that has already observed the committed head re-reads and hashes the
-committed bytes behind it, folds only the frames past it, and answers the per-handle divergence
-guard from that comparison rather than by re-encoding the observed prefix: what the comparison
-establishes — the committed prefix is byte for byte the history this handle verified, and the
+restriction. A handle that has already observed the committed head re-reads the committed bytes
+behind it and compares them with the bytes it kept, folds only the frames past it, and answers
+the per-handle divergence guard from that comparison rather than by re-encoding the observed
+prefix: what the comparison establishes — the committed prefix is byte for byte the history this handle verified, and the
 frames past it chain from the head it observed — is strictly more than the guard asks. Everything
 the strict reader refuses before it decodes, the resumed reader reaches too, by handing the
 decision back to it: a writers' lock that is not a regular file or cannot be held, a reserved
@@ -129,7 +163,7 @@ the committed length, a committed prefix that is no longer the bytes the handle 
 tail that does not chain. The restriction is the one that separates a reader from a writer: the
 resumed reader removes no staging name and synchronizes no directory, because an inspector that
 mutates a store has changed the thing it came to observe. Its cached view is a reader's view and
-a transaction cannot use it: it carries the fold and the committed-byte hash, not the frames a
+a transaction cannot use it: it carries the fold and the committed bytes, not the frames a
 writer appends onto, and not the promise that every object the fold binds has been hashed. Bound
 content is read and hashed by the capture that hands those bytes to its caller, which is the same
 rule a read on the write path follows — see *When bound content is read* below for which capture
@@ -291,7 +325,12 @@ history. A separate suite checks the same damage against an open handle's reads,
 history whose observed prefix was rewritten under a genuine tail. A capture unit test counts the
 frames a handle decodes, re-encodes and folds and the objects it hashes, and requires ten captures
 with no write between them to verify the committed history once and the content they hand out
-every time; `tests/consistent_capture.rs` checks that a capture reusing a view still folds what
+every time; others require a handle's writer and capture views to hold their committed bytes in
+one buffer, across the handle's own appends and after a writer rereads everything, and a view
+neither can share — one from before a privacy rewrite, or an empty writer's — to be dropped by
+the next operation; journal unit tests require an append to extend that buffer in place, each
+view of it to keep exactly the bytes it verified, and every new buffer to start at its committed
+size; `tests/consistent_capture.rs` checks that a capture reusing a view still folds what
 another writer committed, that a committed frame damaged in place afterwards refuses through the
 strict reader without changing a file, that damaged content still refuses the next capture, that a
 writers' lock that is no longer a regular file refuses one, and that a reserved recovery entry

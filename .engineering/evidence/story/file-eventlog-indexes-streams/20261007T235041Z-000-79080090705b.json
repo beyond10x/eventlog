@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T23:50:41Z",
+  "actor": "human:timo",
+  "artifact": "story:file-eventlog-indexes-streams",
+  "kind": "story",
+  "revision": 17,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked -p eventlog-file --no-fail-fast -- --test-threads=1 on wave/file-provider-cost 1ba2af2f: 30 lanes, 204 passed, 0 failed, 0 ignored; cargo clippy --locked -p eventlog-file --all-targets -- -D warnings exit 0; cargo fmt --all --check exit 0; cargo check --locked --workspace --all-targets exit 0",
+    "reference": "wave/file-provider-cost 1ba2af2f"
+  }
+}

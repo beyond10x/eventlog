@@ -1,0 +1,144 @@
+{
+  "waves": [
+    {
+      "wave": 1,
+      "artifacts": [
+        {
+          "id": "story:caller-owned-postgres-connections-for-er-facades",
+          "inferred": true,
+          "scope": [
+            {
+              "confidence": "inferred",
+              "path": "CHANGELOG.md"
+            },
+            {
+              "confidence": "inferred",
+              "path": "Cargo.lock"
+            },
+            {
+              "confidence": "inferred",
+              "path": "README.md"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-postgres/Cargo.toml"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-postgres/src/lib.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-postgres/src/pool.rs"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-postgres/tests/"
+            },
+            {
+              "confidence": "inferred",
+              "path": "docs/design/"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "wave": 2,
+      "artifacts": [
+        {
+          "id": "story:file-eventlog-indexes-streams",
+          "inferred": false,
+          "scope": [
+            {
+              "confidence": "cited",
+              "path": "README.md"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/lib.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/state.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "website/docs/providers.md"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "wave": 3,
+      "artifacts": [
+        {
+          "id": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+          "inferred": true,
+          "scope": [
+            {
+              "confidence": "inferred",
+              "path": "CHANGELOG.md"
+            },
+            {
+              "confidence": "inferred",
+              "path": "crates/eventlog-file/src/capture.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/cost.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/journal.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "crates/eventlog-file/src/lib.rs"
+            },
+            {
+              "confidence": "cited",
+              "path": "docs/design/file-provider.md"
+            },
+            {
+              "confidence": "inferred",
+              "path": "website/docs/operations.md"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "collisions": [
+    {
+      "a": "story:caller-owned-postgres-connections-for-er-facades",
+      "b": "story:file-eventlog-indexes-streams",
+      "path": "README.md",
+      "confidence": "inferred"
+    },
+    {
+      "a": "story:caller-owned-postgres-connections-for-er-facades",
+      "b": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+      "path": "CHANGELOG.md",
+      "confidence": "inferred"
+    },
+    {
+      "a": "story:file-eventlog-indexes-streams",
+      "b": "story:file-eventlog-rechecks-its-prefix-by-comparison",
+      "path": "crates/eventlog-file/src/lib.rs",
+      "confidence": "cited"
+    }
+  ],
+  "unassessed": [
+    "story:generate-capture-types-from-ess",
+    "story:incremental-history-digest-for-a-resumed-handle",
+    "story:postgres-crash-recovery-test-under-parallel-threads",
+    "story:postgres-feed-reads-drain-under-a-held-watermark",
+    "story:resumed-snapshot-clearing-has-no-reachable-cause",
+    "story:strict-reader-lock-case-races-a-forked-crash-child",
+    "story:tree-store-checks-out-on-windows",
+    "story:tree-store-keeps-text-once"
+  ],
+  "cycles": []
+}

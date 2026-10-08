@@ -42,9 +42,11 @@ pub(crate) struct Observed {
     manifest: Manifest,
     /// The fold of the whole committed history.
     state: State,
-    /// The hash of the committed bytes the fold was built from. A resumed reader re-reads exactly
-    /// those bytes and refuses to reuse the view when they are not them, so a committed frame
-    /// damaged in place after a capture is never served from memory.
+    /// The committed bytes the fold was built from. A resumed reader re-reads the file's committed
+    /// prefix, compares it with them byte for byte and refuses to reuse the view when it is not
+    /// them, so a committed frame damaged in place after a capture is never served from memory.
+    /// On a [`FileEventStore`] the buffer is the writer's view's wherever the two agree
+    /// ([`retain_once`]).
     content: journal::Content,
 }
 
@@ -105,8 +107,11 @@ impl ConsistentTenantCapture for FileTenantCapture {
             let observation = &mut *self.observation.lock().await;
             capture(
                 &self.root,
-                &mut observation.observed,
-                &mut observation.view,
+                Slots {
+                    observed: &mut observation.observed,
+                    view: &mut observation.view,
+                    writer: None,
+                },
                 tenant,
                 projections,
                 limits,
@@ -126,8 +131,11 @@ impl ConsistentTenantCapture for FileTenantCapture {
             let observation = &mut *self.observation.lock().await;
             capture(
                 &self.root,
-                &mut observation.observed,
-                &mut observation.view,
+                Slots {
+                    observed: &mut observation.observed,
+                    view: &mut observation.view,
+                    writer: None,
+                },
                 tenant,
                 projections,
                 limits,
@@ -151,8 +159,11 @@ impl ConsistentTenantCapture for FileEventStore {
             let runtime = &mut *self.runtime.lock().await;
             capture(
                 &self.root,
-                &mut runtime.observed,
-                &mut runtime.captured,
+                Slots {
+                    observed: &mut runtime.observed,
+                    view: &mut runtime.captured,
+                    writer: Some(&mut runtime.verified),
+                },
                 tenant,
                 projections,
                 limits,
@@ -172,8 +183,11 @@ impl ConsistentTenantCapture for FileEventStore {
             let runtime = &mut *self.runtime.lock().await;
             capture(
                 &self.root,
-                &mut runtime.observed,
-                &mut runtime.captured,
+                Slots {
+                    observed: &mut runtime.observed,
+                    view: &mut runtime.captured,
+                    writer: Some(&mut runtime.verified),
+                },
                 tenant,
                 projections,
                 limits,
@@ -181,6 +195,58 @@ impl ConsistentTenantCapture for FileEventStore {
             )
             .await
         })
+    }
+}
+
+/// What one capture reads and moves: the head this handle observed and its reader's view, and on a
+/// [`FileEventStore`] the writer's view too, which the capture keeps its committed bytes once with.
+struct Slots<'a> {
+    observed: &'a mut Option<Manifest>,
+    view: &'a mut Option<Observed>,
+    writer: Option<&'a mut Option<crate::Verified>>,
+}
+
+/// Keep one handle's committed bytes once, as a capture stores its view.
+///
+/// The writer's view and the reader's view of a [`FileEventStore`] reach the same bytes by
+/// separate reads. The capture has already moved its view onto the writer's buffer wherever the
+/// two agree, inside the blocking work that read it ([`capture`]). A writer's view that still
+/// keeps a buffer of its own disagrees with the bytes the capture has just verified under the
+/// writers' lock, or names a head the capture has just moved past: either way the next
+/// transaction cannot resume from it, so it is dropped rather than kept beside the capture's as a
+/// second copy.
+///
+/// Synchronous, and called in the same poll that stores the view: no await sits between the
+/// adoption and this, so a capture dropped by its caller either stores nothing or stores a view
+/// this has already been applied to. A pointer comparison: it reads no byte on the executor.
+fn retain_once(writer: &mut Option<crate::Verified>, reader: &Observed) {
+    if writer
+        .as_ref()
+        .is_some_and(|verified| !verified.content.shares_bytes_with(&reader.content))
+    {
+        *writer = None;
+    }
+}
+
+/// The reader's committed bytes on a [`FileEventStore`], for a transaction's blocking work to keep
+/// its own in ([`journal::Journal::adopt`]). A clone of the view: a reference count, no bytes.
+pub(crate) fn reader_bytes(captured: Option<&Observed>) -> Option<journal::Content> {
+    captured.map(|view| view.content.clone())
+}
+
+/// Keep one handle's committed bytes once, after a transaction entered.
+///
+/// The transaction has already moved its bytes onto the reader's buffer, inside its blocking work,
+/// wherever the two agree. A reader's view that still keeps a buffer of its own disagrees with the
+/// bytes the writer has just verified under the writers' lock — a history it observed is no longer
+/// the committed one — so it is dropped rather than kept as a second copy. A pointer comparison:
+/// this runs on the async executor and reads no byte.
+pub(crate) fn keep_reader_once(captured: &mut Option<Observed>, writer: &journal::Journal) {
+    if captured
+        .as_ref()
+        .is_some_and(|view| !writer.shares_bytes_with(&view.content))
+    {
+        *captured = None;
     }
 }
 
@@ -205,16 +271,26 @@ type Observe<T> =
 
 async fn capture<T: Send + 'static>(
     root: &Path,
-    observed: &mut Option<Manifest>,
-    view: &mut Option<Observed>,
+    slots: Slots<'_>,
     tenant: &TenantId,
     projections: &[ProjectionSpec],
     limits: CaptureLimits,
     observe: Observe<T>,
 ) -> Result<T, CaptureError> {
+    let Slots {
+        observed,
+        view,
+        writer,
+    } = slots;
     validate_capture_request(tenant, projections)?;
     let root = root.to_owned();
     let previous = observed.clone();
+    // A clone of the writer's view, so the blocking work below can keep this capture's bytes in
+    // its buffer: a reference count, no bytes.
+    let writer_bytes = writer
+        .as_deref()
+        .and_then(Option::as_ref)
+        .map(|verified| verified.content.clone());
     // Taken, not borrowed, and filtered against the head this handle actually holds: a capture
     // that refuses leaves no view behind, so the next one reads everything again rather than
     // trusting a view assembled beside a refusal; and any entry point that moved the observed head
@@ -226,7 +302,7 @@ async fn capture<T: Send + 'static>(
     let owner = tenant.clone();
     let requested = projections.to_vec();
     let (manifest, extended, verified, outcome) = blocking(move || {
-        observed_history(
+        let (manifest, extended, mut verified, outcome) = observed_history(
             &root,
             previous.as_ref(),
             reusable,
@@ -234,7 +310,13 @@ async fn capture<T: Send + 'static>(
             &requested,
             limits,
             observe,
-        )
+        )?;
+        // Comparing bytes is file-sized work, so it is done here with the read, as `enter` does
+        // it for a writer ([`journal::Content::adopt`]).
+        if let Some(writer) = &writer_bytes {
+            verified.content.adopt(writer);
+        }
+        Ok((manifest, extended, verified, outcome))
     })
     .await?;
     // The design names exactly two refusals that may be answered from validated state ahead of the
@@ -258,6 +340,9 @@ async fn capture<T: Send + 'static>(
     }
     let value = outcome?;
     *observed = Some(manifest);
+    if let Some(writer) = writer {
+        retain_once(writer, &verified);
+    }
     *view = Some(verified);
     Ok(value)
 }
@@ -265,8 +350,9 @@ async fn capture<T: Send + 'static>(
 /// Read the committed history under the writers' lock and observe one tenant in it.
 ///
 /// With a verified view of `previous` in hand, [`journal::resume_strict`] compares
-/// `manifest.json` with it and re-hashes the committed bytes behind it: an unchanged head costs
-/// the lock, that comparison and one raw pass over those bytes, and a longer history costs the
+/// `manifest.json` with it and re-reads the committed bytes behind it, comparing them with the
+/// bytes the view kept: an unchanged head costs the lock, that comparison and one raw pass over
+/// those bytes, and a longer history costs the
 /// same pass plus the frames past the observed length, chained from the observed digest and
 /// folded onto the state the handle already had. Anything else — no view, a pending recovery
 /// intent, a new epoch, a shorter or unchained file, or a committed prefix that is no longer the
@@ -323,6 +409,9 @@ fn observed_history<T>(
             crate::cost::charge(root, |cost| {
                 cost.frames_reencoded += previous.sequence;
             });
+            // Re-encoding hashes every frame it re-encodes; that is this root's journal work.
+            #[cfg(test)]
+            let _hashing = crate::cost::hashing_for(root);
             journal::extends_observed(&strict.manifest, &strict.transactions, previous)?
         }
         None => true,
@@ -1122,6 +1211,137 @@ mod tests {
                 material: CaptureMaterial::Identity
             }),
             "an empty stored identity is corruption, not permission to mint a replacement"
+        );
+    }
+
+    /// One handle keeps its committed bytes once. A capture builds its view from a strict read of
+    /// the whole file and then shares the writer's buffer instead of keeping that copy; this
+    /// handle's own appends then extend the one buffer in place while the reader's view still
+    /// holds it, rather than giving the writer a copy per append.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_keeps_its_committed_bytes_once() {
+        async fn shared(store: &FileEventStore) -> bool {
+            let runtime = store.runtime.lock().await;
+            let (Some(verified), Some(captured)) = (&runtime.verified, &runtime.captured) else {
+                panic!("the fixture needs both views");
+            };
+            verified.content.shares_bytes_with(&captured.content)
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("retained-once-owner").unwrap();
+        let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.stream_identity(&tenant).await.unwrap();
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        assert!(
+            shared(&store).await,
+            "a capture kept its own copy of the committed bytes"
+        );
+        for index in 0..5_u64 {
+            store
+                .append(
+                    &stream,
+                    if index == 0 {
+                        Expected::NoStream
+                    } else {
+                        Expected::Exact(index)
+                    },
+                    &[eventlog_conformance::event(
+                        "item.changed",
+                        i64::try_from(index).unwrap(),
+                    )],
+                    &eventlog_conformance::meta(&format!("own-{index}"), &json!({})),
+                )
+                .await
+                .unwrap();
+            assert!(
+                shared(&store).await,
+                "append {index} gave the writer a copy of the committed bytes"
+            );
+        }
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        assert!(
+            shared(&store).await,
+            "a capture after the writer moved kept its own copy"
+        );
+    }
+
+    /// A reader's view the writer cannot share is dropped by the next transaction rather than kept
+    /// beside the writer's as a second copy. A privacy rewrite is the case where they cannot: the
+    /// capture's view holds the epoch before it, every frame of which differs from the new one, and
+    /// those are the bytes the rewrite removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_view_from_before_a_privacy_rewrite_is_dropped_by_the_next_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("reader-dropped-owner").unwrap();
+        let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.stream_identity(&tenant).await.unwrap();
+        for index in 0..2_u64 {
+            store
+                .append(
+                    &stream,
+                    if index == 0 {
+                        Expected::NoStream
+                    } else {
+                        Expected::Exact(index)
+                    },
+                    &[eventlog_conformance::event(
+                        "item.changed",
+                        i64::try_from(index).unwrap(),
+                    )],
+                    &eventlog_conformance::meta(&format!("before-{index}"), &json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        store.redact(&stream, 1, "privacy").await.unwrap();
+        assert!(
+            store.runtime.lock().await.captured.is_some(),
+            "the control: the rewrite itself leaves the reader's view where it was"
+        );
+        store.read_stream(&stream, 0, 10).await.unwrap();
+        let runtime = store.runtime.lock().await;
+        assert!(
+            runtime.verified.is_some(),
+            "the fixture needs the writer's view"
+        );
+        assert!(
+            runtime.captured.is_none(),
+            "a reader's view of the epoch before a rewrite was kept beside the writer's"
+        );
+    }
+
+    /// The capture-side half of the same rule: a writer's view the capture cannot share is dropped
+    /// rather than kept as a second copy. A writer that observed the store empty and a capture that
+    /// reads what another handle committed since cannot share a buffer, because a view of no bytes
+    /// never adopts one; and the writer's view names a head the capture has moved past.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_writer_view_the_capture_cannot_share_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let tenant = TenantId::new("writer-dropped-owner").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        assert!(
+            store.runtime.lock().await.verified.is_some(),
+            "the control: the open keeps the writer's view"
+        );
+        {
+            let other = FileEventStore::open(root).await.unwrap();
+            other.stream_identity(&tenant).await.unwrap();
+        }
+        store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+        let runtime = store.runtime.lock().await;
+        assert!(
+            runtime.captured.is_some(),
+            "the fixture needs the reader's view"
+        );
+        assert!(
+            runtime.verified.is_none(),
+            "a writer's view the capture could not share was kept beside the capture's"
         );
     }
 }
