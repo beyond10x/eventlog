@@ -8,6 +8,9 @@ struct Args {
     cgroup: PathBuf,
     output: PathBuf,
     stop: PathBuf,
+    /// The `application_name` whose backends the summary counts as `workload_connections_max`.
+    #[arg(long, default_value = "eventlog-capacity-workload")]
+    workload_application: String,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval: Duration::from_millis(20),
         query_timeout: Duration::from_secs(1),
         attribute_connections_above: 8,
+        workload_application_name: args.workload_application,
     })
     .await?;
     println!("{summary}");

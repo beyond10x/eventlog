@@ -21,6 +21,18 @@ under bare-version tags such as `0.1.0`.
   `state_change` and `xact_start`, and whether each pid is still counted in the next sample. The
   `<= 8` connection check is unchanged.
 
+### Fixed
+
+- Capacity laboratory: the comparative lane's `<= 8` connection budget counts only the workload's
+  own backends. `capacity-sweep` starts every worker of both adapters with
+  `application_name=eventlog-capacity-workload`, and the metrics collector reports
+  `workload_connections` per sample and `workload_connections_max` per configuration beside the
+  unchanged all-backend `connections` and `connections_max_excluding_observer`. The CI service's
+  `pg_isready` health check opens short-lived client backends; one sampled beside the eight pool
+  connections failed the lane with nine. A maximum of zero workload connections also fails the
+  budget. Over-threshold attribution still covers every client backend, and no application name
+  is written to the receipt. See `docs/design/comparative-capacity-connection-budget.md`.
+
 ## 0.8.2 — 2026-10-08
 
 ### Performance
