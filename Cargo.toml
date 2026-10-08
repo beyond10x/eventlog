@@ -15,7 +15,7 @@ license = "Apache-2.0"
 repository = "https://github.com/beyond10x/eventlog"
 homepage = "https://github.com/beyond10x/eventlog"
 rust-version = "1.91"
-version = "0.8.2"
+version = "0.8.3"
 publish = false
 
 [workspace.dependencies]
