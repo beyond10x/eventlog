@@ -264,7 +264,6 @@ impl PostgresEventStore {
         self.pool.status()
     }
     /// Observe the connections this handle's pool has opened, retired and replaced.
-    #[cfg(feature = "pool-churn")]
     pub fn pool_churn(&self) -> PoolChurn {
         self.pool.churn()
     }
