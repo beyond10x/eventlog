@@ -277,6 +277,23 @@ impl PostgresEventStore {
         let _registration = self.registration.lock().await;
         self.frozen.store(true, Ordering::Release);
     }
+    /// Run a deletion or erasure with this handle's verified content forgotten before it starts
+    /// and again after it settles, whatever its outcome.
+    ///
+    /// The second forget is the one that matters: a read through this handle while the removal is
+    /// in flight still sees the row and may verify it, and only a forget after the commit makes
+    /// that read unable to remember it ([`VerifiedContent`]'s generation).
+    fn forgetting<'a, T: Send + 'a>(
+        &'a self,
+        removal: BoxFuture<'a, Result<T, EventLogError>>,
+    ) -> BoxFuture<'a, Result<T, EventLogError>> {
+        Box::pin(async move {
+            self.verified.forget();
+            let outcome = removal.await;
+            self.verified.forget();
+            outcome
+        })
+    }
     fn bounded<'a, T: Send + 'a>(
         &'a self,
         future: impl std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
@@ -787,9 +804,7 @@ impl EventStore for PostgresEventStore {
         &'a self,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.bounded(async move {
-            // Erased content is not kept in this handle's memory.
-            self.verified.forget();
+        self.forgetting(self.bounded(async move {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -852,7 +867,7 @@ impl EventStore for PostgresEventStore {
                 .map_err(|_| EventLogError::UnknownCommit)?;
             client.settled();
             Ok(())
-        })
+        }))
     }
 
     fn projection_list<'a>(
@@ -1054,9 +1069,7 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         digest: &'a str,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.bounded(async move {
-            // Deleted content is not kept in this handle's memory.
-            self.verified.forget();
+        self.forgetting(self.bounded(async move {
             let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
             client
@@ -1068,7 +1081,7 @@ impl EventStore for PostgresEventStore {
                 .map_err(backend)?;
             client.settled();
             Ok(())
-        })
+        }))
     }
 
     fn create_projections(

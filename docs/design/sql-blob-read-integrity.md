@@ -94,7 +94,7 @@ stored row, but stay in that process's memory until one of those events or the h
 On PostgreSQL the handle is one `PostgresEventStore`, shared by every pooled connection it leases:
 `get_blob`, every callback's `ProjectionStore::get_blob`, and the readback of `put_blob` and of a
 blob-bearing atomic group ask the memory; `put_blob` and a blob-bearing group remember the hash
-they computed, `delete_blob` and `forget_tenant` clear it, and a `put_blob` or blob-bearing group
+they computed, `delete_blob` and `forget_tenant` clear it before they start and again after they settle (a read racing them through the same pooled handle sees the row before the commit; a check notes the memory's generation and is not remembered across a clear, and hashes without holding the memory), and a `put_blob` or blob-bearing group
 that returns an error (including a deadline or an unknown commit) clears it. A consistent tenant
 capture still hashes every row it returns, and so does schema admission.
 

@@ -24,8 +24,18 @@
 //! or the handle is dropped. A deletion or erasure through **another** handle or process does not
 //! reach this one; such an entry is never returned — a hit requires storage to hold identical
 //! bytes — but it is still a copy in this process's memory until one of those events.
+//!
+//! **Ordering.** A provider forgets both before a deletion or erasure and after it commits. Every
+//! read notes the memory's generation when it looks up, hashes and compares **without** holding the
+//! memory, and is remembered only if no [`VerifiedContent::forget`] happened in between. So a read
+//! through the same handle that raced a deletion or erasure — and saw the row before the commit —
+//! cannot put the erased bytes back once the post-commit forget has run, and reads that miss hash
+//! in parallel rather than one at a time.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{EventLogError, validate_legacy_blob_count, validate_stored_blob};
 
@@ -41,20 +51,17 @@ pub struct VerifiedContent {
 #[derive(Default)]
 struct State {
     /// Verified content by its SHA-256, exactly as it was verified.
-    by_hash: HashMap<String, Vec<u8>>,
+    by_hash: HashMap<String, Arc<[u8]>>,
     /// The sum of the lengths in `by_hash`.
     held: usize,
     /// Full checks this memory could not answer and therefore ran.
     hashed: u64,
+    /// Bumped by every [`VerifiedContent::forget`]; a check that began under an older value is
+    /// not remembered.
+    generation: u64,
 }
 
 impl State {
-    fn known(&self, integrity_sha256: &str, bytes: &[u8]) -> bool {
-        self.by_hash
-            .get(integrity_sha256)
-            .is_some_and(|verified| verified.as_slice() == bytes)
-    }
-
     fn insert(&mut self, integrity_sha256: &str, bytes: &[u8]) {
         if bytes.len() > VERIFIED_CONTENT_BUDGET || self.by_hash.contains_key(integrity_sha256) {
             return;
@@ -65,7 +72,7 @@ impl State {
         }
         self.held += bytes.len();
         self.by_hash
-            .insert(integrity_sha256.to_owned(), bytes.to_vec());
+            .insert(integrity_sha256.to_owned(), Arc::from(bytes));
     }
 }
 
@@ -73,7 +80,45 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
 }
 
+/// What one lookup saw: the remembered content under the hash, if any, and the generation.
+struct Lookup {
+    remembered: Option<Arc<[u8]>>,
+    generation: u64,
+}
+
+impl Lookup {
+    /// Whether `bytes` equal the remembered content in full. Compared outside the memory's lock.
+    fn hit(&self, bytes: &[u8]) -> bool {
+        self.remembered
+            .as_deref()
+            .is_some_and(|verified| verified == bytes)
+    }
+}
+
 impl VerifiedContent {
+    fn look_up(&self, integrity_sha256: Option<&str>) -> Result<Lookup, EventLogError> {
+        let state = self.state.lock().map_err(poisoned)?;
+        Ok(Lookup {
+            remembered: integrity_sha256.and_then(|hash| state.by_hash.get(hash).cloned()),
+            generation: state.generation,
+        })
+    }
+
+    /// Count one full check before it runs, so a check that refuses is counted too.
+    fn count_full_check(&self) -> Result<(), EventLogError> {
+        self.state.lock().map_err(poisoned)?.hashed += 1;
+        Ok(())
+    }
+
+    /// Remember content a full check accepted, unless a forget happened since its lookup.
+    fn settle(&self, lookup: &Lookup, integrity_sha256: &str, bytes: &[u8]) {
+        if let Ok(mut state) = self.state.lock()
+            && state.generation == lookup.generation
+        {
+            state.insert(integrity_sha256, bytes);
+        }
+    }
+
     /// Validate one stored SQL row — [`validate_stored_blob`] — and return its bytes, skipping
     /// the SHA-256 when its hash names remembered content equal to `bytes` in full.
     ///
@@ -89,20 +134,16 @@ impl VerifiedContent {
         integrity_sha256: Option<String>,
         integrity_v1: i64,
     ) -> Result<Vec<u8>, EventLogError> {
-        let mut state = self.state.lock().map_err(poisoned)?;
-        if integrity_v1 == 1
-            && integrity_sha256
-                .as_deref()
-                .is_some_and(|hash| state.known(hash, &bytes))
-        {
+        let lookup = self.look_up(integrity_sha256.as_deref())?;
+        if integrity_v1 == 1 && lookup.hit(&bytes) {
             validate_legacy_blob_count(&bytes, byte_count)?;
             return Ok(bytes);
         }
-        state.hashed += 1;
+        self.count_full_check()?;
         let hash = integrity_sha256.clone();
         let bytes = validate_stored_blob(bytes, byte_count, integrity_sha256, integrity_v1)?;
         if let Some(hash) = hash {
-            state.insert(&hash, &bytes);
+            self.settle(&lookup, &hash, &bytes);
         }
         Ok(bytes)
     }
@@ -111,7 +152,8 @@ impl VerifiedContent {
     /// equal remembered content in full, otherwise `full`'s answer, remembered when it is `true`.
     ///
     /// `full` is the provider's complete check: it must hash `bytes` and compare the result with
-    /// `integrity_sha256`, and answer `true` only when they agree.
+    /// `integrity_sha256`, and answer `true` only when they agree. It runs without the memory's
+    /// lock held.
     ///
     /// # Errors
     /// [`EventLogError::Backend`] when the memory's lock was poisoned.
@@ -121,14 +163,14 @@ impl VerifiedContent {
         integrity_sha256: &str,
         full: impl FnOnce(&[u8]) -> bool,
     ) -> Result<bool, EventLogError> {
-        let mut state = self.state.lock().map_err(poisoned)?;
-        if state.known(integrity_sha256, bytes) {
+        let lookup = self.look_up(Some(integrity_sha256))?;
+        if lookup.hit(bytes) {
             return Ok(true);
         }
-        state.hashed += 1;
+        self.count_full_check()?;
         let matched = full(bytes);
         if matched {
-            state.insert(integrity_sha256, bytes);
+            self.settle(&lookup, integrity_sha256, bytes);
         }
         Ok(matched)
     }
@@ -144,11 +186,13 @@ impl VerifiedContent {
         }
     }
 
-    /// Drop everything remembered, so deleted or erased content is not kept in memory.
+    /// Drop everything remembered, so deleted or erased content is not kept in memory, and refuse
+    /// to remember any check that began before this call.
     pub fn forget(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.by_hash.clear();
             state.held = 0;
+            state.generation += 1;
         }
     }
 
@@ -220,6 +264,56 @@ mod tests {
             4,
             "a changed length is refused by the length check, without hashing"
         );
+    }
+
+    /// Whether another thread can use the memory within two seconds.
+    fn usable_from_another_thread(verified: &std::sync::Arc<VerifiedContent>) -> bool {
+        let (sent, received) = std::sync::mpsc::channel();
+        let other = std::sync::Arc::clone(verified);
+        std::thread::spawn(move || {
+            let _ = sent.send(other.entries());
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok()
+    }
+
+    /// The SHA-256 runs without the handle-wide lock, so reads through one handle that miss hash
+    /// in parallel rather than one at a time.
+    #[test]
+    fn a_full_check_runs_without_holding_the_memory() {
+        let verified = std::sync::Arc::new(VerifiedContent::default());
+        let bytes = b"object".to_vec();
+        let hash = blob_integrity_sha256(&bytes);
+        let mut free = false;
+        assert!(
+            verified
+                .check_recorded(&bytes, &hash, |candidate| {
+                    free = usable_from_another_thread(&verified);
+                    blob_integrity_sha256(candidate) == hash
+                })
+                .unwrap()
+        );
+        assert!(free, "the full check ran while holding the memory");
+    }
+
+    /// Content whose check began before a `forget` is not remembered after it: a read racing a
+    /// deletion or erasure through the same handle cannot put the erased bytes back.
+    #[test]
+    fn a_check_that_began_before_a_forget_remembers_nothing() {
+        let verified = VerifiedContent::default();
+        let bytes = b"object".to_vec();
+        let hash = blob_integrity_sha256(&bytes);
+        assert!(
+            verified
+                .check_recorded(&bytes, &hash, |candidate| {
+                    verified.forget();
+                    blob_integrity_sha256(candidate) == hash
+                })
+                .unwrap()
+        );
+        assert_eq!((verified.held(), verified.entries()), (0, 0));
+        assert_eq!(verified.hashed(), 1);
     }
 
     #[test]

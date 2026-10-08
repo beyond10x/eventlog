@@ -226,3 +226,6 @@ async fn deletion_erasure_and_a_failed_binding_drop_remembered_content() {
     assert_eq!(store.verified.held(), 0, "erasure");
     store.drop_tables().await.unwrap();
 }
+
+#[cfg(test)]
+mod adversary;
