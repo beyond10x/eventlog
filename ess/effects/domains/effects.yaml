@@ -64,4 +64,4 @@ types:
         type: Boolean
     invariants:
       - records_attempt == true
-      - records_terminal == true or records_incomplete == true
+      - any: [records_terminal == true, records_incomplete == true]

@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-08T09:07:27Z",
+  "actor": "human:timo",
+  "artifact": "story:effects-spec-validates-on-current-ess",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "ess validate --path ess/effects (ess 0.56.0): eventlog v1 — 2 file(s), valid"
+  }
+}
