@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-08T12:24:45Z",
+  "actor": "human:timo",
+  "artifact": "story:capacity-proof-counts-a-ninth-connection",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/eventlog/actions/runs/37775594770"
+  }
+}

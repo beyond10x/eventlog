@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:input-validation-adversary-pass-1
 kind: review-result
-status: active
+status: archived
 title: Public input validation adversary pass 1
 relations:
 - reviews: story:validate-public-append-inputs
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: story:validate-public-append-inputs at eae613186532260679fb16f82e0a56e7c3faf44c against5c1ff2690f07ec0b91f14cce307fff2a6b65ddca
 verdict: nothing found

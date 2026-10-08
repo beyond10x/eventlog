@@ -2,13 +2,14 @@
 format: aep.planning-md/3
 id: review-result:capture-verified-review-1
 kind: review-result
-status: active
+status: archived
 title: 'Independent verification pass 1: does the resumed reader refuse everything the strict reader refuses'
 relations:
 - reviews: story:file-capture-reuses-the-verified-view
-revision: 2
+revision: 3
 transitions:
 - {from: "draft", to: "active", at: "2026-09-21T06:19:52Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "active", to: "archived", at: "2026-10-08T11:00:45Z", actor: "human:timo", revision: 3}
 ---
 unit: story:file-capture-reuses-the-verified-view — commit b5a6e0ae19a5d02616a8c260a1f3d67060317ba3, worktree ess-evolution-capture-verified-review-1-20260921
 verdict: red

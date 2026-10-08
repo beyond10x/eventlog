@@ -2,13 +2,14 @@
 format: aep.planning-md/3
 id: review-result:verify-once-review-1
 kind: review-result
-status: active
+status: archived
 title: 'Independent verification pass 1: a file Eventlog transaction costs what it touches'
 relations:
 - reviews: story:file-eventlog-verifies-once-per-open
-revision: 2
+revision: 3
 transitions:
 - {from: "draft", to: "active", at: "2026-09-20T22:59:22Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "active", to: "archived", at: "2026-10-08T11:00:49Z", actor: "human:timo", revision: 3}
 ---
 unit: story:file-eventlog-verifies-once-per-open — commit c698923038de4413e0bbba3cd91ae108607d6be9, worktree home-path:sha256:d30a97f67dd9c970031b7f1d0664be59b72fc6a61618902ce26b329f11655122 (HEAD detached, no tracked file modified)
 verdict: red

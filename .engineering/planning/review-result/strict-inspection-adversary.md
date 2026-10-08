@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:strict-inspection-adversary
 kind: review-result
-status: active
+status: archived
 title: Independent strict inspection review
 relations:
 - reviews: story:strict-read-only-history-inspection
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: strict-read-only-history-inspection, fd8a96b plus stable inspection implementation working tree
 verdict: CONFIRMED — three blocker findings; correction required

@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sql-blob-integrity-design-pass-1
 kind: review-result
-status: active
+status: archived
 title: SQL blob integrity independent technical design review, pass one
 relations:
 - reviews: story:sql-blob-read-integrity
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 needs-revision
 story:sql-blob-read-integrity — The selected design requires a backfill UPDATE but states that it supersedes only the predecessor's no-DDL constraint, leaving the predecessor's explicit no-UPDATE rule contradictory; explicitly authorize only integrity-metadata backfill inside the fenced migration while retaining the runtime no-overwrite rule. — docs/design/sql-blob-read-integrity.md:21

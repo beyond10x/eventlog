@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:adversary-verify-content-once-pass-1
 kind: review-result
-status: active
+status: archived
 title: Adversary pass 1 on verifying blob content once per handle (77e0d563)
 relations:
 - reviews: story:file-and-postgres-verify-each-content-once
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:45Z", actor: "human:timo", revision: 2}
 ---
 needs-revision
 

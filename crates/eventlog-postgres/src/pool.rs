@@ -255,6 +255,67 @@ pub struct PoolStatus {
     pub closed: bool,
 }
 
+/// Connection churn one pool has made since it was created; every count only grows.
+///
+/// Modelled as `eventlog.pool.PoolChurn` in `ess/pool/`; this encoding is held to the committed
+/// JSON Schema projection under `ess/pool-generated/`.
+///
+/// - `opened`: every connection the pool established.
+/// - A *retirement* is a connection the pool closed instead of keeping idle, counted once when
+///   the pool decides it, by cause. `retired_shutdown` takes precedence: a connection retired
+///   after the pool closed counts there. Otherwise `retired_closed_client` counts a client the
+///   driver had already closed (on return, or found idle at checkout), and
+///   `retired_unsettled_lease` a lease dropped open without settling.
+/// - `replacements`: the connections in `opened` made while the non-shutdown retirements so far
+///   outnumbered the replacements so far. Each such retirement allows one replacement; every
+///   other connection only fills capacity the pool had never opened. So `replacements` is at
+///   most `retired_unsettled_lease + retired_closed_client`, and `opened - replacements` is the
+///   most connections the pool ever had open at once without retiring any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct PoolChurn {
+    pub opened: u64,
+    pub replacements: u64,
+    pub retired_unsettled_lease: u64,
+    pub retired_closed_client: u64,
+    pub retired_shutdown: u64,
+}
+
+#[derive(Clone, Copy)]
+enum Retirement {
+    UnsettledLease,
+    ClosedClient,
+    Shutdown,
+}
+
+impl Retirement {
+    fn of(pool_closed: bool, client_closed: bool) -> Self {
+        if pool_closed {
+            Self::Shutdown
+        } else if client_closed {
+            Self::ClosedClient
+        } else {
+            Self::UnsettledLease
+        }
+    }
+}
+
+impl PoolChurn {
+    fn retire(&mut self, cause: Retirement) {
+        match cause {
+            Retirement::UnsettledLease => self.retired_unsettled_lease += 1,
+            Retirement::ClosedClient => self.retired_closed_client += 1,
+            Retirement::Shutdown => self.retired_shutdown += 1,
+        }
+    }
+    fn open(&mut self) {
+        self.opened += 1;
+        if self.retired_unsettled_lease + self.retired_closed_client > self.replacements {
+            self.replacements += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct RecyclePause {
@@ -296,6 +357,7 @@ struct PoolState {
     waiting: usize,
     idle: Vec<Connection>,
     closed: bool,
+    churn: PoolChurn,
 }
 
 // Own queued membership even when timeout/cancellation drops an unpolled semaphore grant.
@@ -403,13 +465,20 @@ impl Pool {
                 }
                 // Keep the driver inside the lease while awaiting it. Cancelling this await
                 // transfers that same connection and permit to quarantine, not to a replacement.
+                // The retirement is counted after the close, so a cancelled close counts once,
+                // in the lease's drop.
                 connection.close().await;
-                lease.client = self.state.lock().map_err(super::poisoned)?.idle.pop();
+                let mut state = self.state.lock().map_err(super::poisoned)?;
+                let cause = Retirement::of(state.closed, true);
+                state.churn.retire(cause);
+                lease.client = state.idle.pop();
             } else {
                 if self.state.lock().map_err(super::poisoned)?.closed {
                     return Err(EventLogError::Closed);
                 }
-                lease.client = Some(self.connect().await?);
+                let connection = self.connect().await?;
+                self.state.lock().map_err(super::poisoned)?.churn.open();
+                lease.client = Some(connection);
                 let connection = lease.client.as_ref().expect("connected lease");
                 tokio::time::timeout(self.options.connect_timeout,connection.client.batch_execute(&format!("SET search_path TO {}; SET default_transaction_isolation = 'read committed'; SET default_transaction_read_only = off; SET statement_timeout = {}; SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",self.config.schema,self.options.statement_timeout.as_millis(),self.options.lock_timeout.as_millis(),self.options.transaction_timeout.as_millis()))).await.map_err(|_|EventLogError::Deadline {operation:"session configuration"})?.map_err(super::backend)?;
                 break;
@@ -491,6 +560,13 @@ impl Pool {
             idle: state.idle.len(),
             closed: state.closed,
         }
+    }
+    #[cfg(any(test, feature = "pool-churn"))]
+    pub(crate) fn churn(&self) -> PoolChurn {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .churn
     }
     #[cfg(test)]
     fn pause(&self, point: PausePoint) {
@@ -618,6 +694,15 @@ impl Drop for Lease {
         }
         // Closing is part of the outstanding lease. Capacity never returns on abort() alone.
         let connection = self.client.take();
+        if let Some(connection) = &connection {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cause = Retirement::of(state.closed, connection.client.is_closed());
+            state.churn.retire(cause);
+        }
         let permit = self.connection_permit.take();
         let pool = Arc::clone(&self.pool);
         tokio::spawn(async move {
@@ -1195,5 +1280,136 @@ mod tests {
             status.idle, 0,
             "shutdown must close a lease returned during closure"
         );
+    }
+
+    fn churn(
+        opened: u64,
+        replacements: u64,
+        unsettled: u64,
+        closed_client: u64,
+        shutdown: u64,
+    ) -> PoolChurn {
+        PoolChurn {
+            opened,
+            replacements,
+            retired_unsettled_lease: unsettled,
+            retired_closed_client: closed_client,
+            retired_shutdown: shutdown,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settled_return_counts_neither_retirement_nor_replacement() {
+        let Some(pool) = fixture(1, 1) else { return };
+        for _ in 0..3 {
+            let mut lease = pool.acquire().await.unwrap();
+            lease.settled();
+            drop(lease);
+        }
+        assert_eq!(pool.churn(), churn(1, 0, 0, 0, 0));
+        pool.shutdown().await.unwrap();
+        assert_eq!(
+            pool.churn(),
+            churn(1, 0, 0, 0, 1),
+            "shutdown retires the idle connection as shutdown, not as a replaceable retirement"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsettled_lease_drop_counts_one_retirement_and_its_replacement() {
+        let Some(pool) = fixture(1, 1) else { return };
+        let mut settled = pool.acquire().await.unwrap();
+        settled.settled();
+        drop(settled);
+        let unsettled = pool.acquire().await.unwrap();
+        drop(unsettled);
+        assert_eq!(
+            pool.churn(),
+            churn(1, 0, 1, 0, 0),
+            "the retirement is counted when the pool decides it, before its driver stops"
+        );
+        let mut replacement = pool.acquire().await.unwrap();
+        assert_eq!(pool.churn(), churn(2, 1, 1, 0, 0));
+        replacement.settled();
+        drop(replacement);
+        let mut reused = pool.acquire().await.unwrap();
+        reused.settled();
+        drop(reused);
+        assert_eq!(pool.churn(), churn(2, 1, 1, 0, 0));
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_idle_client_counts_a_closed_client_retirement_and_its_replacement() {
+        let Some(pool) = fixture(1, 1) else { return };
+        let mut held = pool.acquire().await.unwrap();
+        let pid: i32 = held
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        held.settled();
+        drop(held);
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").unwrap();
+        let (observer, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let observer_driver = tokio::spawn(connection);
+        let terminated: bool = observer
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(terminated);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pool.state.lock().unwrap().idle[0].client.is_closed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the idle driver observes the terminated backend");
+        let mut replacement = pool.acquire().await.unwrap();
+        replacement.settled();
+        drop(replacement);
+        assert_eq!(pool.churn(), churn(2, 1, 0, 1, 0));
+        pool.shutdown().await.unwrap();
+        drop(observer);
+        observer_driver.await.unwrap().unwrap();
+    }
+
+    /// The committed schema's object properties are exactly the serialized fields, each a
+    /// nonnegative integer; a schema keyword this check does not know is a refusal.
+    #[test]
+    fn pool_churn_serializes_to_its_committed_ess_schema() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ess/pool-generated/schema/types/eventlog.pool.PoolChurn.schema.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let node = &schema["$defs"]["eventlog.pool.PoolChurn"];
+        assert_eq!(schema["$ref"], "#/$defs/eventlog.pool.PoolChurn");
+        assert_eq!(node["type"], "object");
+        assert_eq!(node["additionalProperties"], false);
+        let properties = node["properties"].as_object().unwrap();
+        let mut required: Vec<_> = node["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        required.sort();
+        let mut declared: Vec<_> = properties.keys().cloned().collect();
+        declared.sort();
+        assert_eq!(required, declared);
+        for property in properties.values() {
+            let mut keys: Vec<_> = property.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            assert_eq!(keys, ["minimum", "type"], "unchecked keyword in {property}");
+            assert_eq!(property["type"], "integer");
+            assert_eq!(property["minimum"], 0);
+        }
+        let encoded = serde_json::to_value(churn(u64::MAX, 1, 2, 3, 4)).unwrap();
+        let encoded = encoded.as_object().unwrap();
+        let mut fields: Vec<_> = encoded.keys().cloned().collect();
+        fields.sort();
+        assert_eq!(fields, declared);
+        assert!(encoded.values().all(serde_json::Value::is_u64));
     }
 }

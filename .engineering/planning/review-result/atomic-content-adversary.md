@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:atomic-content-adversary
 kind: review-result
-status: active
+status: archived
 title: Independent atomic content publication review
 relations:
 - reviews: story:atomic-blob-append
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:45Z", actor: "human:timo", revision: 2}
 ---
 unit: story:atomic-blob-append at fd7ce06d31796bcf9e90f8388d26c0cfe3f3e175 plus the handed-back atomic-content diff
 verdict: nothing found

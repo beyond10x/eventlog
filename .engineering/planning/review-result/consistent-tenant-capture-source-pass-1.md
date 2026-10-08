@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:consistent-tenant-capture-source-pass-1
 kind: review-result
-status: active
+status: archived
 title: Consistent tenant capture source examination pass 1
 relations:
 - reviews: story:consistent-tenant-capture
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:46Z", actor: "human:timo", revision: 2}
 ---
 unit: native consistent tenant capture, source `5b4d4f83efe23f85294de7b5fef8b7de3ebdc878` (tree `36331305b3aa38ba118594758fd34a2b4a34800d`), base `8746a693c6084ab516170278a72c6c8cf5c8e46c`; findings cover that commit plus my four untracked test files
 verdict: CONFIRMED

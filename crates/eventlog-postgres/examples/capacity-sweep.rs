@@ -1,12 +1,21 @@
 //! Comparative laboratory supervisor. The identical worker source links each adapter separately.
 #[path = "observation/metrics_collector.rs"]
 mod metrics_collector;
+#[path = "observation/workload_budget.rs"]
+mod workload_budget;
 use clap::Parser;
 use serde_json::{Value, json};
 use std::{fs, io, path::Path, process::Command, time::Duration};
 
+/// One adapter's worker binary and the tagged connection string every one of its workers uses.
+#[derive(Clone, Copy)]
+struct WorkerProcess<'a> {
+    binary: &'a Path,
+    url: &'a str,
+}
+
 fn worker(
-    binary: &Path,
+    process: WorkerProcess<'_>,
     prefix: &str,
     index: usize,
     lanes: usize,
@@ -14,7 +23,8 @@ fn worker(
     mode: &str,
     output: &Path,
 ) -> io::Result<Value> {
-    let result = Command::new(binary)
+    let result = Command::new(process.binary)
+        .env("EVENTLOG_TEST_POSTGRES_URL", process.url)
         .args([
             prefix,
             &index.to_string(),
@@ -54,8 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = args.output.as_path();
     fs::create_dir(output)?;
     let cgroup = args.cgroup.as_path();
-    let postgres =
-        std::env::var("EVENTLOG_TEST_POSTGRES_URL")?.parse::<tokio_postgres::Config>()?;
+    let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL")?;
+    let postgres = url.parse::<tokio_postgres::Config>()?;
+    // Every worker of both adapters connects under one tag, so the budget counts the workload's
+    // backends and not another client of the same server, such as a health check's probe.
+    let workload_url = workload_budget::tagged_url(&url, workload_budget::WORKLOAD_APPLICATION);
+    let workload_url = workload_url.as_str();
     let mut configurations = Vec::new();
     let generation: String = time::OffsetDateTime::now_utc()
         .unix_timestamp()
@@ -71,6 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("baseline", args.baseline.as_path()),
         ("candidate", args.candidate.as_path()),
     ] {
+        let process = WorkerProcess {
+            binary,
+            url: workload_url,
+        };
         for aggregate in [1, 8, 32] {
             for mode in ["uniform", "hot"] {
                 let label = format!("{adapter}-{aggregate}-{mode}");
@@ -84,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 );
                 worker(
-                    binary,
+                    process,
                     &prefix,
                     0,
                     1,
@@ -102,6 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         maximum_duration: Duration::from_secs(120),
                         interval: Duration::from_millis(20),
                         query_timeout: Duration::from_secs(2),
+                        attribute_connections_above: 8,
+                        workload_application_name: workload_budget::WORKLOAD_APPLICATION.to_owned(),
+                        reset_statements: true,
                     },
                 ));
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -110,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if aggregate == 1 {
                         for index in 0..2 {
                             results.push(worker(
-                                binary,
+                                process,
                                 &prefix,
                                 index,
                                 1,
@@ -125,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let path = output.join(format!("{label}-worker{index}"));
                                 let prefix = &prefix;
                                 scope.spawn(move || {
-                                    worker(binary, prefix, index, aggregate / 2, 128, mode, &path)
+                                    worker(process, prefix, index, aggregate / 2, 128, mode, &path)
                                 })
                             })
                             .collect();
@@ -190,9 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && maximum("projection_lag_us") <= 10_000_000
                     && metrics["postgres_failures"] == 0
                     && metrics["cgroup_failures"] == 0
-                    && metrics["connections_max_excluding_observer"]
-                        .as_u64()
-                        .is_some_and(|value| value <= 8)
+                    && workload_budget::within_connection_budget(&metrics)
                     && metrics["statements_before"]["status"] == "observed"
                     && metrics["statements_after"]["status"] == "observed"
                     && metrics["statements_before"]["value"]["stats_reset"]
@@ -208,10 +227,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         == metrics["cgroup_last"]["memory_events"]["oom"]
                     && metrics["cgroup_first"]["memory_events"]["max"]
                         == metrics["cgroup_last"]["memory_events"]["max"];
-                let receipt = json!({"adapter":adapter,"mode":mode,"aggregate_concurrency":aggregate,"workers":workers,"metrics":metrics,"succeeded":total("succeeded"),"elapsed_us":elapsed_us,"p50_us":quantile(&latencies,50),"p95_us":quantile(&latencies,95),"p99_us":quantile(&latencies,99),"valid_observed_envelope":valid,"limits":"End-to-end append/read bounds are conservative queue and transaction duration upper bounds. Server statement timings and sampled transaction ages are separately labeled; no exact internal queue histogram. Two processes run sequentially at aggregate concurrency one. Metrics include warmup and replay; worker latency excludes both."});
+                // Each worker process owns one pool; null where the adapter has none to report.
+                let pool_churn: Vec<_> = workers
+                    .iter()
+                    .map(|value| value["pool_churn"].clone())
+                    .collect();
+                let receipt = json!({"adapter":adapter,"pool_churn_by_worker":pool_churn,"mode":mode,"aggregate_concurrency":aggregate,"workers":workers,"metrics":metrics,"succeeded":total("succeeded"),"elapsed_us":elapsed_us,"p50_us":quantile(&latencies,50),"p95_us":quantile(&latencies,95),"p99_us":quantile(&latencies,99),"valid_observed_envelope":valid,"limits":"End-to-end append/read bounds are conservative queue and transaction duration upper bounds. Server statement timings and sampled transaction ages are separately labeled; no exact internal queue histogram. Two processes run sequentially at aggregate concurrency one. Metrics include warmup and replay; worker latency excludes both."});
                 println!(
                     "{}",
-                    json!({"configuration":label,"valid_observed_envelope":valid,"samples":latencies.len(),"p99_us":quantile(&latencies,99)})
+                    json!({"configuration":label,"valid_observed_envelope":valid,"samples":latencies.len(),"p99_us":quantile(&latencies,99),"connections_max_excluding_observer":metrics["connections_max_excluding_observer"],"workload_connections_max":metrics["workload_connections_max"],"pool_churn_by_worker":pool_churn})
                 );
                 fs::write(
                     output.join(format!("{label}.json")),

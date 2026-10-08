@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-08T11:00:28Z",
+  "actor": "human:timo",
+  "artifact": "story:validate-public-append-inputs",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:input-validation-adversary-pass-1",
+    "review": "review-result:input-validation-adversary-pass-1",
+    "outcome": "no-op"
+  }
+}

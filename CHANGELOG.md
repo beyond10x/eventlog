@@ -5,6 +5,41 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- PostgreSQL: `PostgresEventStore::pool_churn` returns the new `#[non_exhaustive]`, serializable
+  `PoolChurn`: the connections the handle's pool has opened, the ones it retired by cause (a lease
+  dropped without settling, a client already closed, shutdown) and the connections that replaced a
+  retirement. A connection counts as a replacement while earlier non-shutdown retirements
+  outnumber earlier replacements; every other connection only fills capacity. `PoolStatus` is
+  unchanged. The type is modelled as `eventlog.pool.PoolChurn` in `ess/pool/`, and a test holds
+  its encoding to the committed schema in `ess/pool-generated/`. The accessor sits behind the new
+  default feature `pool-churn`.
+- Capacity laboratory: each `capacity` worker reports its pool's churn, and `capacity-sweep` carries
+  it per worker into each configuration receipt. The metrics collector records, for a sample over
+  eight client connections, each counted backend's `pid`, `backend_start`, `state`,
+  `state_change` and `xact_start`, and whether each pid is still counted in the next sample. The
+  `<= 8` connection check is unchanged.
+
+### Fixed
+
+- Capacity laboratory: the comparative lane's `<= 8` connection budget counts only the workload's
+  own backends. `capacity-sweep` starts every worker of both adapters with
+  `application_name=eventlog-capacity-workload`, and the metrics collector reports
+  `workload_connections` per sample and `workload_connections_max` per configuration beside the
+  unchanged all-backend `connections` and `connections_max_excluding_observer`. The CI service's
+  `pg_isready` health check opens short-lived client backends; one sampled beside the eight pool
+  connections failed the lane with nine. A maximum of zero workload connections also fails the
+  budget. Over-threshold attribution still covers every client backend, and no application name
+  is written to the receipt. See `docs/design/comparative-capacity-connection-budget.md`.
+- Capacity laboratory: each comparative configuration starts from an empty `pg_stat_statements`.
+  The metrics collector resets the extension immediately before the configuration's opening
+  statement snapshot, so an eviction caused by statements registered earlier on the same server,
+  such as the production gate's, can no longer move `dealloc` inside a configuration and fail its
+  envelope. A refused or timed-out reset leaves that snapshot `unavailable`, which fails the
+  configuration. The deallocation and `stats_reset` equality checks are unchanged. See
+  `docs/design/comparative-capacity-connection-budget.md`.
+
 ## 0.8.2 — 2026-10-08
 
 ### Performance

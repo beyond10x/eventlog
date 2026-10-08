@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:caller-owned-postgres-connections-for-er-facades
 kind: story
-status: draft
+status: implemented
 title: Preserve caller-owned PostgreSQL connections in the existing bounded pool
 refs:
 - provider: er
@@ -29,7 +29,11 @@ scope:
   path: crates/eventlog-postgres/tests/
 - confidence: inferred
   path: docs/design/
-revision: 4
+revision: 7
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-08T11:00:38Z", actor: "human:timo", revision: 5}
+- {from: "proposed", to: "active", at: "2026-10-08T11:00:38Z", actor: "human:timo", revision: 6}
+- {from: "active", to: "implemented", at: "2026-10-08T12:24:45Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":1}}}
 ---
 # Preserve caller-owned PostgreSQL connection authority for ER facades
 

@@ -1,10 +1,11 @@
-//! Read-only laboratory observation. This module does not select or admit a workload.
+//! Laboratory observation. This module does not select or admit a workload. Its only write is the
+//! caller-requested `pg_stat_statements` reset before a collection's opening statement snapshot.
 //!
 //! The caller binds a disposable PostgreSQL server and its cgroup before starting.
 //! Every sample carries actual elapsed time and errors: a failed observation is never zero.
 //! Activity ages and sampled occupancy are not completed transaction/lock durations.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -22,6 +23,13 @@ pub struct MetricsConfig {
     pub maximum_duration: Duration,
     pub interval: Duration,
     pub query_timeout: Duration,
+    /// A sample counting more connections than this records each counted backend.
+    pub attribute_connections_above: u64,
+    /// The `application_name` that marks the workload's own backends; never retained.
+    pub workload_application_name: String,
+    /// Reset `pg_stat_statements` immediately before the opening statement snapshot, so the
+    /// collection starts from an empty table. A failed reset makes that snapshot unavailable.
+    pub reset_statements: bool,
 }
 
 struct Observer {
@@ -119,14 +127,27 @@ async fn connect(config: &Config, timeout: Duration) -> Result<Observer, &'stati
     Ok(Observer { client, driver })
 }
 
-async fn sample_postgres(client: &Client, timeout: Duration) -> Result<Value, &'static str> {
+async fn sample_postgres(
+    client: &Client,
+    workload_application_name: &str,
+    timeout: Duration,
+) -> Result<Value, &'static str> {
     // No query text, addresses, usernames, application names, database names or row values.
     // The activity population is all client backends on this isolated server except this probe.
+    // `workload_connections` counts only those carrying the workload's application_name, which
+    // is compared on the server and never returned: other clients of the same server, such as a
+    // health check's short-lived `pg_isready` backends, stay in `connections` only.
     // max_query_age of lock waiters is an upper bound on lock wait, not the wait itself.
+    // `backends` identifies each counted backend by pid and timestamps only; the collector keeps
+    // it in a record only for a sample over the attribution threshold.
     let query = r"
         SELECT jsonb_build_object(
           'observed_at', clock_timestamp(),
           'connections', count(*),
+          'workload_connections', count(*) FILTER (WHERE application_name = $1),
+          'backends', COALESCE(jsonb_agg(jsonb_build_object(
+            'pid', pid, 'backend_start', backend_start, 'state', state,
+            'state_change', state_change, 'xact_start', xact_start) ORDER BY pid), '[]'::jsonb),
           'active', count(*) FILTER (WHERE state = 'active'),
           'idle', count(*) FILTER (WHERE state = 'idle'),
           'idle_in_transaction', count(*) FILTER (WHERE state LIKE 'idle in transaction%'),
@@ -136,18 +157,42 @@ async fn sample_postgres(client: &Client, timeout: Duration) -> Result<Value, &'
         ) FROM pg_stat_activity
         WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
     ";
-    let row = tokio::time::timeout(timeout, client.query_one(query, &[]))
-        .await
-        .map_err(|_| "observer_query_timeout")?
-        .map_err(|_| "observer_query_failed")?;
+    let row = tokio::time::timeout(
+        timeout,
+        client.query_one(query, &[&workload_application_name]),
+    )
+    .await
+    .map_err(|_| "observer_query_timeout")?
+    .map_err(|_| "observer_query_failed")?;
     row.try_get(0).map_err(|_| "observer_result_decode_failed")
 }
 
-async fn statement_snapshot(config: &Config, timeout: Duration) -> Value {
+async fn statement_snapshot(config: &Config, timeout: Duration, reset: bool) -> Value {
     let observer = match connect(config, timeout).await {
         Ok(observer) => observer,
         Err(error) => return json!({"status": "unavailable", "error": error}),
     };
+    // A reset on the snapshot's own connection, immediately before it: the collection then
+    // starts from an empty table, so no statement registered before it can be evicted inside it
+    // and move `dealloc`. A refused reset (no privilege, no extension) is not an observation.
+    if reset {
+        let error = match tokio::time::timeout(
+            timeout,
+            observer
+                .client
+                .batch_execute("SELECT pg_stat_statements_reset()"),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some("statement_reset_failed"),
+            Err(_) => Some("statement_reset_timeout"),
+        };
+        if let Some(error) = error {
+            observer.close().await;
+            return json!({"status": "unavailable", "error": error});
+        }
+    }
     // PostgreSQL17/pg_stat_statements1.11 schema, verified against the assigned test server.
     // Classify on the server; the retained result contains no SQL text or statement identifiers.
     // These are cumulative statement timings, never whole-transaction wall-clock timings.
@@ -197,6 +242,23 @@ async fn statement_snapshot(config: &Config, timeout: Duration) -> Value {
     };
     observer.close().await;
     value
+}
+
+/// One over-threshold sample's backends, each marked with whether its pid is still counted in
+/// the next sample; `null` when that sample was not observed.
+fn attribute(sample: u64, backends: Vec<Value>, next: Option<&BTreeSet<i64>>) -> Value {
+    let backends: Vec<Value> = backends
+        .into_iter()
+        .map(|mut backend| {
+            let present = match (next, backend["pid"].as_i64()) {
+                (Some(next), Some(pid)) => Value::Bool(next.contains(&pid)),
+                _ => Value::Null,
+            };
+            backend["present_in_next_sample"] = present;
+            backend
+        })
+        .collect();
+    json!({"sample": sample, "connections": backends.len(), "backends": backends})
 }
 
 fn write_record(output: &mut BufWriter<File>, value: &Value) -> io::Result<()> {
@@ -252,7 +314,12 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     let mut output = BufWriter::new(file);
     let start = Instant::now();
     let started_unix_ms = utc_unix_ms();
-    let statements_before = statement_snapshot(&config.postgres, config.query_timeout).await;
+    let statements_before = statement_snapshot(
+        &config.postgres,
+        config.query_timeout,
+        config.reset_statements,
+    )
+    .await;
     write_record(
         &mut output,
         &json!({
@@ -276,6 +343,7 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     let mut cgroup_failures = 0_u64;
     let mut postgres_failures = 0_u64;
     let mut connections_max = 0_u64;
+    let mut workload_connections_max = 0_u64;
     let mut memory_max = 0_u64;
     let mut lock_waiters_max = 0_u64;
     let mut previous_tick = None;
@@ -283,6 +351,8 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     let mut occupancy_lock_backend_ms = 0_u128;
     let mut previous_lock_waiters = None;
     let mut previous_pg_success = false;
+    let mut over_threshold: Option<(u64, Vec<Value>)> = None;
+    let mut attributed = Vec::new();
     loop {
         let tick = start.elapsed();
         let gap_ms = previous_tick.map(|previous| tick.saturating_sub(previous).as_millis());
@@ -316,12 +386,38 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
             None
         };
         let observation = match &observer {
-            Some(connected) => sample_postgres(&connected.client, config.query_timeout).await,
+            Some(connected) => {
+                sample_postgres(
+                    &connected.client,
+                    &config.workload_application_name,
+                    config.query_timeout,
+                )
+                .await
+            }
             None => Err(connect_error.unwrap_or("observer_unavailable")),
         };
+        let sample = samples + 1;
+        let mut followup = Value::Null;
         let postgres = match observation {
-            Ok(value) => {
+            Ok(mut value) => {
+                let backends = match value.as_object_mut().and_then(|v| v.remove("backends")) {
+                    Some(Value::Array(backends)) => backends,
+                    _ => Vec::new(),
+                };
+                let pids: BTreeSet<i64> = backends
+                    .iter()
+                    .filter_map(|backend| backend["pid"].as_i64())
+                    .collect();
+                if let Some((previous, counted)) = over_threshold.take() {
+                    let resolved = attribute(previous, counted, Some(&pids));
+                    followup = resolved.clone();
+                    attributed.push(resolved);
+                }
                 let connections = value["connections"].as_u64().unwrap_or(0);
+                if connections > config.attribute_connections_above {
+                    value["over_threshold_backends"] = Value::Array(backends.clone());
+                    over_threshold = Some((sample, backends));
+                }
                 let waiters = value["lock_waiters"].as_u64().unwrap_or(0);
                 // Only integrate adjacent successful samples; missing intervals stay missing.
                 if previous_pg_success
@@ -330,12 +426,19 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
                     occupancy_lock_backend_ms += u128::from(previous) * gap;
                 }
                 connections_max = connections_max.max(connections);
+                workload_connections_max = workload_connections_max
+                    .max(value["workload_connections"].as_u64().unwrap_or(0));
                 lock_waiters_max = lock_waiters_max.max(waiters);
                 previous_lock_waiters = Some(waiters);
                 previous_pg_success = true;
                 json!({"status": "observed", "value": value})
             }
             Err(error) => {
+                if let Some((previous, counted)) = over_threshold.take() {
+                    let resolved = attribute(previous, counted, None);
+                    followup = resolved.clone();
+                    attributed.push(resolved);
+                }
                 postgres_failures += 1;
                 previous_lock_waiters = None;
                 previous_pg_success = false;
@@ -345,14 +448,15 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
                 json!({"status": "unavailable", "error": error})
             }
         };
-        samples += 1;
+        samples = sample;
         write_record(
             &mut output,
             &json!({
                 "kind": "sample", "sample": samples,
                 "elapsed_ms": tick.as_millis(), "unix_ms": utc_unix_ms(),
                 "collection_duration_ms": start.elapsed().saturating_sub(tick).as_millis(),
-                "cgroup": cgroup, "postgres": postgres
+                "cgroup": cgroup, "postgres": postgres,
+                "previous_over_threshold_attribution": followup
             }),
         )?;
         if config.stop_file.exists() || start.elapsed() >= config.maximum_duration {
@@ -364,10 +468,13 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
             .saturating_sub(start.elapsed().saturating_sub(tick));
         tokio::time::sleep(remainder).await;
     }
+    if let Some((previous, counted)) = over_threshold.take() {
+        attributed.push(attribute(previous, counted, None));
+    }
     if let Some(connected) = observer.take() {
         connected.close().await;
     }
-    let statements_after = statement_snapshot(&config.postgres, config.query_timeout).await;
+    let statements_after = statement_snapshot(&config.postgres, config.query_timeout, false).await;
     let first = first_cgroup.unwrap_or(Value::Null);
     let last = last_cgroup.unwrap_or(Value::Null);
     let summary = json!({
@@ -377,6 +484,9 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
         "cgroup_failures": cgroup_failures, "postgres_failures": postgres_failures,
         "sample_gap_max_ms": maximum_gap_ms,
         "connections_max_excluding_observer": connections_max,
+        "workload_connections_max": workload_connections_max,
+        "connection_attribution_threshold": config.attribute_connections_above,
+        "over_threshold_samples": attributed,
         "observer_connections_additional": 1,
         "memory_current_sampled_max_bytes": memory_max,
         "lock_waiters_sampled_max": lock_waiters_max,

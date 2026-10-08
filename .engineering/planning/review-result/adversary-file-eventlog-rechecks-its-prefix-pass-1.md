@@ -2,13 +2,15 @@
 format: aep.planning-md/3
 id: review-result:adversary-file-eventlog-rechecks-its-prefix-pass-1
 kind: review-result
-status: active
+status: archived
 title: Adversary pass 1 on the prefix comparison (9920a7db)
 tags:
 - adversary
 relations:
 - reviews: story:file-eventlog-rechecks-its-prefix-by-comparison
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:44Z", actor: "human:timo", revision: 2}
 ---
 Recorded verbatim except that the home-directory prefix is written `~`, as the repository's personal-paths rule requires.
 

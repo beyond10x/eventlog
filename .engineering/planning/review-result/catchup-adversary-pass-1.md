@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:catchup-adversary-pass-1
 kind: review-result
-status: active
+status: archived
 title: Catch-up adversary pass 1
 relations:
 - reviews: story:reuse-postgres-connections-after-empty-catch-up
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:46Z", actor: "human:timo", revision: 2}
 ---
 unit: story:reuse-postgres-connections-after-empty-catch-up at 15c049633363dd0f504c7ccaeb36ee01c1bb4bd6, base 32bf1596c853cdedfb5477e1f790c060c5bc1d13
 verdict: nothing found

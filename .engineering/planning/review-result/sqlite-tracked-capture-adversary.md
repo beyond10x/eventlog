@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sqlite-tracked-capture-adversary
 kind: review-result
-status: active
+status: archived
 title: Projection alias omission in acknowledged capture deltas
 relations:
 - reviews: story:sqlite-tracked-capture
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: SQLite capture continuity working tree based on 06c1e99c, review pass 1
 verdict: CONFIRMED (corrected by implementor; see final report.md)

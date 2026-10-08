@@ -40,8 +40,8 @@ mod schema;
 mod verify_content_once;
 use pool::Pool;
 pub use pool::{
-    AuthorizedConnection, PoolOptions, PoolStatus, PostgresConfig, PostgresConnectionAuthority,
-    PostgresTransportAssurance,
+    AuthorizedConnection, PoolChurn, PoolOptions, PoolStatus, PostgresConfig,
+    PostgresConnectionAuthority, PostgresTransportAssurance,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_postgres::{GenericClient, Row, Transaction};
@@ -262,6 +262,10 @@ impl PostgresEventStore {
     /// Observe configured and currently held pool bounds.
     pub fn pool_status(&self) -> PoolStatus {
         self.pool.status()
+    }
+    /// Observe the connections this handle's pool has opened, retired and replaced.
+    pub fn pool_churn(&self) -> PoolChurn {
+        self.pool.churn()
     }
     /// Stop new acquisitions and wait a bounded interval for active leases to finish.
     /// # Errors

@@ -2,12 +2,14 @@
 format: aep.planning-md/3
 id: review-result:provider-proof-adversary-pass-1
 kind: review-result
-status: active
+status: archived
 title: Adversarial review of provider-qualified production proof
 owner: gpt-5.6-sol
 relations:
 - reviews: story:provider-qualified-production-proof
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 ## Independent adversarial review
 

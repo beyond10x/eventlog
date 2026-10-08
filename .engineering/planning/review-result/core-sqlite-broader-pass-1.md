@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:core-sqlite-broader-pass-1
 kind: review-result
-status: active
+status: archived
 title: Core and SQLite broader review pass 1
 relations:
 - reviews: story:integrate-reviewed-feature-contracts
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:47Z", actor: "human:timo", revision: 2}
 ---
 unit: broader core/SQLite review at 096cdbe77c0adf1c8ade9b3b3985fcdbbb8cfcd9 plus tests-only working tree
 verdict: NEEDS-CHANGE

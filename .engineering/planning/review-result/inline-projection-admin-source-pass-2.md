@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:inline-projection-admin-source-pass-2
 kind: review-result
-status: active
+status: archived
 title: Final administration source review accepted
 relations:
 - reviews: story:inline-projection-administration
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:47Z", actor: "human:timo", revision: 2}
 ---
 ## Verdict: ACCEPT
 
