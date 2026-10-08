@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:consistent-tenant-capture-source-pass-2
 kind: review-result
-status: active
+status: archived
 title: Consistent tenant capture final source examination
 relations:
 - reviews: story:consistent-tenant-capture
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:47Z", actor: "human:timo", revision: 2}
 ---
 unit: final source examination of native consistent tenant capture, source `d15672f4f3497ad839c1fcff9536664d49aea513`, base `8746a693c6084ab516170278a72c6c8cf5c8e46c`, plus two reviewer test files
 verdict: INFEASIBLE

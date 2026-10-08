@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sql-blob-integrity-code-pass-2-interrupted
 kind: review-result
-status: active
+status: archived
 title: Second SQL integrity code examination interrupted by platform review
 relations:
 - reviews: story:sql-blob-read-integrity
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 ## Second code examination interrupted
 

@@ -2,13 +2,15 @@
 format: aep.planning-md/3
 id: review-result:adversary-file-eventlog-indexes-streams-pass-1
 kind: review-result
-status: active
+status: archived
 title: Adversary pass 1 on the per-stream index (d01992d0)
 tags:
 - adversary
 relations:
 - reviews: story:file-eventlog-indexes-streams
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:44Z", actor: "human:timo", revision: 2}
 ---
 Recorded verbatim except that the home-directory prefix is written `~`, as the repository's personal-paths rule requires.
 

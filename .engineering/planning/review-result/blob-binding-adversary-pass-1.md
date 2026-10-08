@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:blob-binding-adversary-pass-1
 kind: review-result
-status: active
+status: archived
 title: Blob binding adversary pass 1
 relations:
 - reviews: story:blob-binding-conflicts
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:45Z", actor: "human:timo", revision: 2}
 ---
 ## Subject and source
 

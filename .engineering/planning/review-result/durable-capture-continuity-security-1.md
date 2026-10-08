@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:durable-capture-continuity-security-1
 kind: review-result
-status: active
+status: archived
 title: 'Security pass 1: a redacted row value survives in the journal'
 relations:
 - reviews: story:durable-capture-continuity
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:47Z", actor: "human:timo", revision: 2}
 ---
 unit: story:durable-capture-continuity — commit d9a07279, managed tree durable-continuity
 verdict: NEEDS-CHANGE

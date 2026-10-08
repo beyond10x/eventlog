@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:strict-inspection-runner
 kind: review-result
-status: active
+status: archived
 title: Independent proof runner identity timing review
 relations:
 - reviews: story:strict-read-only-history-inspection
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:49Z", actor: "human:timo", revision: 2}
 ---
 unit: production-proof runner capture ordering; working tree on 5478e87
 verdict: nothing found

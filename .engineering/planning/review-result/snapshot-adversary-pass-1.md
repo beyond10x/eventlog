@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:snapshot-adversary-pass-1
 kind: review-result
-status: active
+status: archived
 title: Snapshot adversary pass 1
 relations:
 - reviews: story:prevent-stale-snapshots-after-redaction
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: story:prevent-stale-snapshots-after-redaction at d25e5675e299119af905e0c2df9a8c862934e08a against699c0e15a2c3669d88329543f113e6302ba9dc7e
 verdict: nothing found

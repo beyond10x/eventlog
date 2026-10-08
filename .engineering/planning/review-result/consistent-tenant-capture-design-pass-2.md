@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:consistent-tenant-capture-design-pass-2
 kind: review-result
-status: active
+status: archived
 title: Consistent tenant capture design review pass 2
 relations:
 - reviews: story:consistent-tenant-capture
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:46Z", actor: "human:timo", revision: 2}
 ---
 approve
 

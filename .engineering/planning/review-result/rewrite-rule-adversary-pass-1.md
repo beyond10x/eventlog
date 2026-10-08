@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:rewrite-rule-adversary-pass-1
 kind: review-result
-status: active
+status: archived
 title: Rewrite-rule repair adversary pass 1
 relations:
 - reviews: story:reject-postgres-rewrite-rules
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: story:reject-postgres-rewrite-rules at 6bbb06d5a21412a8c51ae69e5462b4eb28d36460
 verdict: nothing found

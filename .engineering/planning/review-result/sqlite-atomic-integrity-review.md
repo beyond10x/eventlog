@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sqlite-atomic-integrity-review
 kind: review-result
-status: active
+status: archived
 title: SQLite atomic integrity independent review
 relations:
 - reviews: task:validate-atomic-blob-reuse
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: task:validate-atomic-blob-reuse, frozen uncommitted repair over ec3418866f138e021e5be0cfcae3b370d72bb73a, source base ac6b1731654329d32f1e3c9cf164fefad6a5b46a
 verdict: nothing found

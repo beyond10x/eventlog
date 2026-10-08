@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-08T11:00:33Z",
+  "actor": "human:timo",
+  "artifact": "story:sql-blob-read-integrity",
+  "kind": "story",
+  "revision": 40,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:sql-blob-integrity-code-pass-1-interrupted",
+    "reference": "209ac320a",
+    "review": "review-result:sql-blob-integrity-code-pass-1-interrupted",
+    "outcome": "fixed"
+  }
+}

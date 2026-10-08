@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sqlite-tracked-capture-recheck
 kind: review-result
-status: active
+status: archived
 title: Corrected provider checkpoint recheck
 relations:
 - reviews: story:sqlite-tracked-capture
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: SQLite capture continuity working tree based on 06c1e99c, review pass 2
 verdict: nothing found (pass-1 confirmed defect corrected and rechecked)

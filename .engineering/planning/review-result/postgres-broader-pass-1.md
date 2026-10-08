@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:postgres-broader-pass-1
 kind: review-result
-status: active
+status: archived
 title: PostgreSQL broader review pass 1
 relations:
 - reviews: story:reuse-postgres-connections-after-empty-catch-up
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: PostgreSQL runtime, schema admission, pool and proof tooling at 15c049633363dd0f504c7ccaeb36ee01c1bb4bd6 plus tests-only review diff
 verdict: CONFIRMED

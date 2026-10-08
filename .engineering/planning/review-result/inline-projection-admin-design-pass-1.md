@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:inline-projection-admin-design-pass-1
 kind: review-result
-status: active
+status: archived
 title: Inline projection administration design review pass 1
 relations:
 - reviews: story:inline-projection-administration
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:47Z", actor: "human:timo", revision: 2}
 ---
 needs-revision
 story:inline-projection-administration — The PostgreSQL attachment section must select REPEATABLE READ or an equivalent single-snapshot rule because READ ONLY alone does not make its multi-query registry/catalog comparison coherent. — docs/design/inline-projection-administration.md:166

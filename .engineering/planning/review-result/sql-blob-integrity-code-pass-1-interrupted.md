@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sql-blob-integrity-code-pass-1-interrupted
 kind: review-result
-status: active
+status: archived
 title: SQL integrity review interrupted before regression execution
 relations:
 - reviews: story:sql-blob-read-integrity
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: story:sql-blob-read-integrity at e52572d963781c3af6da8daed5de4522502e4683
 verdict: incomplete — automated safety checks interrupted before execution

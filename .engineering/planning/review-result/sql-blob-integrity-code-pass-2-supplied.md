@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sql-blob-integrity-code-pass-2-supplied
 kind: review-result
-status: active
+status: archived
 title: Existing second SQL examination confirms hidden SQLite semantics
 relations:
 - reviews: story:sql-blob-read-integrity
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 ## Existing independent second examination
 

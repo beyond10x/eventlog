@@ -2,12 +2,14 @@
 format: aep.planning-md/3
 id: review-result:sql-blob-integrity-code-pass-1-execution
 kind: review-result
-status: active
+status: archived
 title: Coordinator execution confirms two independently authored SQL regressions
 relations:
 - reviews: story:sql-blob-read-integrity
 - informed_by: review-result:sql-blob-integrity-code-pass-1-interrupted
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 unit: story:sql-blob-read-integrity at e52572d963781c3af6da8daed5de4522502e4683
 verdict: CONFIRMED — two prepared regressions fail

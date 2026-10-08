@@ -2,11 +2,14 @@
 format: aep.planning-md/3
 id: story:tree-store-keeps-text-once
 kind: story
-status: draft
+status: active
 title: A tree store keeps each long text once
 relations:
 - serves: vision:O2
-revision: 2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-08T11:00:38Z", actor: "human:timo", revision: 3}
+- {from: "proposed", to: "active", at: "2026-10-08T11:00:38Z", actor: "human:timo", revision: 4}
 ---
 # A tree store keeps each long text once
 

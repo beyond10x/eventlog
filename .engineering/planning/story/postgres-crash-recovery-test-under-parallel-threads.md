@@ -2,12 +2,14 @@
 format: aep.planning-md/3
 id: story:postgres-crash-recovery-test-under-parallel-threads
 kind: story
-status: draft
+status: archived
 title: The native group crash-recovery test passes under parallel test threads
 owner: eventlog
 relations:
 - informed_by: story:file-eventlog-verifies-once-per-open
-revision: 2
+revision: 3
+transitions:
+- {from: "draft", to: "archived", at: "2026-10-08T11:00:38Z", actor: "human:timo", revision: 3}
 ---
 ## Outcome
 

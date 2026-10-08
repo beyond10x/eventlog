@@ -2,11 +2,13 @@
 format: aep.planning-md/3
 id: review-result:sql-blob-integrity-design-pass-2
 kind: review-result
-status: active
+status: archived
 title: Independent second SQL blob integrity design review
 relations:
 - reviews: story:sql-blob-read-integrity
-revision: 1
+revision: 2
+transitions:
+- {from: "active", to: "archived", at: "2026-10-08T11:00:48Z", actor: "human:timo", revision: 2}
 ---
 approve
 What I read: 3 planning artifacts via `nl -ba` (`story:sql-blob-read-integrity`, implemented dependency `story:blob-binding-conflicts`, and `review-result:sql-blob-integrity-design-pass-1`), repository `AGENTS.md`, the frozen review brief and correction memo, both binding designs, both ESS model files, RFC 0020, all six SQLite/PostgreSQL byte-returning paths, every guard/inline/group/catch-up/rebuild callback owner, both provider migration/admission implementations, PostgreSQL pool shutdown handling, and the production-proof roster, using `sha256sum`, `git rev-parse`, `git status`, `git log`, `rg`, `wc`, `sed`, and `nl -ba`; all brief-specified frozen hashes and repository heads matched.
