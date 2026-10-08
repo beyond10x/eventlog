@@ -1,0 +1,15 @@
+{
+  "at": "2026-10-08T09:58:31Z",
+  "actor": "human:timo",
+  "artifact": "story:file-and-postgres-verify-each-content-once",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "finding 2: hash outside the lock, fixed in 3196f857",
+    "reference": "crates/eventlog-core/src/verified_content.rs:92",
+    "review": "review-result:adversary-verify-content-once-pass-1",
+    "outcome": "fixed"
+  }
+}
