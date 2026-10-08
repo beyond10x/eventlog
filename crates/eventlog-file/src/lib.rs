@@ -9,6 +9,8 @@ mod journal;
 pub use inspection::FileHistoryInspector;
 mod projection;
 mod state;
+#[cfg(test)]
+mod verify_content_once;
 
 pub use capture::FileTenantCapture;
 
@@ -17,7 +19,8 @@ use eventlog_core::{
     CatchUpProgress, Claim, ClaimedCommand, CommandMeta, EventLogError, EventStore, Expected,
     FeedPage, GroupRange, Guard, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector,
     Read, ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId,
-    bounded_limit, new_event_id, redaction_tombstone, validate_append, validate_field,
+    VerifiedContent, bounded_limit, new_event_id, redaction_tombstone, validate_append,
+    validate_field,
 };
 use journal::{Journal, backend, hash};
 use serde_json::Value;
@@ -36,6 +39,9 @@ pub struct FileEventStore {
     root: PathBuf,
     runtime: Mutex<Runtime>,
     permit: AdmissionPermit,
+    /// Blob content this handle has verified or hashed at write time; see
+    /// [`eventlog_core::VerifiedContent`].
+    content: Arc<VerifiedContent>,
 }
 #[derive(Default)]
 struct Runtime {
@@ -80,12 +86,17 @@ struct Transaction {
     root: PathBuf,
     privacy: bool,
     permit: AdmissionPermit,
+    /// The handle's verified content, shared with every transaction it runs.
+    content: Arc<VerifiedContent>,
     /// Object files this transaction created, by object id, whether or not it goes on to commit
     /// them. A transaction that refuses has already applied its own `Op::Blob`s to `state`, so
     /// `clean_blobs` would read those objects as live; this is the list that says otherwise.
     written: Vec<String>,
     staged_blobs: Vec<PathBuf>,
     atomic_content: bool,
+    /// Whether this transaction bound blob content. A binding write that returns an error drops
+    /// everything the handle remembers, so content of a write that did not commit is not kept.
+    binds: bool,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -136,6 +147,7 @@ impl FileEventStore {
                 ..Runtime::default()
             }),
             permit: AdmissionPermit::default(),
+            content: Arc::default(),
         };
         // The cache starts empty, so this transaction is the complete one: it rereads and chains
         // the whole history, hashes every active object and disposes of what nothing references.
@@ -160,6 +172,7 @@ impl FileEventStore {
             .filter(|verified| Some(&verified.manifest) == observed.as_ref());
         let inline = runtime.inline.clone();
         let permit = self.permit.clone();
+        let content = Arc::clone(&self.content);
         let reader = capture::reader_bytes(runtime.captured.as_ref());
         let mut tx = blocking(move || {
             enter(
@@ -169,11 +182,16 @@ impl FileEventStore {
                 reader.as_ref(),
                 inline,
                 permit,
+                content,
             )
         })
         .await?;
         capture::keep_reader_once(&mut runtime.captured, &tx.journal);
         let outcome = work(&mut tx).await;
+        let binds = tx.binds;
+        if outcome.is_err() && binds {
+            self.content.forget();
+        }
         let result = match outcome {
             Ok(result) => result,
             // A refusal that recorded nothing and wrote nothing leaves the view exactly as the
@@ -213,7 +231,7 @@ impl FileEventStore {
                 return Err(refusal);
             }
         };
-        let (manifest, transactions, state, cacheable, content) = blocking(move || {
+        let committed = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
                     position: tx.state.next_position,
@@ -270,7 +288,11 @@ impl FileEventStore {
             let (manifest, transactions, content) = tx.journal.into_parts();
             Ok((manifest, transactions, state, cacheable, content))
         })
-        .await?;
+        .await;
+        if committed.is_err() && binds {
+            self.content.forget();
+        }
+        let (manifest, transactions, state, cacheable, content) = committed?;
         runtime.observed = Some(manifest.clone());
         if cacheable {
             runtime.verified = Some(Verified {
@@ -442,6 +464,7 @@ impl Transaction {
         tenant: &TenantId,
         blob: &eventlog_core::BlobWrite,
     ) -> Result<(), EventLogError> {
+        self.binds = true;
         if let Some(old) = self.blob(tenant, &blob.digest)? {
             if old != blob.bytes {
                 return Err(EventLogError::Invalid(
@@ -454,6 +477,8 @@ impl Transaction {
             id: new_event_id(),
             hash: hash(&blob.bytes),
         };
+        // This handle hashed these exact bytes; a write that does not commit forgets them.
+        self.content.remember(&object.hash, &blob.bytes);
         let directory = self.root.join("blobs");
         fs::create_dir_all(&directory).map_err(backend)?;
         self::directory(&directory)?;
@@ -693,7 +718,22 @@ impl Transaction {
         }
         Ok(())
     }
+    /// Read one bound object and return it once it is shown to be the content its record names.
+    ///
+    /// The bytes are always read from the object file. They are accepted without a SHA-256 only
+    /// when they equal, in full, content this handle already verified under the recorded hash
+    /// ([`VerifiedContent`]); otherwise they are hashed, and remembered if they match.
     fn blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError> {
+        self.object(tenant, digest, true)
+    }
+    /// [`Self::blob`], or with `remembered` false the complete check that hashes every read:
+    /// what an opening or resuming transaction runs over the objects its history binds.
+    fn object(
+        &self,
+        tenant: &TenantId,
+        digest: &str,
+        remembered: bool,
+    ) -> Result<Option<Vec<u8>>, EventLogError> {
         let Some(blob) = self
             .state
             .blobs
@@ -707,8 +747,15 @@ impl Transaction {
             return Err(backend("blob is not a regular file"));
         }
         let bytes = fs::read(path).map_err(backend)?;
-        verified(&self.root, &bytes, &blob.hash)
-            .ok_or_else(|| backend("referenced blob integrity check failed"))?;
+        let full = |bytes: &[u8]| verified(&self.root, bytes, &blob.hash).is_some();
+        let intact = if remembered {
+            self.content.check_recorded(&bytes, &blob.hash, full)?
+        } else {
+            full(&bytes)
+        };
+        if !intact {
+            return Err(backend("referenced blob integrity check failed"));
+        }
         Ok(Some(bytes))
     }
     /// Hold a retry's batch to the batch the committed group actually carried.
@@ -791,6 +838,7 @@ impl Transaction {
         tenant: &TenantId,
         blobs: &[(String, Vec<u8>)],
     ) -> Result<(), EventLogError> {
+        self.binds = true;
         let directory = self.root.join("blobs");
         let mut fresh: Vec<(Blob, String)> = Vec::new();
         let mut objects: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
@@ -818,6 +866,8 @@ impl Transaction {
                 id: new_event_id(),
                 hash: hash(bytes),
             };
+            // This handle hashed these exact bytes; a write that does not commit forgets them.
+            self.content.remember(&blob.hash, bytes);
             objects.push((blob.id.clone(), directory.join(&blob.id), bytes.clone()));
             fresh.push((blob, digest.clone()));
         }
@@ -1007,6 +1057,7 @@ fn enter(
     reader: Option<&journal::Content>,
     inline: Vec<Arc<dyn Projector>>,
     permit: AdmissionPermit,
+    content: Arc<VerifiedContent>,
 ) -> Result<Transaction, EventLogError> {
     if let (Some(observed), Some(verified)) = (observed, verified)
         && let Some(resumed) = Journal::resume(root, observed, &verified.content)?
@@ -1027,13 +1078,15 @@ fn enter(
             root: root.to_owned(),
             privacy: false,
             permit,
+            content: Arc::clone(&content),
             written: Vec::new(),
             staged_blobs: Vec::new(),
             atomic_content: false,
+            binds: false,
         };
         // Only the objects the new frames bind are new to this handle; the rest it already hashed.
         for (tenant, digest) in &bound {
-            tx.blob(tenant, digest)?;
+            tx.object(tenant, digest, false)?;
         }
         if advanced {
             // Another writer's frames can retire a generation this handle still has cached.
@@ -1058,14 +1111,16 @@ fn enter(
         root: root.to_owned(),
         privacy: false,
         permit,
+        content,
         written: Vec::new(),
         staged_blobs: Vec::new(),
         atomic_content: false,
+        binds: false,
     };
     tx.clear_snapshots()?;
     tx.clean_blobs()?;
     for (tenant, digest) in tx.state.blobs.keys() {
-        tx.blob(&TenantId::new(tenant)?, digest)?;
+        tx.object(&TenantId::new(tenant)?, digest, false)?;
     }
     Ok(tx)
 }
@@ -1612,6 +1667,8 @@ impl EventStore for FileEventStore {
         let (tenant, digest) = (tenant.clone(), digest.to_owned());
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
+                // Deleted content is not kept in this handle's memory.
+                tx.content.forget();
                 tx.record(Op::Blob {
                     tenant,
                     digest,
@@ -1654,6 +1711,8 @@ impl EventStore for FileEventStore {
         let tenant = tenant.clone();
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
+                // Erased content is not kept in this handle's memory.
+                tx.content.forget();
                 for transaction in &mut tx.journal.transactions {
                     let mut ops: Vec<Op> =
                         serde_json::from_value(transaction.clone()).map_err(backend)?;
@@ -1712,9 +1771,11 @@ impl EventStore for FileEventStore {
                 root: self.root.clone(),
                 privacy: false,
                 permit: self.permit.clone(),
+                content: Arc::clone(&self.content),
                 written: Vec::new(),
                 staged_blobs: Vec::new(),
                 atomic_content: false,
+                binds: false,
             };
             tx.register(projector.as_ref())?;
             let manifest = blocking(move || {

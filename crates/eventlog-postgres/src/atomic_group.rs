@@ -7,7 +7,7 @@ use super::{
 };
 use eventlog_core::{
     AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
-    BlobWrite, GroupRange, blob_integrity_sha256, validate_stored_blob,
+    BlobWrite, GroupRange, blob_integrity_sha256,
 };
 
 #[cfg(test)]
@@ -148,6 +148,7 @@ impl PostgresEventStore {
                 admission: Some((&self.admission_permit, stream.tenant())),
                 reservation_pending: false,
                 callback_failed: Arc::clone(callback_failed),
+                verified: &self.verified,
                 selected: None,
             };
             let result = admission.check(&mut projections).await;
@@ -242,6 +243,7 @@ impl PostgresEventStore {
                 admission: None,
                 reservation_pending: false,
                 callback_failed: Arc::clone(callback_failed),
+                verified: &self.verified,
                 selected: None,
             };
             for recorded in &written {
@@ -364,6 +366,8 @@ impl PostgresEventStore {
             // The integrity columns are the same contract the standalone port writes; a binding
             // this path published without them would fail the table's own check.
             let integrity_sha256 = blob_integrity_sha256(&blob.bytes);
+            // This handle hashed these exact bytes; a group that returns an error forgets them.
+            self.verified.remember(&integrity_sha256, &blob.bytes);
             transaction.execute(
                 &format!("INSERT INTO {prefix}_blobs (tenant_id,digest,bytes,byte_count,recorded_at,integrity_sha256,integrity_v1) VALUES ($1,$2,$3,$4,$5,$6,1) ON CONFLICT (tenant_id,digest) DO NOTHING"),
                 &[&group.tenant.as_str(),&blob.digest,&blob.bytes,&byte_count,&OffsetDateTime::now_utc(),&integrity_sha256],
@@ -373,7 +377,7 @@ impl PostgresEventStore {
                 &[&group.tenant.as_str(),&blob.digest],
             ).await.map_err(backend)?;
             let stored = match row {
-                Some(row) => validate_stored_blob(
+                Some(row) => self.verified.check_stored(
                     row.get(0),
                     row.get(1),
                     row.get(2),
@@ -402,6 +406,7 @@ impl PostgresEventStore {
                 admission: Some((&self.admission_permit, &group.tenant)),
                 reservation_pending: false,
                 callback_failed: Arc::clone(callback_failed),
+                verified: &self.verified,
                 selected: None,
             };
             let result = admission.check(&mut projections).await;
@@ -516,7 +521,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
             let mut request = request.clone();
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
             self.freeze().await;
-            tokio::time::timeout(self.pool.options.transaction_timeout, async {
+            let outcome = tokio::time::timeout(self.pool.options.transaction_timeout, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
@@ -553,7 +558,13 @@ impl AtomicBlobEventStore for PostgresEventStore {
                 }
             })
             .await
-            .map_err(|_| EventLogError::UnknownCommit)?
+            .map_err(|_| EventLogError::UnknownCommit)
+            .and_then(|outcome| outcome);
+            // Content of a blob-bearing group that returned an error is not kept.
+            if outcome.is_err() && !request.blobs.is_empty() {
+                self.verified.forget();
+            }
+            outcome
         })
     }
 }
