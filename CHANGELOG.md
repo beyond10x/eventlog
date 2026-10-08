@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.8.3 — 2026-10-08
+
 ### Added
 
 - PostgreSQL: `PostgresEventStore::pool_churn` returns the new `#[non_exhaustive]`, serializable
@@ -13,8 +15,8 @@ under bare-version tags such as `0.1.0`.
   retirement. A connection counts as a replacement while earlier non-shutdown retirements
   outnumber earlier replacements; every other connection only fills capacity. `PoolStatus` is
   unchanged. The type is modelled as `eventlog.pool.PoolChurn` in `ess/pool/`, and a test holds
-  its encoding to the committed schema in `ess/pool-generated/`. The accessor sits behind the new
-  default feature `pool-churn`.
+  its encoding to the committed schema in `ess/pool-generated/`. The new default feature
+  `pool-churn` only tells the capacity harness that the accessor exists; the accessor is not gated.
 - Capacity laboratory: each `capacity` worker reports its pool's churn, and `capacity-sweep` carries
   it per worker into each configuration receipt. The metrics collector records, for a sample over
   eight client connections, each counted backend's `pid`, `backend_start`, `state`,
