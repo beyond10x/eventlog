@@ -122,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         query_timeout: Duration::from_secs(2),
                         attribute_connections_above: 8,
                         workload_application_name: workload_budget::WORKLOAD_APPLICATION.to_owned(),
+                        reset_statements: true,
                     },
                 ));
                 tokio::time::sleep(Duration::from_millis(150)).await;

@@ -40,3 +40,33 @@ from the next sample. Without the probe loop, 11 runs never sampled more than ei
 
 A workload that opens a ninth connection still fails: `tests/capacity_budget.rs` holds nine
 tagged backends against the budget and requires the check to refuse them.
+
+## Statement statistics start empty in each configuration
+
+Each configuration's envelope also requires `pg_stat_statements` to report the same `dealloc` and
+the same `stats_reset` in the snapshots taken before and after it. A changed `dealloc` means the
+extension evicted entries during the configuration, so the statement timings in the receipt no
+longer cover all of its statements.
+
+The counters are cumulative for the whole server. In the required lane the production gate runs
+first on the same server and fills the table towards `pg_stat_statements.max` (5,000), so an
+eviction lands inside whichever configuration crosses the limit, whatever that configuration did.
+CI run 37772785925 failed that way on `baseline-8-hot` (`dealloc` 1 to 2); on `main` the same step
+once fell between two configurations and passed.
+
+So the sweep has the metrics collector reset `pg_stat_statements` immediately before each
+configuration's opening snapshot, on the snapshot's own connection (`reset_statements` in
+`examples/observation/metrics_collector.rs`). Every configuration starts from an empty table and
+can only see an eviction by registering more than `pg_stat_statements.max` distinct statements
+itself. The reset lives in the collector, not the sweep, because the collector owns the snapshot
+the envelope reads: a refused reset (no privilege, no extension) or a timed-out one turns that
+snapshot into `unavailable` with `statement_reset_failed` or `statement_reset_timeout`, and the
+existing `statements_before` status check fails the configuration visibly. Both equality checks
+stay: nothing inside a configuration resets the table again. The standalone `capacity-metrics`
+smoke does not reset.
+
+Reproduced locally by filling the table to 4,991 entries and registering a new distinct statement
+every 25 ms during one comparative proof: without the reset 8 of 12 configurations were invalid
+on `dealloc` alone; with it every configuration read 0 before and after, and all 12 were valid.
+`tests/capacity_budget.rs` holds a resetting collection to a fresh `stats_reset` and zero
+deallocations, and a role without the reset privilege to an unavailable snapshot.
