@@ -32,6 +32,13 @@ under bare-version tags such as `0.1.0`.
   connections failed the lane with nine. A maximum of zero workload connections also fails the
   budget. Over-threshold attribution still covers every client backend, and no application name
   is written to the receipt. See `docs/design/comparative-capacity-connection-budget.md`.
+- Capacity laboratory: each comparative configuration starts from an empty `pg_stat_statements`.
+  The metrics collector resets the extension immediately before the configuration's opening
+  statement snapshot, so an eviction caused by statements registered earlier on the same server,
+  such as the production gate's, can no longer move `dealloc` inside a configuration and fail its
+  envelope. A refused or timed-out reset leaves that snapshot `unavailable`, which fails the
+  configuration. The deallocation and `stats_reset` equality checks are unchanged. See
+  `docs/design/comparative-capacity-connection-budget.md`.
 
 ## 0.8.2 — 2026-10-08
 

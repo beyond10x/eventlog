@@ -6,6 +6,11 @@
 //! tagged workload in both directions: nine tagged backends still fail it, and an untagged
 //! bystander next to eight tagged ones does not.
 //!
+//! The lane also compares `pg_stat_statements` deallocations before and after each
+//! configuration, so a collection for the lane resets the statement table first: a table filled
+//! by earlier work would otherwise evict an entry inside whichever configuration crossed
+//! `pg_stat_statements.max`. A reset the server refuses leaves the opening snapshot unavailable.
+//!
 //! Set `EVENTLOG_TEST_POSTGRES_URL` to run the database cases; without it they report themselves
 //! as not run.
 
@@ -43,6 +48,16 @@ async fn client(url: &str) -> Client {
 
 /// One short collection while the given clients are held open.
 async fn observe(url: &str, application: &str, name: &str) -> serde_json::Value {
+    collect(url.parse().unwrap(), application, name, false).await
+}
+
+/// One short collection, resetting `pg_stat_statements` first when asked.
+async fn collect(
+    postgres: tokio_postgres::Config,
+    application: &str,
+    name: &str,
+    reset_statements: bool,
+) -> serde_json::Value {
     let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("capacity-budget-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
@@ -50,7 +65,7 @@ async fn observe(url: &str, application: &str, name: &str) -> serde_json::Value 
     let stop = directory.join("stop");
     let collector = tokio::spawn(metrics_collector::collect(
         metrics_collector::MetricsConfig {
-            postgres: url.parse().unwrap(),
+            postgres,
             cgroup: directory.join("no-cgroup"),
             output: directory.join("metrics.jsonl"),
             stop_file: stop.clone(),
@@ -59,6 +74,7 @@ async fn observe(url: &str, application: &str, name: &str) -> serde_json::Value 
             query_timeout: Duration::from_secs(2),
             attribute_connections_above: 8,
             workload_application_name: application.to_owned(),
+            reset_statements,
         },
     ));
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -193,5 +209,87 @@ async fn the_pooled_adapter_keeps_the_tag_on_its_connections() {
     assert!(
         tagged >= 1,
         "the pool's connections carry the URL's application_name"
+    );
+}
+
+/// Whether the connected database has `pg_stat_statements` installed.
+async fn statements_installed(client: &Client) -> bool {
+    client
+        .query_one(
+            "SELECT EXISTS (SELECT FROM pg_extension WHERE extname = 'pg_stat_statements')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_that_resets_statements_starts_from_an_empty_table() {
+    let Some(url) = url() else {
+        eprintln!("skipped: the statement reset requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let admin = client(&url).await;
+    if !statements_installed(&admin).await {
+        eprintln!("skipped: the statement reset requires pg_stat_statements");
+        return;
+    }
+    let reset_before: serde_json::Value = admin
+        .query_one(
+            "SELECT to_jsonb(stats_reset) FROM pg_stat_statements_info",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let application = format!("eventlog-budget-reset-{}", std::process::id());
+    let summary = collect(url.parse().unwrap(), &application, "reset", true).await;
+    let before = &summary["statements_before"];
+    assert_eq!(before["status"], "observed", "{summary}");
+    assert_eq!(
+        before["value"]["deallocations"], 0,
+        "an emptied table has evicted nothing: {summary}"
+    );
+    assert_ne!(
+        before["value"]["stats_reset"], reset_before,
+        "the opening snapshot follows a fresh reset: {summary}"
+    );
+    assert_eq!(
+        before["value"]["stats_reset"], summary["statements_after"]["value"]["stats_reset"],
+        "nothing resets the table again inside the collection: {summary}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_statement_reset_leaves_the_opening_snapshot_unavailable() {
+    let Some(url) = url() else {
+        eprintln!("skipped: the statement reset requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let admin = client(&url).await;
+    if !statements_installed(&admin).await {
+        eprintln!("skipped: the statement reset requires pg_stat_statements");
+        return;
+    }
+    // A login role without the reset privilege, which PostgreSQL grants to superusers only.
+    admin
+        .batch_execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles \
+               WHERE rolname = 'eventlog_test_statement_reader') \
+             THEN CREATE ROLE eventlog_test_statement_reader LOGIN; END IF; END $$",
+        )
+        .await
+        .unwrap();
+    let mut reader: tokio_postgres::Config = url.parse().unwrap();
+    reader.user("eventlog_test_statement_reader");
+
+    let application = format!("eventlog-budget-refused-{}", std::process::id());
+    let summary = collect(reader, &application, "refused", true).await;
+    assert_eq!(
+        summary["statements_before"],
+        json!({"status": "unavailable", "error": "statement_reset_failed"}),
+        "a refused reset is never an observed snapshot: {summary}"
     );
 }

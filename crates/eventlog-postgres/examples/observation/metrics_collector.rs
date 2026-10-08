@@ -1,4 +1,5 @@
-//! Read-only laboratory observation. This module does not select or admit a workload.
+//! Laboratory observation. This module does not select or admit a workload. Its only write is the
+//! caller-requested `pg_stat_statements` reset before a collection's opening statement snapshot.
 //!
 //! The caller binds a disposable PostgreSQL server and its cgroup before starting.
 //! Every sample carries actual elapsed time and errors: a failed observation is never zero.
@@ -26,6 +27,9 @@ pub struct MetricsConfig {
     pub attribute_connections_above: u64,
     /// The `application_name` that marks the workload's own backends; never retained.
     pub workload_application_name: String,
+    /// Reset `pg_stat_statements` immediately before the opening statement snapshot, so the
+    /// collection starts from an empty table. A failed reset makes that snapshot unavailable.
+    pub reset_statements: bool,
 }
 
 struct Observer {
@@ -163,11 +167,32 @@ async fn sample_postgres(
     row.try_get(0).map_err(|_| "observer_result_decode_failed")
 }
 
-async fn statement_snapshot(config: &Config, timeout: Duration) -> Value {
+async fn statement_snapshot(config: &Config, timeout: Duration, reset: bool) -> Value {
     let observer = match connect(config, timeout).await {
         Ok(observer) => observer,
         Err(error) => return json!({"status": "unavailable", "error": error}),
     };
+    // A reset on the snapshot's own connection, immediately before it: the collection then
+    // starts from an empty table, so no statement registered before it can be evicted inside it
+    // and move `dealloc`. A refused reset (no privilege, no extension) is not an observation.
+    if reset {
+        let error = match tokio::time::timeout(
+            timeout,
+            observer
+                .client
+                .batch_execute("SELECT pg_stat_statements_reset()"),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some("statement_reset_failed"),
+            Err(_) => Some("statement_reset_timeout"),
+        };
+        if let Some(error) = error {
+            observer.close().await;
+            return json!({"status": "unavailable", "error": error});
+        }
+    }
     // PostgreSQL17/pg_stat_statements1.11 schema, verified against the assigned test server.
     // Classify on the server; the retained result contains no SQL text or statement identifiers.
     // These are cumulative statement timings, never whole-transaction wall-clock timings.
@@ -289,7 +314,12 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     let mut output = BufWriter::new(file);
     let start = Instant::now();
     let started_unix_ms = utc_unix_ms();
-    let statements_before = statement_snapshot(&config.postgres, config.query_timeout).await;
+    let statements_before = statement_snapshot(
+        &config.postgres,
+        config.query_timeout,
+        config.reset_statements,
+    )
+    .await;
     write_record(
         &mut output,
         &json!({
@@ -444,7 +474,7 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     if let Some(connected) = observer.take() {
         connected.close().await;
     }
-    let statements_after = statement_snapshot(&config.postgres, config.query_timeout).await;
+    let statements_after = statement_snapshot(&config.postgres, config.query_timeout, false).await;
     let first = first_cgroup.unwrap_or(Value::Null);
     let last = last_cgroup.unwrap_or(Value::Null);
     let summary = json!({

@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         query_timeout: Duration::from_secs(1),
         attribute_connections_above: 8,
         workload_application_name: args.workload_application,
+        reset_statements: false,
     })
     .await?;
     println!("{summary}");
