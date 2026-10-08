@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.8.2 — 2026-10-08
+
 ### Performance
 
 - File and PostgreSQL: a handle hashes each distinct blob content once, as SQLite already did,
@@ -17,6 +19,12 @@ under bare-version tags such as `0.1.0`.
   `eventlog_core::VerifiedContent` (32 MiB per handle, cleared on blob deletion, tenant erasure
   and a failed blob-binding write), which SQLite now uses unchanged in behaviour. Nothing persisted
   changes.
+
+### Fixed
+
+- `ess/effects` validates on ess 0.56.0: the `EffectBoundaryCoverage` invariant that one of
+  `records_terminal` and `records_incomplete` holds is written with structured `any:`, since the
+  compact predicate form has no `or`. The condition is unchanged.
 
 ## 0.8.1 — 2026-10-08
 
