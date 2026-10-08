@@ -265,6 +265,7 @@ impl PostgresEventStore {
                         admission: None,
                         reservation_pending: false,
                         callback_failed: Arc::clone(&callback_failed),
+                        verified: &self.verified,
                         selected: Some(projector.projections()),
                     };
                     let mut position = 0_i64;

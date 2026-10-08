@@ -15,6 +15,8 @@ mod aggregate;
 mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod blob_integrity;
+mod verified_content;
+pub use verified_content::{VERIFIED_CONTENT_BUDGET, VerifiedContent};
 mod capture;
 mod inline_admin;
 pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
