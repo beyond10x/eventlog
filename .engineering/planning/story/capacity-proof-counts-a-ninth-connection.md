@@ -21,7 +21,7 @@ scope:
   path: docs/
 - confidence: inferred
   path: ess/
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T10:55:56Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-08T10:55:56Z", actor: "human:timo", revision: 4}
@@ -55,3 +55,19 @@ A pool retires a connection (quarantine of an unsettled lease, or a closed clien
 - The lane records, per configuration, the retirements and replacements each worker pool made, and for any sample over budget the `pid` and `backend_start` of each counted backend, so the red can be attributed.
 - Either the over-budget sample is shown to be an exiting backend and the check counts only backends a pool can still use, with the reason stated in `docs/`; or a pool is shown to hold more than `max_connections`, and that is fixed test-first in `pool.rs`.
 - The connection check is not loosened by changing 8 to 9.
+
+## Cause (verified)
+
+The ninth backend is the CI service container's health check, not a pool. `.github/workflows/persistence-proof.yml` runs `pg_isready -U postgres` every 5 s; each probe opens a short-lived client backend that the collector counted with the workload.
+
+| observation | result |
+|---|---|
+| 11 local comparative proofs, no health check | 0 samples over 8; every candidate pool opened 4, retired 0, replaced 0 (`PoolChurn`) |
+| 1 proof with `pg_isready` every 100 ms, before the fix | candidate-32-hot read 9; the extra backend (pid 2595) was idle 1.2 ms after `backend_start` and absent in the next sample; the 8 pool backends started 4-5 s earlier; pools retired 0 |
+| 3 proofs with the probe loop, after the fix | all-backend maximum 9 in 2 runs; workload maximum 8; 12/12 configurations valid in each |
+
+The hypothesis in this story (retirement overlapping a replacement) did not hold: no pool retired a connection in any run.
+
+## Fix
+
+Workers of both adapters connect with `application_name=eventlog-capacity-workload`; the budget check reads the workload maximum and fails at 0 or above 8. The all-backend count and per-backend attribution stay in the receipt. `tests/capacity_budget.rs` holds 9 tagged backends plus one bystander and requires the check to refuse it; a stub of the old all-backend rule fails 2 of its 4 cases. Reason recorded in `docs/design/comparative-capacity-connection-budget.md`.
