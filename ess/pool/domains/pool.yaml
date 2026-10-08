@@ -1,0 +1,33 @@
+domain: eventlog.pool
+
+# A transient, in-process observation of one bounded connection pool. No persistent entity,
+# lifecycle, event or domain concept is introduced; values reset with the pool.
+types:
+  - name: eventlog.pool.PoolChurn
+    kind: struct
+    fields:
+      - name: opened
+        type: Integer
+      - name: replacements
+        type: Integer
+      - name: retired_unsettled_lease
+        type: Integer
+      - name: retired_closed_client
+        type: Integer
+      - name: retired_shutdown
+        type: Integer
+    invariants:
+      - opened >= 0
+      - replacements >= 0
+      - retired_unsettled_lease >= 0
+      - retired_closed_client >= 0
+      - retired_shutdown >= 0
+      - replacements <= opened
+    # Monotonic counts since the pool was created. opened counts every successful connect.
+    # A retirement is a connection the pool closed instead of keeping idle, counted once at the
+    # decision, by cause: a lease dropped without settling, a client already closed (on return
+    # or found idle at checkout), or pool shutdown (shutdown takes precedence over the others).
+    # A connect is a replacement when, as it completes, earlier non-shutdown retirements exceed
+    # earlier replacements; every other connect only fills capacity the pool never had open.
+    # Also replacements <= retired_unsettled_lease + retired_closed_client, which ESS invariants
+    # cannot state (no sum of two facts). Rust refines each count to u64.

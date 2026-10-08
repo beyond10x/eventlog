@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         maximum_duration: Duration::from_secs(120),
                         interval: Duration::from_millis(20),
                         query_timeout: Duration::from_secs(2),
+                        attribute_connections_above: 8,
                     },
                 ));
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -208,10 +209,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         == metrics["cgroup_last"]["memory_events"]["oom"]
                     && metrics["cgroup_first"]["memory_events"]["max"]
                         == metrics["cgroup_last"]["memory_events"]["max"];
-                let receipt = json!({"adapter":adapter,"mode":mode,"aggregate_concurrency":aggregate,"workers":workers,"metrics":metrics,"succeeded":total("succeeded"),"elapsed_us":elapsed_us,"p50_us":quantile(&latencies,50),"p95_us":quantile(&latencies,95),"p99_us":quantile(&latencies,99),"valid_observed_envelope":valid,"limits":"End-to-end append/read bounds are conservative queue and transaction duration upper bounds. Server statement timings and sampled transaction ages are separately labeled; no exact internal queue histogram. Two processes run sequentially at aggregate concurrency one. Metrics include warmup and replay; worker latency excludes both."});
+                // Each worker process owns one pool; null where the adapter has none to report.
+                let pool_churn: Vec<_> = workers
+                    .iter()
+                    .map(|value| value["pool_churn"].clone())
+                    .collect();
+                let receipt = json!({"adapter":adapter,"pool_churn_by_worker":pool_churn,"mode":mode,"aggregate_concurrency":aggregate,"workers":workers,"metrics":metrics,"succeeded":total("succeeded"),"elapsed_us":elapsed_us,"p50_us":quantile(&latencies,50),"p95_us":quantile(&latencies,95),"p99_us":quantile(&latencies,99),"valid_observed_envelope":valid,"limits":"End-to-end append/read bounds are conservative queue and transaction duration upper bounds. Server statement timings and sampled transaction ages are separately labeled; no exact internal queue histogram. Two processes run sequentially at aggregate concurrency one. Metrics include warmup and replay; worker latency excludes both."});
                 println!(
                     "{}",
-                    json!({"configuration":label,"valid_observed_envelope":valid,"samples":latencies.len(),"p99_us":quantile(&latencies,99)})
+                    json!({"configuration":label,"valid_observed_envelope":valid,"samples":latencies.len(),"p99_us":quantile(&latencies,99),"connections_max_excluding_observer":metrics["connections_max_excluding_observer"],"pool_churn_by_worker":pool_churn})
                 );
                 fs::write(
                     output.join(format!("{label}.json")),

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.pool.PoolChurn",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "ca900fb9faa759080b36f212232cf0ed88472d0208e616539db156a0b2614d4e",
+    "contract_digest": "slice-sha256/2:bc983db51845beea68bee14360002d4654679f1e5ce1f42a9422dcc9c8d56c9d",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.pool.PoolChurn": {
+      "title": "PoolChurn",
+      "x-ess-name": "eventlog.pool.PoolChurn",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "opened": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replacements": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retired_unsettled_lease": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retired_closed_client": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retired_shutdown": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "opened",
+        "replacements",
+        "retired_unsettled_lease",
+        "retired_closed_client",
+        "retired_shutdown"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "opened >= 0",
+        "replacements >= 0",
+        "retired_unsettled_lease >= 0",
+        "retired_closed_client >= 0",
+        "retired_shutdown >= 0",
+        "replacements <= opened"
+      ]
+    }
+  }
+}

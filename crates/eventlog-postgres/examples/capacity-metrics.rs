@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         maximum_duration: Duration::from_secs(2),
         interval: Duration::from_millis(20),
         query_timeout: Duration::from_secs(1),
+        attribute_connections_above: 8,
     })
     .await?;
     println!("{summary}");

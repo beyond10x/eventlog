@@ -291,10 +291,16 @@ async fn main() {
     }
     latencies.sort_unstable();
     append_latencies.sort_unstable();
+    // The baseline adapter compiles this same source without the `pool-churn` feature and has
+    // no pool to report, so its workers emit null.
+    #[cfg(feature = "pool-churn")]
+    let pool_churn = serde_json::to_value(store.pool_churn()).expect("pool churn");
+    #[cfg(not(feature = "pool-churn"))]
+    let pool_churn = serde_json::Value::Null;
     let quantile = |values: &[u64], n: usize| values[(values.len() - 1) * n / 100];
     println!(
         "{}",
-        json!({"worker":worker,"concurrency":concurrency,"samples":latencies.len(),"mode":if hot{"hot"}else{"uniform"},"steady_started_unix_ns":steady_started_at,"elapsed_us":workload_elapsed_us,"succeeded":succeeded,"conflicts":conflicts,"refused":refused,"deduplicated":deduplicated,"correctness_violations":violations,"last_position":last_position,"safe_feed_delay_us":feed_lag_us,"projection_lag_us":projection_lag_us,"guard_lock_and_read_total_us":hot_guard.lock_read_us.load(Ordering::Relaxed),"guard_calls":hot_guard.calls.load(Ordering::Relaxed),"p50_us":quantile(&latencies,50),"p95_us":quantile(&latencies,95),"p99_us":quantile(&latencies,99),"append_p99_us":quantile(&append_latencies,99),"max_us":latencies.last(),"latencies_us":latencies,"append_latencies_us":append_latencies})
+        json!({"worker":worker,"concurrency":concurrency,"samples":latencies.len(),"mode":if hot{"hot"}else{"uniform"},"steady_started_unix_ns":steady_started_at,"elapsed_us":workload_elapsed_us,"succeeded":succeeded,"conflicts":conflicts,"refused":refused,"deduplicated":deduplicated,"correctness_violations":violations,"last_position":last_position,"safe_feed_delay_us":feed_lag_us,"projection_lag_us":projection_lag_us,"guard_lock_and_read_total_us":hot_guard.lock_read_us.load(Ordering::Relaxed),"guard_calls":hot_guard.calls.load(Ordering::Relaxed),"p50_us":quantile(&latencies,50),"p95_us":quantile(&latencies,95),"p99_us":quantile(&latencies,99),"append_p99_us":quantile(&append_latencies,99),"max_us":latencies.last(),"latencies_us":latencies,"append_latencies_us":append_latencies,"pool_churn":pool_churn})
     );
     if violations != 0 {
         std::process::exit(1);
