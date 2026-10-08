@@ -4,7 +4,7 @@
 //! Every sample carries actual elapsed time and errors: a failed observation is never zero.
 //! Activity ages and sampled occupancy are not completed transaction/lock durations.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -22,6 +22,8 @@ pub struct MetricsConfig {
     pub maximum_duration: Duration,
     pub interval: Duration,
     pub query_timeout: Duration,
+    /// A sample counting more connections than this records each counted backend.
+    pub attribute_connections_above: u64,
 }
 
 struct Observer {
@@ -123,10 +125,15 @@ async fn sample_postgres(client: &Client, timeout: Duration) -> Result<Value, &'
     // No query text, addresses, usernames, application names, database names or row values.
     // The activity population is all client backends on this isolated server except this probe.
     // max_query_age of lock waiters is an upper bound on lock wait, not the wait itself.
+    // `backends` identifies each counted backend by pid and timestamps only; the collector keeps
+    // it in a record only for a sample over the attribution threshold.
     let query = r"
         SELECT jsonb_build_object(
           'observed_at', clock_timestamp(),
           'connections', count(*),
+          'backends', COALESCE(jsonb_agg(jsonb_build_object(
+            'pid', pid, 'backend_start', backend_start, 'state', state,
+            'state_change', state_change, 'xact_start', xact_start) ORDER BY pid), '[]'::jsonb),
           'active', count(*) FILTER (WHERE state = 'active'),
           'idle', count(*) FILTER (WHERE state = 'idle'),
           'idle_in_transaction', count(*) FILTER (WHERE state LIKE 'idle in transaction%'),
@@ -197,6 +204,23 @@ async fn statement_snapshot(config: &Config, timeout: Duration) -> Value {
     };
     observer.close().await;
     value
+}
+
+/// One over-threshold sample's backends, each marked with whether its pid is still counted in
+/// the next sample; `null` when that sample was not observed.
+fn attribute(sample: u64, backends: Vec<Value>, next: Option<&BTreeSet<i64>>) -> Value {
+    let backends: Vec<Value> = backends
+        .into_iter()
+        .map(|mut backend| {
+            let present = match (next, backend["pid"].as_i64()) {
+                (Some(next), Some(pid)) => Value::Bool(next.contains(&pid)),
+                _ => Value::Null,
+            };
+            backend["present_in_next_sample"] = present;
+            backend
+        })
+        .collect();
+    json!({"sample": sample, "connections": backends.len(), "backends": backends})
 }
 
 fn write_record(output: &mut BufWriter<File>, value: &Value) -> io::Result<()> {
@@ -283,6 +307,8 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
     let mut occupancy_lock_backend_ms = 0_u128;
     let mut previous_lock_waiters = None;
     let mut previous_pg_success = false;
+    let mut over_threshold: Option<(u64, Vec<Value>)> = None;
+    let mut attributed = Vec::new();
     loop {
         let tick = start.elapsed();
         let gap_ms = previous_tick.map(|previous| tick.saturating_sub(previous).as_millis());
@@ -319,9 +345,28 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
             Some(connected) => sample_postgres(&connected.client, config.query_timeout).await,
             None => Err(connect_error.unwrap_or("observer_unavailable")),
         };
+        let sample = samples + 1;
+        let mut followup = Value::Null;
         let postgres = match observation {
-            Ok(value) => {
+            Ok(mut value) => {
+                let backends = match value.as_object_mut().and_then(|v| v.remove("backends")) {
+                    Some(Value::Array(backends)) => backends,
+                    _ => Vec::new(),
+                };
+                let pids: BTreeSet<i64> = backends
+                    .iter()
+                    .filter_map(|backend| backend["pid"].as_i64())
+                    .collect();
+                if let Some((previous, counted)) = over_threshold.take() {
+                    let resolved = attribute(previous, counted, Some(&pids));
+                    followup = resolved.clone();
+                    attributed.push(resolved);
+                }
                 let connections = value["connections"].as_u64().unwrap_or(0);
+                if connections > config.attribute_connections_above {
+                    value["over_threshold_backends"] = Value::Array(backends.clone());
+                    over_threshold = Some((sample, backends));
+                }
                 let waiters = value["lock_waiters"].as_u64().unwrap_or(0);
                 // Only integrate adjacent successful samples; missing intervals stay missing.
                 if previous_pg_success
@@ -336,6 +381,11 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
                 json!({"status": "observed", "value": value})
             }
             Err(error) => {
+                if let Some((previous, counted)) = over_threshold.take() {
+                    let resolved = attribute(previous, counted, None);
+                    followup = resolved.clone();
+                    attributed.push(resolved);
+                }
                 postgres_failures += 1;
                 previous_lock_waiters = None;
                 previous_pg_success = false;
@@ -345,14 +395,15 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
                 json!({"status": "unavailable", "error": error})
             }
         };
-        samples += 1;
+        samples = sample;
         write_record(
             &mut output,
             &json!({
                 "kind": "sample", "sample": samples,
                 "elapsed_ms": tick.as_millis(), "unix_ms": utc_unix_ms(),
                 "collection_duration_ms": start.elapsed().saturating_sub(tick).as_millis(),
-                "cgroup": cgroup, "postgres": postgres
+                "cgroup": cgroup, "postgres": postgres,
+                "previous_over_threshold_attribution": followup
             }),
         )?;
         if config.stop_file.exists() || start.elapsed() >= config.maximum_duration {
@@ -363,6 +414,9 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
             .interval
             .saturating_sub(start.elapsed().saturating_sub(tick));
         tokio::time::sleep(remainder).await;
+    }
+    if let Some((previous, counted)) = over_threshold.take() {
+        attributed.push(attribute(previous, counted, None));
     }
     if let Some(connected) = observer.take() {
         connected.close().await;
@@ -377,6 +431,8 @@ pub async fn collect(config: MetricsConfig) -> io::Result<Value> {
         "cgroup_failures": cgroup_failures, "postgres_failures": postgres_failures,
         "sample_gap_max_ms": maximum_gap_ms,
         "connections_max_excluding_observer": connections_max,
+        "connection_attribution_threshold": config.attribute_connections_above,
+        "over_threshold_samples": attributed,
         "observer_connections_additional": 1,
         "memory_current_sampled_max_bytes": memory_max,
         "lock_waiters_sampled_max": lock_waiters_max,
