@@ -40,9 +40,6 @@ surfaces:
   relationships:
   - kind: supports
     label: Provides durable event-backed owner state
-    target: connectors/docs
-  - kind: supports
-    label: Provides durable event-backed owner state
     target: identity/docs
   - kind: supports
     label: Provides durable workflow state and evidence
