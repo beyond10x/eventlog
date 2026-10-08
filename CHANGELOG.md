@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.8.1 — 2026-10-08
+
 ### Performance
 
 - File: a resumed handle whose journal changed in the last two seconds re-checks the committed
