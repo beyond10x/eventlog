@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:capacity-proof-counts-a-ninth-connection
 kind: story
-status: active
+status: implemented
 title: The comparative capacity proof intermittently observes nine client connections against a budget of eight
 relations:
 - serves: vision:O2
@@ -21,10 +21,11 @@ scope:
   path: docs/
 - confidence: inferred
   path: ess/
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T10:55:56Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-08T10:55:56Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-08T12:24:45Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 
