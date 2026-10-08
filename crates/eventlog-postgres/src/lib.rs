@@ -25,9 +25,9 @@ use eventlog_core::{
     AppendResult, BlobMigrationReport, BoxFuture, CatchUpProgress, Claim, ClaimedCommand,
     CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
     MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
-    Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, blob_integrity_sha256,
-    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
-    validate_field, validate_stored_blob,
+    Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, VerifiedContent,
+    blob_integrity_sha256, bounded_limit, indexed_value, new_event_id, redaction_tombstone,
+    validate_append, validate_field,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -36,6 +36,8 @@ mod capture;
 mod inline_admin;
 mod pool;
 mod schema;
+#[cfg(test)]
+mod verify_content_once;
 use pool::Pool;
 pub use pool::{
     AuthorizedConnection, PoolOptions, PoolStatus, PostgresConfig, PostgresConnectionAuthority,
@@ -62,6 +64,9 @@ pub struct PostgresEventStore {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    /// Blob content this handle has verified or hashed at write time; see
+    /// [`eventlog_core::VerifiedContent`].
+    verified: VerifiedContent,
 }
 
 impl PostgresEventStore {
@@ -246,6 +251,7 @@ impl PostgresEventStore {
             admission_permit: eventlog_core::AdmissionPermit::default(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            verified: VerifiedContent::default(),
         }
     }
     /// Issue the owner host's transaction-admission grant before handing the store to domains.
@@ -270,6 +276,23 @@ impl PostgresEventStore {
     async fn freeze(&self) {
         let _registration = self.registration.lock().await;
         self.frozen.store(true, Ordering::Release);
+    }
+    /// Run a deletion or erasure with this handle's verified content forgotten before it starts
+    /// and again after it settles, whatever its outcome.
+    ///
+    /// The second forget is the one that matters: a read through this handle while the removal is
+    /// in flight still sees the row and may verify it, and only a forget after the commit makes
+    /// that read unable to remember it ([`VerifiedContent`]'s generation).
+    fn forgetting<'a, T: Send + 'a>(
+        &'a self,
+        removal: BoxFuture<'a, Result<T, EventLogError>>,
+    ) -> BoxFuture<'a, Result<T, EventLogError>> {
+        Box::pin(async move {
+            self.verified.forget();
+            let outcome = removal.await;
+            self.verified.forget();
+            outcome
+        })
     }
     fn bounded<'a, T: Send + 'a>(
         &'a self,
@@ -781,7 +804,7 @@ impl EventStore for PostgresEventStore {
         &'a self,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.bounded(async move {
+        self.forgetting(self.bounded(async move {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -844,7 +867,7 @@ impl EventStore for PostgresEventStore {
                 .map_err(|_| EventLogError::UnknownCommit)?;
             client.settled();
             Ok(())
-        })
+        }))
     }
 
     fn projection_list<'a>(
@@ -930,10 +953,13 @@ impl EventStore for PostgresEventStore {
         digest: &'a str,
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.bounded(async move {
+        let put = self.bounded(async move {
             validate_field("digest", digest)?;
             let prefix = &self.prefix;
             let integrity_sha256 = blob_integrity_sha256(bytes);
+            // This handle hashed `bytes` itself, so that pair is known; the readback below still
+            // compares the stored row against it. A put that returns an error forgets it.
+            self.verified.remember(&integrity_sha256, bytes);
             let mut client = self.pool.acquire().await?;
             client.quarantine();
             let transaction = client
@@ -979,7 +1005,7 @@ impl EventStore for PostgresEventStore {
                     // Retry publication rather than acknowledging a binding we never observed.
                     continue;
                 };
-                let stored = validate_stored_blob(
+                let stored = self.verified.check_stored(
                     row.get(0),
                     row.get(1),
                     row.get(2),
@@ -997,6 +1023,13 @@ impl EventStore for PostgresEventStore {
             transaction.commit().await.map_err(backend)?;
             client.settled();
             Ok(())
+        });
+        Box::pin(async move {
+            let outcome = put.await;
+            if outcome.is_err() {
+                self.verified.forget();
+            }
+            outcome
         })
     }
 
@@ -1020,7 +1053,7 @@ impl EventStore for PostgresEventStore {
                 .map_err(backend)?;
             client.settled();
             row.map(|row| {
-                validate_stored_blob(
+                self.verified.check_stored(
                     row.get(0),
                     row.get(1),
                     row.get(2),
@@ -1036,7 +1069,7 @@ impl EventStore for PostgresEventStore {
         tenant: &'a TenantId,
         digest: &'a str,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.bounded(async move {
+        self.forgetting(self.bounded(async move {
             let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
             client
@@ -1048,7 +1081,7 @@ impl EventStore for PostgresEventStore {
                 .map_err(backend)?;
             client.settled();
             Ok(())
-        })
+        }))
     }
 
     fn create_projections(
@@ -1219,6 +1252,7 @@ impl EventStore for PostgresEventStore {
                     admission: None,
                     reservation_pending: false,
                     callback_failed: Arc::clone(&callback_failed),
+                    verified: &self.verified,
                     selected: None,
                 };
                 for recorded in &events {
@@ -1284,7 +1318,7 @@ impl EventStore for PostgresEventStore {
             loop {
                 let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
                 if rows.is_empty() {break;}
-                let mut projections=PostgresProjections {client:&transaction,blob_prefix:&self.prefix,projection_prefix:"eventlog_rebuild",lock_prefix:&self.prefix,inline:&self.inline_names,tenant,admission:None,reservation_pending:false,callback_failed:Arc::clone(&callback_failed),selected:None};
+                let mut projections=PostgresProjections {client:&transaction,blob_prefix:&self.prefix,projection_prefix:"eventlog_rebuild",lock_prefix:&self.prefix,inline:&self.inline_names,tenant,admission:None,reservation_pending:false,callback_failed:Arc::clone(&callback_failed),verified:&self.verified,selected:None};
                 for row in &rows {let event=read_event(row)?; let result=projector.apply(&event,&mut projections).await; ensure_callback_integrity(&callback_failed)?; result?; position=to_i64(event.global_seq)?; applied+=1;}
             }
             // MVCC keeps the original visible until this replacement and cursor commit together.
@@ -1369,6 +1403,8 @@ struct PostgresProjections<'a, 'b> {
     admission: Option<(&'a eventlog_core::AdmissionPermit, &'a TenantId)>,
     reservation_pending: bool,
     callback_failed: Arc<AtomicBool>,
+    /// The owning handle's verified content.
+    verified: &'a VerifiedContent,
     selected: Option<&'a [ProjectionSpec]>,
 }
 
@@ -1393,7 +1429,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .map_err(backend)?;
             let result = row
                 .map(|row| {
-                    validate_stored_blob(
+                    self.verified.check_stored(
                         row.get(0),
                         row.get(1),
                         row.get(2),

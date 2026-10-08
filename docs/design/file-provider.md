@@ -212,6 +212,29 @@ cache keyed by file identity, which would serve a blob damaged in place with its
 unverified once; and hashing only where the CPU has SHA-NI, which changes nothing here. None of
 them is needed once the committed record is the source of the digest.
 
+### Verified content, once per handle
+
+`EventStore::get_blob`, a batched `Read::Blob` and every callback's `ProjectionStore::get_blob`
+read the object file on every call, and hash it at most once per distinct content per handle. A
+handle remembers each `(recorded hash, exact bytes)` pair it verified on such a read, or hashed
+itself while binding (`put_blob`, either blob-bearing group), in the provider-neutral
+`eventlog_core::VerifiedContent` that SQLite and PostgreSQL use too
+(`ess/blob-integrity/domains/blobs.yaml`, `eventlog.blobs.VerifiedContent`). A read is accepted
+without a SHA-256 only when the hash its committed record names is remembered and the bytes just
+read equal the remembered bytes in full; anything else is hashed against the record and refused on
+a mismatch, so an object changed after a verified read is refused on the next read through the same
+handle. A guard that reads its batch once per member therefore pays one hash, not one per member.
+
+What is remembered, and for how long: at most 32 MiB of content per handle, cleared rather than
+grown past that; all of it is dropped when the handle deletes a blob, erases a tenant, or returns
+an error from a transaction that bound blobs, including a refused put and a group whose member
+conflicts after its batch was bound. A guard or projector that panics unwinds past that clearing.
+A deletion or erasure through another handle or process does not reach this memory; such an entry
+is never returned, since a hit needs identical bytes on disk, but it stays in this process's memory
+until one of those events or the handle is dropped. Opening and resuming still hash every object
+the history they fold binds, without the memory, and captures are unchanged: `capture_tenant` and
+`DeferredBlob::bytes` hash what they hand out.
+
 ## Content and privacy
 
 Blob bytes live separately in `blobs/`; journal entries contain a tenant/digest binding, object

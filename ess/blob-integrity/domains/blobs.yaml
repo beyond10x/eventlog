@@ -27,3 +27,14 @@ entities:
     # These refinements are enforced by the Rust/SQL boundaries in the binding design.
     # Present means a current integrity-bearing binding exists. Explicit deletion/erasure
     # removes it, and a later put may establish a new binding. No product lifecycle is implied.
+  - name: eventlog.blobs.VerifiedContent
+    identity:
+      name: integrity_sha256
+      type: String
+    fields:
+      - name: byte_count
+        type: Integer
+    lifecycle:
+      initial: Remembered
+      states: [Remembered]
+      terminal: [Remembered]

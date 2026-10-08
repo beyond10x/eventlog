@@ -5,6 +5,19 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Performance
+
+- File and PostgreSQL: a handle hashes each distinct blob content once, as SQLite already did,
+  instead of on every read. `EventStore::get_blob` and every callback's `ProjectionStore::get_blob`
+  still read the bytes from storage on each call and accept them without SHA-256 only when they
+  equal, in full, content the handle verified or hashed while writing under the same hash; any
+  other bytes are hashed and refused on a mismatch, so content changed after a verified read is
+  refused on the next read through the same handle. A guard that reads a batch blob once per member
+  of an M-member batch now pays one hash instead of M. The memory is the new provider-neutral
+  `eventlog_core::VerifiedContent` (32 MiB per handle, cleared on blob deletion, tenant erasure
+  and a failed blob-binding write), which SQLite now uses unchanged in behaviour. Nothing persisted
+  changes.
+
 ## 0.8.1 — 2026-10-08
 
 ### Performance
