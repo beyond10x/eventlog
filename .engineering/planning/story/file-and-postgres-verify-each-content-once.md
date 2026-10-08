@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:file-and-postgres-verify-each-content-once
 kind: story
-status: active
+status: implemented
 title: File and PostgreSQL verify each blob's content once per handle
 relations:
 - serves: vision:O2
@@ -23,10 +23,11 @@ scope:
   path: docs/design/sql-blob-read-integrity.md
 - confidence: cited
   path: ess/blob-integrity/domains/blobs.yaml
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T09:04:31Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-10-08T09:04:31Z", actor: "human:timo", revision: 5}
+- {from: "active", to: "implemented", at: "2026-10-08T10:04:02Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1,"review_outcome":2}}}
 ---
 ## Outcome
 

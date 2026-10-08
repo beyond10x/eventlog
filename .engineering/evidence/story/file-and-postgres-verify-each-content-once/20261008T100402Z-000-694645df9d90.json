@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-08T10:04:02Z",
+  "actor": "human:timo",
+  "artifact": "story:file-and-postgres-verify-each-content-once",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "package gates at 2aa18c90: fmt+clippy -D warnings exit 0 (core,file,sqlite,postgres); cargo test -p: core 42, file 208, sqlite 226 passed exit 0; postgres 120 passed, 2 failed (TLS fixture absent, identical at main) on disposable postgres:17.6"
+  }
+}
