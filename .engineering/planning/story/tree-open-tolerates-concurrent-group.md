@@ -2,14 +2,15 @@
 format: aep.planning-md/3
 id: story:tree-open-tolerates-concurrent-group
 kind: story
-status: active
+status: implemented
 title: A tree store opens while another handle commits a group
 relations:
 - serves: vision:O2
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-13T02:42:14Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-13T02:42:14Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-13T02:44:50Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 # A tree store opens while another handle commits a group
 

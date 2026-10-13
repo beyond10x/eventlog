@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-13T02:44:50Z",
+  "actor": "human:timo",
+  "artifact": "story:tree-open-tolerates-concurrent-group",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p eventlog-tree --locked at 6f79cd9e3: 60 passed, 0 failed"
+  }
+}
