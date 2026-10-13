@@ -5,6 +5,14 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Tree store: opening a store while another handle commits a group no longer reports "tree store
+  is corrupt: a group whose event is missing". The open lists each tenant's group files before it
+  reads the events, and reads only the listed groups; a group committed after the list is not read
+  and its events are torn, as an interrupted write's are. A listed group whose event is missing
+  is still refused.
+
 ## 0.8.3 — 2026-10-08
 
 ### Added
