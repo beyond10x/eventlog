@@ -433,6 +433,15 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
     for tenant_directory in subdirectories(&root.join("tenants"))? {
         let segment_name = tenant_of(&tenant_directory)?;
         let mut history = TenantHistory::default();
+        // The groups are listed before anything else is read. A writer commits its blobs and
+        // events before its group file, so every group in this list finds its events below; a
+        // group committed after the list is not read, and its events are torn.
+        let mut group_list = Vec::new();
+        for shard in subdirectories(&tenant_directory.join("groups"))? {
+            group_list.extend(json_files(&shard)?);
+        }
+        #[cfg(test)]
+        between_passes();
         // A reader of the first layout would serve a split blob's manifest as the blob, so a
         // store that holds one must say so in `store.json`.
         if !format.splits() && crate::split::holds_split_files(root, &segment_name) {
@@ -488,62 +497,60 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
             }
         }
 
-        // Every group, with the events it commits.
+        // Every listed group, with the events it commits.
         let mut committed: BTreeMap<String, Committed> = BTreeMap::new();
         let mut owner: BTreeMap<String, String> = BTreeMap::new();
-        for shard in subdirectories(&tenant_directory.join("groups"))? {
-            for path in json_files(&shard)? {
-                let record = GroupRecord::from_value(&read_json(&path)?)?;
-                let key = record.key_digest();
-                if group_path(root, &record.tenant, &key) != path {
-                    return Err(corrupt("a group file whose name does not match it"));
-                }
-                let mut members = Vec::with_capacity(record.members.len());
-                // An event's index is its place among all of the group's events, member after member.
-                let mut index = 0_u64;
-                for member in &record.members {
-                    let mut list = Vec::with_capacity(member.events.len());
-                    for digest in &member.events {
-                        let (event, _) = events
-                            .get(digest)
-                            .ok_or_else(|| corrupt("a group whose event is missing"))?;
-                        if event.group != key
-                            || event.index != index
-                            || event.stream_type != member.stream_type
-                            || event.stream_id != member.stream_id
-                            || event.tenant != record.tenant
-                        {
-                            return Err(corrupt("a group whose event names another group"));
-                        }
-                        if owner.insert(digest.clone(), key.clone()).is_some() {
-                            return Err(corrupt("an event two groups commit"));
-                        }
-                        list.push(event.clone());
-                        index += 1;
-                    }
-                    members.push(list);
-                }
-                let mut blobs = Vec::new();
-                for digest in &record.blobs {
-                    let held = if record.tenant == segment_name {
-                        tenant_blobs.get(digest).cloned()
-                    } else {
-                        crate::split::read_blob(root, &record.tenant, digest)?
-                    };
-                    if let Some(bytes) = held {
-                        blobs.push((digest.clone(), bytes));
-                    }
-                }
-                loaded.group_files.insert(path);
-                committed.insert(
-                    key,
-                    Committed {
-                        record,
-                        events: members,
-                        blobs,
-                    },
-                );
+        for path in group_list {
+            let record = GroupRecord::from_value(&read_json(&path)?)?;
+            let key = record.key_digest();
+            if group_path(root, &record.tenant, &key) != path {
+                return Err(corrupt("a group file whose name does not match it"));
             }
+            let mut members = Vec::with_capacity(record.members.len());
+            // An event's index is its place among all of the group's events, member after member.
+            let mut index = 0_u64;
+            for member in &record.members {
+                let mut list = Vec::with_capacity(member.events.len());
+                for digest in &member.events {
+                    let (event, _) = events
+                        .get(digest)
+                        .ok_or_else(|| corrupt("a group whose event is missing"))?;
+                    if event.group != key
+                        || event.index != index
+                        || event.stream_type != member.stream_type
+                        || event.stream_id != member.stream_id
+                        || event.tenant != record.tenant
+                    {
+                        return Err(corrupt("a group whose event names another group"));
+                    }
+                    if owner.insert(digest.clone(), key.clone()).is_some() {
+                        return Err(corrupt("an event two groups commit"));
+                    }
+                    list.push(event.clone());
+                    index += 1;
+                }
+                members.push(list);
+            }
+            let mut blobs = Vec::new();
+            for digest in &record.blobs {
+                let held = if record.tenant == segment_name {
+                    tenant_blobs.get(digest).cloned()
+                } else {
+                    crate::split::read_blob(root, &record.tenant, digest)?
+                };
+                if let Some(bytes) = held {
+                    blobs.push((digest.clone(), bytes));
+                }
+            }
+            loaded.group_files.insert(path);
+            committed.insert(
+                key,
+                Committed {
+                    record,
+                    events: members,
+                    blobs,
+                },
+            );
         }
         for (digest, (_, path)) in &events {
             if !owner.contains_key(digest) {
@@ -665,4 +672,135 @@ fn replay_order(
         .into_iter()
         .map(|key| committed.remove(&key).expect("every ordered group"))
         .collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once on this thread, between the two passes of the next [`load`].
+    static BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn between_passes() {
+    if let Some(hook) = BETWEEN_PASSES.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BETWEEN_PASSES, load};
+    use crate::TreeEventStore;
+    use eventlog_conformance::{event, meta};
+    use eventlog_core::{EventStore, Expected, StreamId, TenantId};
+    use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn stream(id: &str) -> StreamId {
+        StreamId::new(TenantId::new("tenant-a").unwrap(), "item", id).unwrap()
+    }
+
+    async fn append(store: &TreeEventStore, id: &str) {
+        store
+            .append(
+                &stream(id),
+                Expected::NoStream,
+                &[event("item.received", 1), event("item.indexed", 2)],
+                &meta(id, &json!({})),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn files(root: &Path, part: &str) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_owned()];
+        while let Some(directory) = stack.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .components()
+                    .any(|component| component.as_os_str() == part)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_group_committed_between_the_passes_is_absent_and_its_events_are_torn() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let writer = Arc::new(runtime.block_on(async {
+            let store = TreeEventStore::open(&root).await.unwrap();
+            append(&store, "x").await;
+            store
+        }));
+        let handle = runtime.handle().clone();
+        let second = Arc::clone(&writer);
+        BETWEEN_PASSES.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                handle.block_on(append(&second, "y"));
+            }));
+        });
+
+        let loaded = load(&root).unwrap();
+
+        let groups: usize = loaded
+            .tenants
+            .values()
+            .map(|tenant| tenant.groups.len())
+            .sum();
+        assert_eq!(
+            groups, 1,
+            "only the group committed before the open is read"
+        );
+        assert_eq!(loaded.group_files.len(), 1);
+        let late: Vec<PathBuf> = files(&root.join("tenants"), "y");
+        assert_eq!(late.len(), 2, "the late group wrote two events");
+        let mut torn = loaded.torn.clone();
+        torn.sort();
+        assert_eq!(torn, late, "the late group's events are torn");
+        // The next open reads the late group whole.
+        let groups: usize = load(&root)
+            .unwrap()
+            .tenants
+            .values()
+            .map(|tenant| tenant.groups.len())
+            .sum();
+        assert_eq!(groups, 2);
+    }
+
+    #[test]
+    fn a_group_whose_event_is_missing_is_still_refused() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        runtime.block_on(async {
+            let store = TreeEventStore::open(&root).await.unwrap();
+            append(&store, "x").await;
+        });
+        let events = files(&root.join("tenants"), "x");
+        assert_eq!(events.len(), 2);
+        fs::remove_file(&events[0]).unwrap();
+
+        let Err(refused) = load(&root) else {
+            panic!("a missing event is refused");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("a group whose event is missing"),
+            "{refused}"
+        );
+    }
 }
