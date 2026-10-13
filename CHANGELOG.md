@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.8.4 — 2026-10-13
+
 ### Fixed
 
 - Tree store: opening a store while another handle commits a group no longer reports "tree store
