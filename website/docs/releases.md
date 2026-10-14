@@ -6,6 +6,27 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.9.0 — October 14, 2026
+
+- Two opt-in on-disk layouts, chosen only when a store is created. The defaults are unchanged:
+  `TreeEventStore::open` still creates `eventlog-tree/2` and `FileEventStore::open` still creates
+  `eventlog-file/1`, an existing store keeps its layout, nothing is migrated, and this release
+  reads every layout. Earlier releases refuse the new ones, so opt in only once every reader of
+  the store has 0.9.0.
+- Tree store: `TreeLayout::Hashed` (`eventlog-tree/3`) changes the on-disk stream paths to
+  `streams/<kk>/<h>`, so every event path fits a Windows Git checkout without long paths for a
+  tenant of up to 36 escaped bytes. Tools that read stream directories by path must read them
+  through the API instead.
+- File provider: `FileLayout::Segmented` (`eventlog-file/2`) seals the history into segments, so a
+  resumed handle compares only the segments it cannot trust: about 7 times fewer bytes after its
+  own write in the measured case.
+- Fixes: a capture after a write resumes from the writer's view; a resumed handle no longer drops
+  snapshots for another handle's frames; a dropped writer lock is released even with a forked
+  child; two handles creating one tree store both open; `rustls` 0.23.46.
+- The SQLite capture checkpoint is encoded with types generated from the ESS specification.
+
+Read the [0.9.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.0).
+
 ## 0.8.4 — October 13, 2026
 
 - Tree store: opening a store while another handle commits a group no longer reports a corrupt

@@ -13,13 +13,13 @@ Consumed as a library, with File, SQLite and PostgreSQL providers. In-memory ope
 
 ## Status
 
-Version **0.8.4**, under [Apache-2.0](LICENSE). Pin the bare Git tag `0.8.4`. What changed is
-recorded in the [release notes](https://github.com/beyond10x/eventlog/releases/tag/0.8.4) and in
+Version **0.9.0**, under [Apache-2.0](LICENSE). Pin the bare Git tag `0.9.0`. What changed is
+recorded in the [release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.0) and in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Build, test, run
 
-Install Git and Rust 1.91 or newer. From a checkout of tag `0.8.4`:
+Install Git and Rust 1.91 or newer. From a checkout of tag `0.9.0`:
 
 ```bash
 cargo test --locked -p eventlog-file -- --test-threads=1

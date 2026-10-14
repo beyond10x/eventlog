@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.0 — 2026-10-14
+
 ### Added
 
 - Tree store: an opt-in layout, `eventlog-tree/3`, whose event paths fit a Git checkout on Windows
@@ -45,6 +47,25 @@ under bare-version tags such as `0.1.0`.
 - CI (`real-backends`) validates every specification under `ess/` and regenerates every
   `ess/*-generated/` output with the pinned ess release, refusing any difference
   (`cargo run --locked -p eventlog-postgres --example ess-drift`).
+
+### Fixed
+
+- File provider: a capture after a write through the same handle starts from the writer's verified
+  view of its head instead of re-reading, re-chaining, re-encoding and re-folding the whole history;
+  the committed prefix is still compared byte for byte, and any difference falls back to the strict
+  re-read.
+- File provider: a resumed handle no longer disposes of snapshots after folding another handle's
+  frames. Frames of one epoch retire no generation; redaction and tenant erasure, the only
+  operations that do, start a new epoch that goes to the complete opener, and `load_snapshot`
+  refuses a cache of a retired generation wherever it sits.
+- File provider: a writer lock holder releases `writer.lock` when it drops, so a subprocess forked
+  by the host no longer keeps the lock alive and `inspect` no longer answers `SourceBusy` for it.
+- Tree store: two handles creating one store at the same moment both open. Each stages
+  `store.json` under a name of its own and publishes it by hard link, so the first one published
+  wins and a later creator uses it; on a filesystem without hard links the publish falls back to
+  the previous rename. The hashed layout's Windows path bound holds for a tenant of at most 36
+  escaped bytes, as its documentation now states.
+- Dependencies: `rustls` 0.23.46 (RUSTSEC-2026-0346 to 0349).
 
 ## 0.8.4 — 2026-10-13
 
