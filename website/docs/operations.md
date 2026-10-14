@@ -52,7 +52,7 @@ returns `UnknownCommit`; query the claim or retry the original request.
 ## Validate a deployment
 
 The local repository gate is `bash scripts/gate.sh`. Set `EVENTLOG_TEST_POSTGRES_URL` to a
-disposable PostgreSQL fixture first. Some 0.3.0 cases refuse a missing URL; other cases report
+disposable PostgreSQL fixture first. Some cases refuse a missing URL; other cases report
 that they did not run. Neither result proves the PostgreSQL provider.
 
 The required production proof uses disposable PostgreSQL with verified TLS and both migration
