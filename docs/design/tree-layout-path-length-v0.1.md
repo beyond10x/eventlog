@@ -1,10 +1,32 @@
 # Tree-store path length on Windows checkouts, v0.1
 
-Status: **proposed**. Serves O2. Story: `story:tree-store-checks-out-on-windows`.
+Status: **built as option C, opt-in** (2026-10-14). Serves O2. Story: `story:tree-store-checks-out-on-windows`.
+Decision: `decision-blocker:on-disk-layout-changes`, option A.
 
-This document changes no bytes. Every option below changes the on-disk layout that the planning stores of
-several repositories hold, so it is a coordinated migration and needs an Atlas ADR before any of it is
-built.
+## What was built
+
+The decision chose a new layout version written only on explicit opt-in, with the old layout read
+forever and no migration. So option C below ships as `eventlog-tree/3`, without the migration step:
+
+- `TreeEventStore::open_in(root, TreeLayout::Hashed)` creates a store whose `store.json` says
+  `eventlog-tree/3`. Its stream directory is `streams/<kk>/<h>`, `h` the first 32 hex characters of
+  `sha256(seg(type) + "/" + seg(id))` and `kk` its first two. Everything else is `eventlog-tree/2`.
+- `TreeEventStore::open` and `open_with_inline` create `eventlog-tree/2`, byte for byte as 0.8.4 did.
+  A store that exists keeps the layout its `store.json` names, whatever an open asks for; so does a
+  directory of tree files without a `store.json`. `TreeEventStore::layout` reports it.
+- Every release from this one reads all three formats. Eventlog 0.8.4 and earlier refuse an
+  `eventlog-tree/3` store as "not an eventlog-tree store", so an owner opts in only once every reader
+  of the store is on a release that has it.
+- No migration moves an existing store between stream layouts. An existing planning store that must
+  check out on Windows needs a further decision; until then its owner can start a new store in the
+  hashed layout.
+- `layout::tests::a_hashed_store_writes_every_event_under_max_path_after_the_checkout_prefix` holds
+  the bound: 149 characters under `.engineering/state` for tenant `planning`, whatever the stream
+  type or id, so 225 after Eventlog's 76-character checkout prefix and 231 after Entity Runtime's 82.
+- Every `eventlog-tree` test that writes a store runs in both layouts, and
+  `tests/fixtures/tree-0.8.4/`, a store 0.8.4 wrote, must keep reading unchanged.
+
+The rest of this document is the proposal as it was written before the decision.
 
 The tag `eventlog-tree/2` has since been taken by split blobs and texts
 (`tree-text-blobs-v0.1.md`), which change no event path. The stream-directory change proposed here
