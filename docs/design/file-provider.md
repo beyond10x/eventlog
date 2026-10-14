@@ -163,14 +163,19 @@ segment (`ess/file-layout/`, `eventlog.file_layout.Segments`). Sealed segment *i
 committed length. The committed history, its frames and its digest chain are the concatenation of
 those files, so every check above is unchanged; each frame carries its store's format, and a
 sealed segment ends at a frame boundary. An append that finds the active segment holding at least
-`seal_at` bytes seals it first: under `append.json`, which records the seal, it renames
-`events.jsonl` to the next sealed name (refusing a name already taken), synchronizes both
-directories, creates a new `events.jsonl` with the frame, and only then publishes the manifest.
-Recovery undoes an unpublished seal by moving the segment back, and requires a published one to
-be complete. A sealed segment is never written again; a privacy rewrite starts the new epoch with
-one active segment and removes the retired epoch's sealed segments before its intent is cleared.
-A missing, short, long, linked or unexplained segment file refuses the complete opener, the
-strict reader and the inspector, and is left where it was found.
+`seal_at` bytes seals it first. A next sealed name that is already taken refuses the append
+before it writes any intent. Under `append.json`, which records the seal, the append renames
+`events.jsonl` to the next sealed name, synchronizes both directories, creates a new
+`events.jsonl` with the frame, and only then publishes the manifest. Recovery undoes an
+unpublished seal by moving the segment back. It moves back only a regular file of exactly the
+active length the intent recorded whose bytes extend the sealed prefix into the recorded history;
+anything else at that name refuses, and `events.jsonl` is left as it is. Recovery requires a
+published seal to be complete. A sealed segment is never written again; a privacy rewrite starts
+the new epoch with one active segment and removes the retired epoch's sealed segments before its
+intent is cleared. A missing, short, long, linked or unexplained segment file refuses the
+complete opener, the strict reader and the inspector, and is left where it was found. A resumed
+writer or capture that finds an unexplained segment file hands the store to its complete opener,
+which refuses it.
 
 What a resumed handle reads and trusts, per layout:
 
