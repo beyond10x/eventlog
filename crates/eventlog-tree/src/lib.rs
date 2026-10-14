@@ -5,7 +5,8 @@
 //! ```text
 //! <root>/store.json                                     {format, identity}, written once
 //! <root>/tenants/<tenant>/identity.json                 the tenant's stream identity, written once
-//! <root>/tenants/<tenant>/streams/<type>/<id>/<digest>.json    one event per file
+//! <root>/tenants/<tenant>/streams/<type>/<id>/<digest>.json    one event per file (nested)
+//! <root>/tenants/<tenant>/streams/<kk>/<hash>/<digest>.json    eventlog-tree/3: the same, hashed
 //! <root>/tenants/<tenant>/groups/<kk>/<key-digest>.json        one command per file: the commit point
 //! <root>/tenants/<tenant>/blobs/<kk>/<digest>           content-addressed bytes
 //! <root>/tenants/<tenant>/split-blobs/<kk>/<digest>.json  eventlog-tree/2: a blob as a manifest
@@ -17,6 +18,14 @@
 //! the layout a new store is created in, may keep a blob that is a JSON document as a manifest
 //! whose long string literals are texts stored once by their SHA-256; a reader serves the exact
 //! bytes either way. [`migrate`] moves an `eventlog-tree/1` store to `eventlog-tree/2`.
+//!
+//! `eventlog-tree/3` is `eventlog-tree/2` with each stream's directory named by a hash of its
+//! key ([`TreeLayout::Hashed`]), so that every event path has one length, short enough for a Git
+//! checkout on Windows without long paths. A store is created in it only when its owner asks, with
+//! [`TreeEventStore::open_in`]; [`TreeEventStore::open`] creates `eventlog-tree/2` as every earlier
+//! release did. Either way the layout is the store's: every open reads and writes the layout its
+//! `store.json` names, and no migration moves a store from one stream layout to the other.
+//! Eventlog 0.8.4 and earlier refuse to open an `eventlog-tree/3` store as not a tree store.
 //!
 //! No file describes the whole store, so two branches that wrote different streams merge with no
 //! textual conflict. Two branches that wrote one stream merge too: they added different files, and
@@ -41,6 +50,7 @@ mod split;
 mod verify;
 
 pub use copy::{CopyReport, copy};
+pub use layout::TreeLayout;
 pub use migrate::{MigrationMode, MigrationReport, migrate};
 pub use verify::{Finding, verify};
 
@@ -56,8 +66,8 @@ use eventlog_core::{
 use eventlog_sqlite::{EventOrigin, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
-    FORMAT, backend, canonical, corrupt, event_path, group_path, identity_path, sha256_hex,
-    tenant_dir, write_atomic, write_once,
+    FORMAT, FORMAT_V3, backend, canonical, corrupt, event_path, group_path, identity_path,
+    sha256_hex, tenant_dir, write_atomic, write_once,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,6 +123,29 @@ impl TreeEventStore {
     /// [`TreeEventStore::torn`] for the one kind of leftover an open tolerates.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, EventLogError> {
         Self::open_with_inline(root, Vec::new()).await
+    }
+
+    /// Open the store at `root`, creating it in `layout` when the directory holds none.
+    ///
+    /// `layout` is used only to create a store: a store that exists keeps the layout its
+    /// `store.json` names, and so does a directory that already holds tree files without a
+    /// `store.json`. [`TreeEventStore::layout`] says which one a store has.
+    ///
+    /// # Errors
+    /// As [`TreeEventStore::open`].
+    pub async fn open_in(
+        root: impl AsRef<Path>,
+        layout: TreeLayout,
+    ) -> Result<Self, EventLogError> {
+        Self::open_in_with_inline(root, layout, Vec::new()).await
+    }
+
+    /// The layout this store's event files are in, from `store.json`.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when `store.json` cannot be read.
+    pub fn layout(&self) -> Result<TreeLayout, EventLogError> {
+        Ok(layout::store_format(&self.root)?.layout())
     }
 
     /// Whether the state this store serves was replayed from its files, rather than read back from
@@ -192,8 +225,21 @@ impl TreeEventStore {
         root: impl AsRef<Path>,
         inline: Vec<Arc<dyn Projector>>,
     ) -> Result<Self, EventLogError> {
+        Self::open_in_with_inline(root, TreeLayout::Nested, inline).await
+    }
+
+    /// [`TreeEventStore::open_with_inline`], creating the store in `layout` when the directory
+    /// holds none, as [`TreeEventStore::open_in`] does.
+    ///
+    /// # Errors
+    /// As [`TreeEventStore::open_with_inline`].
+    pub async fn open_in_with_inline(
+        root: impl AsRef<Path>,
+        layout: TreeLayout,
+        inline: Vec<Arc<dyn Projector>>,
+    ) -> Result<Self, EventLogError> {
         let root = root.as_ref().to_owned();
-        prepare(&root)?;
+        prepare(&root, layout)?;
         let state = build(&root, inline, Vec::new()).await?;
         Ok(Self {
             root,
@@ -353,13 +399,15 @@ impl TreeEventStore {
         }
 
         let persisted = (|| {
-            let splits = layout::store_format(&self.root)?.splits();
+            let format = layout::store_format(&self.root)?;
+            let splits = format.splits();
             for (digest, bytes) in blobs {
                 split::write_blob(&self.root, tenant.as_str(), digest, bytes, splits)?;
             }
             for record in &written {
                 let path = event_path(
                     &self.root,
+                    format,
                     &record.tenant,
                     &record.stream_type,
                     &record.stream_id,
@@ -408,8 +456,9 @@ fn writer_lock(root: &Path) -> Result<fs::File, EventLogError> {
 }
 
 /// Refuse a directory that holds another kind of store, and create `store.json` in one that
-/// holds none.
-fn prepare(root: &Path) -> Result<(), EventLogError> {
+/// holds none: in `layout` for an empty directory, and nested for one that already holds tree
+/// files, which every release before `eventlog-tree/3` wrote nested.
+fn prepare(root: &Path, layout: TreeLayout) -> Result<(), EventLogError> {
     // A file store's journal here would be a second history nobody replays.
     if root.join("manifest.json").exists() || root.join("events.jsonl").exists() {
         return Err(EventLogError::Invalid(
@@ -423,7 +472,11 @@ fn prepare(root: &Path) -> Result<(), EventLogError> {
             layout::store_format(root)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let value = json!({ "format": FORMAT, "identity": eventlog_core::new_event_id() });
+            let format = match layout {
+                TreeLayout::Hashed if !root.join("tenants").exists() => FORMAT_V3,
+                _ => FORMAT,
+            };
+            let value = json!({ "format": format, "identity": eventlog_core::new_event_id() });
             write_once(&manifest, &canonical(&value))?;
         }
         Err(error) => return Err(backend(error)),
@@ -854,8 +907,10 @@ impl EventStore for TreeEventStore {
             record.redacted = Some(reason.to_owned());
             let record = record.clone();
             let written = record.digest().and_then(|digest| {
+                let format = layout::store_format(&self.root)?;
                 let path = event_path(
                     &self.root,
+                    format,
                     &record.tenant,
                     &record.stream_type,
                     &record.stream_id,

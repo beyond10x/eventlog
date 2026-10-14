@@ -2,12 +2,15 @@
 //! unchanged, writes interrupted before their commit point, forks made by merging two copies, and
 //! files edited behind the store's back.
 
+#[macro_use]
+mod each_layout;
+
 use eventlog_conformance::{event, meta};
 use eventlog_core::{
     AppendGroup, AtomicEventStore, BranchableEventStore, EventLogError, EventStore, Expected,
     HeadSetDigest, StreamAppend, StreamId, TenantId,
 };
-use eventlog_tree::TreeEventStore;
+use eventlog_tree::{TreeEventStore, TreeLayout};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -61,12 +64,13 @@ fn copy_tree(from: &Path, into: &Path) {
     merge_into(from, into);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn history_reopens_with_the_same_ids_versions_instants_and_receipts() {
+async fn history_reopens_with_the_same_ids_versions_instants_and_receipts(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let body = json!({ "command": "one" });
     let first = {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store.stream_identity(stream("x").tenant()).await.unwrap();
         store
             .append(
@@ -79,10 +83,14 @@ async fn history_reopens_with_the_same_ids_versions_instants_and_receipts() {
             .unwrap()
     };
     let identity_before = {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store.stream_identity(stream("x").tenant()).await.unwrap()
     };
-    let store = TreeEventStore::open(directory.path()).await.unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     assert_eq!(
         store.stream_identity(stream("x").tenant()).await.unwrap(),
         identity_before,
@@ -107,8 +115,7 @@ async fn history_reopens_with_the_same_ids_versions_instants_and_receipts() {
     assert_eq!(read[1].parents, vec![read[0].digest.clone().unwrap()]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_group_and_its_blobs_reopen_whole() {
+async fn a_group_and_its_blobs_reopen_whole(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let tenant = TenantId::new("tenant-a").unwrap();
     let group = AppendGroup {
@@ -129,7 +136,9 @@ async fn a_group_and_its_blobs_reopen_whole() {
     };
     let blobs = vec![("blob-1".to_owned(), b"bytes".to_vec())];
     let written = {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store
             .append_group_guarded_with_blobs(
                 &group,
@@ -139,7 +148,9 @@ async fn a_group_and_its_blobs_reopen_whole() {
             .await
             .unwrap()
     };
-    let store = TreeEventStore::open(directory.path()).await.unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     assert_eq!(
         store.get_blob(&tenant, "blob-1").await.unwrap(),
         Some(b"bytes".to_vec())
@@ -164,11 +175,12 @@ async fn a_group_and_its_blobs_reopen_whole() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_event_without_its_group_file_is_never_served_and_repair_removes_it() {
+async fn an_event_without_its_group_file_is_never_served_and_repair_removes_it(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store
             .append(
                 &stream("x"),
@@ -187,7 +199,9 @@ async fn an_event_without_its_group_file_is_never_served_and_repair_removes_it()
     assert_eq!(groups.len(), 1);
     fs::remove_file(&groups[0]).unwrap();
 
-    let store = TreeEventStore::open(directory.path()).await.unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     assert_eq!(
         store.stream_version(&stream("x")).await.unwrap(),
         None,
@@ -198,11 +212,10 @@ async fn an_event_without_its_group_file_is_never_served_and_repair_removes_it()
     assert!(store.torn().unwrap().is_empty(), "repair left a torn file");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn two_branches_that_wrote_different_streams_merge_into_one_history() {
+async fn two_branches_that_wrote_different_streams_merge_into_one_history(layout: TreeLayout) {
     let base = tempfile::tempdir().unwrap();
     {
-        let store = TreeEventStore::open(base.path()).await.unwrap();
+        let store = TreeEventStore::open_in(base.path(), layout).await.unwrap();
         store
             .append(
                 &stream("x"),
@@ -218,7 +231,7 @@ async fn two_branches_that_wrote_different_streams_merge_into_one_history() {
     copy_tree(base.path(), ours.path());
     copy_tree(base.path(), theirs.path());
     {
-        let store = TreeEventStore::open(ours.path()).await.unwrap();
+        let store = TreeEventStore::open_in(ours.path(), layout).await.unwrap();
         store
             .append(
                 &stream("x"),
@@ -230,7 +243,9 @@ async fn two_branches_that_wrote_different_streams_merge_into_one_history() {
             .unwrap();
     }
     {
-        let store = TreeEventStore::open(theirs.path()).await.unwrap();
+        let store = TreeEventStore::open_in(theirs.path(), layout)
+            .await
+            .unwrap();
         store
             .append(
                 &stream("y"),
@@ -242,7 +257,7 @@ async fn two_branches_that_wrote_different_streams_merge_into_one_history() {
             .unwrap();
     }
     merge_into(theirs.path(), ours.path());
-    let store = TreeEventStore::open(ours.path()).await.unwrap();
+    let store = TreeEventStore::open_in(ours.path(), layout).await.unwrap();
     assert_eq!(store.stream_version(&stream("x")).await.unwrap(), Some(2));
     assert_eq!(store.stream_version(&stream("y")).await.unwrap(), Some(1));
     assert_eq!(
@@ -252,11 +267,12 @@ async fn two_branches_that_wrote_different_streams_merge_into_one_history() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_heads_joins_it() {
+async fn two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_heads_joins_it(
+    layout: TreeLayout,
+) {
     let base = tempfile::tempdir().unwrap();
     {
-        let store = TreeEventStore::open(base.path()).await.unwrap();
+        let store = TreeEventStore::open_in(base.path(), layout).await.unwrap();
         store
             .append(
                 &stream("x"),
@@ -272,7 +288,7 @@ async fn two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_h
     copy_tree(base.path(), ours.path());
     copy_tree(base.path(), theirs.path());
     for (directory, key, value) in [(ours.path(), "ours", 2), (theirs.path(), "theirs", 3)] {
-        let store = TreeEventStore::open(directory).await.unwrap();
+        let store = TreeEventStore::open_in(directory, layout).await.unwrap();
         store
             .append(
                 &stream("x"),
@@ -285,7 +301,7 @@ async fn two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_h
     }
     merge_into(theirs.path(), ours.path());
 
-    let store = TreeEventStore::open(ours.path()).await.unwrap();
+    let store = TreeEventStore::open_in(ours.path(), layout).await.unwrap();
     let heads = store.heads(&stream("x")).await.unwrap();
     assert_eq!(
         heads.len(),
@@ -342,7 +358,7 @@ async fn two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_h
     assert_eq!(store.heads(&stream("x")).await.unwrap().len(), 1);
 
     drop(store);
-    let reopened = TreeEventStore::open(ours.path()).await.unwrap();
+    let reopened = TreeEventStore::open_in(ours.path(), layout).await.unwrap();
     assert_eq!(
         reopened.heads(&stream("x")).await.unwrap().len(),
         1,
@@ -354,10 +370,11 @@ async fn two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_h
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_merge_expectation_on_a_linear_stream_is_refused() {
+async fn a_merge_expectation_on_a_linear_stream_is_refused(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    let store = TreeEventStore::open(directory.path()).await.unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     store
         .append(
             &stream("x"),
@@ -381,11 +398,12 @@ async fn a_merge_expectation_on_a_linear_stream_is_refused() {
     assert_eq!(store.stream_version(&stream("x")).await.unwrap(), Some(1));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_event_file_edited_behind_the_store_is_refused_on_open() {
+async fn an_event_file_edited_behind_the_store_is_refused_on_open(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store
             .append(
                 &stream("x"),
@@ -404,17 +422,20 @@ async fn an_event_file_edited_behind_the_store_is_refused_on_open() {
         .unwrap()
         .replace("\"value\":1", "\"value\":2");
     fs::write(&file, edited).unwrap();
-    let Err(error) = TreeEventStore::open(directory.path()).await else {
+    let Err(error) = TreeEventStore::open_in(directory.path(), layout).await else {
         panic!("a store with an edited event opened");
     };
     assert!(matches!(error, EventLogError::Backend(ref message) if message.contains("corrupt")));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_second_handle_sees_the_first_handles_commit_before_it_writes() {
+async fn a_second_handle_sees_the_first_handles_commit_before_it_writes(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    let first = TreeEventStore::open(directory.path()).await.unwrap();
-    let second = TreeEventStore::open(directory.path()).await.unwrap();
+    let first = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    let second = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     first
         .append(
             &stream("x"),
@@ -442,11 +463,12 @@ async fn a_second_handle_sees_the_first_handles_commit_before_it_writes() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds() {
+async fn a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store
             .append(
                 &stream("x"),
@@ -458,7 +480,9 @@ async fn a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds() {
             .unwrap();
         store.redact(&stream("x"), 1, "erased").await.unwrap();
     }
-    let store = TreeEventStore::open(directory.path()).await.unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     let events = store.read_stream(&stream("x"), 0, 10).await.unwrap().events;
     assert!(
         events[0].is_redacted(),
@@ -468,8 +492,7 @@ async fn a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds() {
     assert_eq!(events[1].parents, vec![events[0].digest.clone().unwrap()]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn two_members_of_one_group_on_one_stream_chain_and_reopen() {
+async fn two_members_of_one_group_on_one_stream_chain_and_reopen(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let tenant = TenantId::new("tenant-a").unwrap();
     let group = AppendGroup {
@@ -489,7 +512,9 @@ async fn two_members_of_one_group_on_one_stream_chain_and_reopen() {
         meta: meta("one-stream-group", &json!({})),
     };
     let written = {
-        let store = TreeEventStore::open(directory.path()).await.unwrap();
+        let store = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
         store.append_group(&group).await.unwrap()
     };
     assert_eq!(
@@ -497,7 +522,22 @@ async fn two_members_of_one_group_on_one_stream_chain_and_reopen() {
         vec![written.appends[0].events[0].digest.clone().unwrap()],
         "the second member does not follow the first"
     );
-    let store = TreeEventStore::open(directory.path()).await.unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     assert_eq!(store.heads(&stream("x")).await.unwrap().len(), 1);
     assert_eq!(store.stream_version(&stream("x")).await.unwrap(), Some(2));
 }
+
+each_layout!(
+    history_reopens_with_the_same_ids_versions_instants_and_receipts,
+    a_group_and_its_blobs_reopen_whole,
+    an_event_without_its_group_file_is_never_served_and_repair_removes_it,
+    two_branches_that_wrote_different_streams_merge_into_one_history,
+    two_branches_that_wrote_one_stream_fork_it_and_only_a_merge_over_both_heads_joins_it,
+    a_merge_expectation_on_a_linear_stream_is_refused,
+    an_event_file_edited_behind_the_store_is_refused_on_open,
+    a_second_handle_sees_the_first_handles_commit_before_it_writes,
+    a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds,
+    two_members_of_one_group_on_one_stream_chain_and_reopen,
+);

@@ -485,6 +485,7 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
                     }
                     if crate::layout::stream_dir(
                         root,
+                        format,
                         &record.tenant,
                         &record.stream_type,
                         &record.stream_id,
@@ -691,7 +692,7 @@ fn between_passes() {
 #[cfg(test)]
 mod tests {
     use super::{BETWEEN_PASSES, load};
-    use crate::TreeEventStore;
+    use crate::{TreeEventStore, TreeLayout};
     use eventlog_conformance::{event, meta};
     use eventlog_core::{EventStore, Expected, StreamId, TenantId};
     use serde_json::json;
@@ -715,33 +716,30 @@ mod tests {
             .unwrap();
     }
 
-    fn files(root: &Path, part: &str) -> Vec<PathBuf> {
-        let mut found = Vec::new();
-        let mut stack = vec![root.to_owned()];
-        while let Some(directory) = stack.pop() {
-            for entry in fs::read_dir(&directory).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path
-                    .components()
-                    .any(|component| component.as_os_str() == part)
-                {
-                    found.push(path);
-                }
-            }
-        }
-        found.sort();
-        found
+    /// The event files of stream `item/<id>`, in whichever layout the store at `root` has.
+    fn files(root: &Path, id: &str) -> Vec<PathBuf> {
+        let format = crate::layout::store_format(root).unwrap();
+        crate::layout::json_files(&crate::layout::stream_dir(
+            root, format, "tenant-a", "item", id,
+        ))
+        .unwrap()
     }
 
     #[test]
     fn a_group_committed_between_the_passes_is_absent_and_its_events_are_torn() {
+        for layout in [TreeLayout::Nested, TreeLayout::Hashed] {
+            a_group_committed_between_the_passes_is_absent_and_its_events_are_torn_in(layout);
+        }
+    }
+
+    fn a_group_committed_between_the_passes_is_absent_and_its_events_are_torn_in(
+        layout: TreeLayout,
+    ) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_owned();
         let writer = Arc::new(runtime.block_on(async {
-            let store = TreeEventStore::open(&root).await.unwrap();
+            let store = TreeEventStore::open_in(&root, layout).await.unwrap();
             append(&store, "x").await;
             store
         }));
@@ -765,7 +763,7 @@ mod tests {
             "only the group committed before the open is read"
         );
         assert_eq!(loaded.group_files.len(), 1);
-        let late: Vec<PathBuf> = files(&root.join("tenants"), "y");
+        let late: Vec<PathBuf> = files(&root, "y");
         assert_eq!(late.len(), 2, "the late group wrote two events");
         let mut torn = loaded.torn.clone();
         torn.sort();
@@ -782,14 +780,20 @@ mod tests {
 
     #[test]
     fn a_group_whose_event_is_missing_is_still_refused() {
+        for layout in [TreeLayout::Nested, TreeLayout::Hashed] {
+            a_group_whose_event_is_missing_is_still_refused_in(layout);
+        }
+    }
+
+    fn a_group_whose_event_is_missing_is_still_refused_in(layout: TreeLayout) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_owned();
         runtime.block_on(async {
-            let store = TreeEventStore::open(&root).await.unwrap();
+            let store = TreeEventStore::open_in(&root, layout).await.unwrap();
             append(&store, "x").await;
         });
-        let events = files(&root.join("tenants"), "x");
+        let events = files(&root, "x");
         assert_eq!(events.len(), 2);
         fs::remove_file(&events[0]).unwrap();
 

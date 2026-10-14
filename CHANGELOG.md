@@ -5,6 +5,21 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- Tree store: an opt-in layout, `eventlog-tree/3`, whose event paths fit a Git checkout on Windows
+  without `core.longpaths`. `TreeEventStore::open_in(root, TreeLayout::Hashed)` (and
+  `open_in_with_inline`) creates a store whose stream directories are `streams/<kk>/<h>`, `h` the
+  first 32 hex characters of the SHA-256 of the escaped `<type>/<id>`. An event path under
+  `.engineering/state` for tenant `planning` is then 149 characters for every stream, against 198
+  and growing with the stream id before; a test holds it under 260 after the 76-character
+  checkout prefix of a Cargo Git dependency. `TreeEventStore::layout` reports a store's layout.
+- Nothing changes for a store that does not opt in: `TreeEventStore::open` creates
+  `eventlog-tree/2` as before, a store keeps the layout its `store.json` names whatever an open
+  asks for, and every layout reads in this release. No migration moves a store between stream
+  layouts. Eventlog 0.8.4 and earlier refuse to open an `eventlog-tree/3` store, so opt in only
+  once every reader of the store has this release.
+
 ## 0.8.4 — 2026-10-13
 
 ### Fixed

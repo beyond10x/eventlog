@@ -2,6 +2,9 @@
 //! position order, every stream gapless, and each event's tree `{version, digest, parents}` kept
 //! in an origin map beside the event rather than in its body.
 
+#[macro_use]
+mod each_layout;
+
 use eventlog_conformance::{event, meta};
 use eventlog_core::{
     AppendGroup, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup, BlobWrite,
@@ -9,7 +12,7 @@ use eventlog_core::{
     RecordedEvent, StreamAppend, StreamId, TenantId, redaction_tombstone,
 };
 use eventlog_sqlite::{OriginMap, SqliteEventStore};
-use eventlog_tree::{CopyReport, TreeEventStore, copy};
+use eventlog_tree::{CopyReport, TreeEventStore, TreeLayout, copy};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,10 +138,13 @@ fn blobs() -> Vec<(String, Vec<u8>)> {
     vec![("blob-1".to_owned(), b"bytes".to_vec())]
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_tree_copied_into_sqlite_holds_every_event_blob_and_receipt_modulo_the_origin_map() {
+async fn a_tree_copied_into_sqlite_holds_every_event_blob_and_receipt_modulo_the_origin_map(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path()).await.unwrap();
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     for owner in ["tenant-a", "tenant-b"] {
         tree.stream_identity(&tenant(owner)).await.unwrap();
     }
@@ -284,11 +290,13 @@ fn appended_hash(body: &serde_json::Value) -> String {
 
 /// Build a stream that two checkouts forked and one of them merged, as two directories that hold
 /// the same files but were merged in opposite directions.
-async fn forked_and_merged() -> (tempfile::TempDir, tempfile::TempDir, Vec<String>) {
+async fn forked_and_merged(
+    layout: TreeLayout,
+) -> (tempfile::TempDir, tempfile::TempDir, Vec<String>) {
     let ours = tempfile::tempdir().unwrap();
     let theirs = tempfile::tempdir().unwrap();
     {
-        let store = TreeEventStore::open(ours.path()).await.unwrap();
+        let store = TreeEventStore::open_in(ours.path(), layout).await.unwrap();
         store
             .append(
                 &stream("tenant-a", "x"),
@@ -303,7 +311,7 @@ async fn forked_and_merged() -> (tempfile::TempDir, tempfile::TempDir, Vec<Strin
     // Theirs writes first, so by § 6.3's tie-break its side sorts first on both checkouts.
     let mut written = Vec::new();
     for (directory, key) in [(theirs.path(), "theirs"), (ours.path(), "ours")] {
-        let store = TreeEventStore::open(directory).await.unwrap();
+        let store = TreeEventStore::open_in(directory, layout).await.unwrap();
         let result = store
             .append(
                 &stream("tenant-a", "x"),
@@ -327,7 +335,7 @@ async fn forked_and_merged() -> (tempfile::TempDir, tempfile::TempDir, Vec<Strin
     }
     merge_into(theirs.path(), ours.path());
     {
-        let store = TreeEventStore::open(ours.path()).await.unwrap();
+        let store = TreeEventStore::open_in(ours.path(), layout).await.unwrap();
         let heads = store.heads(&stream("tenant-a", "x")).await.unwrap();
         assert_eq!(heads.len(), 2, "the fixture did not fork the stream");
         let merged = store
@@ -345,12 +353,13 @@ async fn forked_and_merged() -> (tempfile::TempDir, tempfile::TempDir, Vec<Strin
     (ours, theirs, written)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_forked_then_merged_tree_linearizes_in_position_order_the_same_way_on_every_checkout() {
-    let (ours, theirs, written) = forked_and_merged().await;
+async fn a_forked_then_merged_tree_linearizes_in_position_order_the_same_way_on_every_checkout(
+    layout: TreeLayout,
+) {
+    let (ours, theirs, written) = forked_and_merged(layout).await;
     let mut linearized = Vec::new();
     for directory in [ours.path(), theirs.path()] {
-        let tree = TreeEventStore::open(directory).await.unwrap();
+        let tree = TreeEventStore::open_in(directory, layout).await.unwrap();
         let target = SqliteEventStore::in_memory("copy").await.unwrap();
         copy(&tree, &target).await.unwrap();
         let origins = target.origins(&tenant("tenant-a")).await.unwrap();
@@ -420,10 +429,11 @@ async fn a_forked_then_merged_tree_linearizes_in_position_order_the_same_way_on_
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_copy_refuses_a_target_that_already_holds_history_and_writes_nothing() {
+async fn a_copy_refuses_a_target_that_already_holds_history_and_writes_nothing(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path()).await.unwrap();
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     for owner in ["tenant-a", "tenant-b"] {
         tree.append(
             &stream(owner, "x"),
@@ -466,10 +476,11 @@ async fn a_copy_refuses_a_target_that_already_holds_history_and_writes_nothing()
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn origins_survive_reopening_the_sqlite_file_and_go_with_an_erased_tenant() {
+async fn origins_survive_reopening_the_sqlite_file_and_go_with_an_erased_tenant(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path().join("tree"))
+    let tree = TreeEventStore::open_in(directory.path().join("tree"), layout)
         .await
         .unwrap();
     tree.append(
@@ -507,8 +518,8 @@ async fn origins_survive_reopening_the_sqlite_file_and_go_with_an_erased_tenant(
 }
 
 /// A tree whose two tenants each hold one event and one blob.
-async fn two_tenant_tree(directory: &Path) -> TreeEventStore {
-    let tree = TreeEventStore::open(directory).await.unwrap();
+async fn two_tenant_tree(directory: &Path, layout: TreeLayout) -> TreeEventStore {
+    let tree = TreeEventStore::open_in(directory, layout).await.unwrap();
     for owner in ["tenant-a", "tenant-b"] {
         tree.append(
             &stream(owner, "x"),
@@ -527,10 +538,11 @@ async fn two_tenant_tree(directory: &Path) -> TreeEventStore {
     tree
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_copy_refuses_a_target_that_binds_a_tree_blob_to_other_bytes_and_writes_nothing() {
+async fn a_copy_refuses_a_target_that_binds_a_tree_blob_to_other_bytes_and_writes_nothing(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = two_tenant_tree(directory.path()).await;
+    let tree = two_tenant_tree(directory.path(), layout).await;
     let target = SqliteEventStore::in_memory("copy").await.unwrap();
     target
         .put_blob(&tenant("tenant-b"), "blob-b", b"other bytes")
@@ -550,10 +562,11 @@ async fn a_copy_refuses_a_target_that_binds_a_tree_blob_to_other_bytes_and_write
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_copy_refuses_a_target_with_queued_restored_identities_and_writes_nothing() {
+async fn a_copy_refuses_a_target_with_queued_restored_identities_and_writes_nothing(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = two_tenant_tree(directory.path()).await;
+    let tree = two_tenant_tree(directory.path(), layout).await;
     let target = SqliteEventStore::in_memory("copy").await.unwrap();
     target
         .restore_events(vec![eventlog_sqlite::RestoredEvent {
@@ -582,3 +595,12 @@ async fn a_copy_refuses_a_target_with_queued_restored_identities_and_writes_noth
     }
     assert_eq!(target.restored_pending().unwrap(), 1);
 }
+
+each_layout!(
+    a_tree_copied_into_sqlite_holds_every_event_blob_and_receipt_modulo_the_origin_map,
+    a_forked_then_merged_tree_linearizes_in_position_order_the_same_way_on_every_checkout,
+    a_copy_refuses_a_target_that_already_holds_history_and_writes_nothing,
+    origins_survive_reopening_the_sqlite_file_and_go_with_an_erased_tenant,
+    a_copy_refuses_a_target_that_binds_a_tree_blob_to_other_bytes_and_writes_nothing,
+    a_copy_refuses_a_target_with_queued_restored_identities_and_writes_nothing,
+);

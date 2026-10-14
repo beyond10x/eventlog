@@ -70,7 +70,8 @@ impl MigrationReport {
 ///
 /// Idempotent: on a store already migrated, a dry run reports nothing pending and an apply
 /// changes nothing. A raw blob in an `eventlog-tree/2` store — one merged from a branch that had
-/// not migrated — is split like any other.
+/// not migrated — is split like any other. An `eventlog-tree/3` store already splits, so it keeps
+/// its format and only has its raw blobs split; no migration changes a store's stream layout.
 ///
 /// # Errors
 /// Refuses a directory that is not a tree store, and a store the replay cannot verify, before
@@ -136,7 +137,12 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
     }
     let mut report = MigrationReport {
         from_format: format.tag().to_owned(),
-        to_format: FORMAT.to_owned(),
+        to_format: if format == StoreFormat::V1 {
+            FORMAT
+        } else {
+            format.tag()
+        }
+        .to_owned(),
         blobs: served_before.blobs.len(),
         already_split,
         blobs_split: plan.len(),
