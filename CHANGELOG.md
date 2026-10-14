@@ -5,6 +5,20 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- File provider: an opt-in segmented layout, `eventlog-file/2`, so that a resumed handle's
+  history check stops re-reading the whole store after each write. `FileEventStore::open_with_layout`
+  with the new `#[non_exhaustive]` `FileLayout::Segmented { seal_at }` (or `FileLayout::segmented()`,
+  256 KiB) creates a store whose active `events.jsonl` is sealed into `segments/` once it holds
+  `seal_at` bytes; a resume skips each sealed segment whose trusted stamp still matches and compares
+  the rest byte for byte, as `eventlog-file/1` does for its one file. The layout is chosen only at
+  creation: `open` still creates `eventlog-file/1` byte for byte as before, an existing store keeps
+  its layout, nothing is migrated, and this release reads both. An earlier release refuses an
+  `eventlog-file/2` store by its format. A `seal_at` of 0 is refused. The manifest's `segments`
+  record is modelled in `ess/file-layout/`, and a test holds it to the committed schema in
+  `ess/file-layout-generated/`. Additive: a minor release.
+
 ## 0.8.4 — 2026-10-13
 
 ### Fixed

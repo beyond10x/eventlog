@@ -11,6 +11,13 @@ use std::{
 };
 
 const FORMAT: &str = "eventlog-file/1";
+/// The segmented layout: sealed segments under `segments/`, then the active one in
+/// `events.jsonl`. A store is written in it only when its owner asked for it at creation
+/// ([`FileLayout::Segmented`]); [`FORMAT`] stays the default and is read by every release.
+const SEGMENTED_FORMAT: &str = "eventlog-file/2";
+/// The seal size [`FileLayout::segmented`] chooses: a resume inside the untrusted window compares
+/// at most about this many bytes of the active segment, beside the young sealed ones.
+const DEFAULT_SEAL_AT: u64 = 256 * 1024;
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[cfg(test)]
@@ -36,6 +43,48 @@ mod adversary2_compare_once;
 #[path = "adversary_compare_once.rs"]
 mod adversary_compare_once;
 
+/// The on-disk layout a store is created with. A store that already exists keeps its own: no
+/// release migrates one, and every release reads both.
+///
+/// `ess/file-layout/` models it (`eventlog.file_layout.Layout`, `SegmentedPolicy`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileLayout {
+    /// `eventlog-file/1`: the whole committed history in `events.jsonl`. The default.
+    #[default]
+    Single,
+    /// `eventlog-file/2`: sealed segments under `segments/`, then the active segment in
+    /// `events.jsonl`. An append that finds the active segment holding at least `seal_at`
+    /// committed bytes seals it first. A sealed segment is never written again, so once its
+    /// inode stamp is trusted a resumed handle need not re-read it; a resume inside the
+    /// untrusted window reads the active segment and the young sealed ones, not the whole history.
+    /// `seal_at` must be at least 1 and is persisted in the store's manifest.
+    Segmented {
+        /// The committed size of the active segment at which the next append seals it.
+        seal_at: u64,
+    },
+}
+
+impl FileLayout {
+    /// The segmented layout at the default seal size (256 KiB).
+    #[must_use]
+    pub const fn segmented() -> Self {
+        Self::Segmented {
+            seal_at: DEFAULT_SEAL_AT,
+        }
+    }
+}
+
+/// The manifest's segment record of an `eventlog-file/2` store (`eventlog.file_layout.Segments`):
+/// the committed length of every sealed segment, in history order. The active segment holds the
+/// rest of the manifest's committed length.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Segments {
+    seal_at: u64,
+    sealed: Vec<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
@@ -45,6 +94,57 @@ pub(crate) struct Manifest {
     pub sequence: u64,
     pub length: u64,
     pub digest: String,
+    /// Present exactly on an `eventlog-file/2` manifest, so an `eventlog-file/1` manifest is
+    /// written byte for byte as before, and a released reader refuses the new layout twice over:
+    /// by its format and by this unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segments: Option<Segments>,
+}
+
+impl Manifest {
+    /// Whether this manifest names a layout this release reads, and names it consistently: every
+    /// sealed segment holds at least one byte and they fit inside the committed length.
+    fn known(&self) -> bool {
+        match (self.format.as_str(), &self.segments) {
+            (FORMAT, None) => true,
+            (SEGMENTED_FORMAT, Some(segments)) => {
+                segments.seal_at >= 1
+                    && segments.sealed.iter().all(|length| *length > 0)
+                    && segments
+                        .sealed
+                        .iter()
+                        .try_fold(0_u64, |sum, length| sum.checked_add(*length))
+                        .is_some_and(|sum| sum <= self.length)
+            }
+            _ => false,
+        }
+    }
+
+    /// The committed lengths of the sealed segments; none on `eventlog-file/1`.
+    fn sealed(&self) -> &[u64] {
+        self.segments
+            .as_ref()
+            .map_or(&[], |segments| segments.sealed.as_slice())
+    }
+
+    /// The committed length of `events.jsonl`: everything on `eventlog-file/1`.
+    fn active_length(&self) -> u64 {
+        self.length.saturating_sub(
+            self.sealed()
+                .iter()
+                .fold(0, |sum, l| sum.saturating_add(*l)),
+        )
+    }
+
+    fn seal_at(&self) -> Option<u64> {
+        self.segments.as_ref().map(|segments| segments.seal_at)
+    }
+}
+
+/// Where sealed segment `index` lives. Its name is its position, so the manifest's list is all
+/// a reader needs to find every committed byte.
+fn segment_path(root: &Path, index: usize) -> PathBuf {
+    root.join("segments").join(format!("{index:010}.jsonl"))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -138,6 +238,11 @@ pub(crate) struct Content {
     /// still for the whole read and was last changed well before it began. While the file still
     /// carries exactly this stamp, its bytes are these bytes, and a resume need not read them.
     stamp: Option<Stamp>,
+    /// The same, for each sealed segment of an `eventlog-file/2` history, in history order: the
+    /// stamp each segment file carried while this view verified its bytes, when it was trusted.
+    /// Empty on `eventlog-file/1`, and shorter than the manifest's list wherever a view keeps
+    /// no stamp for a segment, which costs that segment a comparison and trusts nothing.
+    sealed: Vec<Option<Stamp>>,
 }
 
 /// One append-only buffer of committed bytes, shared by the views of one handle.
@@ -168,6 +273,7 @@ impl Content {
             length: bytes.len(),
             retained: Arc::new(Retained(Mutex::new(bytes))),
             stamp: None,
+            sealed: Vec::new(),
         }
     }
 
@@ -208,6 +314,19 @@ impl Content {
     fn stamped(mut self, stamp: Option<Stamp>) -> Self {
         self.stamp = stamp;
         self
+    }
+
+    /// Keep `sealed` as the stamps of the sealed segments these bytes were read from.
+    fn sealed_stamped(mut self, sealed: Vec<Option<Stamp>>) -> Self {
+        self.sealed = sealed;
+        self
+    }
+
+    /// The active segment these bytes end in has just been sealed by an append: a new sealed
+    /// segment, whose stamp is not trusted yet, and a new active one, which has none.
+    fn seal(&mut self) {
+        self.sealed.push(None);
+        self.stamp = None;
     }
 
     /// Move this view onto `other`'s buffer when the bytes one of them verified begin the other's,
@@ -258,12 +377,14 @@ impl Content {
             retained: Arc::clone(&other.retained),
             length: common,
             stamp: None,
+            sealed: Vec::new(),
         };
         adopted.absorb(&rest);
         if !adopted.shares_bytes_with(other) {
             return false;
         }
         adopted.stamp = self.stamp;
+        adopted.sealed = std::mem::take(&mut self.sealed);
         *self = adopted;
         true
     }
@@ -274,29 +395,20 @@ impl Content {
     }
 }
 
-/// Whether the next `content.length` bytes of `events` are, byte for byte, the bytes `content`
-/// verified. Reading stops at the first difference.
-///
-/// The cost is charged here, by the comparison, and only once every byte has matched.
-fn same_prefix(root: &Path, events: &mut File, content: &Content) -> Result<bool, EventLogError> {
-    let retained = content.retained.bytes();
-    let verified = &retained[..content.length];
+/// Whether the next `verified.len()` bytes of `file` are, byte for byte, `verified`. Reading stops
+/// at the first difference. The caller charges the comparison, once every file it compared has
+/// matched.
+fn same_bytes(file: &mut File, verified: &[u8]) -> Result<bool, EventLogError> {
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut compared = 0;
     while compared < verified.len() {
         let want = (verified.len() - compared).min(buffer.len());
-        let read = events.read(&mut buffer[..want]).map_err(backend)?;
+        let read = file.read(&mut buffer[..want]).map_err(backend)?;
         if read == 0 || buffer[..read] != verified[compared..compared + read] {
             return Ok(false);
         }
         compared += read;
     }
-    #[cfg(test)]
-    crate::cost::charge(root, |cost| {
-        cost.prefix_bytes_compared += compared as u64;
-    });
-    #[cfg(not(test))]
-    let _ = root;
     Ok(true)
 }
 
@@ -324,10 +436,19 @@ pub(crate) struct Stamp {
 const UNTRUSTED_NS: i128 = 2_000_000_000;
 
 impl Stamp {
-    #[cfg(unix)]
     fn of(file: &File) -> Option<Self> {
+        Self::from_metadata(&file.metadata().ok()?)
+    }
+
+    /// The stamp of a regular file from metadata already taken: an `lstat` of a name that
+    /// [`regular`] admitted describes the same inode a later open of it would.
+    #[cfg(unix)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "a platform without inode stamps answers None for the same call"
+    )]
+    fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
         use std::os::unix::fs::MetadataExt as _;
-        let metadata = file.metadata().ok()?;
         Some(Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -340,7 +461,7 @@ impl Stamp {
     }
 
     #[cfg(not(unix))]
-    fn of(_file: &File) -> Option<Self> {
+    fn from_metadata(_metadata: &fs::Metadata) -> Option<Self> {
         None
     }
 }
@@ -403,14 +524,33 @@ pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal
     }
     let manifest: Manifest = serde_json::from_slice(&inspection_read(manifest_file, manifest_len)?)
         .map_err(|_| InspectionError::CorruptSource)?;
-    if manifest.format != FORMAT {
+    if manifest.format != FORMAT && manifest.format != SEGMENTED_FORMAT {
         return Err(InspectionError::UnsupportedSource);
     }
-    if manifest.store.is_empty() || manifest.length != events_len {
+    if !manifest.known() || manifest.store.is_empty() || manifest.active_length() != events_len {
         return Err(InspectionError::CorruptSource);
     }
-    let transactions = decode(&inspection_read(events_file, events_len)?, &manifest)
-        .map_err(|_| InspectionError::CorruptSource)?;
+    // Sealed segments are journal bytes too, and count against the same budget.
+    if manifest_len
+        .checked_add(manifest.length)
+        .ok_or(InspectionError::LimitExceeded)?
+        > source_bytes
+    {
+        return Err(InspectionError::LimitExceeded);
+    }
+    let mut committed = Vec::new();
+    read_sealed(root, &manifest, &mut committed).map_err(|_| InspectionError::CorruptSource)?;
+    if unexplained_segments(root, &manifest).map_err(|_| InspectionError::CorruptSource)? {
+        return Err(InspectionError::CorruptSource);
+    }
+    let active = inspection_read(events_file, events_len)?;
+    let committed = if committed.is_empty() {
+        active
+    } else {
+        committed.extend(active);
+        committed
+    };
+    let transactions = decode(&committed, &manifest).map_err(|_| InspectionError::CorruptSource)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -513,6 +653,91 @@ fn read(path: &Path) -> Result<Vec<u8>, EventLogError> {
     regular(path)?;
     fs::read(path).map_err(backend)
 }
+
+/// Append every sealed segment `manifest` names to `into`, in history order, and return the stamp
+/// each file earned while it was read ([`trusted`]). Nothing on `eventlog-file/1`.
+///
+/// Each segment must be a regular file of exactly its committed length ending at a frame
+/// boundary, under a `segments` directory that is a physical directory: a missing, short, long or
+/// linked segment refuses. A frame never spans two files, so a sealed segment that does not end
+/// in a newline is not a segment any writer sealed.
+fn read_sealed(
+    root: &Path,
+    manifest: &Manifest,
+    into: &mut Vec<u8>,
+) -> Result<Vec<Option<Stamp>>, EventLogError> {
+    let sealed = manifest.sealed();
+    if sealed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !physical_directory(&root.join("segments")).map_err(backend)? {
+        return Err(corrupt());
+    }
+    let mut stamps = Vec::with_capacity(sealed.len());
+    for (index, length) in sealed.iter().enumerate() {
+        let path = segment_path(root, index);
+        regular(&path)?;
+        let mut file = File::open(&path).map_err(backend)?;
+        let started = now_ns();
+        let before = Stamp::of(&file);
+        let start = into.len();
+        (&mut file)
+            .take(length.checked_add(1).ok_or_else(corrupt)?)
+            .read_to_end(into)
+            .map_err(backend)?;
+        if (into.len() - start) as u64 != *length || into.last() != Some(&b'\n') {
+            return Err(corrupt());
+        }
+        stamps.push(trusted(before, Stamp::of(&file), started));
+    }
+    Ok(stamps)
+}
+
+/// Whether `segments/` holds an entry `manifest` does not name. Only an interrupted seal leaves
+/// one, and only beside its durable intent, which recovery resolves first; any other is not
+/// committed history, and a complete reader refuses it rather than guess what it is.
+fn unexplained_segments(root: &Path, manifest: &Manifest) -> Result<bool, EventLogError> {
+    if manifest.segments.is_none() {
+        return Ok(false);
+    }
+    let entries = match fs::read_dir(root.join("segments")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(!manifest.sealed().is_empty());
+        }
+        Err(error) => return Err(backend(error)),
+    };
+    let named = manifest.sealed().len();
+    for entry in entries {
+        let name = entry.map_err(backend)?.file_name();
+        let explained = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".jsonl"))
+            .filter(|index| index.len() == 10 && index.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|index| index.parse::<usize>().ok())
+            .is_some_and(|index| index < named);
+        if !explained {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Remove sealed segments `0..count` of a retired epoch, and synchronize their directory.
+/// Absent ones are already gone: a recovery may be finishing what an interrupted run began.
+fn remove_sealed(root: &Path, count: usize) -> Result<(), EventLogError> {
+    if count == 0 {
+        return Ok(());
+    }
+    for index in 0..count {
+        match fs::remove_file(segment_path(root, index)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(backend(error)),
+        }
+    }
+    sync_dir(&root.join("segments"))
+}
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), EventLogError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -532,15 +757,21 @@ fn atomic_json(root: &Path, name: &str, value: &impl Serialize) -> Result<(), Ev
 
 impl Journal {
     pub fn open(root: &Path) -> Result<Self, EventLogError> {
-        Self::open_with_creation(root, true)
+        Self::open_with_creation(root, Some(FileLayout::Single))
+    }
+
+    /// Open a journal, creating a missing store in `layout`. An existing store keeps its own.
+    pub fn open_with_layout(root: &Path, layout: FileLayout) -> Result<Self, EventLogError> {
+        Self::open_with_creation(root, Some(layout))
     }
 
     /// Open a provisioned journal without minting any missing authority.
     pub fn open_existing(root: &Path) -> Result<Self, EventLogError> {
-        Self::open_with_creation(root, false)
+        Self::open_with_creation(root, None)
     }
 
-    fn open_with_creation(root: &Path, create: bool) -> Result<Self, EventLogError> {
+    fn open_with_creation(root: &Path, layout: Option<FileLayout>) -> Result<Self, EventLogError> {
+        let create = layout.is_some();
         #[cfg(test)]
         let _hashing = crate::cost::hashing_for(root);
         // A tree store keeps its history as one file per event under `store.json`. Opening one
@@ -577,13 +808,29 @@ impl Journal {
             if root.join("events.jsonl").exists() || root.join("privacy.json").exists() {
                 return Err(corrupt());
             }
+            let (format, segments) = match layout {
+                Some(FileLayout::Segmented { seal_at }) if seal_at >= 1 => (
+                    SEGMENTED_FORMAT,
+                    Some(Segments {
+                        seal_at,
+                        sealed: Vec::new(),
+                    }),
+                ),
+                Some(FileLayout::Segmented { .. }) => {
+                    return Err(EventLogError::Invalid(
+                        "a segmented file store seals at one byte or more".into(),
+                    ));
+                }
+                _ => (FORMAT, None),
+            };
             let manifest = Manifest {
-                format: FORMAT.into(),
+                format: format.into(),
                 store: new_event_id(),
                 epoch: 0,
                 sequence: 0,
                 length: 0,
                 digest: ZERO.into(),
+                segments,
             };
             write_synced(&root.join("events.jsonl"), b"")?;
             sync_dir(root)?;
@@ -594,7 +841,7 @@ impl Journal {
         }
         let mut manifest: Manifest =
             serde_json::from_slice(&read(&manifest_path)?).map_err(|_| corrupt())?;
-        if manifest.format != FORMAT {
+        if !manifest.known() {
             return Err(corrupt());
         }
         if root.join("privacy.json").exists() && root.join("append.json").exists() {
@@ -614,15 +861,20 @@ impl Journal {
             .write(true)
             .open(&events_path)
             .map_err(backend)?;
-        if events.metadata().map_err(backend)?.len() < manifest.length {
+        let active = manifest.active_length();
+        if events.metadata().map_err(backend)?.len() < active {
+            return Err(corrupt());
+        }
+        // Sized from the committed length: this vector becomes the handle's kept bytes.
+        let mut committed = Vec::with_capacity(usize::try_from(manifest.length).map_err(backend)?);
+        let sealed = read_sealed(root, &manifest, &mut committed)?;
+        if unexplained_segments(root, &manifest)? {
             return Err(corrupt());
         }
         let started = now_ns();
         let before = Stamp::of(&events);
-        // Sized from the committed length: this vector becomes the handle's kept bytes.
-        let mut committed = Vec::with_capacity(usize::try_from(manifest.length).map_err(backend)?);
         (&mut events)
-            .take(manifest.length)
+            .take(active)
             .read_to_end(&mut committed)
             .map_err(backend)?;
         let transactions = decode(&committed, &manifest)?;
@@ -630,10 +882,12 @@ impl Journal {
         crate::cost::charge(root, |cost| {
             cost.frames_chained += transactions.len() as u64;
         });
-        if events.metadata().map_err(backend)?.len() > manifest.length {
+        if events.metadata().map_err(backend)?.len() > active {
             return Err(corrupt());
         }
-        let content = Content::of(committed).stamped(trusted(before, Stamp::of(&events), started));
+        let content = Content::of(committed)
+            .stamped(trusted(before, Stamp::of(&events), started))
+            .sealed_stamped(sealed);
         sweep_unselected(root)?;
         sync_dir(root)?;
         Ok(Self {
@@ -662,6 +916,16 @@ impl Journal {
             .checked_add(line.len() as u64)
             .ok_or_else(corrupt)?;
         next.digest = digest;
+        // A segmented store whose active segment has reached its seal size seals it first: the
+        // frame then opens a new active segment, and the sealed one is never written again.
+        let active = self.manifest.active_length();
+        let seal = self
+            .manifest
+            .seal_at()
+            .is_some_and(|seal_at| active > 0 && active >= seal_at);
+        if seal && let Some(segments) = next.segments.as_mut() {
+            segments.sealed.push(active);
+        }
         let intent = AppendIntent {
             before: self.manifest.clone(),
             after: next.clone(),
@@ -669,18 +933,27 @@ impl Journal {
         };
         atomic_json(&self.root, "append.json", &intent)?;
         checkpoint("append-prepared");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(self.root.join("events.jsonl"))
-            .map_err(backend)?;
-        file.seek(SeekFrom::Start(self.manifest.length))
-            .map_err(backend)?;
+        let events = self.root.join("events.jsonl");
+        let mut file = if seal {
+            self.seal_active(&events)?
+        } else {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&events)
+                .map_err(backend)?;
+            file.seek(SeekFrom::Start(active)).map_err(backend)?;
+            file
+        };
         let midpoint = line.len() / 2;
         file.write_all(&line[..midpoint]).map_err(backend)?;
         checkpoint("append-torn");
         file.write_all(&line[midpoint..])
             .and_then(|()| file.sync_all())
             .map_err(backend)?;
+        if seal {
+            // The new active segment's directory entry is durable before the manifest names it.
+            sync_dir(&self.root)?;
+        }
         // Failure after the rename can mean the commit exists. Do not encourage a new identity.
         checkpoint("append-synced");
         atomic_json(&self.root, "manifest.json", &next)
@@ -695,8 +968,46 @@ impl Journal {
         });
         self.manifest = next;
         self.transactions.push(transaction);
+        if seal {
+            self.content.seal();
+        }
         self.content.absorb(&line);
         Ok(())
+    }
+
+    /// Move the active segment to its sealed name and create an empty active segment, returning it
+    /// open for the frame. Runs after `append.json` names the seal, so an interruption anywhere
+    /// here is undone by [`recover_append`]: a sealed name the manifest does not list yet is moved
+    /// back over `events.jsonl`.
+    ///
+    /// A name already taken refuses: the manifest names every sealed segment, so one more is
+    /// nothing a writer made, and a rename would silently replace it.
+    fn seal_active(&self, events: &Path) -> Result<File, EventLogError> {
+        let directory = self.root.join("segments");
+        match physical_directory(&directory) {
+            Ok(true) => {}
+            Ok(false) => return Err(corrupt()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory).map_err(backend)?;
+                sync_dir(&self.root)?;
+            }
+            Err(error) => return Err(backend(error)),
+        }
+        let target = segment_path(&self.root, self.manifest.sealed().len());
+        match fs::symlink_metadata(&target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(corrupt()),
+            Err(error) => return Err(backend(error)),
+        }
+        fs::rename(events, &target).map_err(backend)?;
+        sync_dir(&directory)?;
+        sync_dir(&self.root)?;
+        checkpoint("append-sealed");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(events)
+            .map_err(backend)
     }
 
     /// The committed bytes this journal decoded, for a test that resumes onto them.
@@ -786,6 +1097,11 @@ impl Journal {
         next.sequence = 0;
         next.length = 0;
         next.digest = ZERO.into();
+        // The new epoch's history is one active segment; the retired epoch's sealed segments hold
+        // the bytes this rewrite removes, and its recovery deletes them after the switch.
+        if let Some(segments) = next.segments.as_mut() {
+            segments.sealed.clear();
+        }
         let mut bytes = Vec::new();
         for transaction in &transactions {
             next.sequence += 1;
@@ -850,63 +1166,150 @@ fn resumed_committed(
     }
     let manifest: Manifest =
         serde_json::from_slice(&read(&manifest_path)?).map_err(|_| corrupt())?;
-    if manifest.format != FORMAT {
+    if !manifest.known() {
         return Err(corrupt());
     }
-    if manifest.store != observed.store
+    if manifest.format != observed.format
+        || manifest.store != observed.store
         || manifest.epoch != observed.epoch
         || manifest.sequence < observed.sequence
         || manifest.length < observed.length
+        || content.length() != observed.length
     {
         return Ok(None);
     }
+    // The segments this handle verified are still sealed at the lengths it verified, and the one
+    // it saw active has at most grown, whether or not it has been sealed since. Anything else is
+    // not an extension of the observed history, and the complete opener decides it.
+    let observed_sealed = observed.sealed();
+    let sealed = manifest.sealed();
+    let held = observed_sealed.len();
+    if manifest.seal_at() != observed.seal_at()
+        || sealed.len() < held
+        || sealed[..held] != *observed_sealed
+        || sealed
+            .get(held)
+            .is_some_and(|length| *length < observed.active_length())
+    {
+        return Ok(None);
+    }
+    if !sealed.is_empty() && !physical_directory(&root.join("segments")).map_err(backend)? {
+        return Err(corrupt());
+    }
     let events_path = root.join("events.jsonl");
     regular(&events_path)?;
-    if fs::metadata(&events_path).map_err(backend)?.len() != manifest.length {
+    if fs::metadata(&events_path).map_err(backend)?.len() != manifest.active_length() {
         return Ok(None);
     }
-    let mut events = File::open(&events_path).map_err(backend)?;
-    let started = now_ns();
-    let before = Stamp::of(&events);
-    // A file that still carries the stamp taken when these bytes were verified still holds them,
-    // and nothing was appended: its length is in the stamp. Nothing needs re-reading.
-    if content.stamp.is_some() && content.stamp == before && manifest == *observed {
-        #[cfg(test)]
-        crate::cost::charge(root, |cost| {
-            cost.resumes_trusted += 1;
-        });
-        return Ok(Some((manifest, Vec::new(), content.clone())));
-    }
-    // Otherwise the committed prefix is re-read as raw bytes and compared with the bytes this
-    // handle verified: cheaper than decoding and rechaining it, cheaper than hashing it, and the
-    // only way a handle can tell that what it verified is still there. Any difference — a byte,
-    // or a length the view does not have — is the same answer a different digest was.
-    if content.length() != observed.length || !same_prefix(root, &mut events, content)? {
-        return Ok(None);
-    }
-    // The bytes just matched are the view's own; carrying it costs a reference count.
-    let mut observed_content = content.clone();
-    // Past the prefix: an unchanged head reads nothing more.
-    let fresh = if manifest == *observed {
-        Vec::new()
-    } else {
-        let mut tail = Vec::new();
-        events.read_to_end(&mut tail).map_err(backend)?;
-        match decode_chain(&tail, &manifest, observed.sequence, &observed.digest) {
-            Ok(fresh) => {
-                observed_content.absorb(&tail);
-                fresh
+    // Every file of the committed history, in order: each sealed segment, then the active one.
+    // For each, the bytes of it this handle verified (all of an observed sealed segment, the
+    // observed length of the segment it saw active, none of a newer one) are either vouched for
+    // by an unchanged trusted stamp or re-read and compared with the bytes it kept; the bytes past
+    // them are read into the tail, which must chain from the observed head. On `eventlog-file/1`
+    // this is one file, `events.jsonl`, exactly as before.
+    let retained = content.retained.bytes();
+    let mut offset = 0_usize;
+    let mut compared = 0_u64;
+    let mut read_any = false;
+    let mut tail = Vec::new();
+    let mut stamps = Vec::with_capacity(sealed.len() + 1);
+    for index in 0..=sealed.len() {
+        let is_sealed = index < sealed.len();
+        let (path, committed) = if is_sealed {
+            (segment_path(root, index), sealed[index])
+        } else {
+            (events_path.clone(), manifest.active_length())
+        };
+        let (verified, kept) = match index.cmp(&held) {
+            std::cmp::Ordering::Less => (
+                observed_sealed[index],
+                content.sealed.get(index).copied().flatten(),
+            ),
+            std::cmp::Ordering::Equal => (observed.active_length(), content.stamp),
+            std::cmp::Ordering::Greater => (0, None),
+        };
+        let verified_len = usize::try_from(verified).map_err(backend)?;
+        if is_sealed {
+            let metadata = fs::symlink_metadata(&path).map_err(backend)?;
+            if !metadata.is_file() {
+                return Err(corrupt());
             }
-            Err(_) => return Ok(None),
+            // A sealed segment that still carries the stamp taken when its bytes were verified
+            // still holds them: a stamp is only kept once the file has held still for the whole
+            // untrusted window, and its length is in it. Nothing of it needs re-reading.
+            if kept.is_some() && kept == Stamp::from_metadata(&metadata) && verified == committed {
+                stamps.push(kept);
+                offset += verified_len;
+                continue;
+            }
         }
+        let mut file = File::open(&path).map_err(backend)?;
+        let started = now_ns();
+        let before = Stamp::of(&file);
+        // The same rule for the active segment, which `eventlog-file/1` has always applied to its
+        // one file.
+        if !is_sealed && kept.is_some() && kept == before && verified == committed {
+            stamps.push(kept);
+            offset += verified_len;
+            continue;
+        }
+        read_any = true;
+        // Otherwise the bytes this handle verified are re-read as raw bytes and compared with the
+        // bytes it kept: cheaper than decoding and rechaining them, cheaper than hashing them,
+        // and the only way a handle can tell that what it verified is still there. Any difference
+        // — a byte, or a length the view does not have — is the same answer a different digest
+        // was.
+        if !same_bytes(&mut file, &retained[offset..offset + verified_len])? {
+            return Ok(None);
+        }
+        offset += verified_len;
+        compared += verified;
+        let rest = committed - verified;
+        let start = tail.len();
+        (&mut file)
+            .take(rest.checked_add(1).ok_or_else(corrupt)?)
+            .read_to_end(&mut tail)
+            .map_err(backend)?;
+        if (tail.len() - start) as u64 != rest {
+            return Ok(None);
+        }
+        // A frame never spans two files: a sealed segment ends at a frame boundary.
+        if is_sealed && rest > 0 && tail.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        // Every byte of this file has now been read and matched or read for the tail; stamp it
+        // for the next resume.
+        stamps.push(trusted(before, Stamp::of(&file), started));
+    }
+    drop(retained);
+    #[cfg(not(test))]
+    let _ = (compared, read_any);
+    #[cfg(test)]
+    crate::cost::charge(root, |cost| {
+        if read_any {
+            cost.prefix_bytes_compared += compared;
+        } else {
+            cost.resumes_trusted += 1;
+        }
+    });
+    // Past the observed head: an unchanged head has an empty tail, which chains only when the
+    // manifest is the observed one.
+    let Ok(fresh) = decode_chain(&tail, &manifest, observed.sequence, &observed.digest) else {
+        return Ok(None);
     };
     #[cfg(test)]
     crate::cost::charge(root, |cost| {
         cost.frames_chained += fresh.len() as u64;
     });
-    // Every byte of the file has now been read and matched; stamp them for the next resume.
-    let observed_content = observed_content.stamped(trusted(before, Stamp::of(&events), started));
-    Ok(Some((manifest, fresh, observed_content)))
+    // The bytes just matched are the view's own; carrying it costs a reference count.
+    let mut resumed = content.clone();
+    resumed.absorb(&tail);
+    let active = stamps.pop().flatten();
+    Ok(Some((
+        manifest,
+        fresh,
+        resumed.stamped(active).sealed_stamped(stamps),
+    )))
 }
 
 /// Whether the committed history still contains the exact prefix a handle observed.
@@ -1131,7 +1534,7 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| damaged())?)
             .map_err(|_| damaged())?;
-    if manifest.format != FORMAT {
+    if !manifest.known() {
         return Err(damaged());
     }
     let events_path = root.join("events.jsonl");
@@ -1141,11 +1544,23 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
     {
         return Err(damaged());
     }
-    let committed = fs::read(&events_path).map_err(|_| damaged())?;
-    // Surplus bytes are as much a refusal as missing ones: neither is history this manifest commits.
-    if committed.len() as u64 != manifest.length {
+    // Sealed segments first, each exactly its committed length; then the active segment.
+    let mut sealed = Vec::new();
+    read_sealed(root, &manifest, &mut sealed).map_err(|_| damaged())?;
+    if unexplained_segments(root, &manifest).map_err(|_| damaged())? {
         return Err(damaged());
     }
+    let active = fs::read(&events_path).map_err(|_| damaged())?;
+    // Surplus bytes are as much a refusal as missing ones: neither is history this manifest commits.
+    if active.len() as u64 != manifest.active_length() {
+        return Err(damaged());
+    }
+    let committed = if sealed.is_empty() {
+        active
+    } else {
+        sealed.extend(active);
+        sealed
+    };
     let transactions = decode(&committed, &manifest).map_err(|_| damaged())?;
     #[cfg(test)]
     crate::cost::charge(root, |cost| {
@@ -1206,30 +1621,87 @@ fn recover_append(root: &Path, current: &Manifest) -> Result<(), EventLogError> 
     if current != &intent.before && current != &intent.after {
         return Err(corrupt());
     }
-    let mut bytes = read(&root.join("events.jsonl"))?;
-    let boundary = usize::try_from(intent.before.length).map_err(backend)?;
-    if bytes.len() < boundary {
+    let (before, after) = (&intent.before, &intent.after);
+    let held = before.sealed().len();
+    // An append either leaves the sealed segments alone or seals exactly the active segment it
+    // found: one more sealed segment, of exactly the active length before it.
+    let sealing = after.sealed().len() == held + 1;
+    if !before.known()
+        || !after.known()
+        || after.format != before.format
+        || after.seal_at() != before.seal_at()
+        || after.sealed()[..held.min(after.sealed().len())] != *before.sealed()
+        || (sealing && after.sealed()[held] != before.active_length())
+        || (!sealing && after.sealed().len() != held)
+    {
         return Err(corrupt());
     }
-    decode(&bytes[..boundary], &intent.before)?;
-    let suffix = &bytes[boundary..];
-    if !intent.frame.as_bytes().starts_with(suffix) {
-        return Err(corrupt());
-    }
-    let mut planned = bytes[..boundary].to_vec();
-    planned.extend(intent.frame.as_bytes());
-    decode(&planned, &intent.after)?;
-    if current == &intent.after {
-        decode(&bytes, current)?;
+    let events = root.join("events.jsonl");
+    let mut prefix = Vec::new();
+    read_sealed(root, before, &mut prefix)?;
+    if sealing {
+        let target = segment_path(root, held);
+        let renamed = match fs::symlink_metadata(&target) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(backend(error)),
+        };
+        if current == before {
+            // Uncommitted: put the active segment back where the manifest says it is. A sealing
+            // append never writes into the segment it seals, so that is the whole of the undo,
+            // and it replaces whatever part of the new active segment was written.
+            if renamed {
+                regular(&target)?;
+                fs::rename(&target, &events).map_err(backend)?;
+                sync_dir(&root.join("segments"))?;
+                sync_dir(root)?;
+            }
+            let mut committed = prefix;
+            committed.extend(read(&events)?);
+            decode(&committed, before)?;
+            let mut planned = committed;
+            planned.extend(intent.frame.as_bytes());
+            decode(&planned, after)?;
+        } else {
+            if !renamed {
+                return Err(corrupt());
+            }
+            let mut committed = Vec::new();
+            read_sealed(root, after, &mut committed)?;
+            committed.extend(read(&events)?);
+            decode(&committed, after)?;
+        }
     } else {
-        bytes.truncate(boundary);
-        let file = OpenOptions::new()
-            .write(true)
-            .open(root.join("events.jsonl"))
-            .map_err(backend)?;
-        file.set_len(intent.before.length)
-            .and_then(|()| file.sync_all())
-            .map_err(backend)?;
+        let mut bytes = read(&events)?;
+        let boundary = usize::try_from(before.active_length()).map_err(backend)?;
+        if bytes.len() < boundary {
+            return Err(corrupt());
+        }
+        let mut committed = prefix;
+        let sealed_length = committed.len();
+        committed.extend(&bytes[..boundary]);
+        decode(&committed, before)?;
+        let suffix = &bytes[boundary..];
+        if !intent.frame.as_bytes().starts_with(suffix) {
+            return Err(corrupt());
+        }
+        let mut planned = committed;
+        planned.extend(intent.frame.as_bytes());
+        decode(&planned, after)?;
+        if current == after {
+            planned.truncate(sealed_length);
+            planned.extend(&bytes);
+            decode(&planned, current)?;
+        } else {
+            bytes.truncate(boundary);
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&events)
+                .map_err(backend)?;
+            file.set_len(before.active_length())
+                .and_then(|()| file.sync_all())
+                .map_err(backend)?;
+        }
     }
     fs::remove_file(root.join("append.json")).map_err(backend)?;
     sync_dir(root)
@@ -1242,7 +1714,7 @@ fn encode(
     transaction: Value,
 ) -> Result<(Vec<u8>, String), EventLogError> {
     let mut frame = Frame {
-        format: FORMAT.into(),
+        format: manifest.format.clone(),
         store: manifest.store.clone(),
         epoch: manifest.epoch,
         sequence,
@@ -1277,7 +1749,7 @@ fn decode_chain(
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let mut frame: Frame = serde_json::from_slice(line).map_err(|_| corrupt())?;
         sequence = sequence.checked_add(1).ok_or_else(corrupt)?;
-        if frame.format != FORMAT
+        if frame.format != manifest.format
             || frame.store != manifest.store
             || frame.epoch != manifest.epoch
             || frame.sequence != sequence
@@ -1303,6 +1775,11 @@ fn recover_privacy(root: &Path, current: &Manifest) -> Result<Manifest, EventLog
     if (current != &intent.before && current != &intent.after)
         || intent.before.store != intent.after.store
         || intent.after.epoch != intent.before.epoch.checked_add(1).ok_or_else(corrupt)?
+        || !intent.before.known()
+        || !intent.after.known()
+        || intent.after.format != intent.before.format
+        || intent.after.seal_at() != intent.before.seal_at()
+        || !intent.after.sealed().is_empty()
     {
         return Err(corrupt());
     }
@@ -1310,7 +1787,10 @@ fn recover_privacy(root: &Path, current: &Manifest) -> Result<Manifest, EventLog
     if hash(&events) == intent.replacement_digest {
         decode(&events, &intent.after)?;
     } else {
-        decode(&events, &intent.before)?;
+        let mut committed = Vec::new();
+        read_sealed(root, &intent.before, &mut committed)?;
+        committed.extend(events);
+        decode(&committed, &intent.before)?;
         let replacement = read(&root.join("privacy.next"))?;
         if hash(&replacement) != intent.replacement_digest {
             return Err(corrupt());
@@ -1322,6 +1802,9 @@ fn recover_privacy(root: &Path, current: &Manifest) -> Result<Manifest, EventLog
     }
     atomic_json(root, "manifest.json", &intent.after)?;
     checkpoint("privacy-committed");
+    // The retired epoch's sealed segments hold bytes the rewrite removed. They go before the
+    // intent does, so an interruption here leaves the intent that finishes the removal.
+    remove_sealed(root, intent.before.sealed().len())?;
     if root.join("privacy.next").exists() {
         fs::remove_file(root.join("privacy.next")).map_err(backend)?;
     }
@@ -2150,5 +2633,256 @@ mod tests {
              how the five entry points came to disagree:\n  {}",
             written_by_hand.join("\n  ")
         );
+    }
+
+    /// Every file under `root`, recursively, as one lossy string: what a privacy rewrite must have
+    /// removed a body from, sealed segments included.
+    fn every_byte_below(root: &Path) -> String {
+        let mut all = String::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                all.push_str(&every_byte_below(&path));
+            } else {
+                all.push_str(&String::from_utf8_lossy(&fs::read(path).unwrap()));
+            }
+        }
+        all
+    }
+
+    const SEAL_EVERY_FRAME: FileLayout = FileLayout::Segmented { seal_at: 1 };
+
+    /// The segmented layout's append boundaries, including the one a seal adds: the active
+    /// segment moved to its sealed name and no new active segment yet. Every boundary before the
+    /// manifest leaves the history as it was, sealed nothing, and appends again; the one after it
+    /// leaves the sealed segment and the new frame.
+    #[test]
+    fn process_death_at_each_segmented_append_boundary() {
+        for point in [
+            "append-prepared",
+            "append-sealed",
+            "append-torn",
+            "append-synced",
+            "append-committed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            {
+                let mut journal = Journal::open_with_layout(root.path(), SEAL_EVERY_FRAME).unwrap();
+                journal.append(json!({"value": "original"})).unwrap();
+                assert_eq!(journal.manifest.sealed(), [0_u64; 0]);
+            }
+            // The child opens the existing store, so the store's own seal size makes it seal.
+            crash(root.path(), point);
+            let mut journal = Journal::open(root.path()).unwrap();
+            let committed = point == "append-committed";
+            assert_eq!(journal.transactions[0], json!({"value":"original"}));
+            assert_eq!(
+                journal.transactions.len(),
+                if committed { 2 } else { 1 },
+                "{point}"
+            );
+            assert_eq!(
+                journal.manifest.sealed().len(),
+                usize::from(committed),
+                "{point}"
+            );
+            assert!(!root.path().join("append.json").exists(), "{point}");
+            assert_eq!(
+                fs::metadata(root.path().join("events.jsonl"))
+                    .unwrap()
+                    .len(),
+                journal.manifest.active_length(),
+                "{point}"
+            );
+            journal.append(json!({"value": "after"})).unwrap();
+            drop(journal);
+            assert_eq!(
+                Journal::open(root.path()).unwrap().transactions.len(),
+                if committed { 3 } else { 2 },
+                "{point}"
+            );
+        }
+    }
+
+    /// A privacy rewrite of a segmented store removes the retired epoch's sealed segments, at
+    /// every boundary it can be interrupted at, including after the manifest switched and before
+    /// the segments were removed.
+    #[test]
+    fn process_death_at_each_segmented_privacy_boundary() {
+        for point in ["privacy-prepared", "privacy-renamed", "privacy-committed"] {
+            let root = tempfile::tempdir().unwrap();
+            {
+                let mut journal = Journal::open_with_layout(root.path(), SEAL_EVERY_FRAME).unwrap();
+                journal
+                    .append(json!({"value": "sensitive-old-body"}))
+                    .unwrap();
+                journal.append(json!({"value": "later"})).unwrap();
+                assert_eq!(journal.manifest.sealed().len(), 1);
+            }
+            assert!(every_byte_below(&root.path().join("segments")).contains("sensitive-old-body"));
+            crash(root.path(), point);
+            let journal = Journal::open(root.path()).unwrap();
+            assert_eq!(journal.transactions, vec![json!({"value":"erased"})]);
+            assert_eq!(journal.manifest.sealed(), [0_u64; 0], "{point}");
+            assert!(
+                !every_byte_below(root.path()).contains("sensitive-old-body"),
+                "{point}: a retired sealed segment survived the rewrite"
+            );
+        }
+    }
+
+    /// A manifest names one of the two layouts this release reads, consistently, or nothing opens
+    /// it: segment records on `eventlog-file/1`, none on `eventlog-file/2`, a zero seal size, an
+    /// empty sealed segment, or sealed segments longer than the history.
+    #[test]
+    fn a_manifest_that_misnames_its_layout_is_refused() {
+        type Change = fn(&mut Value);
+        let cases: [(&str, Change); 6] = [
+            ("segments on the single layout", |manifest| {
+                manifest["segments"] = json!({"seal_at": 1, "sealed": []});
+            }),
+            ("no segments on the segmented layout", |manifest| {
+                manifest["format"] = json!("eventlog-file/2");
+            }),
+            ("an unknown format", |manifest| {
+                manifest["format"] = json!("eventlog-file/3");
+            }),
+            ("a zero seal size", |manifest| {
+                manifest["format"] = json!("eventlog-file/2");
+                manifest["segments"] = json!({"seal_at": 0, "sealed": []});
+            }),
+            ("an empty sealed segment", |manifest| {
+                manifest["format"] = json!("eventlog-file/2");
+                manifest["segments"] = json!({"seal_at": 1, "sealed": [0]});
+            }),
+            ("sealed segments past the history", |manifest| {
+                manifest["format"] = json!("eventlog-file/2");
+                manifest["segments"] = json!({"seal_at": 1, "sealed": [1_000_000]});
+            }),
+        ];
+        for (name, change) in cases {
+            let root = tempfile::tempdir().unwrap();
+            drop(Journal::open(root.path()).unwrap());
+            let path = root.path().join("manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            change(&mut manifest);
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(Journal::open(root.path()).is_err(), "{name}");
+            assert!(open_strict(root.path()).is_err(), "{name}");
+            assert!(inspect(root.path(), u64::MAX).is_err(), "{name}");
+        }
+    }
+
+    /// A segmented resume over another writer's seals: the frames past the observed head are
+    /// chained across the new sealed segments; a sealed segment rewritten at its own length, or a
+    /// fork that keeps the observed lengths, is handed to the complete opener.
+    #[test]
+    fn a_segmented_resume_reads_past_its_head_across_seals_and_refuses_a_rewritten_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open_with_layout(root.path(), SEAL_EVERY_FRAME).unwrap();
+        journal.append(json!({"value": 1})).unwrap();
+        journal.append(json!({"value": 2})).unwrap();
+        let observed = journal.manifest.clone();
+        let observed_content = journal.content();
+        drop(journal);
+        let mut other = Journal::open(root.path()).unwrap();
+        other.append(json!({"value": 3})).unwrap();
+        other.append(json!({"value": 4})).unwrap();
+        let head = other.manifest.clone();
+        let head_content = other.content();
+        drop(other);
+        assert_eq!(head.sealed().len(), 3);
+        let extended = Journal::resume(root.path(), &observed, &observed_content)
+            .unwrap()
+            .unwrap();
+        assert_eq!(extended.fresh, [json!({"value": 3}), json!({"value": 4})]);
+        assert_eq!(extended.manifest, head);
+        drop(extended);
+        let strict = resume_strict(root.path(), &observed, &observed_content).unwrap();
+        assert_eq!(strict.fresh.len(), 2);
+        drop(strict);
+
+        // The first sealed segment rewritten at its own length: the bytes this handle verified
+        // are not there any more, whichever resume asks.
+        let first = segment_path(root.path(), 0);
+        let original = fs::read(&first).unwrap();
+        let mut rewritten = original.clone();
+        let at = rewritten.windows(1).position(|b| b == b"1").unwrap();
+        rewritten[at] = b'7';
+        fs::write(&first, &rewritten).unwrap();
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_none()
+        );
+        assert!(resume_strict(root.path(), &head, &head_content).is_none());
+        assert!(Journal::open(root.path()).is_err());
+        assert!(open_strict(root.path()).is_err());
+        fs::write(&first, &original).unwrap();
+        assert!(
+            Journal::resume(root.path(), &head, &head_content)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The manifest's segment record is the ESS value `eventlog.file_layout.Segments`: its encoding
+    /// has exactly the committed schema's properties, each of the declared type, and nothing else.
+    #[test]
+    fn the_segment_record_serializes_to_its_committed_ess_schema() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../ess/file-layout-generated/schema/types/eventlog.file_layout.Segments.schema.json",
+        );
+        let schema: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(schema["$ref"], "#/$defs/eventlog.file_layout.Segments");
+        let node = &schema["$defs"]["eventlog.file_layout.Segments"];
+        assert_eq!(node["type"], "object");
+        assert_eq!(node["additionalProperties"], false);
+        let properties = node["properties"].as_object().unwrap();
+        let mut declared: Vec<_> = properties.keys().cloned().collect();
+        declared.sort();
+        let mut required: Vec<_> = node["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        required.sort();
+        assert_eq!(required, declared);
+        assert_eq!(
+            properties["seal_at"],
+            json!({"type": "integer", "minimum": 1})
+        );
+        assert_eq!(
+            properties["sealed"],
+            json!({"type": "array", "items": {"type": "integer"}})
+        );
+        let encoded = serde_json::to_value(Segments {
+            seal_at: 1,
+            sealed: vec![3, 4],
+        })
+        .unwrap();
+        let mut fields: Vec<_> = encoded.as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+        assert_eq!(fields, declared);
+        assert!(encoded["seal_at"].is_u64());
+        assert!(
+            encoded["sealed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(Value::is_u64)
+        );
+        // And it is what a segmented manifest carries, while a single-layout one carries none.
+        let root = tempfile::tempdir().unwrap();
+        let segmented = Journal::open_with_layout(root.path(), SEAL_EVERY_FRAME).unwrap();
+        let written = serde_json::to_value(&segmented.manifest).unwrap();
+        assert_eq!(written["format"], SEGMENTED_FORMAT);
+        assert_eq!(written["segments"], json!({"seal_at": 1, "sealed": []}));
+        drop(segmented);
+        let single = tempfile::tempdir().unwrap();
+        let written =
+            serde_json::to_value(&Journal::open(single.path()).unwrap().manifest).unwrap();
+        assert!(written.get("segments").is_none());
     }
 }
