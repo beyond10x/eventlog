@@ -926,6 +926,12 @@ impl Journal {
         if seal && let Some(segments) = next.segments.as_mut() {
             segments.sealed.push(active);
         }
+        // A seal that would refuse refuses before its intent exists: recovery reads an entry at
+        // the sealed name as the active segment the seal moved, so a refusal after the intent
+        // would leave recovery a foreign file to move over `events.jsonl`.
+        if seal {
+            self.seal_target_free()?;
+        }
         let intent = AppendIntent {
             before: self.manifest.clone(),
             after: next.clone(),
@@ -975,30 +981,42 @@ impl Journal {
         Ok(())
     }
 
+    /// Whether the next seal can take its name: `Ok(true)` when `segments/` is a physical
+    /// directory, `Ok(false)` when it does not exist yet. Anything else at `segments/`, or any
+    /// entry already at the next sealed name, refuses: the manifest names every sealed segment, so
+    /// one more is nothing a writer made, and a rename would silently replace it.
+    fn seal_target_free(&self) -> Result<bool, EventLogError> {
+        let exists = match physical_directory(&self.root.join("segments")) {
+            Ok(true) => true,
+            Ok(false) => return Err(corrupt()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(backend(error)),
+        };
+        if exists {
+            let target = segment_path(&self.root, self.manifest.sealed().len());
+            match fs::symlink_metadata(&target) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(corrupt()),
+                Err(error) => return Err(backend(error)),
+            }
+        }
+        Ok(exists)
+    }
+
     /// Move the active segment to its sealed name and create an empty active segment, returning it
     /// open for the frame. Runs after `append.json` names the seal, so an interruption anywhere
     /// here is undone by [`recover_append`]: a sealed name the manifest does not list yet is moved
     /// back over `events.jsonl`.
     ///
-    /// A name already taken refuses: the manifest names every sealed segment, so one more is
-    /// nothing a writer made, and a rename would silently replace it.
+    /// A name already taken refuses ([`Self::seal_target_free`], asked before the intent and
+    /// again here).
     fn seal_active(&self, events: &Path) -> Result<File, EventLogError> {
         let directory = self.root.join("segments");
-        match physical_directory(&directory) {
-            Ok(true) => {}
-            Ok(false) => return Err(corrupt()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&directory).map_err(backend)?;
-                sync_dir(&self.root)?;
-            }
-            Err(error) => return Err(backend(error)),
+        if !self.seal_target_free()? {
+            fs::create_dir(&directory).map_err(backend)?;
+            sync_dir(&self.root)?;
         }
         let target = segment_path(&self.root, self.manifest.sealed().len());
-        match fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => return Err(corrupt()),
-            Err(error) => return Err(backend(error)),
-        }
         fs::rename(events, &target).map_err(backend)?;
         sync_dir(&directory)?;
         sync_dir(&self.root)?;
@@ -1195,6 +1213,12 @@ fn resumed_committed(
     }
     if !sealed.is_empty() && !physical_directory(&root.join("segments")).map_err(backend)? {
         return Err(corrupt());
+    }
+    // A `segments/` entry the manifest does not name refuses the complete opener, the strict
+    // reader and the inspector; a resume hands it to the complete opener rather than serve or
+    // extend a store none of them accepts. One listing of `segments/`, on `eventlog-file/2` only.
+    if unexplained_segments(root, &manifest)? {
+        return Ok(None);
     }
     let events_path = root.join("events.jsonl");
     regular(&events_path)?;
@@ -1650,8 +1674,18 @@ fn recover_append(root: &Path, current: &Manifest) -> Result<(), EventLogError> 
             // Uncommitted: put the active segment back where the manifest says it is. A sealing
             // append never writes into the segment it seals, so that is the whole of the undo,
             // and it replaces whatever part of the new active segment was written.
+            //
+            // Only the segment this append moved goes back: a regular file of exactly the active
+            // length the intent recorded, whose bytes extend the sealed prefix into `before`.
+            // Anything else at that name is not ours to move, and `events.jsonl` is left alone.
             if renamed {
-                regular(&target)?;
+                let moved = read(&target)?;
+                if moved.len() as u64 != before.active_length() {
+                    return Err(corrupt());
+                }
+                let mut committed = prefix.clone();
+                committed.extend(&moved);
+                decode(&committed, before)?;
                 fs::rename(&target, &events).map_err(backend)?;
                 sync_dir(&root.join("segments"))?;
                 sync_dir(root)?;
@@ -2701,6 +2735,60 @@ mod tests {
                 if committed { 3 } else { 2 },
                 "{point}"
             );
+        }
+    }
+
+    /// A seal refused because its name is taken refuses before it writes an intent: nothing is
+    /// left for recovery to resolve, and the handle still appends no frame onto the taken name.
+    #[test]
+    fn a_seal_refused_by_a_taken_name_writes_no_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open_with_layout(root.path(), SEAL_EVERY_FRAME).unwrap();
+        journal.append(json!({"value": "original"})).unwrap();
+        let active = fs::read(root.path().join("events.jsonl")).unwrap();
+        fs::create_dir(root.path().join("segments")).unwrap();
+        fs::write(segment_path(root.path(), 0), b"not a segment\n").unwrap();
+        assert!(journal.append(json!({"value": "refused"})).is_err());
+        assert!(
+            !root.path().join("append.json").exists(),
+            "the refused seal left an intent for recovery to resolve"
+        );
+        assert_eq!(fs::read(root.path().join("events.jsonl")).unwrap(), active);
+    }
+
+    /// Recovery of a seal interrupted before its rename moves back only the segment the seal
+    /// moved. A file that appeared at the sealed name since, whether of another length or of the
+    /// active length with other bytes, is refused, and `events.jsonl` is left as it was.
+    #[test]
+    fn a_recovered_seal_moves_back_only_the_segment_it_sealed() {
+        for same_length in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            {
+                let mut journal = Journal::open_with_layout(root.path(), SEAL_EVERY_FRAME).unwrap();
+                journal.append(json!({"value": "original"})).unwrap();
+            }
+            crash(root.path(), "append-prepared");
+            assert!(root.path().join("append.json").exists());
+            let active = fs::read(root.path().join("events.jsonl")).unwrap();
+            let foreign = if same_length {
+                let mut bytes = vec![b'x'; active.len() - 1];
+                bytes.push(b'\n');
+                bytes
+            } else {
+                b"not a segment\n".to_vec()
+            };
+            fs::create_dir_all(root.path().join("segments")).unwrap();
+            fs::write(segment_path(root.path(), 0), &foreign).unwrap();
+            assert!(
+                Journal::open(root.path()).is_err(),
+                "same length: {same_length}"
+            );
+            assert_eq!(
+                fs::read(root.path().join("events.jsonl")).unwrap(),
+                active,
+                "same length: {same_length}: recovery moved a foreign file over the active segment"
+            );
+            assert_eq!(fs::read(segment_path(root.path(), 0)).unwrap(), foreign);
         }
     }
 
