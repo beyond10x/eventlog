@@ -2,11 +2,16 @@
 format: aep.planning-md/3
 id: story:postgres-feed-reads-drain-under-a-held-watermark
 kind: story
-status: draft
+status: active
 title: Postgres tests that read the feed once fail under a held commit watermark
 summary: atomic_group.rs:598 red 3/3 at base under load; e603605 drains 2 sites; 10 candidates, 1 non-member, :551 zero-branch hazard open
 owner: eventlog
-revision: 1
+relations:
+- serves: vision:O2
+revision: 3
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 3}
 ---
 ## Outcome
 
