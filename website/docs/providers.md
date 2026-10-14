@@ -27,6 +27,14 @@ capacity are outside the established proof.
 Keep the complete store together. `manifest.json` and the committed prefix of `events.jsonl`
 are authority, alongside referenced content. A manifest cannot be recreated from a guess.
 
+A store is created in the layout `eventlog-file/1` unless its owner opts in to the segmented
+layout `eventlog-file/2` with `FileEventStore::open_with_layout(path, FileLayout::segmented())`.
+Segmented stores keep sealed segments under `segments/`; those files are authority too. A segmented
+store's resumes after a write compare only the segments that changed recently, not the whole
+history. The layout is chosen when a store is created: an existing store keeps its own, nothing
+migrates, and every release reads both. Releases before the segmented layout refuse an
+`eventlog-file/2` store.
+
 Each handle indexes the events it has folded by stream. Within a call, a `stream_version` head
 lookup reads no event and a `read_stream` window reads the events it returns plus one, however
 many events other streams hold; feed, catch-up and projection rebuild reads walk the store in

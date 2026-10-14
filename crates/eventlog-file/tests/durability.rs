@@ -11,6 +11,8 @@ use std::{
     process::Command,
 };
 
+mod layouts;
+
 fn tenant() -> TenantId {
     TenantId::new("durable-owner").unwrap()
 }
@@ -146,8 +148,15 @@ async fn reopen_preserves_receipts_and_cache_deletion_preserves_authority() {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn privacy_removes_active_bytes_and_never_reuses_feed_positions() {
+    // On the segmented layout the secret's frame is sealed by the next append, so this also holds
+    // that a privacy rewrite removes every sealed segment of the epoch it retires.
+    for variant in [layouts::Variant::Single, layouts::Variant::SegmentedSealed] {
+        privacy_removes_active_bytes(variant).await;
+    }
+}
+async fn privacy_removes_active_bytes(variant: layouts::Variant) {
     let directory = tempfile::tempdir().unwrap();
-    let store = FileEventStore::open(directory.path()).await.unwrap();
+    let store = variant.open(directory.path()).await;
     let secret = "payload-marker-that-must-disappear";
     let request =
         [eventlog_core::NewEvent::new("item.created", 1, json!({"marker":secret})).unwrap()];
@@ -508,46 +517,56 @@ async fn a_bound_blob_removed_after_open_refuses_reads_without_changing_state() 
 /// a history no opener accepts, which is the opposite of leaving the history alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_damaged_committed_frame_refuses_the_next_append_without_altering_the_history() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = FileEventStore::open(directory.path()).await.unwrap();
-    store
-        .append(
-            &stream("a"),
-            Expected::NoStream,
-            &[event("item.created", 4242)],
-            &meta("first-frame", &json!({})),
-        )
-        .await
-        .unwrap();
-    // Damage inside the committed frame, leaving the committed length and the manifest untouched.
-    let events = directory.path().join("events.jsonl");
-    let committed = String::from_utf8(fs::read(&events).unwrap()).unwrap();
-    assert!(committed.contains("4242"));
-    fs::write(&events, committed.replacen("4242", "4243", 1)).unwrap();
-    let damaged = fs::read(&events).unwrap();
-    let manifest = fs::read(directory.path().join("manifest.json")).unwrap();
-    let appended = store
-        .append(
-            &stream("b"),
-            Expected::NoStream,
-            &[event("item.created", 1)],
-            &meta("after-damage", &json!({})),
-        )
-        .await;
-    assert!(
-        matches!(&appended, Err(EventLogError::Backend(message)) if message.contains("integrity")),
-        "the append refuses on the damaged prefix: {appended:?}"
-    );
-    assert_eq!(
-        fs::read(&events).unwrap(),
-        damaged,
-        "the refused append wrote no frame"
-    );
-    assert_eq!(
-        fs::read(directory.path().join("manifest.json")).unwrap(),
-        manifest,
-        "the refused append did not move the commit point"
-    );
+    // On both layouts, and on the segmented one with the damage in the active and in a sealed
+    // segment (`layouts::VARIANTS`).
+    for variant in layouts::VARIANTS {
+        let directory = tempfile::tempdir().unwrap();
+        let store = variant.open(directory.path()).await;
+        store
+            .append(
+                &stream("a"),
+                Expected::NoStream,
+                &[event("item.created", 4242)],
+                &meta("first-frame", &json!({})),
+            )
+            .await
+            .unwrap();
+        variant.settle(&store).await;
+        // Damage inside the committed frame, leaving every committed length and the manifest
+        // untouched.
+        let hit = layouts::damage_in_place(directory.path(), "4242", "4243");
+        layouts::assert_damaged_where(variant, directory.path(), &hit);
+        let files = layouts::journal_files(directory.path());
+        let damaged = layouts::history(directory.path());
+        let manifest = fs::read(directory.path().join("manifest.json")).unwrap();
+        let appended = store
+            .append(
+                &stream("b"),
+                Expected::NoStream,
+                &[event("item.created", 1)],
+                &meta("after-damage", &json!({})),
+            )
+            .await;
+        assert!(
+            matches!(&appended, Err(EventLogError::Backend(message)) if message.contains("integrity")),
+            "{variant:?}: the append refuses on the damaged prefix: {appended:?}"
+        );
+        assert_eq!(
+            layouts::journal_files(directory.path()),
+            files,
+            "{variant:?}: the refused append sealed no segment"
+        );
+        assert_eq!(
+            layouts::history(directory.path()),
+            damaged,
+            "{variant:?}: the refused append wrote no frame"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("manifest.json")).unwrap(),
+            manifest,
+            "{variant:?}: the refused append did not move the commit point"
+        );
+    }
 }
 /// What keeps a resumed handle from serving a retired generation is the generation comparison on
 /// load, not a disposal on the resumed path: inside one epoch no frame retires a generation, so

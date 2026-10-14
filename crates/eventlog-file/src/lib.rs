@@ -9,12 +9,15 @@ mod inline_admin;
 mod inspection;
 mod journal;
 pub use inspection::FileHistoryInspector;
+#[cfg(test)]
+mod measure_segmented;
 mod projection;
 mod state;
 #[cfg(test)]
 mod verify_content_once;
 
 pub use capture::FileTenantCapture;
+pub use journal::FileLayout;
 
 use eventlog_core::{
     AdmissionPermit, AppendGroup, AppendGroupResult, AppendResult, AtomicEventStore, BoxFuture,
@@ -117,7 +120,27 @@ impl FileEventStore {
     /// # Errors
     /// Refuses corrupt history, unknown formats and inaccessible storage.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, EventLogError> {
-        Self::open_with_creation(path.as_ref(), true).await
+        Self::open_with_creation(path.as_ref(), Some(FileLayout::Single)).await
+    }
+
+    /// Open the store as [`FileEventStore::open`] does, creating a missing one in `layout`.
+    ///
+    /// The layout is the owner's explicit opt-in, and it is chosen once, when the store is
+    /// created: a store that already exists is opened in the layout it has, whatever `layout`
+    /// says, and is never migrated. Every release reads both layouts.
+    /// # Errors
+    /// Refuses a segmented layout that seals at zero bytes with [`EventLogError::Invalid`], and
+    /// otherwise what [`FileEventStore::open`] refuses.
+    pub async fn open_with_layout(
+        path: impl AsRef<Path>,
+        layout: FileLayout,
+    ) -> Result<Self, EventLogError> {
+        if layout == (FileLayout::Segmented { seal_at: 0 }) {
+            return Err(EventLogError::Invalid(
+                "a segmented file store seals at one byte or more".into(),
+            ));
+        }
+        Self::open_with_creation(path.as_ref(), Some(layout)).await
     }
 
     /// Open an already provisioned store without creating a missing root, lock or manifest.
@@ -125,18 +148,18 @@ impl FileEventStore {
     /// # Errors
     /// Refuses missing or corrupt authority, unknown formats and inaccessible storage.
     pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self, EventLogError> {
-        Self::open_with_creation(path.as_ref(), false).await
+        Self::open_with_creation(path.as_ref(), None).await
     }
 
-    async fn open_with_creation(path: &Path, create: bool) -> Result<Self, EventLogError> {
+    async fn open_with_creation(
+        path: &Path,
+        layout: Option<FileLayout>,
+    ) -> Result<Self, EventLogError> {
         let root = root_path(path)?;
         let path = root.clone();
-        let journal = blocking(move || {
-            if create {
-                Journal::open(&path)
-            } else {
-                Journal::open_existing(&path)
-            }
+        let journal = blocking(move || match layout {
+            Some(layout) => Journal::open_with_layout(&path, layout),
+            None => Journal::open_existing(&path),
         })
         .await?;
         State::replay(&journal.transactions)?;
@@ -2612,6 +2635,96 @@ mod stamped_resume_cost {
 
     fn stream() -> StreamId {
         StreamId::new(TenantId::new("stamp-cost").unwrap(), "item", "one").unwrap()
+    }
+
+    /// The committed length, and the bytes a resume of a segmented store cannot vouch for by a
+    /// stamp right after `own_append`: the active segment, and the segment the append sealed when
+    /// it sealed one (that file changed just now). Everything else was verified after the window.
+    fn untrusted_after(root: &Path, sealed_before: usize) -> (u64, u64) {
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        let committed = manifest["length"].as_u64().unwrap();
+        let sealed: Vec<u64> = manifest["segments"]["sealed"]
+            .as_array()
+            .map(|sealed| sealed.iter().map(|l| l.as_u64().unwrap()).collect())
+            .unwrap_or_default();
+        let active = committed - sealed.iter().sum::<u64>();
+        let young: u64 = sealed[sealed_before.min(sealed.len())..].iter().sum();
+        (committed, active + young)
+    }
+
+    /// story:incremental-history-digest-for-a-resumed-handle. A handle's own append puts every
+    /// resume after it inside the untrusted window. On `eventlog-file/1` each of those resumes
+    /// re-reads and compares the whole committed prefix — the control, and the cost the story
+    /// exists for. On `eventlog-file/2` a resume compares only the segments it holds no trusted
+    /// stamp for: the active one and any the append just sealed. Every sealed segment the handle
+    /// verified after the window is vouched for by its unchanged stamp, as `eventlog-file/1`
+    /// vouches for its one file outside the window. Nothing is hashed on either path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_segmented_resume_compares_only_the_segments_it_cannot_trust() {
+        for layout in [FileLayout::Single, FileLayout::Segmented { seal_at: 1024 }] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            {
+                let store = FileEventStore::open_with_layout(root, layout)
+                    .await
+                    .unwrap();
+                for index in 0..40 {
+                    let stream =
+                        StreamId::new(stream().tenant().clone(), "item", format!("s{index}"))
+                            .unwrap();
+                    store
+                        .append(
+                            &stream,
+                            Expected::NoStream,
+                            &[event("item.changed", index)],
+                            &meta(&format!("seed-{index}"), &serde_json::json!({})),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            // Past the window: the next open stamps every file it verifies.
+            tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+            let store = FileEventStore::open(root).await.unwrap();
+            let sealed_before = fs::read_dir(root.join("segments")).map_or(0, Iterator::count);
+            store
+                .append(
+                    &stream(),
+                    Expected::NoStream,
+                    &[event("item.changed", 1)],
+                    &meta("own", &serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+            let (committed, untrusted) = untrusted_after(root, sealed_before);
+            for read in 0..2 {
+                let before = crate::cost::of(root);
+                store.read_stream(&stream(), 0, 10).await.unwrap();
+                let cost = crate::cost::of(root) - before;
+                assert_eq!(cost.journal_bytes_hashed, 0, "{layout:?} {read}: {cost:?}");
+                assert_eq!(cost.resumes_trusted, 0, "{layout:?} {read}: {cost:?}");
+                if layout == FileLayout::Single {
+                    assert_eq!(
+                        cost.prefix_bytes_compared, committed,
+                        "{layout:?} {read}: the control did not compare the whole prefix: {cost:?}"
+                    );
+                } else {
+                    assert!(
+                        sealed_before >= 8,
+                        "the fixture sealed {sealed_before} segments"
+                    );
+                    assert_eq!(
+                        cost.prefix_bytes_compared, untrusted,
+                        "{layout:?} {read}: the resume compared a trusted sealed segment: {cost:?}"
+                    );
+                    assert!(
+                        untrusted * 4 < committed,
+                        "{layout:?}: {untrusted} of {committed} bytes are untrusted"
+                    );
+                }
+            }
+        }
     }
 
     fn limits() -> eventlog_core::CaptureLimits {

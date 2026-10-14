@@ -105,3 +105,89 @@ async fn review_blob_empty_content_is_a_binding_across_handles() {
         Some(&b"rebound"[..])
     );
 }
+
+/// The same shared contracts on the segmented layout, `eventlog-file/2`
+/// (decision-blocker:on-disk-layout-changes: conformance holds both layouts). A small seal size,
+/// so every exercise commits across many sealed segments rather than within one.
+mod segmented {
+    use eventlog_core::EventStore;
+    use eventlog_file::{FileEventStore, FileLayout};
+    use std::sync::Arc;
+
+    const LAYOUT: FileLayout = FileLayout::Segmented { seal_at: 256 };
+
+    async fn open(root: &std::path::Path) -> FileEventStore {
+        FileEventStore::open_with_layout(root, LAYOUT)
+            .await
+            .unwrap()
+    }
+
+    macro_rules! contract {
+        ($name:ident, $run:ident) => {
+            #[tokio::test(flavor = "multi_thread")]
+            async fn $name() {
+                let directory = tempfile::tempdir().unwrap();
+                let store: Arc<dyn EventStore> = Arc::new(open(directory.path()).await);
+                eventlog_conformance::$run(&store).await;
+                assert!(
+                    directory.path().join("segments").exists(),
+                    "the exercise sealed no segment"
+                );
+            }
+        };
+    }
+    contract!(file_projections_contract, run_projections);
+    contract!(file_inline_contract, run_inline_projections);
+    contract!(file_paging_contract, run_paging);
+    contract!(file_rebuild_contract, run_rebuild_isolation);
+    contract!(file_public_inputs_contract, run_public_input_validation);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_storage_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        eventlog_conformance::run(&store).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_groups_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        eventlog_conformance::run_atomic_groups(&store).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_guarded_group_blobs_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        assert!(eventlog_conformance::run_guarded_group_blobs(&store).await);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_blob_group_retry_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        eventlog_conformance::run_blob_group_retry_identity(&store).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_claims_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        eventlog_conformance::run_claims(&store).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_snapshots_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn EventStore> = Arc::new(open(directory.path()).await);
+        eventlog_conformance::run_snapshot_generations(store).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_scopes_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        eventlog_conformance::run_scope_atomicity(&store, &store.admission_permit()).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_callback_failure_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open(directory.path()).await;
+        eventlog_conformance::run_inline_failure_atomicity(&store, &store.admission_permit()).await;
+    }
+}

@@ -1,0 +1,43 @@
+domain: eventlog.file_layout
+
+# Value-only coordinates for the file provider's on-disk layouts (decision-blocker
+# on-disk-layout-changes, option A). No domain concept, entity or lifecycle is introduced:
+# these are the storage coordinates a store's manifest commits and a handle's owner selects.
+types:
+  - name: eventlog.file_layout.Layout
+    kind: enum
+    variants:
+      - Single
+      - Segmented
+    # Single is `eventlog-file/1`: the whole committed history in `events.jsonl`. It is the
+    # layout a store is created with unless its owner opts in to Segmented, and every release
+    # keeps reading it. Segmented is `eventlog-file/2`: sealed segments under `segments/`
+    # followed by the active segment `events.jsonl`. The layout is chosen when a store is
+    # created and never changes afterwards: no release migrates a store or refuses either one.
+  - name: eventlog.file_layout.SegmentedPolicy
+    kind: struct
+    fields:
+      - name: seal_at
+        type: Integer
+    invariants:
+      - seal_at >= 1
+    # The owner's opt-in. An append that finds the active segment holding at least seal_at
+    # committed bytes seals it first, so every sealed segment is one file no writer touches
+    # again. Rust refines seal_at to a nonzero u64; the store persists it in its manifest so
+    # every writer of the store seals at the same size.
+  - name: eventlog.file_layout.Segments
+    kind: struct
+    fields:
+      - name: seal_at
+        type: Integer
+      - name: sealed
+        type: List<Integer>
+    invariants:
+      - seal_at >= 1
+    # The manifest's segment record of a Segmented store: the committed byte length of every
+    # sealed segment, in history order. Every entry is positive and their sum is at most the
+    # manifest's committed length; the remainder is the active segment's committed length.
+    # The committed history is the concatenation of the sealed segments and the active one.
+    # A resumed handle re-reads (and compares with the bytes it verified) only the segments
+    # whose inode stamp changed or is still inside the two-second untrusted window; it trusts
+    # exactly what an `eventlog-file/1` handle trusts of its one file, per file.
