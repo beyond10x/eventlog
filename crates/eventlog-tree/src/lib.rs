@@ -20,8 +20,11 @@
 //! bytes either way. [`migrate`] moves an `eventlog-tree/1` store to `eventlog-tree/2`.
 //!
 //! `eventlog-tree/3` is `eventlog-tree/2` with each stream's directory named by a hash of its
-//! key ([`TreeLayout::Hashed`]), so that every event path has one length, short enough for a Git
-//! checkout on Windows without long paths. A store is created in it only when its owner asks, with
+//! key ([`TreeLayout::Hashed`]), so that every event path has one length whatever the stream. The
+//! hash bounds the stream part only: the tenant segment and blob names are not bounded, so a Git
+//! checkout on Windows without long paths fits only for a tenant whose escaped segment is at most
+//! 36 bytes and `sha256:<64 hex>` blob digests ([`TreeLayout::Hashed`] gives the budget). A store
+//! is created in it only when its owner asks, with
 //! [`TreeEventStore::open_in`]; [`TreeEventStore::open`] creates `eventlog-tree/2` as every earlier
 //! release did. Either way the layout is the store's: every open reads and writes the layout its
 //! `store.json` names, and no migration moves a store from one stream layout to the other.
@@ -476,8 +479,15 @@ fn prepare(root: &Path, layout: TreeLayout) -> Result<(), EventLogError> {
                 TreeLayout::Hashed if !root.join("tenants").exists() => FORMAT_V3,
                 _ => FORMAT,
             };
-            let value = json!({ "format": format, "identity": eventlog_core::new_event_id() });
-            write_once(&manifest, &canonical(&value))?;
+            let identity = eventlog_core::new_event_id();
+            let value = json!({ "format": format, "identity": identity });
+            // No lock is held yet, so two handles may create one store at once. The first
+            // `store.json` published is the store's; a later one never replaces it, since the
+            // first handle may already have appended under its layout. The others honour it.
+            // That needs hard links; without them `publish_once` falls back to a rename.
+            if !layout::publish_once(&manifest, &canonical(&value), &identity)? {
+                layout::store_format(root)?;
+            }
         }
         Err(error) => return Err(backend(error)),
     }
