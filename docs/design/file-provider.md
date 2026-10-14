@@ -9,7 +9,11 @@ certification and production capacity are not established by these tests.
 ## Authority and commit
 
 `manifest.json` selects the committed byte length, transaction sequence, digest, store identity
-and privacy epoch of `events.jsonl`. Both files are authority. Removing a manifest from an existing
+and privacy epoch of `events.jsonl`. Both files are authority. That is the layout
+`eventlog-file/1`, which every store has unless its owner opted in to the segmented layout
+`eventlog-file/2` when creating it; there the committed history is the sealed segments the
+manifest lists followed by `events.jsonl`, and every one of those files is authority
+(*The segmented layout* below). Removing a manifest from an existing
 log refuses; it never initializes a replacement history. Each JSONL frame carries a version,
 sequence, previous digest and one ordered transaction. SHA-256 covers the canonical serialized
 frame with an empty digest field. Unknown physical fields, wrong sequence/previous digest,
@@ -72,8 +76,10 @@ handle observed and the committed bytes are still the bytes it verified, the han
 frames and the fold it already has, decoding no frame and reading no blob. When it names a longer
 history on the same store and epoch, the handle reads only the bytes past its observed length,
 chains them from its observed digest to the new manifest digest, folds those frames onto the state
-it had, verifies the objects those frames bind, and disposes of snapshots they retired. A resumed
-operation also removes the staging names no durable intent selected, as a complete open does.
+it had, and verifies the objects those frames bind. It disposes of no snapshot: frames of one
+epoch retire no snapshot generation, because redaction and tenant erasure, the only operations that
+do, commit a new epoch; that privacy commit disposes of the retired snapshots (after a crash, the
+next fresh open does), and a handle that observed the earlier epoch is refused as diverged. A resumed operation also removes the staging names no durable intent selected, as a complete open does.
 Anything else — a new epoch, a pending recovery intent, a shorter or unchained file, a byte length
 that disagrees with the manifest, a committed prefix that is not the bytes this handle verified,
 or a head this handle never folded — falls back to the complete reread, which refuses a history
@@ -123,7 +129,9 @@ caller cancels stores no view and leaves the writer's as it was. A `FileTenantCa
 view. Views of two epochs never share a buffer, so a privacy
 rewrite's new history never keeps the bytes it removed alive; a capture view of the old epoch keeps
 them, as it keeps its decoded fold, until this handle's next transaction drops it or its next
-capture replaces it. Nothing of this is persisted, and `eventlog-file/1` is unchanged.
+capture replaces it. Nothing of this is persisted, and `eventlog-file/1` is unchanged. On
+`eventlog-file/2` the kept bytes are the same bytes — the whole committed history, concatenated
+across its files — beside one stamp per file.
 
 What the stamp detects, and what it does not:
 
@@ -133,6 +141,73 @@ What the stamp detects, and what it does not:
 | a change inside the two-second window | yes: nothing inside the window is trusted |
 | a store to a shared mapping after its first write fault in a dirty cycle | no |
 | a write to the block device under a mounted filesystem, or root setting the clock back to the exact nanosecond | no; outside this provider's threat model. The complete verification at every open still reads everything |
+
+### The segmented layout, `eventlog-file/2`
+
+On `eventlog-file/1` the stamp covers one file that every append changes, so after any write —
+the handle's own included — each resume for the next two seconds compares the whole committed
+history: O(store bytes) per transaction inside the window. No digest removes that read, persisted
+or not: damage in place microseconds after a write leaves the bytes as the only evidence. What
+removes it is files that stop changing.
+
+`FileEventStore::open_with_layout(path, FileLayout::Segmented { seal_at })` (or
+`FileLayout::segmented()`, 256 KiB) creates a store in `eventlog-file/2`. It is an explicit,
+creation-time opt-in: `open` creates `eventlog-file/1` as before, a store that already exists is
+opened in the layout it has whatever layout is passed, no release migrates a store, and every
+release reads both. A release before this one refuses an `eventlog-file/2` store by its format
+and by its manifest's unknown `segments` field; it never misreads one.
+
+The manifest adds `segments`: the store's `seal_at` and the committed length of every sealed
+segment (`ess/file-layout/`, `eventlog.file_layout.Segments`). Sealed segment *i* is
+`segments/<i, ten digits>.jsonl`; `events.jsonl` is the active segment and holds the rest of the
+committed length. The committed history, its frames and its digest chain are the concatenation of
+those files, so every check above is unchanged; each frame carries its store's format, and a
+sealed segment ends at a frame boundary. An append that finds the active segment holding at least
+`seal_at` bytes seals it first. A next sealed name that is already taken refuses the append
+before it writes any intent. Under `append.json`, which records the seal, the append renames
+`events.jsonl` to the next sealed name, synchronizes both directories, creates a new
+`events.jsonl` with the frame, and only then publishes the manifest. Recovery undoes an
+unpublished seal by moving the segment back. It moves back only a regular file of exactly the
+active length the intent recorded whose bytes extend the sealed prefix into the recorded history;
+anything else at that name refuses, and `events.jsonl` is left as it is. Recovery requires a
+published seal to be complete. A sealed segment is never written again; a privacy rewrite starts
+the new epoch with one active segment and removes the retired epoch's sealed segments before its
+intent is cleared. A missing, short, long, linked or unexplained segment file refuses the
+complete opener, the strict reader and the inspector, and is left where it was found. A resumed
+writer or capture that finds an unexplained segment file hands the store to its complete opener,
+which refuses it.
+
+What a resumed handle reads and trusts, per layout:
+
+| | `eventlog-file/1` | `eventlog-file/2` |
+| --- | --- | --- |
+| reads always | `manifest.json`; the stamp of `events.jsonl` | `manifest.json`; the stamp of every segment file and of `events.jsonl` |
+| re-reads and compares | the whole committed history, whenever its one file's stamp is not trusted and unchanged — inside two seconds of any write, its own included | only the files whose stamp is not trusted and unchanged: the active segment after a write, and a sealed segment for its first two seconds after sealing or after any change to it |
+| reads past the observed head | the new bytes, chained from the observed digest | the same, across any segments sealed since |
+| trusts | that a file with an unchanged trusted stamp holds unchanged bytes | the same, per file, and nothing more |
+
+So the trust is unchanged — one rule, the stamp table above, applied to each file instead of one
+— and what changes is how much of the history it has to be applied to: inside the window after a
+write a resume compares about `seal_at` bytes plus the young sealed segments instead of the whole
+history. The complete open still reads and rechains every byte of every segment, and every object.
+
+Measured on this workstation (i9-10900K, no SHA-NI; release build), on the story's fixture of
+1,000 frames and 1,000 blobs of 10 KiB (`src/measure_segmented.rs`), 2026-10-14, one run on a
+shared machine (load average about 20 to 30). Each row is 200 read transactions on one handle;
+`aged` opened a store unchanged for longer than the window, and `own-write` is the same handle
+after one append of its own.
+
+| layout | committed bytes | row | 200 reads | blobs hashed | prefix bytes compared | journal bytes hashed |
+| --- | --- | --- | --- | --- | --- | --- |
+| `eventlog-file/1` | 1,519,565 in one file | `aged` | 8.4 ms | 0 | 0 | 0 |
+| `eventlog-file/1` | | `own-write` | 41.5 ms | 0 | 304,113,000 | 0 |
+| `eventlog-file/2`, `seal_at` 256 KiB | 1,519,553 in 5 sealed segments and the active one | `aged` | 11.9 ms | 0 | 0 | 0 |
+| `eventlog-file/2`, `seal_at` 256 KiB | | `own-write` | 18.2 ms | 0 | 41,591,000 | 0 |
+
+After its own write, an `eventlog-file/1` handle compares the whole history on every resume (about
+1.52 MB each). An `eventlog-file/2` handle compares only the active segment (about 208 KB each),
+which is 7.3 times fewer bytes. No resume hashes a blob or a journal byte on either layout. The wall
+times come from a single run on a loaded machine; they are an indication, not a budget.
 
 `tests/stamped_resume.rs` damages a file after its stamp is trusted and checks that nothing is
 appended onto the damage. The unit cases in `src/lib.rs` (`stamped_resume_cost`) count what a
@@ -364,3 +439,19 @@ every blob of it to be present together or absent together, the unreferenced obj
 interrupted batch to be gone, and the retry to deduplicate; a second counts the barriers a batch
 takes against the barriers the same work takes one blob per transaction, and a third checks that
 both paths bind the same digests to the same bytes. These are process-death tests, not simulated drive power failure.
+
+Both layouts are held by the same evidence. `tests/conformance.rs` runs every shared contract on
+`eventlog-file/2` too, at a seal size small enough that each exercise crosses many seals. The
+refusal cases of `tests/verify_once_review.rs`, the damaged-frame append case and the privacy case
+of `tests/durability.rs` run on `eventlog-file/1`, and on `eventlog-file/2` with the damage in the
+active and in a sealed segment. `tests/segmented_layout.rs` checks that a store keeps
+`eventlog-file/1` unless its owner opts in and that opting in never migrates one, that every
+writer of a segmented store seals at its persisted size, that a missing, short or unexplained
+segment refuses without altering anything, and that a sealed segment whose stamp a handle trusts
+and that is damaged in place afterwards is neither served nor appended onto. Journal unit tests
+kill subprocesses at every append boundary of a sealing append — including the one between the
+rename and the new active segment — and at every privacy boundary of a segmented store, and require
+no retired sealed segment to survive; others refuse a manifest that misnames its layout and hold
+the segment record to its committed ESS schema. A cost case in `src/lib.rs` requires a resume
+after a handle's own write to compare the whole history on `eventlog-file/1` and only the
+untrusted segments on `eventlog-file/2`.

@@ -15,16 +15,49 @@ use std::path::{Path, PathBuf};
 /// The format tag in `store.json` of a store every blob of which is a raw file.
 pub(crate) const FORMAT_V1: &str = "eventlog-tree/1";
 /// The format tag in `store.json` of a store that may also hold split blobs and texts
-/// (`crate::split`). A new store is created in it.
+/// (`crate::split`). A new store is created in it unless its owner asks for
+/// [`TreeLayout::Hashed`].
 pub(crate) const FORMAT: &str = "eventlog-tree/2";
+/// The format tag in `store.json` of a store that is `eventlog-tree/2` except that each stream's
+/// directory is named by a fixed-length hash of its key ([`stream_dir`]). Written only by a store
+/// created with [`TreeLayout::Hashed`].
+pub(crate) const FORMAT_V3: &str = "eventlog-tree/3";
 
-/// Which of the two layouts a store's `store.json` declares.
+/// Where a new store puts each stream's event files. The layout is chosen once, when the store is
+/// created, and recorded in its `store.json`; every later open keeps it, whatever it asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TreeLayout {
+    /// `streams/<type>/<id>/<digest>.json` (`eventlog-tree/1` and `eventlog-tree/2`): the layout
+    /// every release before this one wrote, and the one a store is created in unless its owner
+    /// asks otherwise. A path grows with its stream type and id.
+    #[default]
+    Nested,
+    /// `streams/<kk>/<32 hex>/<digest>.json` (`eventlog-tree/3`): the directory is the first 32
+    /// hex characters of the SHA-256 of the escaped `<type>/<id>`, fanned out by its first two.
+    /// Every event path has one length whatever the stream: `122 + t` characters under the store
+    /// root, where `t` is the length of the tenant's escaped segment. Eventlog 0.8.4 and earlier
+    /// refuse to open such a store.
+    ///
+    /// The hash bounds the stream part of a path only. The tenant segment is in every path and is
+    /// not bounded (a `TenantId` admits 512 bytes, which escaping can triple), and neither is a
+    /// blob's name, which is its digest escaped. So the Windows budget, `MAX_PATH` (260) after a
+    /// store root of `.engineering/state` and a Git checkout prefix of up to 82 characters, holds
+    /// only for a tenant whose escaped segment is at most 36 bytes and blob digests of the form
+    /// `sha256:<64 hex>`. The event path is then the longest a store writes, 259 characters with
+    /// the prefix; a longer tenant or root, or a blob digest of another form, is past the budget.
+    Hashed,
+}
+
+/// Which of the layouts a store's `store.json` declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreFormat {
     /// `eventlog-tree/1`: raw blob files only.
     V1,
     /// `eventlog-tree/2`: raw blob files, split blobs and texts.
     V2,
+    /// `eventlog-tree/3`: `eventlog-tree/2` with hashed stream directories.
+    V3,
 }
 
 impl StoreFormat {
@@ -33,12 +66,21 @@ impl StoreFormat {
         match self {
             Self::V1 => FORMAT_V1,
             Self::V2 => FORMAT,
+            Self::V3 => FORMAT_V3,
         }
     }
 
     /// Whether a blob may be kept split.
     pub(crate) fn splits(self) -> bool {
-        self == Self::V2
+        matches!(self, Self::V2 | Self::V3)
+    }
+
+    /// Where this format puts each stream's event files.
+    pub(crate) fn layout(self) -> TreeLayout {
+        match self {
+            Self::V1 | Self::V2 => TreeLayout::Nested,
+            Self::V3 => TreeLayout::Hashed,
+        }
     }
 }
 
@@ -56,6 +98,7 @@ pub(crate) fn store_format(root: &Path) -> Result<StoreFormat, EventLogError> {
     match value.get("format").and_then(Value::as_str) {
         Some(FORMAT_V1) => Ok(StoreFormat::V1),
         Some(FORMAT) => Ok(StoreFormat::V2),
+        Some(FORMAT_V3) => Ok(StoreFormat::V3),
         _ => Err(corrupt("store.json is not an eventlog-tree store")),
     }
 }
@@ -94,21 +137,40 @@ pub(crate) fn tenant_dir(root: &Path, tenant: &str) -> PathBuf {
     root.join("tenants").join(segment(tenant))
 }
 
-pub(crate) fn stream_dir(root: &Path, tenant: &str, stream_type: &str, stream_id: &str) -> PathBuf {
-    tenant_dir(root, tenant)
-        .join("streams")
-        .join(segment(stream_type))
-        .join(segment(stream_id))
+/// The directory of a stream's event files in a store of `format`.
+///
+/// Nested, it is `streams/<type>/<id>`, each escaped. Hashed, it is `streams/<kk>/<h>`, where `h`
+/// is the first 32 hex characters of the SHA-256 of `<type>/<id>`, each escaped (escaping
+/// encodes `/`, so the key is unambiguous), and `kk` its first two. The directory only groups a
+/// stream's files: every event file names its own stream, and a reader refuses one that is not
+/// in the directory this function gives for it.
+pub(crate) fn stream_dir(
+    root: &Path,
+    format: StoreFormat,
+    tenant: &str,
+    stream_type: &str,
+    stream_id: &str,
+) -> PathBuf {
+    let streams = tenant_dir(root, tenant).join("streams");
+    match format.layout() {
+        TreeLayout::Nested => streams.join(segment(stream_type)).join(segment(stream_id)),
+        TreeLayout::Hashed => {
+            let key = format!("{}/{}", segment(stream_type), segment(stream_id));
+            let name = &sha256_hex(key.as_bytes())[..32];
+            streams.join(&name[..2]).join(name)
+        }
+    }
 }
 
 pub(crate) fn event_path(
     root: &Path,
+    format: StoreFormat,
     tenant: &str,
     stream_type: &str,
     stream_id: &str,
     digest: &str,
 ) -> PathBuf {
-    stream_dir(root, tenant, stream_type, stream_id).join(format!("{digest}.json"))
+    stream_dir(root, format, tenant, stream_type, stream_id).join(format!("{digest}.json"))
 }
 
 pub(crate) fn group_path(root: &Path, tenant: &str, key_digest: &str) -> PathBuf {
@@ -207,6 +269,69 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EventLogErro
     }
     fs::rename(&staging, path).map_err(backend)?;
     sync_dir(directory)
+}
+
+/// Publish `bytes` as `path` unless a file of that name already exists, and say whether this call
+/// published it. First writer wins: the bytes are staged under a name of this writer's own
+/// (`writer`, unique to it), synced, then hard-linked to `path`, and a link never replaces an
+/// existing name. A writer that finds `path` taken leaves it as it is; the caller reads it.
+///
+/// The guarantee needs hard links. Where the link fails for any other reason than the name being
+/// taken (a filesystem without hard links, such as FAT or exFAT), the staging file is renamed onto
+/// `path` if `path` does not exist yet, as every release before this one did. Two writers that
+/// both find `path` missing there can still both rename, and the later one replaces the earlier;
+/// each still stages under its own name, so neither finds its staging file gone.
+///
+/// For a file written before any lock can be taken. [`write_atomic`]'s staging name is shared by
+/// every writer of one path, so it is only for writers the writer lock serialises.
+pub(crate) fn publish_once(path: &Path, bytes: &[u8], writer: &str) -> Result<bool, EventLogError> {
+    publish_once_with(path, bytes, writer, |from, to| fs::hard_link(from, to))
+}
+
+/// [`publish_once`] with the link step given, so a test can stand in for a filesystem without
+/// hard links.
+fn publish_once_with(
+    path: &Path,
+    bytes: &[u8],
+    writer: &str,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<bool, EventLogError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| corrupt("a file with no directory"))?;
+    fs::create_dir_all(directory).map_err(backend)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| corrupt("a file with no name"))?
+        .to_string_lossy()
+        .into_owned();
+    let staging = directory.join(format!(".{name}.{}.tmp", segment(writer)));
+    let staged = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match link(&staging, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            // No hard links here: the rename that every earlier release published with.
+            Err(_) if path.exists() => Ok(false),
+            Err(_) => fs::rename(&staging, path).map(|()| true),
+        }
+    })();
+    let removed = fs::remove_file(&staging);
+    let published = staged.map_err(backend)?;
+    match removed {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(backend(error)),
+    }
+    if published {
+        sync_dir(directory)?;
+    }
+    Ok(published)
 }
 
 /// Create `path` with `bytes` unless it already exists; an existing file must hold the same bytes.
@@ -309,7 +434,14 @@ mod tests {
             ("identity", length(&identity_path(root, tenant))),
             (
                 "event",
-                length(&event_path(root, tenant, stream_type, &stream_id, &digest)),
+                length(&event_path(
+                    root,
+                    StoreFormat::V2,
+                    tenant,
+                    stream_type,
+                    &stream_id,
+                    &digest,
+                )),
             ),
             ("group", length(&group_path(root, tenant, &digest))),
             ("blob", length(&blob_path(root, tenant, &blob_digest))),
@@ -325,6 +457,138 @@ mod tests {
             "a layout function changed a path length: update the budget table in \
              docs/design/tree-layout-path-length-v0.1.md with these values"
         );
+    }
+
+    /// `<CARGO_HOME>\git\checkouts\<name>-<16 hex>\<7-char rev>\` on GitHub's hosted Windows
+    /// runner, for Eventlog: the prefix every tracked path of a Git dependency is checked out under.
+    const EVENTLOG_CHECKOUT_PREFIX: usize = 76;
+    /// The same for Entity Runtime, the longest consumer name the design budgets for.
+    const ENTITY_RUNTIME_CHECKOUT_PREFIX: usize = 82;
+    /// Git without `core.longpaths` refuses a path of this many characters or more.
+    const MAX_PATH: usize = 260;
+
+    /// `eventlog-tree/3` names a stream's directory by a fixed-length hash of its key, so the
+    /// longest event path a planning store can hold no longer grows with the stream type or id:
+    /// it is computed here over ids that segment escaping makes long, and held under `MAX_PATH`
+    /// after the checkout prefix (`docs/design/tree-layout-path-length-v0.1.md`).
+    #[test]
+    fn a_hashed_store_writes_every_event_under_max_path_after_the_checkout_prefix() {
+        let root = Path::new(".engineering/state");
+        let tenant = "planning";
+        let digest = "f".repeat(64);
+        let long_id = "/".repeat(200);
+        let sha_id = format!("sha256:{}", "f".repeat(64));
+        let streams = [
+            ("er.subject", sha_id.as_str()),
+            ("er.subject", "x"),
+            ("a.stream.type.of.some.length", long_id.as_str()),
+        ];
+        let lengths: Vec<usize> = streams
+            .iter()
+            .map(|(stream_type, stream_id)| {
+                length(&event_path(
+                    root,
+                    StoreFormat::V3,
+                    tenant,
+                    stream_type,
+                    stream_id,
+                    &digest,
+                ))
+            })
+            .collect();
+        let longest = *lengths.iter().max().unwrap();
+        assert_eq!(
+            lengths,
+            vec![longest; streams.len()],
+            "a hashed event path grew with its stream type or id"
+        );
+        assert_eq!(
+            longest, 149,
+            "the hashed event path length changed: update the budget table in \
+             docs/design/tree-layout-path-length-v0.1.md"
+        );
+        assert!(
+            EVENTLOG_CHECKOUT_PREFIX + longest < MAX_PATH,
+            "Eventlog's checkout prefix plus {longest} reaches MAX_PATH"
+        );
+        assert!(
+            ENTITY_RUNTIME_CHECKOUT_PREFIX + longest < MAX_PATH,
+            "Entity Runtime's checkout prefix plus {longest} reaches MAX_PATH"
+        );
+        // The nested layout is unchanged by the hashed one.
+        assert_eq!(
+            length(&event_path(
+                root,
+                StoreFormat::V2,
+                tenant,
+                "er.subject",
+                &sha_id,
+                &digest
+            )),
+            198
+        );
+    }
+
+    #[test]
+    fn a_hashed_stream_directory_is_a_fan_out_and_32_hex_of_the_escaped_key() {
+        let directory = stream_dir(Path::new("r"), StoreFormat::V3, "t", "item", "a/b");
+        let hash = sha256_hex(b"item/a%2Fb");
+        assert_eq!(
+            directory,
+            Path::new("r/tenants/t/streams")
+                .join(&hash[..2])
+                .join(&hash[..32])
+        );
+        assert_ne!(
+            directory,
+            stream_dir(Path::new("r"), StoreFormat::V3, "t", "item/a", "b"),
+            "two stream keys shared a directory"
+        );
+        for format in [StoreFormat::V1, StoreFormat::V2] {
+            assert_eq!(
+                stream_dir(Path::new("r"), format, "t", "item", "a/b"),
+                Path::new("r/tenants/t/streams/item/a%2Fb")
+            );
+        }
+    }
+
+    fn staging_files(directory: &Path) -> Vec<String> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "tmp"))
+            .collect()
+    }
+
+    /// A filesystem without hard links (FAT, exFAT) refuses the link with something other than
+    /// `AlreadyExists`. Creating a store there still works: the writer's own staging file is
+    /// renamed onto a name nobody has published yet, and a published one is still honoured.
+    #[test]
+    fn a_publish_without_hard_links_falls_back_to_a_rename_and_never_replaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.json");
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        assert!(publish_once_with(&path, b"first", "writer-1", unsupported).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(!publish_once_with(&path, b"second", "writer-2", unsupported).unwrap());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"first",
+            "a later publish replaced the first"
+        );
+        assert_eq!(staging_files(directory.path()), Vec::<String>::new());
+    }
+
+    /// With hard links the first publish wins and a later one leaves it as it is.
+    #[test]
+    fn a_publish_with_hard_links_is_first_writer_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.json");
+        assert!(publish_once(&path, b"first", "writer-1").unwrap());
+        assert!(!publish_once(&path, b"second", "writer-2").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(staging_files(directory.path()), Vec::<String>::new());
     }
 
     #[test]

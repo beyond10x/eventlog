@@ -29,6 +29,9 @@ use crate::{
 ///
 /// Every count is supplied by the caller. There is no default and no clamping: a cap nobody chose
 /// is a cap nobody sized, and zero is a real cap rather than "unset".
+///
+/// `eventlog.capture.CaptureLimits` in `ess/capture/`, refined to `u64`; its encoding is the
+/// generated `EventlogCaptureCaptureLimits`, reached through `From` and `TryFrom`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureLimits {
     pub max_events: u64,
@@ -38,12 +41,79 @@ pub struct CaptureLimits {
 }
 
 /// Exact resource usage of a complete capture, including an incrementally reconstructed one.
+///
+/// `eventlog.capture.CaptureUsage` in `ess/capture/`, refined to `u64`; its encoding is the
+/// generated `EventlogCaptureCaptureUsage`, reached through `From` and `TryFrom`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CaptureUsage {
     pub events: u64,
     pub blobs: u64,
     pub projection_rows: u64,
     pub payload_bytes: u64,
+}
+
+/// The count a generated capture value holds, refined to `u64`: a negative, fractional or
+/// out-of-range number is no count.
+fn count(name: &str, number: &serde_json::Number) -> Result<u64, EventLogError> {
+    number
+        .as_u64()
+        .ok_or_else(|| EventLogError::Invalid(format!("{name} {number} is not a u64 count")))
+}
+
+/// The wire form of `eventlog.capture.CaptureLimits`, generated from `ess/capture/`.
+impl From<CaptureLimits> for eventlog_capture_types::EventlogCaptureCaptureLimits {
+    fn from(limits: CaptureLimits) -> Self {
+        Self {
+            max_events: limits.max_events.into(),
+            max_blobs: limits.max_blobs.into(),
+            max_projection_rows: limits.max_projection_rows.into(),
+            max_payload_bytes: limits.max_payload_bytes.into(),
+        }
+    }
+}
+
+/// The limits a generated `eventlog.capture.CaptureLimits` holds, when every cap is a `u64`.
+impl TryFrom<&eventlog_capture_types::EventlogCaptureCaptureLimits> for CaptureLimits {
+    type Error = EventLogError;
+
+    fn try_from(
+        limits: &eventlog_capture_types::EventlogCaptureCaptureLimits,
+    ) -> Result<Self, EventLogError> {
+        Ok(Self {
+            max_events: count("max_events", &limits.max_events)?,
+            max_blobs: count("max_blobs", &limits.max_blobs)?,
+            max_projection_rows: count("max_projection_rows", &limits.max_projection_rows)?,
+            max_payload_bytes: count("max_payload_bytes", &limits.max_payload_bytes)?,
+        })
+    }
+}
+
+/// The wire form of `eventlog.capture.CaptureUsage`, generated from `ess/capture/`.
+impl From<CaptureUsage> for eventlog_capture_types::EventlogCaptureCaptureUsage {
+    fn from(usage: CaptureUsage) -> Self {
+        Self {
+            events: usage.events.into(),
+            blobs: usage.blobs.into(),
+            projection_rows: usage.projection_rows.into(),
+            payload_bytes: usage.payload_bytes.into(),
+        }
+    }
+}
+
+/// The usage a generated `eventlog.capture.CaptureUsage` holds, when every total is a `u64`.
+impl TryFrom<&eventlog_capture_types::EventlogCaptureCaptureUsage> for CaptureUsage {
+    type Error = EventLogError;
+
+    fn try_from(
+        usage: &eventlog_capture_types::EventlogCaptureCaptureUsage,
+    ) -> Result<Self, EventLogError> {
+        Ok(Self {
+            events: count("events", &usage.events)?,
+            blobs: count("blobs", &usage.blobs)?,
+            projection_rows: count("projection_rows", &usage.projection_rows)?,
+            payload_bytes: count("payload_bytes", &usage.payload_bytes)?,
+        })
+    }
 }
 
 /// An immutable provider-issued observation capability, never a persisted or caller-made cursor.

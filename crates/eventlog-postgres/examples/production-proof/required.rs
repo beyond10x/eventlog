@@ -129,7 +129,8 @@ pub fn required_cases() -> Vec<RequiredCase> {
     );
     required.extend(
         cases!("eventlog-tree", "test", "guarded_batch_copy_adversary";
-            "a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy",
+            "a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy::nested",
+            "a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy::hashed",
         ),
     );
     required.extend(cases!("eventlog-file", "test", "conformance";

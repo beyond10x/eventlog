@@ -2,17 +2,25 @@
 format: aep.planning-md/3
 id: story:generate-capture-types-from-ess
 kind: story
-status: draft
+status: implemented
 title: Generate the capture types from ESS once its Rust target leaves serde_json number handling alone
 relations:
 - serves: vision:O2
-revision: 1
+revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-14T07:22:29Z", actor: "human:timo", revision: 3}
+- {from: "proposed", to: "active", at: "2026-10-14T07:22:29Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-14T20:52:49Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Context
 
 The repository rule is to implement against code generated from the ESS specification. For the capture values in `ess/capture/`, `ess generate types --target rust` (ess 0.55.0) emits a standalone crate whose Cargo.toml pins `serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }`, and no flag turns the feature off. Cargo feature unification would enable it for Eventlog and every consumer. With it, `serde_json::to_vec` of `{"a":1.50,"b":1e2}` keeps `1.50` and `1e+2`; without it the output is `1.5` and `100.0`. `request_hash` in `crates/eventlog-core/src/lib.rs` hashes that output, so every stored idempotency hash would stop matching its retry.
 
 Until ESS ships a Rust target without that feature, the durable continuity types (`story:durable-capture-continuity`) are hand-written, held to the committed JSON Schema projection by a test, and `request_hash` is pinned by a test.
+
+## The wait is met (2026-10-14)
+
+`ess generate types --path ess/capture --all-types --target rust --package eventlog-capture-types` on ess 0.59.0 (the latest release, `gh release list -R beyond10x/ess`) writes a Cargo.toml with `serde_json = { version = "=1.0.151" }` and `[features] default = ["exact-numbers"]`, `exact-numbers = ["serde_json/arbitrary_precision"]`. A dependency with `default-features = false` leaves `arbitrary_precision` off; `types-report.json` names that consequence for each value that holds JSON numbers. The story is no longer waiting on ESS.
 
 ## Acceptance
 

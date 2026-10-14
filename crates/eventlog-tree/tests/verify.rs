@@ -1,8 +1,11 @@
 //! Each rule of the offline check refuses the defect it names, and a valid tree has no finding.
 
+#[macro_use]
+mod each_layout;
+
 use eventlog_conformance::{event, meta};
 use eventlog_core::{EventStore, Expected, StreamId, TenantId};
-use eventlog_tree::{TreeEventStore, verify};
+use eventlog_tree::{TreeEventStore, TreeLayout, verify};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,8 +14,8 @@ fn stream(id: &str) -> StreamId {
     StreamId::new(TenantId::new("tenant-a").unwrap(), "item", id).unwrap()
 }
 
-async fn written(root: &Path) {
-    let store = TreeEventStore::open(root).await.unwrap();
+async fn written(root: &Path, layout: TreeLayout) {
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
     store
         .append(
             &stream("x"),
@@ -59,33 +62,29 @@ fn rules(findings: &[eventlog_tree::Finding]) -> Vec<&'static str> {
     findings.iter().map(|finding| finding.rule).collect()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_tree_the_store_wrote_has_no_finding() {
+async fn a_tree_the_store_wrote_has_no_finding(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    written(directory.path()).await;
+    written(directory.path(), layout).await;
     assert_eq!(verify(directory.path(), None), Vec::new());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_file_outside_the_layout_is_v1() {
+async fn a_file_outside_the_layout_is_v1(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    written(directory.path()).await;
+    written(directory.path(), layout).await;
     fs::write(directory.path().join("manifest.json"), b"{}").unwrap();
     assert_eq!(rules(&verify(directory.path(), None)), vec!["V1"]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_event_no_group_commits_is_v3() {
+async fn an_event_no_group_commits_is_v3(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    written(directory.path()).await;
+    written(directory.path(), layout).await;
     fs::remove_file(find(directory.path(), "groups")).unwrap();
     assert_eq!(rules(&verify(directory.path(), None)), vec!["V3", "V3"]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_edited_event_is_v4() {
+async fn an_edited_event_is_v4(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    written(directory.path()).await;
+    written(directory.path(), layout).await;
     let file = find(directory.path(), "streams");
     let edited = fs::read_to_string(&file)
         .unwrap()
@@ -95,24 +94,24 @@ async fn an_edited_event_is_v4() {
     assert!(rules(&verify(directory.path(), None)).contains(&"V4"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_reformatted_file_is_v5() {
+async fn a_reformatted_file_is_v5(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    written(directory.path()).await;
+    written(directory.path(), layout).await;
     let file = directory.path().join("store.json");
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
     fs::write(&file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
     assert_eq!(rules(&verify(directory.path(), None)), vec!["V5"]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_not() {
+async fn a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_not(
+    layout: TreeLayout,
+) {
     let base = tempfile::tempdir().unwrap();
-    written(base.path()).await;
+    written(base.path(), layout).await;
 
     let redacted = tempfile::tempdir().unwrap();
     copy(base.path(), redacted.path());
-    TreeEventStore::open(redacted.path())
+    TreeEventStore::open_in(redacted.path(), layout)
         .await
         .unwrap()
         .redact(&stream("x"), 1, "erased")
@@ -138,3 +137,12 @@ async fn a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_n
     fs::write(&file, text).unwrap();
     assert!(rules(&verify(rewritten.path(), Some(base.path()))).contains(&"V2"));
 }
+
+each_layout!(
+    a_tree_the_store_wrote_has_no_finding,
+    a_file_outside_the_layout_is_v1,
+    an_event_no_group_commits_is_v3,
+    an_edited_event_is_v4,
+    a_reformatted_file_is_v5,
+    a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_not,
+);

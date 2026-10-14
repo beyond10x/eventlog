@@ -604,6 +604,33 @@ mod native_group_crash {
         panic!("the feed never delivered {expected} events");
     }
 
+    /// The tenant's committed events and group receipts, counted in the tables, not through the
+    /// feed.
+    ///
+    /// A withheld feed reads as empty, so `feed_at_least(_, 0)` returns on its first read and
+    /// proves nothing about a crash point that is expected to commit nothing; and because it
+    /// returns on `>=`, a duplicate member committed behind the watermark would not show in a feed
+    /// that already holds the expected count. A plain count in a fresh statement snapshot is not
+    /// bounded by the watermark: it sees every committed row and no uncommitted one. It is the
+    /// positive check that a crash point committed nothing, and what makes the counts after a
+    /// retry exact.
+    async fn committed_rows(store: &PostgresEventStore) -> (i64, i64) {
+        let prefix = &store.prefix;
+        let mut client = store.pool.acquire().await.unwrap();
+        let row = client
+            .query_one(
+                &format!(
+                    "SELECT (SELECT count(*) FROM {prefix}_events WHERE tenant_id = $1),
+                            (SELECT count(*) FROM {prefix}_append_groups WHERE tenant_id = $1)"
+                ),
+                &[&tenant().as_str()],
+            )
+            .await
+            .unwrap();
+        client.settled();
+        (row.get(0), row.get(1))
+    }
+
     fn stream(id: &str) -> StreamId {
         StreamId::new(tenant(), "item", id).unwrap()
     }
@@ -678,6 +705,14 @@ mod native_group_crash {
             );
 
             let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+            assert_eq!(
+                committed_rows(&store).await,
+                if committed { (3, 1) } else { (0, 0) },
+                "{point}: committed events and group receipts after the crash"
+            );
+            // With the table count exact, the feed only has to deliver those rows: for the six
+            // points that committed nothing an empty read is now consistent with, not the proof of,
+            // an empty log.
             let before = feed_at_least(&store, usize::from(committed) * 3).await;
             assert_eq!(before.len(), if committed { 3 } else { 0 }, "{point}");
             for (id, count) in [("a", 2), ("z", 1)] {
@@ -724,6 +759,13 @@ mod native_group_crash {
             } else {
                 assert_eq!(received[0].version, 1, "{point}: fresh retry");
             }
+            // Exact, not a lower bound: the table count refuses a duplicate member or receipt the
+            // watermark still withholds, and the feed must then deliver exactly those members.
+            assert_eq!(
+                committed_rows(&store).await,
+                (3, 1),
+                "{point}: no duplicate or missing group member or receipt"
+            );
             assert_eq!(
                 feed_at_least(&store, received.len()).await,
                 received,

@@ -2,13 +2,18 @@
 format: aep.planning-md/3
 id: story:file-capture-after-a-write-resumes
 kind: story
-status: draft
+status: implemented
 title: A file capture after a write through the same handle resumes from its verified view
 summary: capture after own write re-reads, re-chains and re-folds the whole history
 owner: eventlog
 relations:
 - informed_by: review-result:adversary-file-eventlog-rechecks-its-prefix-pass-1
-revision: 1
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-14T20:52:49Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

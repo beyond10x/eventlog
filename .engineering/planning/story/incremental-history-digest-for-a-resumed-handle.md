@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:incremental-history-digest-for-a-resumed-handle
 kind: story
-status: draft
+status: implemented
 title: A resumed handle proves its prefix without reading all of it
 summary: replace the whole-prefix re-hash with an incremental or block-wise digest; target 7 ms
 owner: eventlog
@@ -13,7 +13,11 @@ relations:
 - informed_by: story:file-eventlog-verifies-once-per-open
 - informed_by: review-result:verify-once-review-1
 - serves: vision:O2
-revision: 3
+revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-14T07:24:21Z", actor: "human:timo", revision: 4}
+- {from: "proposed", to: "active", at: "2026-10-14T07:24:21Z", actor: "human:timo", revision: 5}
+- {from: "active", to: "implemented", at: "2026-10-14T20:52:49Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1,"review":1}}}
 ---
 ## Outcome
 

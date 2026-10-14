@@ -8,13 +8,16 @@
 //! up `<prefix>_group_batches`, which the copy never writes. The same retry that deduplicates on
 //! the tree is therefore told its key belongs to another request on the copy.
 
+#[macro_use]
+mod each_layout;
+
 use eventlog_conformance::{event, meta};
 use eventlog_core::{
     AppendGroup, AtomicEventStore, EventLogError, EventStore, Expected, NoGuard, StreamAppend,
     StreamId, TenantId,
 };
 use eventlog_sqlite::SqliteEventStore;
-use eventlog_tree::{TreeEventStore, copy};
+use eventlog_tree::{TreeEventStore, TreeLayout, copy};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -41,10 +44,13 @@ fn batch() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy() {
+async fn a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path()).await.unwrap();
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     tree.stream_identity(&tenant()).await.unwrap();
     let first = tree
         .append_group_guarded_with_blobs(&group(), Arc::new(NoGuard), &batch())
@@ -77,3 +83,5 @@ async fn a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its
         Err(other) => panic!("unexpected refusal of a copied command's retry: {other:?}"),
     }
 }
+
+each_layout!(a_guarded_batch_retry_that_deduplicates_on_the_tree_deduplicates_on_its_sqlite_copy,);

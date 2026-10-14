@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-14T20:52:49Z",
+  "actor": "human:timo",
+  "artifact": "story:incremental-history-digest-for-a-resumed-handle",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review",
+    "source": "adversary review 2026-10-14: F1 blocker introduced (recover_append moved a foreign file at the next sealed name over events.jsonl after a refused seal) and F2 warning introduced (resumed writer and capture accepted unexplained segment files); both fixed in 0a32898dc, each fix red when reverted; segmented_adversary 6 cases green",
+    "reference": "crates/eventlog-file/tests/segmented_adversary.rs"
+  }
+}

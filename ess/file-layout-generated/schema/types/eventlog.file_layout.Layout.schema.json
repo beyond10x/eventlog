@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.file_layout.Layout",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "ed553f47e1471952b0516ae03a3be6a67cf2e0389f083690a97ed694c4ee75f4",
+    "contract_digest": "slice-sha256/2:4b1f5252a6632542ed5b9c92f2dbd02fd45eb33747d7e65c86e0c7ec888fcd0f",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.file_layout.Layout": {
+      "title": "Layout",
+      "x-ess-name": "eventlog.file_layout.Layout",
+      "x-ess-kind": "enum",
+      "type": "string",
+      "enum": [
+        "Single",
+        "Segmented"
+      ]
+    }
+  }
+}

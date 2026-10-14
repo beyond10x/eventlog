@@ -59,6 +59,23 @@ jobs:
             candidate
             baseline
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install the pinned ess release
+        working-directory: ${{ runner.temp }}
+        env:
+          ESS_VERSION: "0.59.0"
+          ESS_SHA256: b0a22eb459fdfb2dec8ea173030416ef6c5ef9950944f3270c4407dda8b0f753
+        run: |
+          set -euo pipefail
+          asset="ess-$ESS_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          release="https://github.com/beyond10x/ess/releases/download/$ESS_VERSION"
+          curl --fail --silent --show-error --location --output "$asset" "$release/$asset"
+          curl --fail --silent --show-error --location --output SHA256SUMS "$release/SHA256SUMS"
+          grep -Fx "$ESS_SHA256  $asset" SHA256SUMS
+          grep -F "  $asset" SHA256SUMS | sha256sum --check --strict
+          tar -xzf "$asset"
+          echo "$RUNNER_TEMP/ess-$ESS_VERSION-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
+      - name: Specifications validate and generated ESS outputs are current
+        run: cargo run --locked -p eventlog-postgres --example ess-drift
       - name: Configure disposable verified TLS fixture
         run: cargo run --locked -p eventlog-postgres --example production-fixture -- --container '${{ job.services.postgres.id }}' --directory '${{ runner.temp }}/eventlog-proof-tls'
       - name: Required PostgreSQL and SQLite conformance, formatter and linter

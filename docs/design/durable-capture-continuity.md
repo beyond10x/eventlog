@@ -17,19 +17,31 @@ material since a persisted checkpoint, and receive exactly those appends.
 The values live in `ess/capture/domains/capture.yaml` (format `ess/23`):
 `DurableCaptureCheckpoint`, `CaptureContinuityMark`, `SqliteDurableCheckpoint`,
 `JournaledRowChange` and `DurableJournalEntry`. Their JSON Schema projection is committed under
-`ess/capture-generated/schema/types/` and regenerated with:
+`ess/capture-generated/schema/types/`, and the Rust types beside it, in `ess/capture-generated/`
+(crate `eventlog-capture-types`). Both are `ess` managed output, regenerated in place with:
 
 ```console
-ess generate --path ess/capture --kind schema --out <empty directory>
+ess generate --path ess/capture --kind schema --out ess/capture-generated
+ess generate types --path ess/capture --all-types --target rust \
+  --package eventlog-capture-types --out ess/capture-generated
 ```
 
-then copying `schema/types/*.schema.json` over the committed files. The Rust types are
-hand-written: `ess generate types --target rust` emits a crate that enables
+CI regenerates every `ess/*-generated/` output with the pinned ess release and refuses a
+difference (`cargo run --locked -p eventlog-postgres --example ess-drift`). The generated crate
+carries its own `[workspace]` table, so the workspace excludes it and depends on it by path, with
+default features off: its default `exact-numbers` feature enables
 `serde_json/arbitrary_precision`, which Cargo feature unification would turn on for Eventlog and
 every consumer and which changes `serde_json::to_vec` output for numbers such as `1.50`. That
-changes `request_hash` (`crates/eventlog-core/src/lib.rs`) and therefore every stored idempotency
-hash. `story:generate-capture-types-from-ess` records the gap. A test holds the SQLite checkpoint
-encoding to the committed schema, and a test pins one `request_hash` value.
+would change `request_hash` (`crates/eventlog-core/src/lib.rs`) and therefore every stored
+idempotency hash; a test pins one `request_hash` value. `eventlog-core` converts `CaptureLimits`
+and `CaptureUsage`, its `u64` refinements, to and from the generated types.
+
+The SQLite checkpoint encoding is the generated `SqliteDurableCheckpoint`. The journal entry
+(`DurableJournalEntry`, `JournaledRowChange`) is still hand-written: the generated type holds a
+row value as `serde_json::Value`, and without `arbitrary_precision` a value written and read back
+is not always the value its stored text parses to (see "Row values in both journals" below).
+`story:generate-journal-row-types-from-ess` records that gap. A test holds both encodings to the
+committed schema.
 
 ## API
 

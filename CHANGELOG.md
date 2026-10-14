@@ -5,6 +5,68 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.0 — 2026-10-14
+
+### Added
+
+- Tree store: an opt-in layout, `eventlog-tree/3`, whose event paths fit a Git checkout on Windows
+  without `core.longpaths`. `TreeEventStore::open_in(root, TreeLayout::Hashed)` (and
+  `open_in_with_inline`) creates a store whose stream directories are `streams/<kk>/<h>`, `h` the
+  first 32 hex characters of the SHA-256 of the escaped `<type>/<id>`. An event path under
+  `.engineering/state` for tenant `planning` is then 149 characters for every stream, against 198
+  and growing with the stream id before; a test holds it under 260 after the 76-character
+  checkout prefix of a Cargo Git dependency. `TreeEventStore::layout` reports a store's layout.
+- Nothing changes for a store that does not opt in: `TreeEventStore::open` creates
+  `eventlog-tree/2` as before, a store keeps the layout its `store.json` names whatever an open
+  asks for, and every layout reads in this release. No migration moves a store between stream
+  layouts. Eventlog 0.8.4 and earlier refuse to open an `eventlog-tree/3` store, so opt in only
+  once every reader of the store has this release.
+- File provider: an opt-in segmented layout, `eventlog-file/2`, so that a resumed handle's
+  history check stops re-reading the whole store after each write. `FileEventStore::open_with_layout`
+  with the new `#[non_exhaustive]` `FileLayout::Segmented { seal_at }` (or `FileLayout::segmented()`,
+  256 KiB) creates a store whose active `events.jsonl` is sealed into `segments/` once it holds
+  `seal_at` bytes; a resume skips each sealed segment whose trusted stamp still matches and compares
+  the rest byte for byte, as `eventlog-file/1` does for its one file. The layout is chosen only at
+  creation: `open` still creates `eventlog-file/1` byte for byte as before, an existing store keeps
+  its layout, nothing is migrated, and this release reads both. An earlier release refuses an
+  `eventlog-file/2` store by its format. A `seal_at` of 0 is refused. The manifest's `segments`
+  record is modelled in `ess/file-layout/`, and a test holds it to the committed schema in
+  `ess/file-layout-generated/`. Additive: a minor release.
+
+### Changed
+
+- SQLite durable capture continuity encodes its checkpoint with the Rust types
+  `ess generate types` (ess 0.59.0) writes from `ess/capture/` to `ess/capture-generated/`
+  (crate `eventlog-capture-types`, built with default features off so `serde_json` keeps its
+  default number handling and every stored `request_hash` still matches). The journal entry keeps
+  its hand-written encoding, which embeds each row's exact stored text. Bytes written by earlier
+  versions restore as before.
+- `eventlog-core`: `CaptureLimits` and `CaptureUsage` convert to and from the generated
+  `EventlogCaptureCaptureLimits` and `EventlogCaptureCaptureUsage` (`From`, and `TryFrom`, which
+  refuses a number that is not a `u64`). Additive.
+- CI (`real-backends`) validates every specification under `ess/` and regenerates every
+  `ess/*-generated/` output with the pinned ess release, refusing any difference
+  (`cargo run --locked -p eventlog-postgres --example ess-drift`).
+
+### Fixed
+
+- File provider: a capture after a write through the same handle starts from the writer's verified
+  view of its head instead of re-reading, re-chaining, re-encoding and re-folding the whole history;
+  the committed prefix is still compared byte for byte, and any difference falls back to the strict
+  re-read.
+- File provider: a resumed handle no longer disposes of snapshots after folding another handle's
+  frames. Frames of one epoch retire no generation; redaction and tenant erasure, the only
+  operations that do, start a new epoch that goes to the complete opener, and `load_snapshot`
+  refuses a cache of a retired generation wherever it sits.
+- File provider: a writer lock holder releases `writer.lock` when it drops, so a subprocess forked
+  by the host no longer keeps the lock alive and `inspect` no longer answers `SourceBusy` for it.
+- Tree store: two handles creating one store at the same moment both open. Each stages
+  `store.json` under a name of its own and publishes it by hard link, so the first one published
+  wins and a later creator uses it; on a filesystem without hard links the publish falls back to
+  the previous rename. The hashed layout's Windows path bound holds for a tenant of at most 36
+  escaped bytes, as its documentation now states.
+- Dependencies: `rustls` 0.23.46 (RUSTSEC-2026-0346 to 0349).
+
 ## 0.8.4 — 2026-10-13
 
 ### Fixed

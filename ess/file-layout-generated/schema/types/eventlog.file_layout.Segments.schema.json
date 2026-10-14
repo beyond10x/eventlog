@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.file_layout.Segments",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "ed553f47e1471952b0516ae03a3be6a67cf2e0389f083690a97ed694c4ee75f4",
+    "contract_digest": "slice-sha256/2:e4e7e802ebe24ccdcb970e68d57dda536436d941a5f581425e80fe3bbd2725e1",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.file_layout.Segments": {
+      "title": "Segments",
+      "x-ess-name": "eventlog.file_layout.Segments",
+      "x-ess-kind": "struct",
+      "type": "object",
+      "properties": {
+        "seal_at": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sealed": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
+      },
+      "required": [
+        "seal_at",
+        "sealed"
+      ],
+      "additionalProperties": false,
+      "x-ess-invariants": [
+        "seal_at >= 1"
+      ]
+    }
+  }
+}

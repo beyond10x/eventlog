@@ -1,9 +1,10 @@
 //! Durable capture continuity: a checkpoint a later process continues from.
 //!
 //! Design: `docs/design/durable-capture-continuity.md`. The values are modelled in
-//! `ess/capture/domains/capture.yaml`; the [`wire`] types are written by hand to its committed
-//! JSON Schema projection under `ess/capture-generated/schema/types/`, and a test holds the
-//! encoding to that schema.
+//! `ess/capture/domains/capture.yaml`, and their encodings are the Rust types `ess generate
+//! types` writes to `ess/capture-generated/` (crate `eventlog-capture-types`, here `wire`),
+//! except the journal entry, whose row values [`journal_wire`] keeps as exact stored text. A test
+//! holds every encoding to the committed JSON Schema projection beside them.
 //!
 //! On an owner where [`SqliteEventStore::enable_durable_continuity`] ran, every write to captured
 //! material through any connection runs a provider trigger that advances
@@ -21,6 +22,7 @@ use std::{
     sync::Arc,
 };
 
+use eventlog_capture_types as wire;
 use eventlog_core::{
     AppendGroupResult, CaptureError, CaptureLimits, CaptureUsage, CapturedBlob,
     CapturedProjectionDelta, CapturedRowChange, EventLogError, MAX_INDEXED_FIELDS, ProjectionSpec,
@@ -194,19 +196,30 @@ pub(crate) fn indirect_writers(connection: &Connection) -> rusqlite::Result<bool
 }
 
 /// The durable mutation epoch and the random token every write to captured material replaces.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CaptureContinuityMark {
-    epoch: u64,
-    token: String,
+pub(crate) type CaptureContinuityMark = wire::EventlogCaptureCaptureContinuityMark;
+
+fn mark(epoch: u64, token: String) -> CaptureContinuityMark {
+    CaptureContinuityMark {
+        epoch: epoch.into(),
+        token,
+    }
 }
 
-impl CaptureContinuityMark {
-    /// The same mark: equal epoch and equal token. An older copy of the file written as often as
-    /// it lost repeats the epoch; the token makes that coincidence a 128-bit collision.
-    fn same(&self, other: &Self) -> bool {
-        self.epoch == other.epoch && self.token == other.token
-    }
+/// The mark's epoch as SQLite stores it; a decoded epoch that is no `u64` has none.
+fn stored_epoch(mark: &CaptureContinuityMark) -> Result<i64, EventLogError> {
+    let epoch = mark
+        .epoch
+        .as_u64()
+        .ok_or_else(|| EventLogError::Invalid("epoch is not a u64".to_owned()))?;
+    to_i64(epoch)
+}
+
+/// The same mark: equal `u64` epoch and equal token. An older copy of the file written as often
+/// as it lost repeats the epoch; the token makes that coincidence a 128-bit collision.
+fn same(one: &CaptureContinuityMark, other: &CaptureContinuityMark) -> bool {
+    one.epoch.as_u64().is_some()
+        && one.epoch.as_u64() == other.epoch.as_u64()
+        && one.token == other.token
 }
 
 /// The durable values one checkpoint binds, all read inside one capture's transaction.
@@ -217,6 +230,33 @@ pub(crate) struct DurableBinding {
     schema_version: i64,
     mark: CaptureContinuityMark,
     position: u64,
+}
+
+/// The requested declaration a journaled row change names.
+fn projection_scope(
+    specification: &ProjectionSpec,
+) -> wire::EventlogCaptureCapturedProjectionScope {
+    wire::EventlogCaptureCapturedProjectionScope {
+        name: specification.name.to_owned(),
+        indexed_fields: specification
+            .indexed
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+    }
+}
+
+/// Whether `scope` names exactly `specification`: its name and its indexed fields, in order.
+fn scope_is(
+    scope: &wire::EventlogCaptureCapturedProjectionScope,
+    specification: &ProjectionSpec,
+) -> bool {
+    scope.name == specification.name
+        && scope
+            .indexed_fields
+            .iter()
+            .map(String::as_str)
+            .eq(specification.indexed.iter().copied())
 }
 
 fn hex32(value: &str) -> bool {
@@ -258,7 +298,7 @@ fn state(
     if !hex32(&instance) || !hex32(&token) {
         return Ok(None);
     }
-    Ok(Some((instance, CaptureContinuityMark { epoch, token })))
+    Ok(Some((instance, mark(epoch, token))))
 }
 
 /// The newest journal position, zero for an empty journal, `None` without one.
@@ -435,7 +475,7 @@ pub(crate) fn journal_group(
             |row| row.get(0),
         )
         .map_err(backend)?;
-    let mut entry = wire::DurableJournalEntry {
+    let mut entry = journal_wire::DurableJournalEntry {
         position: to_u64(position)?,
         tenant_id: tenant.as_str().to_owned(),
         from,
@@ -447,20 +487,21 @@ pub(crate) fn journal_group(
     // A tenant with redacted history gets a link and nothing else: a row this group replaced may
     // hold a value derived from the redacted event, and the journal must not outlive it.
     if !withheld {
-        entry.event_positions = appended
+        let mut positions: Vec<u64> = appended
             .appends
             .iter()
             .flat_map(|append| &append.events)
             .map(|event| event.global_seq)
             .collect();
-        entry.event_positions.sort_unstable();
+        positions.sort_unstable();
+        entry.event_positions = positions;
         entry.blobs = draft.blobs.into_iter().collect();
         for (specification, row) in draft.rows.into_values() {
             let (Ok(before), Ok(after)) = (stored_text(row.before), stored_text(row.after)) else {
                 return Ok(());
             };
-            entry.rows.push(wire::JournaledRowChange {
-                projection: wire::CapturedProjectionScope::of(&specification),
+            entry.rows.push(journal_wire::JournaledRowChange {
+                projection: projection_scope(&specification),
                 key: row.key,
                 before,
                 after,
@@ -482,9 +523,9 @@ pub(crate) fn journal_group(
             params![
                 position,
                 tenant.as_str(),
-                to_i64(entry.from.epoch)?,
+                stored_epoch(&entry.from)?,
                 entry.from.token,
-                to_i64(entry.to.epoch)?,
+                stored_epoch(&entry.to)?,
                 entry.to.token,
                 text,
                 bytes
@@ -516,30 +557,32 @@ pub(crate) fn encode(checkpoint: &Checkpoint, prefix: &str) -> Option<Vec<u8>> {
         return None;
     }
     let scope = &checkpoint.scope;
-    serde_json::to_vec(&wire::SqliteDurableCheckpoint {
+    serde_json::to_vec(&wire::EventlogCaptureSqliteDurableCheckpoint {
         format: FORMAT.to_owned(),
-        version: VERSION,
+        version: VERSION.into(),
         store_instance: binding.instance.clone(),
         prefix: binding.prefix.clone(),
-        scope: wire::CaptureCheckpointScope {
-            capture: wire::CaptureScope {
+        scope: Box::new(wire::EventlogCaptureCaptureCheckpointScope {
+            capture: Box::new(wire::EventlogCaptureCaptureScope {
                 tenant_id: scope.tenant.as_str().to_owned(),
                 stream_identity: scope.identity.clone(),
-            },
+            }),
             projections: scope
                 .projections
                 .iter()
-                .map(|projection| wire::CapturedProjectionScope {
-                    name: projection.name.clone(),
-                    indexed_fields: projection.indexed.clone(),
+                .map(|projection| {
+                    Box::new(wire::EventlogCaptureCapturedProjectionScope {
+                        name: projection.name.clone(),
+                        indexed_fields: projection.indexed.clone(),
+                    })
                 })
                 .collect(),
-            limits: scope.limits.into(),
-        },
-        usage: checkpoint.usage.into(),
-        position: binding.position,
-        schema_version: binding.schema_version,
-        mark: binding.mark.clone(),
+            limits: Box::new(scope.limits.into()),
+        }),
+        usage: Box::new(checkpoint.usage.into()),
+        position: binding.position.into(),
+        schema_version: binding.schema_version.into(),
+        mark: Box::new(binding.mark.clone()),
     })
     .ok()
 }
@@ -547,24 +590,31 @@ pub(crate) fn encode(checkpoint: &Checkpoint, prefix: &str) -> Option<Vec<u8>> {
 /// A checkpoint restored from bytes `encode` wrote for this prefix, or `None`. `instance` is the
 /// store instance the restoring handle last read, when it has read one.
 pub(crate) fn decode(bytes: &[u8], prefix: &str, instance: Option<&str>) -> Option<Checkpoint> {
-    let wire: wire::SqliteDurableCheckpoint = serde_json::from_slice(bytes).ok()?;
+    let wire: wire::EventlogCaptureSqliteDurableCheckpoint = serde_json::from_slice(bytes).ok()?;
     if wire.format != FORMAT
-        || wire.version != VERSION
+        || wire.version.as_u64() != Some(VERSION)
         || wire.prefix != prefix
         || instance.is_some_and(|instance| wire.store_instance != instance)
         || !hex32(&wire.store_instance)
         || !hex32(&wire.mark.token)
+        || wire.mark.epoch.as_u64().is_none()
     {
         return None;
     }
-    let capture = wire.scope.capture;
+    let position = wire.position.as_u64()?;
+    let schema_version = wire.schema_version.as_i64()?;
+    let limits = CaptureLimits::try_from(&*wire.scope.limits).ok()?;
+    let usage = CaptureUsage::try_from(&*wire.usage).ok()?;
+    let scope = *wire.scope;
+    let capture = *scope.capture;
     let tenant = TenantId::new(capture.tenant_id).ok()?;
     if capture.stream_identity.is_empty() {
         return None;
     }
     let mut names = BTreeSet::new();
-    let mut projections = Vec::with_capacity(wire.scope.projections.len());
-    for projection in wire.scope.projections {
+    let mut projections = Vec::with_capacity(scope.projections.len());
+    for projection in scope.projections {
+        let projection = *projection;
         validate_identifier("projection name", &projection.name).ok()?;
         if !names.insert(projection.name.clone())
             || projection.indexed_fields.len() > MAX_INDEXED_FIELDS
@@ -588,15 +638,15 @@ pub(crate) fn decode(bytes: &[u8], prefix: &str, instance: Option<&str>) -> Opti
             tenant,
             identity: capture.stream_identity,
             projections,
-            limits: wire.scope.limits.into(),
+            limits,
         },
-        wire.usage.into(),
+        usage,
         DurableBinding {
             instance: wire.store_instance,
             prefix: wire.prefix,
-            schema_version: wire.schema_version,
-            mark: wire.mark,
-            position: wire.position,
+            schema_version,
+            mark: *wire.mark,
+            position,
         },
     ))
 }
@@ -668,26 +718,20 @@ fn walk(
         rows: BTreeMap::new(),
     };
     for (position, owner, from_epoch, from_token, to_epoch, to_token, text) in entries {
-        let from = CaptureContinuityMark {
-            epoch: u64::try_from(from_epoch).ok()?,
-            token: from_token,
-        };
-        if !from.same(&walk.end) {
+        let from = mark(u64::try_from(from_epoch).ok()?, from_token);
+        if !same(&from, &walk.end) {
             return None;
         }
-        walk.end = CaptureContinuityMark {
-            epoch: u64::try_from(to_epoch).ok()?,
-            token: to_token,
-        };
+        walk.end = mark(u64::try_from(to_epoch).ok()?, to_token);
         walk.last = u64::try_from(position).ok()?;
         if owner != tenant.as_str() {
             continue;
         }
-        let entry: wire::DurableJournalEntry = serde_json::from_str(&text).ok()?;
+        let entry: journal_wire::DurableJournalEntry = serde_json::from_str(&text).ok()?;
         if entry.position != walk.last
             || entry.tenant_id != owner
-            || !entry.from.same(&from)
-            || !entry.to.same(&walk.end)
+            || !same(&entry.from, &from)
+            || !same(&entry.to, &walk.end)
             || entry.event_positions.is_empty()
         {
             // Every acknowledged group appends an event: an entry of this tenant without one is
@@ -713,7 +757,7 @@ fn walk(
             };
             // Writes address the physical table by name: the same table under another
             // declaration is not an unrelated projection whose change may be left out.
-            if !change.projection.is(specification) {
+            if !scope_is(&change.projection, specification) {
                 return None;
             }
             match walk
@@ -894,7 +938,7 @@ impl Inner {
         {
             return Ok(None);
         }
-        if then.mark.same(&now.mark) && then.position == now.position {
+        if same(&then.mark, &now.mark) && then.position == now.position {
             // The usage is decoded, not counted: one over the request's caps is no proof of a
             // crossed cap, so the complete capture decides instead.
             return Ok(within(old.usage, limits).then_some(Continued::Unchanged));
@@ -902,7 +946,7 @@ impl Inner {
         let Some(walk) = walk(connection, &self.prefix, tenant, projections, then) else {
             return Ok(None);
         };
-        if walk.last == then.position || !walk.end.same(&now.mark) || walk.last != now.position {
+        if walk.last == then.position || !same(&walk.end, &now.mark) || walk.last != now.position {
             return Ok(None);
         }
         let Some(events) = read_events(connection, &self.prefix, tenant, &walk.positions)? else {
@@ -1119,135 +1163,20 @@ impl SqliteEventStore {
     }
 }
 
-/// The JSON encodings, by the names of the ESS types they encode.
-mod wire {
+/// The journal entry encodings, still written by hand: the one part of `ess/capture/` the
+/// generated Rust types cannot carry.
+///
+/// `eventlog.capture.JournaledRowChange` holds a row value as `Optional<Json>`, which the
+/// generated crate types as `serde_json::Value`. Without `serde_json/arbitrary_precision` a value
+/// parsed and written again is not always the value its stored text parses to (a float such as
+/// `1.0715660391465826e-75` drifts by one unit in the last place on every re-read), and with it
+/// every stored `request_hash` changes. These types embed the row's exact stored text instead,
+/// and `story:generate-capture-types-from-ess` records the remaining gap.
+mod journal_wire {
     use serde::{Deserialize, Deserializer, Serialize};
     use serde_json::value::RawValue;
 
-    use super::CaptureContinuityMark;
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct CaptureScope {
-        pub(super) tenant_id: String,
-        pub(super) stream_identity: String,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct CapturedProjectionScope {
-        pub(super) name: String,
-        pub(super) indexed_fields: Vec<String>,
-    }
-
-    impl CapturedProjectionScope {
-        pub(super) fn of(specification: &eventlog_core::ProjectionSpec) -> Self {
-            Self {
-                name: specification.name.to_owned(),
-                indexed_fields: specification
-                    .indexed
-                    .iter()
-                    .map(|field| (*field).to_owned())
-                    .collect(),
-            }
-        }
-
-        pub(super) fn is(&self, specification: &eventlog_core::ProjectionSpec) -> bool {
-            self.name == specification.name
-                && self
-                    .indexed_fields
-                    .iter()
-                    .map(String::as_str)
-                    .eq(specification.indexed.iter().copied())
-        }
-    }
-
-    // The field names are the committed schema's property names, `max_` prefix included.
-    #[allow(clippy::struct_field_names)]
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct CaptureLimits {
-        max_events: u64,
-        max_blobs: u64,
-        max_projection_rows: u64,
-        max_payload_bytes: u64,
-    }
-
-    impl From<eventlog_core::CaptureLimits> for CaptureLimits {
-        fn from(limits: eventlog_core::CaptureLimits) -> Self {
-            Self {
-                max_events: limits.max_events,
-                max_blobs: limits.max_blobs,
-                max_projection_rows: limits.max_projection_rows,
-                max_payload_bytes: limits.max_payload_bytes,
-            }
-        }
-    }
-
-    impl From<CaptureLimits> for eventlog_core::CaptureLimits {
-        fn from(limits: CaptureLimits) -> Self {
-            Self {
-                max_events: limits.max_events,
-                max_blobs: limits.max_blobs,
-                max_projection_rows: limits.max_projection_rows,
-                max_payload_bytes: limits.max_payload_bytes,
-            }
-        }
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct CaptureUsage {
-        events: u64,
-        blobs: u64,
-        projection_rows: u64,
-        payload_bytes: u64,
-    }
-
-    impl From<eventlog_core::CaptureUsage> for CaptureUsage {
-        fn from(usage: eventlog_core::CaptureUsage) -> Self {
-            Self {
-                events: usage.events,
-                blobs: usage.blobs,
-                projection_rows: usage.projection_rows,
-                payload_bytes: usage.payload_bytes,
-            }
-        }
-    }
-
-    impl From<CaptureUsage> for eventlog_core::CaptureUsage {
-        fn from(usage: CaptureUsage) -> Self {
-            Self {
-                events: usage.events,
-                blobs: usage.blobs,
-                projection_rows: usage.projection_rows,
-                payload_bytes: usage.payload_bytes,
-            }
-        }
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct CaptureCheckpointScope {
-        pub(super) capture: CaptureScope,
-        pub(super) projections: Vec<CapturedProjectionScope>,
-        pub(super) limits: CaptureLimits,
-    }
-
-    /// Version 1 of the SQLite encoding of `DurableCaptureCheckpoint`.
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct SqliteDurableCheckpoint {
-        pub(super) format: String,
-        pub(super) version: u64,
-        pub(super) store_instance: String,
-        pub(super) prefix: String,
-        pub(super) scope: CaptureCheckpointScope,
-        pub(super) usage: CaptureUsage,
-        pub(super) position: u64,
-        pub(super) schema_version: i64,
-        pub(super) mark: CaptureContinuityMark,
-    }
+    use super::{CaptureContinuityMark, wire::EventlogCaptureCapturedProjectionScope};
 
     /// Absent is no row; a present JSON `null` is a row whose value is null. A present value is
     /// the exact text the row held, embedded as JSON: re-serializing a parsed value would hand a
@@ -1255,7 +1184,7 @@ mod wire {
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(super) struct JournaledRowChange {
-        pub(super) projection: CapturedProjectionScope,
+        pub(super) projection: EventlogCaptureCapturedProjectionScope,
         pub(super) key: String,
         #[serde(
             default,

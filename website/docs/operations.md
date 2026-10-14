@@ -19,7 +19,9 @@ Test recovery on a disposable copy.
 
 File's manifest selects the committed journal prefix. Opening verifies the history and active
 blobs; later operations re-read the committed prefix and compare it byte for byte with the bytes
-they verified before reusing verified state, unless the file has held still for two seconds. A
+they verified before reusing verified state, unless the file has held still for two seconds; on
+the segmented layout `eventlog-file/2` that rule applies per segment file, so only recently
+changed segments are compared. A
 handle keeps those bytes in memory, once: budget the committed size of `events.jsonl` per open
 handle after open, and up to about twice that as the handle's own appends grow the buffer.
 A valid recovery intent is handled by an authorized opener. Inspectors refuse pending recovery
@@ -52,7 +54,7 @@ returns `UnknownCommit`; query the claim or retry the original request.
 ## Validate a deployment
 
 The local repository gate is `bash scripts/gate.sh`. Set `EVENTLOG_TEST_POSTGRES_URL` to a
-disposable PostgreSQL fixture first. Some 0.3.0 cases refuse a missing URL; other cases report
+disposable PostgreSQL fixture first. Some cases refuse a missing URL; other cases report
 that they did not run. Neither result proves the PostgreSQL provider.
 
 The required production proof uses disposable PostgreSQL with verified TLS and both migration

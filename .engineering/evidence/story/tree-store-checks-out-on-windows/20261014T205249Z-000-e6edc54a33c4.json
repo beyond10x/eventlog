@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-14T20:52:49Z",
+  "actor": "human:timo",
+  "artifact": "story:tree-store-checks-out-on-windows",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "review",
+    "source": "adversary review 2026-10-14: two handles creating one store shared the staging name .store.json.tmp (pre-existing), fixed in a3c709262 by per-writer staging and a hard-link publish; the hashed path bound assumes a tenant of at most 36 escaped bytes, now documented; layout_adversary 3 cases green",
+    "reference": "crates/eventlog-tree/tests/layout_adversary.rs"
+  }
+}

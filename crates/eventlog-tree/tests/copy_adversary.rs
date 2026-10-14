@@ -1,13 +1,16 @@
 //! Adversarial cases for `copy` (design § 9.6): what the author's suite does not say about a
 //! refused copy, blobs shared between groups, file-backed targets and erasure.
 
+#[macro_use]
+mod each_layout;
+
 use eventlog_conformance::{event, meta};
 use eventlog_core::{
     AppendGroup, AtomicEventStore, EventLogError, EventStore, Expected, NoGuard, StreamAppend,
     StreamId, TenantId,
 };
 use eventlog_sqlite::SqliteEventStore;
-use eventlog_tree::{TreeEventStore, copy};
+use eventlog_tree::{TreeEventStore, TreeLayout, copy};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -31,10 +34,13 @@ async fn feed_len(store: &dyn EventStore, owner: &str) -> usize {
 /// AGENTS.md invariant 7, "refusals change nothing": a copy that refuses must leave the target as
 /// it found it. A target that already minted a stream identity for a later tenant holds no events
 /// for it, so it passes the pre-check, and the copy refuses only after the earlier tenant is in.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_copy_refused_for_a_minted_identity_leaves_no_earlier_tenant_in_the_target() {
+async fn a_copy_refused_for_a_minted_identity_leaves_no_earlier_tenant_in_the_target(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path()).await.unwrap();
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     for owner in ["tenant-a", "tenant-b"] {
         tree.stream_identity(&tenant(owner)).await.unwrap();
         tree.append(
@@ -86,10 +92,11 @@ fn shared_blob_group(key: &str, id: &str) -> AppendGroup {
 
 /// Two groups bind one blob; the target is a file database, whose blob reads re-check integrity
 /// (unlike the in-memory target every author case uses), and it is reopened before being read.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_blob_bound_by_two_groups_copies_into_a_file_database_and_survives_reopening() {
+async fn a_blob_bound_by_two_groups_copies_into_a_file_database_and_survives_reopening(
+    layout: TreeLayout,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path().join("tree"))
+    let tree = TreeEventStore::open_in(directory.path().join("tree"), layout)
         .await
         .unwrap();
     let blobs = vec![("shared".to_owned(), b"shared bytes".to_vec())];
@@ -136,10 +143,11 @@ async fn a_blob_bound_by_two_groups_copies_into_a_file_database_and_survives_reo
 }
 
 /// Erasing one copied tenant erases its origins and no other tenant's.
-#[tokio::test(flavor = "multi_thread")]
-async fn erasing_one_copied_tenant_keeps_every_other_tenants_origins() {
+async fn erasing_one_copied_tenant_keeps_every_other_tenants_origins(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
-    let tree = TreeEventStore::open(directory.path()).await.unwrap();
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
     for owner in ["tenant-a", "tenant-b"] {
         tree.append(
             &stream(owner, "x"),
@@ -168,3 +176,9 @@ async fn erasing_one_copied_tenant_keeps_every_other_tenants_origins() {
         "erasing tenant-a took tenant-b's origins"
     );
 }
+
+each_layout!(
+    a_copy_refused_for_a_minted_identity_leaves_no_earlier_tenant_in_the_target,
+    a_blob_bound_by_two_groups_copies_into_a_file_database_and_survives_reopening,
+    erasing_one_copied_tenant_keeps_every_other_tenants_origins,
+);
