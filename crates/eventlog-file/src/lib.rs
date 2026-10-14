@@ -1069,7 +1069,6 @@ fn enter(
         for transaction in &resumed.fresh {
             bound.extend(state.fold(transaction)?);
         }
-        let advanced = !resumed.fresh.is_empty();
         let mut journal = resumed.into_journal(root, verified.transactions);
         journal.adopt(reader);
         let tx = Transaction {
@@ -1090,10 +1089,14 @@ fn enter(
         for (tenant, digest) in &bound {
             tx.object(tenant, digest, false)?;
         }
-        if advanced {
-            // Another writer's frames can retire a generation this handle still has cached.
-            tx.clear_snapshots()?;
-        }
+        // No snapshot is disposed of here, because frames of one epoch retire no generation:
+        // `Transaction::generation` mints one only for a stream that has none, and the only ops
+        // that replace or drop one, `redact` and `forget_tenant`, commit through a privacy rewrite
+        // into a new epoch. That privacy commit disposes of the retired snapshots itself, and after a
+        // crash before it could, the next fresh open does. `Journal::resume` refuses a new epoch,
+        // so this handle reaches the complete opener below, which refuses it as diverged. A cache
+        // file of a retired generation is refused by `load_snapshot`'s generation comparison
+        // wherever it is.
         return Ok(tx);
     }
     let mut journal = Journal::open_existing(root)?;
