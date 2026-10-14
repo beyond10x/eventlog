@@ -733,6 +733,40 @@ async fn client(url: &str) -> tokio_postgres::Client {
     client
 }
 
+/// Follow the feed from `cursor` until it has delivered `expected` events, or fail saying so.
+///
+/// The commit watermark is cluster-wide (`AGENTS.md`, *The watermark couples feed latency across
+/// owners*): a transaction open anywhere in the instance, a sibling case in this lane or another
+/// gate on the same server, withholds committed events from every feed. One read after every
+/// writer committed asks whether the machine happened to be idle. This follows each returned
+/// cursor and never rereads a position it has passed, so a cursor that skipped a position still
+/// fails here, after the bound, instead of being repaired by a read from the start. It stops at
+/// `expected`; the caller's exact assertion on the result is what refuses a surplus.
+async fn feed_from(
+    store: &PostgresEventStore,
+    tenant: &TenantId,
+    mut cursor: u64,
+    mut delivered: Vec<eventlog_core::RecordedEvent>,
+    expected: usize,
+) -> Vec<eventlog_core::RecordedEvent> {
+    for _ in 0..200 {
+        if delivered.len() >= expected {
+            return delivered;
+        }
+        let page = store.read_feed(tenant, cursor, 10).await.expect("readable");
+        cursor = page.next_position;
+        delivered.extend(page.events);
+        if delivered.len() >= expected {
+            return delivered;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "the feed never delivered {expected} events from its cursor; it delivered {}",
+        delivered.len()
+    );
+}
+
 async fn downgrade_blob_table(sql: &tokio_postgres::Client, prefix: &str) {
     sql.batch_execute(&format!(
         "BEGIN;
@@ -836,6 +870,8 @@ async fn a_reader_never_skips_an_event_that_committed_late() {
 
     // A reader that trusted the sequence alone would take position 2 now and never come back for
     // position 1. It sees nothing instead, and waits.
+    // Read once on purpose: a withheld feed is the outcome asserted, and a transaction held
+    // elsewhere in the instance can only withhold more, never deliver the fast writer early.
     let blocked = store.read_feed(&tenant, 0, 10).await.expect("readable");
     assert!(
         blocked.events.is_empty(),
@@ -844,12 +880,8 @@ async fn a_reader_never_skips_an_event_that_committed_late() {
 
     held.commit().await.expect("the slow writer commits second");
 
-    let page = store.read_feed(&tenant, 0, 10).await.expect("readable");
-    let seen: Vec<&str> = page
-        .events
-        .iter()
-        .map(|event| event.stream_id.as_str())
-        .collect();
+    let page = feed_from(&store, &tenant, 0, Vec::new(), 2).await;
+    let seen: Vec<&str> = page.iter().map(|event| event.stream_id.as_str()).collect();
     assert_eq!(
         seen,
         vec!["slow", "fast"],
@@ -1671,16 +1703,17 @@ async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid()
         .await
         .expect("newer writer")
         .expect("later XID commits lower position");
+    // The early read stays a single read: an empty page is what it asserts, and a feed withheld by
+    // some other transaction is empty too. What follows must see both positions, so it follows the
+    // cursor with a bounded retry rather than asking once whether the instance is idle.
     let visible = if let Some(early) = early {
-        first
-            .read_feed(&tenant, early.next_position, 10)
-            .await
-            .expect("resume")
+        feed_from(&first, &tenant, early.next_position, early.events, 2).await
     } else {
-        page.await.expect("reader").expect("feed")
+        let page = page.await.expect("reader").expect("feed");
+        feed_from(&first, &tenant, page.next_position, page.events, 2).await
     };
-    assert_eq!(visible.events.len(), 2, "both positions remain reachable");
-    assert!(visible.events[0].global_seq < visible.events[1].global_seq);
+    assert_eq!(visible.len(), 2, "both positions remain reachable");
+    assert!(visible[0].global_seq < visible[1].global_seq);
 }
 
 #[tokio::test]
