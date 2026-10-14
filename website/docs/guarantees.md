@@ -25,15 +25,13 @@ A second opt-in API, `AtomicEventStore::append_group_guarded_with_blobs`, puts a
 under one durability barrier. File and SQLite implement it; PostgreSQL returns the trait's refusal.
 Do not infer this capability from support for `AtomicBlobEventStore`.
 
-File also has an inherent `append_group_with_blobs` method. In 0.3.0, call the portable trait
+File also has an inherent `append_group_with_blobs` method. Call the portable trait
 explicitly as `AtomicBlobEventStore::append_group_with_blobs(&store, &request)` to avoid Rust
 selecting the inherent method with a different argument shape.
 
 Blob bindings are immutable while present: identical bytes may be retried, different bytes under
 the same tenant/digest binding refuse. Providers verify stored length and content integrity when
 handing bytes out. Domain payloads belong in content storage; events refer to them.
-See the [SQLite 0.3.0 limitation](providers.md#sqlite) before relying on integrity admission
-when a fresh atomic group reuses an existing binding.
 
 ## Inspection and capture
 
