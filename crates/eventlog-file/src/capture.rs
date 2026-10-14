@@ -50,6 +50,22 @@ pub(crate) struct Observed {
     content: journal::Content,
 }
 
+impl Observed {
+    /// A reader's view of the history a writer's view verified, as a capture starts from it.
+    ///
+    /// One direction only: a writer's view makes every promise a reader's does and more, so it
+    /// can stand in for one; nothing turns a reader's view into a writer's. The bytes are shared
+    /// (a reference count); the fold is copied, because the capture folds onto its own and the
+    /// writer's next transaction resumes from the writer's.
+    fn from_writer(verified: &crate::Verified) -> Self {
+        Self {
+            manifest: verified.manifest.clone(),
+            state: verified.state.clone(),
+            content: verified.content.clone(),
+        }
+    }
+}
+
 /// What one handle has observed: the committed head it last accepted, and — when it still has
 /// one — the verified view behind that head, so the next capture pays for what changed.
 ///
@@ -218,12 +234,16 @@ struct Slots<'a> {
 ///
 /// Synchronous, and called in the same poll that stores the view: no await sits between the
 /// adoption and this, so a capture dropped by its caller either stores nothing or stores a view
-/// this has already been applied to. A pointer comparison: it reads no byte on the executor.
+/// this has already been applied to. A pointer and head comparison: it reads no byte on the
+/// executor.
 fn retain_once(writer: &mut Option<crate::Verified>, reader: &Observed) {
-    if writer
-        .as_ref()
-        .is_some_and(|verified| !verified.content.shares_bytes_with(&reader.content))
-    {
+    // A capture that started from the writer's view and took in frames another handle committed
+    // extends the shared buffer in place, so the two still share bytes; but the writer's view
+    // names a head this capture has moved past, and the next transaction would retire it anyway.
+    // Kept, it would only be a second fold held beside the capture's.
+    if writer.as_ref().is_some_and(|verified| {
+        verified.manifest != reader.manifest || !verified.content.shares_bytes_with(&reader.content)
+    }) {
         *writer = None;
     }
 }
@@ -296,9 +316,25 @@ async fn capture<T: Send + 'static>(
     // trusting a view assembled beside a refusal; and any entry point that moved the observed head
     // past what this view folded has already retired it by moving it. The rule and the reason are
     // `FileEventStore::transaction`'s.
+    //
+    // A write through a `FileEventStore` moves the observed head without moving the capture's
+    // view, so after a write that filter leaves nothing. The writer's view of the same head is
+    // then the handle's verified history: every frame in it was chained and folded by this
+    // handle, under a stronger promise than a reader's. The capture starts from a copy of it
+    // rather than rereading, rechaining and refolding what the handle already verified. Nothing is
+    // trusted that a reader's own view would not be: `resume_strict` below compares the committed
+    // prefix with exactly these bytes, and any difference falls to the strict reread and its
+    // refusal.
     let reusable = view
         .take()
-        .filter(|view| Some(&view.manifest) == previous.as_ref());
+        .filter(|view| Some(&view.manifest) == previous.as_ref())
+        .or_else(|| {
+            writer
+                .as_deref()
+                .and_then(Option::as_ref)
+                .filter(|verified| Some(&verified.manifest) == previous.as_ref())
+                .map(Observed::from_writer)
+        });
     let owner = tenant.clone();
     let requested = projections.to_vec();
     let (manifest, extended, verified, outcome) = blocking(move || {
@@ -919,10 +955,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let tenant = TenantId::new("capture-cost-owner").unwrap();
+        // The history is written through another handle, after this one opened: a write through
+        // the capturing handle would leave it a verified view of that history, and its first
+        // capture would then have nothing to pay for (`story:file-capture-after-a-write-resumes`).
         let store = FileEventStore::open(root).await.unwrap();
-        store.stream_identity(&tenant).await.unwrap();
+        let writer = FileEventStore::open(root).await.unwrap();
+        writer.stream_identity(&tenant).await.unwrap();
         for index in 0..8_i64 {
-            store
+            writer
                 .append(
                     &StreamId::new(tenant.clone(), "item", format!("s{index}")).unwrap(),
                     Expected::NoStream,
@@ -931,7 +971,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            store
+            writer
                 .put_blob(
                     &tenant,
                     &format!("d{index}"),
@@ -940,6 +980,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        drop(writer);
 
         let before = crate::cost::of(root);
         let first = store.capture_tenant(&tenant, &[], limits()).await.unwrap();

@@ -92,15 +92,16 @@ async fn a_writer_that_rereads_everything_keeps_the_committed_bytes_once() {
     );
 }
 
-/// A capture after this handle's own appends does not resume onto the capture's view today: a
-/// write through the handle moves `runtime.observed`, `capture` drops a view whose manifest is not
-/// the observed head, and the capture rereads, rechains, re-encodes and refolds the whole history
-/// — five frames here (the identity, `own-0` and `own-1..=3`), and no prefix byte compared.
+/// A capture after this handle's own appends resumes. A write through the handle moves
+/// `runtime.observed` past the capture's view, and before
+/// `story:file-capture-after-a-write-resumes` the capture then reread, rechained, re-encoded and
+/// refolded the whole history — five frames here (the identity, `own-0` and `own-1..=3`) — and
+/// compared no prefix byte.
 ///
-/// Pinned as it is, not as it should be: `story:file-capture-after-a-write-resumes` makes this
-/// capture resume, and when it lands both assertions flip — it compares exactly the bytes its own
-/// view verified (not the longer buffer the writer extended in place) and chains only the three
-/// frames appended since.
+/// Flipped by that story, to the numbers its acceptance names rather than the ones this pin first
+/// predicted: the capture starts from the writer's view of the observed head, so it compares the
+/// whole committed prefix that view verified — the writer's own appends cleared its stamp, so
+/// nothing is trusted unread — and chains none of the frames the handle already chained.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_after_own_appends_compares_only_the_bytes_its_view_verified() {
     let directory = tempfile::tempdir().unwrap();
@@ -111,24 +112,22 @@ async fn a_capture_after_own_appends_compares_only_the_bytes_its_view_verified()
     store.stream_identity(&tenant).await.unwrap();
     append(&store, &stream, "own-0").await;
     store.capture_tenant(&tenant, &[], limits()).await.unwrap();
-    let observed = committed_length(root);
     for index in 1..=3 {
         append(&store, &stream, &format!("own-{index}")).await;
     }
+    let verified = committed_length(root);
     let before = crate::cost::of(root);
     store.capture_tenant(&tenant, &[], limits()).await.unwrap();
     let spent = crate::cost::of(root) - before;
     assert_eq!(
-        spent.prefix_bytes_compared, 0,
-        "a capture after this handle's own write now resumes: if story \
-         file-capture-after-a-write-resumes has landed, flip this to the {observed} bytes its own \
-         view verified: {spent:?}"
+        spent.prefix_bytes_compared, verified,
+        "a capture after this handle's own write compares the {verified} committed bytes the \
+         writer's view verified: {spent:?}"
     );
     assert_eq!(
-        spent.frames_chained, 5,
-        "a capture after this handle's own write no longer rechains the whole history: if story \
-         file-capture-after-a-write-resumes has landed, flip this to the 3 frames appended \
-         since: {spent:?}"
+        spent.frames_chained, 0,
+        "a capture after this handle's own write rechains no frame the handle already chained: \
+         {spent:?}"
     );
 }
 

@@ -112,7 +112,7 @@ pub(crate) struct Blob {
 /// from the journal and one folded onto a cached view run the same inserts for the same events.
 /// Redaction and erasure change no event in place; they rewrite the journal and replay it into a
 /// new `State`. Nothing here is serialized, so the journal's bytes do not depend on it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Events {
     by_position: BTreeMap<u64, RecordedEvent>,
     /// [`stream_key`] → version → global position.
@@ -218,7 +218,7 @@ mod visits {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct State {
     pub events: Events,
     pub commands: BTreeMap<String, (String, GroupRange)>,

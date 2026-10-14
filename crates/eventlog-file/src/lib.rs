@@ -2,6 +2,8 @@
 //! Repository-local Eventlog. JSONL transactions are authoritative; snapshots are disposable.
 mod capture;
 #[cfg(test)]
+mod capture_after_write;
+#[cfg(test)]
 mod cost;
 mod inline_admin;
 mod inspection;
