@@ -2,12 +2,14 @@
 format: aep.planning-md/3
 id: decision-blocker:on-disk-layout-changes
 kind: decision-blocker
-status: open
+status: cleared
 title: Two stories need a new on-disk layout
 relations:
 - blocks: story:incremental-history-digest-for-a-resumed-handle
 - blocks: story:tree-store-checks-out-on-windows
-revision: 1
+revision: 3
+transitions:
+- {from: "open", to: "cleared", at: "2026-10-14T07:24:21Z", actor: "human:timo", revision: 3}
 ---
 ## Question
 
@@ -35,3 +37,10 @@ reader does not understand:
 ## Recommendation
 
 A: no released reader breaks, and each consumer moves when it opts in.
+
+## Decided (2026-10-14)
+
+Option A. Both stories may introduce a new on-disk layout version. A store keeps its current
+layout unless its owner opts in; every release keeps reading the old layout; conformance holds both
+layouts. No migration and no refusal of the old layout. The release that ships either is a minor
+release.

@@ -2,11 +2,14 @@
 format: aep.planning-md/3
 id: story:tree-store-checks-out-on-windows
 kind: story
-status: draft
+status: active
 title: A tree store checks out on Windows without long paths
 relations:
 - serves: vision:O2
-revision: 1
+revision: 3
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-14T07:24:21Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-10-14T07:24:21Z", actor: "human:timo", revision: 3}
 ---
 # A tree store checks out on Windows without long paths
 
