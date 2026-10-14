@@ -2,17 +2,18 @@
 format: aep.planning-md/3
 id: story:strict-reader-lock-case-races-a-forked-crash-child
 kind: story
-status: active
+status: implemented
 title: The strict-reader lock case fails on its own control when a crash child inherits the descriptor
 summary: capture.rs:340 try_lock returns WouldBlock; reproduces at c698923, 3 in 20 under taskset
 owner: eventlog
 relations:
 - informed_by: story:file-eventlog-verifies-once-per-open
 - serves: vision:O2
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-14T20:52:49Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

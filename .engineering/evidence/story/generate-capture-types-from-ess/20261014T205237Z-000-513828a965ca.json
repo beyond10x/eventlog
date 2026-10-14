@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-14T20:52:37Z",
+  "actor": "human:timo",
+  "artifact": "story:generate-capture-types-from-ess",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "package gates on wave/w1014 6e2ac0aa8: cargo test -p eventlog-file 258 passed 0 failed; cargo test -p eventlog-core -p eventlog-sqlite -p eventlog-conformance -p eventlog-tree -p eventlog-postgres 520 passed 0 failed 0 ignored (PostgreSQL 17.6 verified-TLS fixture); clippy -D warnings exit 0; fmt exit 0; ess-drift exit 0",
+    "reference": "wave/w1014@6e2ac0aa8"
+  }
+}

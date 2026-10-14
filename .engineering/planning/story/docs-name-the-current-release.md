@@ -2,17 +2,18 @@
 format: aep.planning-md/3
 id: story:docs-name-the-current-release
 kind: story
-status: active
+status: implemented
 title: The public docs name the current release and summarize every release
 summary: website pages still name 0.3.0 as current; releases.md stops at 0.3.0
 owner: eventlog
 relations:
 - informed_by: review-result:adversary-file-eventlog-indexes-streams-pass-1
 - serves: vision:O2
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-14T07:22:29Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-14T07:22:29Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-14T20:52:49Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

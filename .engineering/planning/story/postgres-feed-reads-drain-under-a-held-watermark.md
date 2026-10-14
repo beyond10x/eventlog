@@ -2,16 +2,17 @@
 format: aep.planning-md/3
 id: story:postgres-feed-reads-drain-under-a-held-watermark
 kind: story
-status: active
+status: implemented
 title: Postgres tests that read the feed once fail under a held commit watermark
 summary: atomic_group.rs:598 red 3/3 at base under load; e603605 drains 2 sites; 10 candidates, 1 non-member, :551 zero-branch hazard open
 owner: eventlog
 relations:
 - serves: vision:O2
-revision: 3
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-14T07:22:30Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-14T20:52:49Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 
@@ -77,3 +78,21 @@ Two findings on e603605, both left standing for this story rather than patched i
 - `adversary.rs:109-113` still reads exactly once.
 - The postgres lane of `evidence/eventlog-tls-gate.sh` runs green 5 of 5 under a concurrent full
   gate on the same machine, or the run count and the load are recorded with the result.
+
+## Sites, as delivered (2026-10-14)
+
+| Site | Outcome | Reason |
+|---|---|---|
+| `conformance.rs:839` | single read kept, commented | it asserts the feed is withheld; a transaction held elsewhere only withholds more |
+| `conformance.rs:847` | bounded drain (`feed_from`) | drains to 2 events, then the exact order |
+| `conformance.rs:1661` | single read kept | it asserts an empty page or nothing, which a withheld feed satisfies |
+| `conformance.rs:1676` | bounded drain | both branches drain from the returned cursor to 2 events, then an exact count |
+| `conformance.rs:1238`, `:1250` | immune | pool errors raised before any query |
+| `conformance.rs:1281`, `:2513` | immune | `Closed` after shutdown; no database read |
+| `inline_admin.rs:398` | immune | asserts an empty feed as a precondition; the rebuild reads past the watermark |
+| `consistent_capture.rs:228` | immune | asserts `feed < captured`, which a withheld feed satisfies |
+| `adversary.rs:109-113` | untouched | still reads exactly once |
+
+The crash case counts committed event and group receipt rows directly after each crash and after the
+retry, so the zero-event branch and the exact count no longer depend on the feed. The package lane ran
+132 passed 4 times under load averages from 12.8 to 65.9 (one run refused by the build queue).
