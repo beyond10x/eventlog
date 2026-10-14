@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 eventlog-core.workspace = true
+eventlog-capture-types.workspace = true
 # `serialize` writes and reads a whole in-memory database, so a tree store reopens without a replay.
 rusqlite = { workspace = true, features = ["serialize"] }
 serde.workspace = true

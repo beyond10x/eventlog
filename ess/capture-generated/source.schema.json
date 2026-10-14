@@ -1,0 +1,320 @@
+{
+  "$defs": {
+    "eventlog.capture.CaptureCheckpointScope": {
+      "additionalProperties": false,
+      "properties": {
+        "capture": {
+          "$ref": "#/$defs/eventlog.capture.CaptureScope"
+        },
+        "limits": {
+          "$ref": "#/$defs/eventlog.capture.CaptureLimits"
+        },
+        "projections": {
+          "items": {
+            "$ref": "#/$defs/eventlog.capture.CapturedProjectionScope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "capture",
+        "projections",
+        "limits"
+      ],
+      "title": "CaptureCheckpointScope",
+      "type": "object",
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.CaptureCheckpointScope"
+    },
+    "eventlog.capture.CaptureContinuityMark": {
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "epoch",
+        "token"
+      ],
+      "title": "CaptureContinuityMark",
+      "type": "object",
+      "x-ess-invariants": [
+        "epoch >= 0"
+      ],
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.CaptureContinuityMark"
+    },
+    "eventlog.capture.CaptureLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "max_blobs": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_payload_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_projection_rows": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_events",
+        "max_blobs",
+        "max_projection_rows",
+        "max_payload_bytes"
+      ],
+      "title": "CaptureLimits",
+      "type": "object",
+      "x-ess-invariants": [
+        "max_events >= 0",
+        "max_blobs >= 0",
+        "max_projection_rows >= 0",
+        "max_payload_bytes >= 0"
+      ],
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.CaptureLimits"
+    },
+    "eventlog.capture.CaptureScope": {
+      "additionalProperties": false,
+      "properties": {
+        "stream_identity": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "stream_identity"
+      ],
+      "title": "CaptureScope",
+      "type": "object",
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.CaptureScope"
+    },
+    "eventlog.capture.CaptureUpdateKind": {
+      "enum": [
+        "Complete",
+        "Unchanged",
+        "AppendDelta"
+      ],
+      "title": "CaptureUpdateKind",
+      "type": "string",
+      "x-ess-kind": "enum",
+      "x-ess-name": "eventlog.capture.CaptureUpdateKind"
+    },
+    "eventlog.capture.CaptureUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "blobs": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "events": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "payload_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "projection_rows": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "events",
+        "blobs",
+        "projection_rows",
+        "payload_bytes"
+      ],
+      "title": "CaptureUsage",
+      "type": "object",
+      "x-ess-invariants": [
+        "events >= 0",
+        "blobs >= 0",
+        "projection_rows >= 0",
+        "payload_bytes >= 0"
+      ],
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.CaptureUsage"
+    },
+    "eventlog.capture.CapturedProjectionScope": {
+      "additionalProperties": false,
+      "properties": {
+        "indexed_fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "indexed_fields"
+      ],
+      "title": "CapturedProjectionScope",
+      "type": "object",
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.CapturedProjectionScope"
+    },
+    "eventlog.capture.DurableCaptureCheckpoint": {
+      "contentEncoding": "base64",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+      "title": "DurableCaptureCheckpoint",
+      "type": "string",
+      "x-ess-kind": "newtype",
+      "x-ess-name": "eventlog.capture.DurableCaptureCheckpoint"
+    },
+    "eventlog.capture.DurableJournalEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "blobs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "event_positions": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "from": {
+          "$ref": "#/$defs/eventlog.capture.CaptureContinuityMark"
+        },
+        "position": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/eventlog.capture.JournaledRowChange"
+          },
+          "type": "array"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "to": {
+          "$ref": "#/$defs/eventlog.capture.CaptureContinuityMark"
+        }
+      },
+      "required": [
+        "position",
+        "tenant_id",
+        "from",
+        "to",
+        "event_positions",
+        "blobs",
+        "rows"
+      ],
+      "title": "DurableJournalEntry",
+      "type": "object",
+      "x-ess-invariants": [
+        "position >= 1"
+      ],
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.DurableJournalEntry"
+    },
+    "eventlog.capture.JournaledRowChange": {
+      "additionalProperties": false,
+      "properties": {
+        "after": {},
+        "before": {},
+        "key": {
+          "type": "string"
+        },
+        "projection": {
+          "$ref": "#/$defs/eventlog.capture.CapturedProjectionScope"
+        }
+      },
+      "required": [
+        "projection",
+        "key"
+      ],
+      "title": "JournaledRowChange",
+      "type": "object",
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.JournaledRowChange"
+    },
+    "eventlog.capture.SqliteDurableCheckpoint": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "type": "string"
+        },
+        "mark": {
+          "$ref": "#/$defs/eventlog.capture.CaptureContinuityMark"
+        },
+        "position": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/eventlog.capture.CaptureCheckpointScope"
+        },
+        "store_instance": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/eventlog.capture.CaptureUsage"
+        },
+        "version": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "format",
+        "version",
+        "store_instance",
+        "prefix",
+        "scope",
+        "usage",
+        "position",
+        "schema_version",
+        "mark"
+      ],
+      "title": "SqliteDurableCheckpoint",
+      "type": "object",
+      "x-ess-invariants": [
+        "version >= 1",
+        "position >= 0"
+      ],
+      "x-ess-kind": "struct",
+      "x-ess-name": "eventlog.capture.SqliteDurableCheckpoint"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-ess-provenance": {
+    "contract_digest": "slice-sha256/2:43adf9017d1e43ea0c84375a42072be99ea89cb1e7e13273ac1ff8d4ba7ad96f",
+    "source_digest": "dde71f18b6f450d85b96f7044567752c025240f9b0b961a0ded826eb54d05f79",
+    "specification_version": "v1",
+    "system": "eventlog"
+  }
+}

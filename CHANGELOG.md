@@ -5,6 +5,21 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Changed
+
+- SQLite durable capture continuity encodes its checkpoint with the Rust types
+  `ess generate types` (ess 0.59.0) writes from `ess/capture/` to `ess/capture-generated/`
+  (crate `eventlog-capture-types`, built with default features off so `serde_json` keeps its
+  default number handling and every stored `request_hash` still matches). The journal entry keeps
+  its hand-written encoding, which embeds each row's exact stored text. Bytes written by earlier
+  versions restore as before.
+- `eventlog-core`: `CaptureLimits` and `CaptureUsage` convert to and from the generated
+  `EventlogCaptureCaptureLimits` and `EventlogCaptureCaptureUsage` (`From`, and `TryFrom`, which
+  refuses a number that is not a `u64`). Additive.
+- CI (`real-backends`) validates every specification under `ess/` and regenerates every
+  `ess/*-generated/` output with the pinned ess release, refusing any difference
+  (`cargo run --locked -p eventlog-postgres --example ess-drift`).
+
 ## 0.8.4 — 2026-10-13
 
 ### Fixed
