@@ -74,7 +74,8 @@ history on the same store and epoch, the handle reads only the bytes past its ob
 chains them from its observed digest to the new manifest digest, folds those frames onto the state
 it had, and verifies the objects those frames bind. It disposes of no snapshot: frames of one
 epoch retire no snapshot generation, because redaction and tenant erasure, the only operations that
-do, commit a new epoch, which only the complete reread follows. A resumed operation also removes the staging names no durable intent selected, as a complete open does.
+do, commit a new epoch; that privacy commit disposes of the retired snapshots (after a crash, the
+next fresh open does), and a handle that observed the earlier epoch is refused as diverged. A resumed operation also removes the staging names no durable intent selected, as a complete open does.
 Anything else — a new epoch, a pending recovery intent, a shorter or unchained file, a byte length
 that disagrees with the manifest, a committed prefix that is not the bytes this handle verified,
 or a head this handle never folded — falls back to the complete reread, which refuses a history
