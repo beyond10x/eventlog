@@ -75,10 +75,42 @@ struct AppendIntent {
     frame: String,
 }
 
+/// An open `writer.lock` whose `flock` this value holds, released by this value's own drop.
+///
+/// Closing the descriptor is not a release. A `flock` belongs to the open file description, and
+/// any `fork` in the process — `Command::spawn` from any thread — copies the descriptor into a
+/// child that keeps the description, and so the lock, alive until it execs or exits. A lock
+/// released by closing therefore outlives its holder by somebody else's fork window, which an
+/// inspection's `try_lock` reports as `SourceBusy`. `LOCK_UN` releases the description's lock
+/// whoever else still has it open, so the lock lives exactly as long as this value.
+/// (story:strict-reader-lock-case-races-a-forked-crash-child)
+struct WriterLock(File);
+
+impl WriterLock {
+    /// Wait for the lock on `file`, and hold it for as long as the returned value lives.
+    fn hold(file: File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    /// Take the lock on `file` only if nobody holds it now.
+    fn try_hold(file: File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // Nothing to report to: a failed unlock leaves the close below to release it.
+        let _ = self.0.unlock();
+    }
+}
+
 pub(crate) struct Journal {
     root: PathBuf,
     // Kept open for the entire read/decide/commit cycle. Each caller opens its own description.
-    _lock: File,
+    _lock: WriterLock,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
     content: Content,
@@ -335,7 +367,7 @@ fn trusted(before: Option<Stamp>, after: Option<Stamp>, started: i128) -> Option
 
 /// Retains the native lock while the caller folds and examines this observation.
 pub(crate) struct InspectedJournal {
-    _lock: File,
+    _lock: WriterLock,
     pub transactions: Vec<Value>,
 }
 
@@ -349,8 +381,8 @@ pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal
         return Err(InspectionError::UnsupportedSource);
     }
     let root_metadata = fs::symlink_metadata(root).map_err(inspection_io)?;
-    let lock = inspection_file(&root.join("writer.lock"))?;
-    lock.try_lock().map_err(|_| InspectionError::SourceBusy)?;
+    let lock = WriterLock::try_hold(inspection_file(&root.join("writer.lock"))?)
+        .map_err(|_| InspectionError::SourceBusy)?;
     for name in ["append.json", "privacy.json"] {
         match fs::symlink_metadata(root.join(name)) {
             Ok(_) => return Err(InspectionError::RecoveryRequired),
@@ -385,7 +417,7 @@ pub(crate) fn inspect(root: &Path, source_bytes: u64) -> Result<InspectedJournal
         let after = fs::symlink_metadata(root).map_err(|_| InspectionError::SourceChanged)?;
         let after_lock = fs::symlink_metadata(root.join("writer.lock"))
             .map_err(|_| InspectionError::SourceChanged)?;
-        let locked = lock.metadata().map_err(inspection_io)?;
+        let locked = lock.0.metadata().map_err(inspection_io)?;
         if (after.dev(), after.ino()) != (root_metadata.dev(), root_metadata.ino())
             || (after_lock.dev(), after_lock.ino()) != (locked.dev(), locked.ino())
         {
@@ -535,7 +567,7 @@ impl Journal {
             .truncate(false)
             .open(lock_path)
             .map_err(backend)?;
-        lock.lock().map_err(backend)?;
+        let lock = WriterLock::hold(lock).map_err(backend)?;
         let manifest_path = root.join("manifest.json");
         if !manifest_path.exists() {
             if !create {
@@ -730,7 +762,7 @@ impl Journal {
             .truncate(false)
             .open(lock_path)
             .map_err(backend)?;
-        lock.lock().map_err(backend)?;
+        let lock = WriterLock::hold(lock).map_err(backend)?;
         let Some((manifest, fresh, content)) = resumed_committed(root, observed, content)? else {
             return Ok(None);
         };
@@ -906,7 +938,7 @@ pub(crate) fn extends_observed(
 /// The lock, the committed manifest, the frames a handle has not verified yet, and the committed
 /// bytes this resume re-read and validated.
 pub(crate) struct Resumed {
-    lock: File,
+    lock: WriterLock,
     pub manifest: Manifest,
     pub fresh: Vec<Value>,
     content: Content,
@@ -934,7 +966,7 @@ pub(crate) struct StrictResumed {
     // Kept open for the whole life of this value and released by its own drop: nothing reads it,
     // and there is deliberately no statement that releases it early. `Journal` holds the writers'
     // lock the same way and for the same reason.
-    _lock: File,
+    _lock: WriterLock,
     pub manifest: Manifest,
     pub fresh: Vec<Value>,
     content: Content,
@@ -993,7 +1025,7 @@ pub(crate) fn resume_strict(
         .truncate(false)
         .open(&lock_path)
         .ok()?;
-    lock.lock().ok()?;
+    let lock = WriterLock::hold(lock).ok()?;
     let (manifest, fresh, content) = resumed_committed(root, observed, content).ok()??;
     Some(StrictResumed {
         _lock: lock,
@@ -1008,7 +1040,7 @@ pub(crate) fn resume_strict(
 /// The interprocess lock is held for as long as this value lives, exactly as an ordinary writer
 /// holds it, so an observation cannot straddle somebody else's commit.
 pub(crate) struct Strict {
-    lock: File,
+    lock: WriterLock,
     pub manifest: Manifest,
     pub transactions: Vec<Value>,
     content: Content,
@@ -1082,8 +1114,8 @@ pub(crate) fn open_strict(root: &Path) -> Result<Strict, CaptureError> {
         .truncate(false)
         .open(&lock_path)
         .map_err(|_| unavailable("file store writer lock cannot be opened"))?;
-    lock.lock()
-        .map_err(|_| unavailable("file store writer lock cannot be held"))?;
+    let lock =
+        WriterLock::hold(lock).map_err(|_| unavailable("file store writer lock cannot be held"))?;
     // A pending intent is the authority of an ordinary opener. Reading past one would either
     // repair history without permission or hand back bytes an erasure has already claimed.
     if pending_intent_exists(root)? {
@@ -1303,6 +1335,72 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    /// Every holder of the writers' lock releases it when it drops, not when the last copy of its
+    /// descriptor closes.
+    ///
+    /// A `fork` anywhere in the process copies every descriptor into a child that keeps the open
+    /// file description until it execs; a lock released by closing outlives its holder by that
+    /// window, and a concurrent `try_lock` (an inspection's `SourceBusy`) sees it held. A
+    /// duplicate made here stands in for that child with no timing in it: it shares the
+    /// description exactly as a forked child does, and it outlives every holder below.
+    /// (story:strict-reader-lock-case-races-a-forked-crash-child)
+    #[test]
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "the case duplicates the descriptor production code deliberately never reads"
+    )]
+    fn every_writer_lock_holder_releases_the_lock_when_it_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let probe = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join("writer.lock"))
+                .expect("existing writer lock")
+        };
+        let released = |holder: &str| {
+            let probe = probe();
+            probe.try_lock().unwrap_or_else(|_| {
+                panic!("{holder}: the lock outlived its holder through a shared description")
+            });
+            probe.unlock().expect("released the probe");
+        };
+
+        let journal = Journal::open(root).expect("initialized store");
+        let inherited = journal._lock.0.try_clone().expect("shared description");
+        let (manifest, content) = (journal.manifest.clone(), journal.content());
+        drop(journal);
+        released("Journal");
+        drop(inherited);
+
+        let resumed = Journal::resume(root, &manifest, &content)
+            .expect("resumable")
+            .expect("same head");
+        let inherited = resumed.lock.0.try_clone().expect("shared description");
+        drop(resumed.into_journal(root, Vec::new()));
+        released("Journal::resume");
+        drop(inherited);
+
+        let strict = open_strict(root).expect("strict read");
+        let inherited = strict.lock.0.try_clone().expect("shared description");
+        drop(strict);
+        released("open_strict");
+        drop(inherited);
+
+        let strict = resume_strict(root, &manifest, &content).expect("same head");
+        let inherited = strict._lock.0.try_clone().expect("shared description");
+        drop(strict);
+        released("resume_strict");
+        drop(inherited);
+
+        let inspected = inspect(root, u64::MAX).expect("inspectable");
+        let inherited = inspected._lock.0.try_clone().expect("shared description");
+        drop(inspected);
+        released("inspect");
+        drop(inherited);
+    }
 
     // Invoked only by the parent tests with an isolated directory and failpoint.
     #[test]
