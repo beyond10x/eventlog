@@ -35,8 +35,13 @@ enum Projection {
 }
 
 /// Every committed output: the directory under `ess/`, its specification and its projections.
-const OUTPUTS: [(&str, &str, &[Projection]); 2] = [
+const OUTPUTS: [(&str, &str, &[Projection]); 3] = [
     ("pool-generated", "pool", &[Projection::Schema]),
+    (
+        "file-layout-generated",
+        "file-layout",
+        &[Projection::Schema],
+    ),
     (
         "capture-generated",
         "capture",
