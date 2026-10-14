@@ -325,6 +325,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventlog-capture-types"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eventlog-conformance"
 version = "0.8.4"
 dependencies = [
@@ -338,6 +346,7 @@ dependencies = [
 name = "eventlog-core"
 version = "0.8.4"
 dependencies = [
+ "eventlog-capture-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -371,6 +380,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "time",
  "tokio",
  "tokio-postgres",
@@ -382,6 +392,7 @@ dependencies = [
 name = "eventlog-sqlite"
 version = "0.8.4"
 dependencies = [
+ "eventlog-capture-types",
  "eventlog-conformance",
  "eventlog-core",
  "nix",

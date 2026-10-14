@@ -26,6 +26,7 @@ pool-churn = []
 
 [dev-dependencies]
 clap.workspace = true
+tempfile.workspace = true
 eventlog-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-postgres.workspace = true
