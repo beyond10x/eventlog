@@ -23,6 +23,16 @@ forever and no migration. So option C below ships as `eventlog-tree/3`, without 
 - `layout::tests::a_hashed_store_writes_every_event_under_max_path_after_the_checkout_prefix` holds
   the bound: 149 characters under `.engineering/state` for tenant `planning`, whatever the stream
   type or id, so 225 after Eventlog's 76-character checkout prefix and 231 after Entity Runtime's 82.
+- The hash bounds the stream part of a path only. The tenant segment is in every path and blob names
+  are their escaped digests; neither is bounded (`TenantId` admits 512 bytes, which escaping can
+  triple). A hashed event path is `122 + t` characters under the store root, `t` the tenant's escaped
+  segment, and it is the longest path a hashed store writes while blob digests are `sha256:<64 hex>`.
+  Under `.engineering/state` (19 characters with its separator) and an 82-character checkout prefix,
+  the budget holds for a tenant of **at most 36 escaped bytes**: 82 + 19 + 122 + 36 = 259, one under
+  `MAX_PATH`. With Eventlog's 76-character prefix the limit is 42. A longer tenant or root, or a blob
+  digest of another form, is past the budget. `tests/layout_adversary.rs`
+  (`a_hashed_store_holds_the_documented_bound_at_the_longest_admitted_tenant`) holds the 36-byte
+  bound and that it is tight.
 - Every `eventlog-tree` test that writes a store runs in both layouts, and
   `tests/fixtures/tree-0.8.4/`, a store 0.8.4 wrote, must keep reading unchanged.
 

@@ -35,8 +35,17 @@ pub enum TreeLayout {
     Nested,
     /// `streams/<kk>/<32 hex>/<digest>.json` (`eventlog-tree/3`): the directory is the first 32
     /// hex characters of the SHA-256 of the escaped `<type>/<id>`, fanned out by its first two.
-    /// Every event path has one length whatever the stream, short enough for a Git checkout on
-    /// Windows without long paths. Eventlog 0.8.4 and earlier refuse to open such a store.
+    /// Every event path has one length whatever the stream: `122 + t` characters under the store
+    /// root, where `t` is the length of the tenant's escaped segment. Eventlog 0.8.4 and earlier
+    /// refuse to open such a store.
+    ///
+    /// The hash bounds the stream part of a path only. The tenant segment is in every path and is
+    /// not bounded (a `TenantId` admits 512 bytes, which escaping can triple), and neither is a
+    /// blob's name, which is its digest escaped. So the Windows budget, `MAX_PATH` (260) after a
+    /// store root of `.engineering/state` and a Git checkout prefix of up to 82 characters, holds
+    /// only for a tenant whose escaped segment is at most 36 bytes and blob digests of the form
+    /// `sha256:<64 hex>`. The event path is then the longest a store writes, 259 characters with
+    /// the prefix; a longer tenant or root, or a blob digest of another form, is past the budget.
     Hashed,
 }
 
@@ -262,6 +271,69 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EventLogErro
     sync_dir(directory)
 }
 
+/// Publish `bytes` as `path` unless a file of that name already exists, and say whether this call
+/// published it. First writer wins: the bytes are staged under a name of this writer's own
+/// (`writer`, unique to it), synced, then hard-linked to `path`, and a link never replaces an
+/// existing name. A writer that finds `path` taken leaves it as it is; the caller reads it.
+///
+/// The guarantee needs hard links. Where the link fails for any other reason than the name being
+/// taken (a filesystem without hard links, such as FAT or exFAT), the staging file is renamed onto
+/// `path` if `path` does not exist yet, as every release before this one did. Two writers that
+/// both find `path` missing there can still both rename, and the later one replaces the earlier;
+/// each still stages under its own name, so neither finds its staging file gone.
+///
+/// For a file written before any lock can be taken. [`write_atomic`]'s staging name is shared by
+/// every writer of one path, so it is only for writers the writer lock serialises.
+pub(crate) fn publish_once(path: &Path, bytes: &[u8], writer: &str) -> Result<bool, EventLogError> {
+    publish_once_with(path, bytes, writer, |from, to| fs::hard_link(from, to))
+}
+
+/// [`publish_once`] with the link step given, so a test can stand in for a filesystem without
+/// hard links.
+fn publish_once_with(
+    path: &Path,
+    bytes: &[u8],
+    writer: &str,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<bool, EventLogError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| corrupt("a file with no directory"))?;
+    fs::create_dir_all(directory).map_err(backend)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| corrupt("a file with no name"))?
+        .to_string_lossy()
+        .into_owned();
+    let staging = directory.join(format!(".{name}.{}.tmp", segment(writer)));
+    let staged = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match link(&staging, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            // No hard links here: the rename that every earlier release published with.
+            Err(_) if path.exists() => Ok(false),
+            Err(_) => fs::rename(&staging, path).map(|()| true),
+        }
+    })();
+    let removed = fs::remove_file(&staging);
+    let published = staged.map_err(backend)?;
+    match removed {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(backend(error)),
+    }
+    if published {
+        sync_dir(directory)?;
+    }
+    Ok(published)
+}
+
 /// Create `path` with `bytes` unless it already exists; an existing file must hold the same bytes.
 ///
 /// Event and group files are content-named and immutable, so a second write of one is either the
@@ -478,6 +550,45 @@ mod tests {
                 Path::new("r/tenants/t/streams/item/a%2Fb")
             );
         }
+    }
+
+    fn staging_files(directory: &Path) -> Vec<String> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "tmp"))
+            .collect()
+    }
+
+    /// A filesystem without hard links (FAT, exFAT) refuses the link with something other than
+    /// `AlreadyExists`. Creating a store there still works: the writer's own staging file is
+    /// renamed onto a name nobody has published yet, and a published one is still honoured.
+    #[test]
+    fn a_publish_without_hard_links_falls_back_to_a_rename_and_never_replaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.json");
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        assert!(publish_once_with(&path, b"first", "writer-1", unsupported).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(!publish_once_with(&path, b"second", "writer-2", unsupported).unwrap());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"first",
+            "a later publish replaced the first"
+        );
+        assert_eq!(staging_files(directory.path()), Vec::<String>::new());
+    }
+
+    /// With hard links the first publish wins and a later one leaves it as it is.
+    #[test]
+    fn a_publish_with_hard_links_is_first_writer_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.json");
+        assert!(publish_once(&path, b"first", "writer-1").unwrap());
+        assert!(!publish_once(&path, b"second", "writer-2").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(staging_files(directory.path()), Vec::<String>::new());
     }
 
     #[test]
