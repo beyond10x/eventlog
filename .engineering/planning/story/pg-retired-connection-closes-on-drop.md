@@ -6,7 +6,7 @@ status: active
 title: A retired PostgreSQL connection closes when its lease drops, on any runtime
 relations:
 - serves: vision:O2
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-16T12:42:19Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-16T12:42:19Z", actor: "human:timo", revision: 3}
@@ -36,3 +36,19 @@ blocks on those locks.
 - Pool accounting is unchanged: capacity returns only after the retirement is accounted; every
   existing pool test passes.
 - Specification: `eventlog.pool` records the synchronous close (ess/pool/domains/pool.yaml).
+
+## Blocked backends (added 2026-10-16)
+
+Measured by a consumer on docker PostgreSQL with a pg_stat_activity/pg_locks probe: an append group
+dropped at the deadline while its backend waits on a lock stays alive server-side after the client
+closes, holding the shared publication-gate advisory lock and its exclusive advisory locks. A
+backend waiting on a lock does not read its socket, so a socket close alone does not end it.
+
+- A retired, unsettled lease sends a server-side cancel for its backend, independent of whether
+  the caller's runtime is polled again, before its capacity is returned.
+- The session sets `client_connection_check_interval`, so a backend whose client is gone aborts its
+  running query even when no cancel could be sent.
+- A test holds a lock from an independent connection so the append's backend blocks inside a
+  query, lets the deadline fire on a current-thread runtime that is not polled again, and, while
+  that lock is still held, observes the backend gone from pg_stat_activity and its advisory locks
+  gone from pg_locks. The test fails on the base commit and with the socket close alone.
