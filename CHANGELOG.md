@@ -16,8 +16,13 @@ under bare-version tags such as `0.1.0`.
   waiting on a lock at its deadline) no longer keeps its advisory and row locks. The pool sends the
   server a cancel for it from a thread of its own, and every session sets
   `client_connection_check_interval` (1 s), so a backend whose client is gone aborts its query even
-  where no cancel can be sent (a `PostgresConnectionAuthority` connection gets no cancel). Pool
-  capacity still returns only after the retirement and its cancel attempt are accounted.
+  where no cancel can be sent (a `PostgresConnectionAuthority` connection gets no cancel). A server
+  that does not know the setting (PostgreSQL 13) or cannot honour it (no closed-socket detection)
+  is still admitted, relying on the cancel alone. Pool capacity still returns only after the
+  retirement and its cancel attempt are accounted.
+- PostgreSQL: a retirement whose close task is dropped with the caller's runtime (a caller that
+  builds a runtime per call) no longer leaves the lease counted as checked out, which had made
+  every later `shutdown` miss its deadline.
 - PostgreSQL: `append_guarded`, `append_group_guarded` and `append_group_with_blobs_guarded` return
   `EventLogError::Deadline { operation: "store operation" }` when the store-operation deadline fires
   before COMMIT was written, and `UnknownCommit` only once COMMIT was sent. Before, every deadline
