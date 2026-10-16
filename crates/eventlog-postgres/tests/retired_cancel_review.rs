@@ -287,7 +287,7 @@ fn a_retirement_dropped_with_its_callers_runtime_does_not_strand_occupancy() {
             PREFIX,
             PoolOptions {
                 max_connections: 1,
-                transaction_timeout: Duration::from_secs(1),
+                transaction_timeout: Duration::from_secs(3),
                 shutdown_timeout: Duration::from_secs(3),
                 ..PoolOptions::default()
             },
