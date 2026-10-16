@@ -5,6 +5,36 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- PostgreSQL: a connection retired from the pool (a lease dropped without settling, after a
+  deadline or a cancelled call) now closes when its lease drops, on the dropping thread. Before,
+  the close ran in a spawned task, so on a caller's current-thread runtime it waited for the
+  caller's next call, and the abandoned transaction stayed open, idle in transaction and holding
+  its locks, until the server's own timeout.
+- PostgreSQL: a backend blocked inside a query when its lease is retired (for example an append
+  waiting on a lock at its deadline) no longer keeps its advisory and row locks. The pool sends the
+  server a cancel for it from a thread of its own, and every session sets
+  `client_connection_check_interval` (1 s), so a backend whose client is gone aborts its query even
+  where no cancel can be sent (a `PostgresConnectionAuthority` connection gets no cancel). A server
+  that does not know the setting (PostgreSQL 13) or cannot honour it (no closed-socket detection)
+  is still admitted, relying on the cancel alone. Pool capacity still returns only after the
+  retirement and its cancel attempt are accounted.
+- PostgreSQL: a retirement whose close task is dropped with the caller's runtime (a caller that
+  builds a runtime per call) no longer leaves the lease counted as checked out, which had made
+  every later `shutdown` miss its deadline.
+- PostgreSQL: `append_guarded`, `append_group_guarded` and `append_group_with_blobs_guarded` return
+  `EventLogError::Deadline { operation: "store operation" }` when the store-operation deadline fires
+  before COMMIT was written, and `UnknownCommit` only once COMMIT was sent. Before, every deadline
+  was `UnknownCommit`, even when nothing could have committed. The two outcomes are named
+  `eventlog.pool.TimedOutWrite` in `ess/pool/`.
+
+  Not a breaking API change: `EventLogError` has the same variants. It is a behaviour change for a
+  caller that matches only `UnknownCommit` and treats every other error as final: such a timeout
+  now arrives as `Deadline`, which means "did not commit; retry", and is safe to retry with the
+  same command identity. A caller that already handles `Deadline` from the other bounded
+  operations needs no change.
+
 ## 0.9.0 — 2026-10-14
 
 ### Added

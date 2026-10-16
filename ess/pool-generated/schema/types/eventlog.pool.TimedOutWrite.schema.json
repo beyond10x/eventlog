@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$ref": "#/$defs/eventlog.pool.TimedOutWrite",
+  "x-ess-provenance": {
+    "system": "eventlog",
+    "specification_version": "v1",
+    "source_digest": "758d9f7d1f4fa359e3f1e582d2053d507dc10608a797b32827857116bf173061",
+    "contract_digest": "slice-sha256/2:24880c13a09666039fc47cca2bfa6c2cd171aca9d809405020ce0e753f4531fa",
+    "regenerate": "ess generate"
+  },
+  "$defs": {
+    "eventlog.pool.TimedOutWrite": {
+      "title": "TimedOutWrite",
+      "x-ess-name": "eventlog.pool.TimedOutWrite",
+      "x-ess-kind": "enum",
+      "type": "string",
+      "enum": [
+        "deadline",
+        "unknown_commit"
+      ]
+    }
+  }
+}

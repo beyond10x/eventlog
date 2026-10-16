@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-16T16:37:57Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-deadline-before-commit-is-not-unknown-commit",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof (PostgreSQL 17.6, verified TLS)",
+    "reference": "c9af44d"
+  }
+}
