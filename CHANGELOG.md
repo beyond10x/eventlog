@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.1 — 2026-10-16
+
 ### Fixed
 
 - PostgreSQL: a connection retired from the pool (a lease dropped without settling, after a
