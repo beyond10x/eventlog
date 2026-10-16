@@ -7,7 +7,7 @@ title: A PostgreSQL maintenance write that times out after COMMIT returns Unknow
 relations:
 - serves: vision:O2
 - informed_by: story:pg-deadline-before-commit-is-not-unknown-commit
-revision: 1
+revision: 2
 ---
 ## Outcome
 
@@ -28,3 +28,10 @@ The append paths and the inline rebuild already split the two outcomes on a comm
   do (`eventlog.pool.TimedOutWrite`).
 - A test per operation withholds the COMMIT reply (a proxy, as the append test does) and asserts
   `UnknownCommit`; each fails on the base commit.
+
+## Demonstrated (2026-10-16)
+
+An adversarial case withholding the COMMIT reply showed `redact` returning
+`Deadline { operation: "store operation" }` for a redaction the server committed. The same `bounded`
+wrapper also surrounds `put_blob`, so it belongs in this story too. The case is kept outside the
+tree until this story starts; it is to be added as its failing-first test.
