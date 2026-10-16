@@ -4,15 +4,21 @@ use eventlog_core::{BoxFuture, EventLogError};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot};
 use tokio_postgres::{
-    Client, Config, NoTls,
+    CancelToken, Client, Config, NoTls,
     config::{Host, SslMode},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
+
+/// How often a backend checks that its client socket is still open while it runs a query.
+/// A backend waiting on a lock reads nothing from its socket, so without this check a closed
+/// connection would not end its query until a lock or statement timeout.
+const CLIENT_CONNECTION_CHECK_INTERVAL_MS: u64 = 1000;
 
 /// Host assertion about the transport created by a caller-owned authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,7 +486,7 @@ impl Pool {
                 self.state.lock().map_err(super::poisoned)?.churn.open();
                 lease.client = Some(connection);
                 let connection = lease.client.as_ref().expect("connected lease");
-                tokio::time::timeout(self.options.connect_timeout,connection.client.batch_execute(&format!("SET search_path TO {}; SET default_transaction_isolation = 'read committed'; SET default_transaction_read_only = off; SET statement_timeout = {}; SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",self.config.schema,self.options.statement_timeout.as_millis(),self.options.lock_timeout.as_millis(),self.options.transaction_timeout.as_millis()))).await.map_err(|_|EventLogError::Deadline {operation:"session configuration"})?.map_err(super::backend)?;
+                tokio::time::timeout(self.options.connect_timeout,connection.client.batch_execute(&format!("SET search_path TO {}; SET default_transaction_isolation = 'read committed'; SET default_transaction_read_only = off; SET statement_timeout = {}; SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}; SET client_connection_check_interval = {CLIENT_CONNECTION_CHECK_INTERVAL_MS}",self.config.schema,self.options.statement_timeout.as_millis(),self.options.lock_timeout.as_millis(),self.options.transaction_timeout.as_millis()))).await.map_err(|_|EventLogError::Deadline {operation:"session configuration"})?.map_err(super::backend)?;
                 break;
             }
         }
@@ -502,7 +508,7 @@ impl Pool {
         #[cfg(test)]
         self.connect_attempts.fetch_add(1, Ordering::AcqRel);
         let work = async {
-            let authorized = match &self.config.source {
+            let (authorized, transport) = match &self.config.source {
                 ConnectionSource::BuiltIn(built_in) => {
                     let BuiltInConnection { connection, tls } = built_in.as_ref();
                     let mut config = connection.clone();
@@ -512,22 +518,37 @@ impl Pool {
                             .connect(MakeRustlsConnect::new(tls.clone()))
                             .await
                             .map_err(super::backend)?;
-                        AuthorizedConnection::new(client, driver)
+                        (
+                            AuthorizedConnection::new(client, driver),
+                            Some(CancelTransport::Tls(Arc::new(tls.clone()))),
+                        )
                     } else {
                         let (client, driver) =
                             config.connect(NoTls).await.map_err(super::backend)?;
-                        AuthorizedConnection::new(client, driver)
+                        (
+                            AuthorizedConnection::new(client, driver),
+                            Some(CancelTransport::Plain),
+                        )
                     }
                 }
+                // A caller-owned transport has no stream factory the pool could open a cancel
+                // request with; its sessions rely on the server's client-connection check.
                 ConnectionSource::CallerOwned(authority) => {
-                    authority.connect(self.options.connect_timeout).await?
+                    (authority.connect(self.options.connect_timeout).await?, None)
                 }
             };
             let (client, connection) = authorized.into_parts();
+            let cancel = transport.map(|transport| ServerCancel {
+                token: client.cancel_token(),
+                transport,
+                timeout: self.options.connect_timeout,
+            });
+            let transport = DriverSlot(Arc::new(Mutex::new(Some(connection))));
+            let polled = transport.clone();
             #[cfg(test)]
             let pause = self.driver_pause.lock().unwrap().take();
             let driver = tokio::spawn(async move {
-                let _ = connection.await;
+                std::future::poll_fn(|context| polled.poll(context)).await;
                 #[cfg(test)]
                 if let Some(pause) = pause {
                     tokio::task::block_in_place(|| {
@@ -539,6 +560,8 @@ impl Pool {
             Ok(Connection {
                 client,
                 driver: Some(driver),
+                transport,
+                cancel,
             })
         };
         tokio::time::timeout(self.options.connect_timeout, work)
@@ -598,10 +621,12 @@ impl Pool {
         };
         for connection in idle {
             // Shutdown cancellation cannot detach idle retirement from occupancy accounting.
+            // An idle connection was settled, so it has no query to cancel; the closed pool
+            // still retires it rather than recycling it.
             drop(Lease {
                 pool: Arc::clone(self),
                 client: Some(connection),
-                reusable: false,
+                reusable: true,
                 connection_permit: None,
             });
         }
@@ -661,6 +686,8 @@ impl DerefMut for Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        // An unsettled lease may have left a query running, or waiting on a lock, server-side.
+        let unsettled = !self.reusable;
         let reusable = self.reusable
             && !self
                 .pool
@@ -693,19 +720,33 @@ impl Drop for Lease {
             self.client = Some(connection);
         }
         // Closing is part of the outstanding lease. Capacity never returns on abort() alone.
+        // The transport closes here, on the dropping thread, and a cancel request leaves on a
+        // thread of its own: neither waits for the caller's runtime to be polled again.
         let connection = self.client.take();
+        let mut cancelled = None;
         if let Some(connection) = &connection {
-            let mut state = self
-                .pool
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let cause = Retirement::of(state.closed, connection.client.is_closed());
-            state.churn.retire(cause);
+            if unsettled && !connection.client.is_closed() {
+                cancelled = connection.cancel.as_ref().and_then(ServerCancel::send);
+            }
+            {
+                let mut state = self
+                    .pool
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Classified before severing, which closes the client.
+                let cause = Retirement::of(state.closed, connection.client.is_closed());
+                state.churn.retire(cause);
+            }
+            connection.sever();
         }
         let permit = self.connection_permit.take();
         let pool = Arc::clone(&self.pool);
         tokio::spawn(async move {
+            if let Some(cancelled) = cancelled {
+                // Finished or timed out; a dropped sender means the attempt could not start.
+                let _ = cancelled.await;
+            }
             if let Some(mut connection) = connection {
                 connection.close().await;
             }
@@ -726,10 +767,18 @@ impl Drop for Lease {
 
 struct Connection {
     client: Client,
+    /// The task that polls `transport`; joined before a retirement is accounted.
     driver: Option<tokio::task::JoinHandle<()>>,
+    transport: DriverSlot,
+    cancel: Option<ServerCancel>,
 }
 impl Connection {
+    /// Drops the driver future, and with it the socket, on the calling thread.
+    fn sever(&self) {
+        self.transport.sever();
+    }
     async fn close(&mut self) {
+        self.sever();
         if let Some(driver) = &mut self.driver {
             driver.abort();
             let _ = driver.await;
@@ -739,9 +788,89 @@ impl Connection {
 }
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.sever();
         if let Some(driver) = &self.driver {
             driver.abort();
         }
+    }
+}
+
+type Driver = BoxFuture<'static, Result<(), EventLogError>>;
+
+/// A connection's driver future, owned outside the task that polls it, so that retiring the
+/// connection drops the future, and the transport it owns, synchronously on the retiring thread,
+/// whether or not the runtime that task belongs to is ever polled again.
+///
+/// The lock is held only for one poll or one take, never across an await.
+#[derive(Clone)]
+struct DriverSlot(Arc<Mutex<Option<Driver>>>);
+impl DriverSlot {
+    /// Ready once the driver has finished or been severed.
+    fn poll(&self, context: &mut Context<'_>) -> Poll<()> {
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(driver) = slot.as_mut() else {
+            return Poll::Ready(());
+        };
+        if driver.as_mut().poll(context).is_ready() {
+            *slot = None;
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+    fn sever(&self) {
+        let driver = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        drop(driver);
+    }
+}
+
+#[derive(Clone)]
+enum CancelTransport {
+    Plain,
+    Tls(Arc<rustls::ClientConfig>),
+}
+
+/// The server-side cancel for one connection: closing the socket alone does not end a query
+/// that waits on a lock, because that backend is not reading its socket.
+struct ServerCancel {
+    token: CancelToken,
+    transport: CancelTransport,
+    timeout: Duration,
+}
+impl ServerCancel {
+    /// Sends the cancel request from a short-lived thread with its own runtime, bounded by the
+    /// pool's connection timeout. The receiver resolves when the attempt has finished, or errs
+    /// when it could not be started. Cancel errors are deliberately not reported: they carry
+    /// connection detail, and the retirement proceeds either way.
+    fn send(&self) -> Option<oneshot::Receiver<()>> {
+        let (finished, attempt) = oneshot::channel();
+        let token = self.token.clone();
+        let transport = self.transport.clone();
+        let timeout = self.timeout;
+        std::thread::Builder::new()
+            .name("eventlog-pg-cancel".into())
+            .spawn(move || {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    runtime.block_on(async {
+                        let request = async {
+                            match transport {
+                                CancelTransport::Plain => token.cancel_query(NoTls).await,
+                                CancelTransport::Tls(tls) => {
+                                    token
+                                        .cancel_query(MakeRustlsConnect::new((*tls).clone()))
+                                        .await
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(timeout, request).await;
+                    });
+                }
+                let _ = finished.send(());
+            })
+            .ok()?;
+        Some(attempt)
     }
 }
 
@@ -1373,6 +1502,136 @@ mod tests {
         pool.shutdown().await.unwrap();
         drop(observer);
         observer_driver.await.unwrap().unwrap();
+    }
+
+    /// A lease dropped while its backend waits on a lock is cancelled server-side, without the
+    /// caller's runtime being polled again. The socket check is switched off for this session so
+    /// that only the cancel request can end the wait: a blocked backend does not read its socket.
+    #[test]
+    fn retired_lease_blocked_in_a_query_is_cancelled_without_polling_the_runtime() {
+        const APPLICATION: &str = "eventlog_pool_blocked_cancel";
+        const KEY: i64 = 0x0e7e_c105_e0b1;
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none());
+            eprintln!("skipped: blocked-lease cancel needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let observing = tokio::runtime::Runtime::new().unwrap();
+        let (observer, holder) = observing.block_on(async {
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+                tokio::spawn(connection);
+                clients.push(client);
+            }
+            let holder = clients.pop().unwrap();
+            holder
+                .query_one("SELECT pg_advisory_lock($1)", &[&KEY])
+                .await
+                .unwrap();
+            (clients.pop().unwrap(), holder)
+        });
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = Pool::new(
+            PostgresConfig::isolated(&format!("{url}?application_name={APPLICATION}"), "pool")
+                .unwrap(),
+            PoolOptions {
+                max_connections: 1,
+                statement_timeout: Duration::from_secs(60),
+                lock_timeout: Duration::from_secs(60),
+                ..PoolOptions::default()
+            },
+        )
+        .unwrap();
+        let pid = caller.block_on(async {
+            let lease = pool.acquire().await.unwrap();
+            lease
+                .batch_execute("SET client_connection_check_interval = 0")
+                .await
+                .unwrap();
+            let pid: i32 = lease
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let blocked = tokio::time::timeout(
+                Duration::from_millis(300),
+                lease.query_one("SELECT pg_advisory_lock($1)", &[&KEY]),
+            )
+            .await;
+            assert!(blocked.is_err(), "the lease waits on the holder's lock");
+            drop(lease);
+            pid
+        });
+        let dropped = std::time::Instant::now();
+        // `caller` stays alive and is never driven again.
+        let (present, waiting) = observing.block_on(async {
+            let present = || async {
+                observer
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
+                        &[&pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+            };
+            let mut seen = present().await;
+            while seen != 0 && dropped.elapsed() < Duration::from_secs(1) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                seen = present().await;
+            }
+            let waiting: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_locks WHERE pid = $1 AND locktype = 'advisory'",
+                    &[&pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            (seen, waiting)
+        });
+        let elapsed = dropped.elapsed();
+        eprintln!("blocked lease backend {pid}: present={present}, elapsed={elapsed:?}");
+        observing.block_on(async {
+            holder
+                .query_one("SELECT pg_advisory_unlock($1)", &[&KEY])
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            present, 0,
+            "the blocked backend outlived its dropped lease by {elapsed:?}"
+        );
+        assert_eq!(
+            waiting, 0,
+            "the blocked backend's advisory lock request is gone"
+        );
+        drop(pool);
+        drop(caller);
+    }
+
+    /// A backend whose client socket is gone aborts a running query even when no cancel request
+    /// reaches it (PostgreSQL 14+ `client_connection_check_interval`).
+    #[tokio::test]
+    async fn every_session_checks_its_client_connection() {
+        let Some(pool) = fixture(1, 0) else { return };
+        let mut lease = pool.acquire().await.unwrap();
+        let interval: String = lease
+            .query_one("SHOW client_connection_check_interval", &[])
+            .await
+            .unwrap()
+            .get(0);
+        lease.settled();
+        drop(lease);
+        pool.shutdown().await.unwrap();
+        assert_eq!(interval, "1s");
     }
 
     /// The committed schema's object properties are exactly the serialized fields, each a
