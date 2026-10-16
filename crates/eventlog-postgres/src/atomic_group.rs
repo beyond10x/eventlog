@@ -3,7 +3,8 @@ use super::{
     AppendResult, Arc, BTreeSet, BoxFuture, COLUMNS, CommandMeta, EventLogError, Expected, Guard,
     NewEvent, NoGuard, OffsetDateTime, PostgresEventStore, PostgresProjections, Projector,
     StreamId, backend, check_expected, ensure_callback_integrity, lock_identity, new_event_id,
-    parse_uuid, poisoned, publication_gate, read_event, select_versions, to_i32, to_i64, to_u64,
+    parse_uuid, poisoned, publication_gate, read_event, select_versions, timed_out_write, to_i32,
+    to_i64, to_u64,
 };
 use eventlog_core::{
     AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
@@ -468,6 +469,7 @@ impl AtomicEventStore for PostgresEventStore {
         Box::pin(async move {
             let fingerprint = group.fingerprint()?;
             self.freeze().await;
+            let commit_started = std::sync::atomic::AtomicBool::new(false);
             tokio::time::timeout(self.pool.options.transaction_timeout, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
@@ -488,6 +490,7 @@ impl AtomicEventStore for PostgresEventStore {
                     Ok(result) => {
                         #[cfg(test)]
                         checkpoint("group-precommit");
+                        commit_started.store(true, std::sync::atomic::Ordering::Release);
                         transaction
                             .commit()
                             .await
@@ -505,7 +508,7 @@ impl AtomicEventStore for PostgresEventStore {
                 }
             })
             .await
-            .map_err(|_| EventLogError::UnknownCommit)?
+            .map_err(|_| timed_out_write(&commit_started))?
         })
     }
 }
@@ -521,6 +524,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
             let mut request = request.clone();
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
             self.freeze().await;
+            let commit_started = std::sync::atomic::AtomicBool::new(false);
             let outcome = tokio::time::timeout(self.pool.options.transaction_timeout, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
@@ -541,6 +545,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
                     Ok(result) => {
                         #[cfg(test)]
                         checkpoint("group-precommit");
+                        commit_started.store(true, std::sync::atomic::Ordering::Release);
                         transaction
                             .commit()
                             .await
@@ -558,7 +563,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
                 }
             })
             .await
-            .map_err(|_| EventLogError::UnknownCommit)
+            .map_err(|_| timed_out_write(&commit_started))
             .and_then(|outcome| outcome);
             // Content of a blob-bearing group that returned an error is not kept.
             if outcome.is_err() && !request.blobs.is_empty() {

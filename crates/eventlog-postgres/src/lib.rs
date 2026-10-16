@@ -363,6 +363,8 @@ impl EventStore for PostgresEventStore {
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendResult, EventLogError>> {
         Box::pin(async move {
+            let commit_started = AtomicBool::new(false);
+            let commit_started = &commit_started;
             tokio::time::timeout(self.pool.options.transaction_timeout, async move {
                 validate_append(events, meta)?;
                 self.freeze().await;
@@ -385,6 +387,7 @@ impl EventStore for PostgresEventStore {
                     .await;
                 match result {
                     Ok(result) => {
+                        commit_started.store(true, Ordering::Release);
                         transaction
                             .commit()
                             .await
@@ -400,7 +403,7 @@ impl EventStore for PostgresEventStore {
                 }
             })
             .await
-            .map_err(|_| EventLogError::UnknownCommit)?
+            .map_err(|_| timed_out_write(commit_started))?
         })
     }
 
@@ -1867,6 +1870,21 @@ fn ensure_callback_integrity(callback_failed: &Arc<AtomicBool>) -> Result<(), Ev
         ));
     }
     Ok(())
+}
+
+/// What an append whose store-operation deadline fired returns (`eventlog.pool.TimedOutWrite`).
+///
+/// Before COMMIT was written the transaction cannot have committed, so the deadline is reported
+/// as such and the caller may retry. Once COMMIT has started the outcome is ambiguous, and the
+/// caller resolves the same command identity instead.
+fn timed_out_write(commit_started: &AtomicBool) -> EventLogError {
+    if commit_started.load(Ordering::Acquire) {
+        EventLogError::UnknownCommit
+    } else {
+        EventLogError::Deadline {
+            operation: "store operation",
+        }
+    }
 }
 
 mod uuid_shim {
