@@ -6,6 +6,19 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.9.1 — October 16, 2026
+
+- PostgreSQL: a connection whose lease is dropped after a deadline or a cancelled call now closes
+  on the dropping thread, on any runtime, and the pool sends the server a cancel for a backend
+  blocked in a query, so an abandoned transaction no longer holds its locks until the server's
+  own timeout.
+- PostgreSQL: a guarded append or append group whose deadline fires before COMMIT was written
+  returns `EventLogError::Deadline`, which is safe to retry; `UnknownCommit` now means COMMIT was
+  sent. No variant changed, but a caller that matches only `UnknownCommit` sees `Deadline` for
+  these timeouts.
+
+Read the [0.9.1 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.1).
+
 ## 0.9.0 — October 14, 2026
 
 - Two opt-in on-disk layouts, chosen only when a store is created. The defaults are unchanged:
