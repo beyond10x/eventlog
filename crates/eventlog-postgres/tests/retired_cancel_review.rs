@@ -168,7 +168,12 @@ async fn counting_proxy(target: SocketAddr) -> (u16, Arc<AtomicUsize>) {
             };
             counted.fetch_add(1, Ordering::AcqRel);
             tokio::spawn(async move {
+                // Without nodelay, Nagle and delayed acknowledgement add ~40 ms to a relayed
+                // round trip, and schema admission's sequential catalog queries then outrun
+                // the store deadline.
+                let _ = inbound.set_nodelay(true);
                 if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                    let _ = outbound.set_nodelay(true);
                     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                 }
             });
@@ -245,7 +250,11 @@ fn only_an_unsettled_retirement_sends_a_cancel_and_only_one() {
         while store.pool_status().checked_out != 0 && started.elapsed() < Duration::from_secs(5) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(store.pool_status().checked_out, 0, "the retirement completes");
+        assert_eq!(
+            store.pool_status().checked_out,
+            0,
+            "the retirement completes"
+        );
         assert_eq!(store.pool_churn().retired_unsettled_lease, 1);
         assert_eq!(
             accepted.load(Ordering::Acquire),
@@ -302,7 +311,10 @@ fn a_retirement_dropped_with_its_callers_runtime_does_not_strand_occupancy() {
         status.checked_out, 0,
         "the retired lease's occupancy is never released once its close task is dropped"
     );
-    assert!(shutdown.is_ok(), "shutdown misses its deadline: {shutdown:?}");
+    assert!(
+        shutdown.is_ok(),
+        "shutdown misses its deadline: {shutdown:?}"
+    );
 }
 
 struct PlainAuthority {
@@ -313,7 +325,10 @@ impl PostgresConnectionAuthority for PlainAuthority {
     fn assurance(&self) -> PostgresTransportAssurance {
         PostgresTransportAssurance::Isolated
     }
-    fn connect(&self, timeout: Duration) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+    fn connect(
+        &self,
+        timeout: Duration,
+    ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
         let mut config = self.config.clone();
         config.connect_timeout(timeout);
         Box::pin(async move {
@@ -367,7 +382,9 @@ fn caller_owned_blocked_backend_ends_after_its_lease_drops() {
     let holder = observing.block_on(async {
         let holder = connect(&url).await;
         holder
-            .batch_execute(&format!("BEGIN; LOCK TABLE {PREFIX}_events IN EXCLUSIVE MODE"))
+            .batch_execute(&format!(
+                "BEGIN; LOCK TABLE {PREFIX}_events IN EXCLUSIVE MODE"
+            ))
             .await
             .unwrap();
         holder
@@ -464,9 +481,64 @@ fn session_configuration_admits_a_postgresql_13_server() {
     );
 }
 
+/// Connects through a fixture that refuses the check-interval setting with `code`, and returns
+/// the store's refusal. The fixture refuses everything after session setup with XX000, so an
+/// admitted session ends there and a refused one ends on `code`.
+fn connect_refusing_check_interval(code: &'static str) -> EventLogError {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let seen = Arc::new(AtomicUsize::new(0));
+                    let _ = refusing_check_interval(socket, seen, code).await;
+                });
+            }
+        });
+        PostgresEventStore::connect_local(
+            &format!("postgres://review@127.0.0.1:{port}/review"),
+            "rcr_check_interval",
+            PoolOptions::default(),
+        )
+        .await
+        .err()
+        .expect("the fixture refuses everything after session setup")
+    })
+}
+
+/// Only "unknown parameter" (42704) and "invalid value" (22023) mean the server cannot check
+/// its client socket; with either, the session is admitted and reaches its first statement.
+#[test]
+fn session_configuration_admits_both_unsupported_check_interval_answers() {
+    for code in ["42704", "22023"] {
+        let refusal = connect_refusing_check_interval(code);
+        assert!(
+            matches!(&refusal, EventLogError::Backend(message) if message.contains("SQLSTATE XX000")),
+            "a session whose server answers {code} is admitted: {refusal:?}"
+        );
+    }
+}
+
+/// Any other refusal of the check-interval setting still fails the session.
+#[test]
+fn session_configuration_refuses_any_other_check_interval_error() {
+    let refusal = connect_refusing_check_interval("42501");
+    assert!(
+        matches!(&refusal, EventLogError::Backend(message) if message.contains("SQLSTATE 42501")),
+        "a session whose server answers 42501 is refused on that error: {refusal:?}"
+    );
+}
+
 fn error_response(code: &str, message: &str) -> Vec<u8> {
     let mut body = Vec::new();
-    for (field, value) in [(b'S', "ERROR"), (b'V', "ERROR"), (b'C', code), (b'M', message)] {
+    for (field, value) in [
+        (b'S', "ERROR"),
+        (b'V', "ERROR"),
+        (b'C', code),
+        (b'M', message),
+    ] {
         body.push(field);
         body.extend_from_slice(value.as_bytes());
         body.push(0);
@@ -485,8 +557,17 @@ fn message_bytes(tag: u8, body: &[u8]) -> Vec<u8> {
 /// Serves one session the way a PostgreSQL 13 server answers this kit's session setup; every
 /// statement after it is refused with a generic error, which is enough to show admission.
 async fn postgres_13_session(
+    socket: tokio::net::TcpStream,
+    seen: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    refusing_check_interval(socket, seen, "42704").await
+}
+
+/// The PostgreSQL 13 fixture, with `SET client_connection_check_interval` refused by `code`.
+async fn refusing_check_interval(
     mut socket: tokio::net::TcpStream,
     seen: Arc<AtomicUsize>,
+    code: &'static str,
 ) -> std::io::Result<()> {
     let length = socket.read_i32().await?;
     let mut startup = vec![0; usize::try_from(length - 4).unwrap()];
@@ -507,8 +588,8 @@ async fn postgres_13_session(
                 let text = String::from_utf8_lossy(&body);
                 let mut reply = if text.contains("client_connection_check_interval") {
                     error_response(
-                        "42704",
-                        "unrecognized configuration parameter \"client_connection_check_interval\"",
+                        code,
+                        "client_connection_check_interval refused by the fixture",
                     )
                 } else if text.starts_with("SET search_path") {
                     message_bytes(b'C', b"SET\x00")
