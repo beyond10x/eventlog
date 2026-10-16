@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-16T16:37:57Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-retired-connection-closes-on-drop",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "bash scripts/gate.sh --production-proof (PostgreSQL 17.6, verified TLS)",
+    "reference": "c9af44d"
+  }
+}

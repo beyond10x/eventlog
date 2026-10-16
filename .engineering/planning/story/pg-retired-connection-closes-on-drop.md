@@ -2,14 +2,15 @@
 format: aep.planning-md/3
 id: story:pg-retired-connection-closes-on-drop
 kind: story
-status: active
+status: implemented
 title: A retired PostgreSQL connection closes when its lease drops, on any runtime
 relations:
 - serves: vision:O2
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-16T12:42:19Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-16T12:42:19Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-16T16:40:35Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

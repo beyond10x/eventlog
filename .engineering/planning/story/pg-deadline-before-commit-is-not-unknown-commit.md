@@ -2,14 +2,15 @@
 format: aep.planning-md/3
 id: story:pg-deadline-before-commit-is-not-unknown-commit
 kind: story
-status: active
+status: implemented
 title: A PostgreSQL append that times out before COMMIT returns Deadline, not UnknownCommit
 relations:
 - serves: vision:O2
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-16T12:42:19Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-16T12:42:19Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-16T16:40:35Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 
