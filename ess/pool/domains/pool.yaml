@@ -31,3 +31,18 @@ types:
     # earlier replacements; every other connect only fills capacity the pool never had open.
     # Also replacements <= retired_unsettled_lease + retired_closed_client, which ESS invariants
     # cannot state (no sum of two facts). Rust refines each count to u64.
+    # A connection retired for any cause is closed when its lease is dropped, synchronously, on
+    # the dropping thread: the transport the driver owns is released before the drop returns,
+    # whatever runtime the caller runs and whether or not that runtime is polled again. The
+    # server therefore sees the session end (and rolls back an open transaction) at once,
+    # instead of keeping it idle in transaction until its own timeout. Capacity is still
+    # returned only after the retirement is accounted.
+  - name: eventlog.pool.TimedOutWrite
+    kind: enum
+    variants: [deadline, unknown_commit]
+    # What a caller of a PostgreSQL append (single, guarded, atomic group, atomic group with
+    # blobs) receives when the store operation's deadline fires before the outcome is known.
+    # deadline: COMMIT was never written to the connection, so the transaction did not commit
+    # and the caller may retry. unknown_commit: COMMIT was written and its reply was not read,
+    # so the caller resolves the same durable command identity before retrying. Rust maps
+    # these to EventLogError::Deadline and EventLogError::UnknownCommit.
