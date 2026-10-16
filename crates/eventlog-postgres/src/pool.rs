@@ -12,6 +12,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, ones
 use tokio_postgres::{
     CancelToken, Client, Config, NoTls,
     config::{Host, SslMode},
+    error::SqlState,
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -19,6 +20,25 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 /// A backend waiting on a lock reads nothing from its socket, so without this check a closed
 /// connection would not end its query until a lock or statement timeout.
 const CLIENT_CONNECTION_CHECK_INTERVAL_MS: u64 = 1000;
+
+/// Turns on the client-connection check where the server supports it. PostgreSQL 13 does not
+/// know the setting (42704), and a 14+ server on a platform that cannot detect a closed socket
+/// refuses a nonzero value (22023); such a session is still admitted, and the server-side cancel
+/// remains what ends a retired query there. Every other error fails the session.
+async fn check_client_connection(client: &Client) -> Result<(), tokio_postgres::Error> {
+    let setting =
+        format!("SET client_connection_check_interval = {CLIENT_CONNECTION_CHECK_INTERVAL_MS}");
+    match client.batch_execute(&setting).await {
+        Err(error)
+            if error.code().is_some_and(|code| {
+                *code == SqlState::UNDEFINED_OBJECT || *code == SqlState::INVALID_PARAMETER_VALUE
+            }) =>
+        {
+            Ok(())
+        }
+        outcome => outcome,
+    }
+}
 
 /// Host assertion about the transport created by a caller-owned authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,7 +506,25 @@ impl Pool {
                 self.state.lock().map_err(super::poisoned)?.churn.open();
                 lease.client = Some(connection);
                 let connection = lease.client.as_ref().expect("connected lease");
-                tokio::time::timeout(self.options.connect_timeout,connection.client.batch_execute(&format!("SET search_path TO {}; SET default_transaction_isolation = 'read committed'; SET default_transaction_read_only = off; SET statement_timeout = {}; SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}; SET client_connection_check_interval = {CLIENT_CONNECTION_CHECK_INTERVAL_MS}",self.config.schema,self.options.statement_timeout.as_millis(),self.options.lock_timeout.as_millis(),self.options.transaction_timeout.as_millis()))).await.map_err(|_|EventLogError::Deadline {operation:"session configuration"})?.map_err(super::backend)?;
+                let configuration = format!(
+                    "SET search_path TO {}; SET default_transaction_isolation = 'read committed'; \
+                     SET default_transaction_read_only = off; SET statement_timeout = {}; \
+                     SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
+                    self.config.schema,
+                    self.options.statement_timeout.as_millis(),
+                    self.options.lock_timeout.as_millis(),
+                    self.options.transaction_timeout.as_millis()
+                );
+                let configure = async {
+                    connection.client.batch_execute(&configuration).await?;
+                    check_client_connection(&connection.client).await
+                };
+                tokio::time::timeout(self.options.connect_timeout, configure)
+                    .await
+                    .map_err(|_| EventLogError::Deadline {
+                        operation: "session configuration",
+                    })?
+                    .map_err(super::backend)?;
                 break;
             }
         }
@@ -740,8 +778,10 @@ impl Drop for Lease {
             }
             connection.sever();
         }
-        let permit = self.connection_permit.take();
-        let pool = Arc::clone(&self.pool);
+        let accounted = RetiredOccupancy {
+            pool: Arc::clone(&self.pool),
+            permit: self.connection_permit.take(),
+        };
         tokio::spawn(async move {
             if let Some(cancelled) = cancelled {
                 // Finished or timed out; a dropped sender means the attempt could not start.
@@ -750,18 +790,36 @@ impl Drop for Lease {
             if let Some(mut connection) = connection {
                 connection.close().await;
             }
-            {
-                let mut state = pool
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.active -= 1;
-                drop(permit);
-            }
-            pool.returned.notify_waiters();
+            #[cfg(test)]
+            let pool = Arc::clone(&accounted.pool);
+            // Capacity returns only now, after the driver stopped and the cancel attempt ended.
+            drop(accounted);
             #[cfg(test)]
             pool.pause(PausePoint::Retired);
         });
+    }
+}
+
+/// A retired lease's occupancy and connection permit, released exactly once when this is
+/// dropped: after the close on the normal path, or when the runtime that ran the close task
+/// drops it unfinished. The driver future was already severed on the dropping thread, so
+/// releasing then frees no capacity whose connection is still open.
+struct RetiredOccupancy {
+    pool: Arc<Pool>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+impl Drop for RetiredOccupancy {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active -= 1;
+            drop(self.permit.take());
+        }
+        self.pool.returned.notify_waiters();
     }
 }
 
