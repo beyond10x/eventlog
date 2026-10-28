@@ -5,6 +5,12 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Changed
+
+- The persistence proof installs ess 0.72.0 (was 0.61.0), and `ess/capture-generated/` is regenerated
+  with it: the `CaptureUpdateKind` variants take their declared names and the crate's serde ranges
+  become compatible ranges.
+
 ## 0.9.1 — 2026-10-16
 
 ### Fixed
