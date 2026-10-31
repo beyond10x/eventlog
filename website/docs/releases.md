@@ -6,6 +6,14 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.9.2 — October 31, 2026
+
+- No library crate changed. The persistence proof now runs with ess 0.75.0 and the generated
+  capture types are regenerated with it.
+- The documentation site moves to docs-system 0.12.0.
+
+Read the [0.9.2 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.2).
+
 ## 0.9.1 — October 16, 2026
 
 - PostgreSQL: a connection whose lease is dropped after a deadline or a cancelled call now closes

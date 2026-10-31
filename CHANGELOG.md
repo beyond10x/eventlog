@@ -5,11 +5,15 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.2 — 2026-10-31
+
 ### Changed
 
-- The persistence proof installs ess 0.75.0 (was 0.61.0), and `ess/capture-generated/` is regenerated
-  with it: the `CaptureUpdateKind` variants take their declared names and the crate's serde ranges
-  become compatible ranges.
+- The persistence proof installs ess 0.75.0 (was 0.61.0), moving through 0.72.0 and 0.74.0, and
+  `ess/capture-generated/` is regenerated with it: the `CaptureUpdateKind` variants take their
+  declared names and the crate's serde ranges become compatible ranges.
+- The documentation site moves to docs-system 0.12.0.
+- No library crate changed: the release carries the pins and the version bump.
 
 ## 0.9.1 — 2026-10-16
 

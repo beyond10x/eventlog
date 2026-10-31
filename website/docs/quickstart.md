@@ -11,7 +11,7 @@ dependencies on its first run. No database server is needed for these two provid
 Choose an empty working directory:
 
 ```bash
-git clone --branch 0.9.1 --depth 1 https://github.com/beyond10x/eventlog.git
+git clone --branch 0.9.2 --depth 1 https://github.com/beyond10x/eventlog.git
 cd eventlog
 cargo test --locked -p eventlog-file -- --test-threads=1
 cargo test --locked -p eventlog-sqlite -- --test-threads=1
@@ -28,8 +28,8 @@ Use the same release tag for every Eventlog crate in a consumer:
 
 ```toml
 [dependencies]
-eventlog-core = { git = "https://github.com/beyond10x/eventlog", tag = "0.9.1" }
-eventlog-file = { git = "https://github.com/beyond10x/eventlog", tag = "0.9.1" }
+eventlog-core = { git = "https://github.com/beyond10x/eventlog", tag = "0.9.2" }
+eventlog-file = { git = "https://github.com/beyond10x/eventlog", tag = "0.9.2" }
 ```
 
 The crates are distributed from Git, with `publish = false`. Choose `eventlog-sqlite` or
@@ -43,6 +43,6 @@ The crates are distributed from Git, with `publish = false`. Choose `eventlog-sq
 4. Append with the expected revision and stable command metadata.
 5. Retain the returned receipt; retry an uncertain result with the original command identity.
 
-The [released conformance examples](https://github.com/beyond10x/eventlog/blob/0.9.1/crates/eventlog-conformance/src/lib.rs)
+The [released conformance examples](https://github.com/beyond10x/eventlog/blob/0.9.2/crates/eventlog-conformance/src/lib.rs)
 show event and command construction. Read [guarantees](guarantees.md) before composing multiple
 streams or publishing blobs, and [operations](operations.md) before opening a durable store.
