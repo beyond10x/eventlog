@@ -5,6 +5,39 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.3 — 2026-11-11
+
+### Changed
+
+- PostgreSQL: `read_many` answers a batch in one REPEATABLE READ snapshot, with one statement per
+  1,000 stream reads and one per 1,000 blob reads, instead of one statement per read. Each result
+  is what `read_stream` or `get_blob` returns for the same arguments. Deadlines follow the
+  separate calls: each statement runs under the store-operation deadline and the statement timeout
+  of one read times the reads it carries, so a batch whose reads each fit alone is not refused for
+  its size.
+- PostgreSQL: `append_group` takes its stream locks, reads its stream heads and inserts its events
+  with one statement per 1,000 streams or events, instead of up to three statements per member;
+  a group's retry reads its stored ranges the same way. A single `append` inserts its events in
+  one statement per 1,000. Version checks, guards, claims, commands, inline projections and
+  atomicity are unchanged, and so is the order positions are drawn in. Each statement that takes a
+  group's stream locks may run for the rest of the group's deadline rather than one statement
+  timeout, since it waits for up to 1,000 locks in turn; `lock_timeout` still bounds each wait.
+  On PostgreSQL 17 on localhost, release build: 10,000 single-row reads through `read_many` fall
+  from 5.0–7.3 s to 0.1–0.15 s; a group of 1,000 events from about 2 s to 0.07–0.2 s; a group of
+  20,000 events on 4,000 streams, which missed the 10 s deadline, commits in 0.8–2.4 s.
+- PostgreSQL: when more than one member of a group refuses, the refusal `append_group` returns
+  can now come from a later member. Every member's events are inserted before any member is
+  projected, so a later member's content that PostgreSQL itself refuses (for example SQLSTATE
+  22P05, a JSON `\u0000`) can be returned instead of an earlier member's inline-projector
+  refusal. Before, members were written and projected one at a time and the earliest refusal
+  won. Conflicts, guard refusals and malformed members still refuse in member order, and a refused
+  group still writes nothing.
+- A group still takes one transaction-scoped advisory lock per distinct stream. With PostgreSQL's
+  default `max_connections` (100) and `max_locks_per_transaction` (64) the shared lock table holds
+  about 7,000 such locks, so a group over 20,000 distinct streams fails with SQLSTATE 53200 (out
+  of shared memory) instead of reaching the deadline; a server that must commit such a group
+  needs a larger `max_locks_per_transaction`.
+
 ## 0.9.2 — 2026-10-31
 
 ### Changed

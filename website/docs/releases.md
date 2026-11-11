@@ -6,6 +6,17 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.9.3 — November 11, 2026
+
+- PostgreSQL: `read_many` answers stream reads in statements of up to 1,000 reads inside one
+  snapshot, and `append_group` inserts a group's events in batched statements. 10,000
+  single-row reads take about 0.2 s instead of 7 s, and a group of 5,000 events about 0.4 s
+  instead of reaching the 10 s deadline.
+- Each batched statement's deadline scales with the reads it carries, so a batch is refused
+  only where its separate reads would be.
+
+Read the [0.9.3 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.3).
+
 ## 0.9.2 — October 31, 2026
 
 - No library crate changed. The persistence proof now runs with ess 0.75.0 and the generated

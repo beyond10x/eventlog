@@ -1,10 +1,16 @@
 //! Group locking precedes ordered semantic application in one PostgreSQL transaction.
+//!
+//! Both ports write events in batched statements: a group's stream locks, stream heads and event
+//! rows each take one statement per [`STATEMENT_BATCH`] items, never one per member or event.
+use std::collections::{BTreeMap, HashMap};
+
 use super::{
-    AppendResult, Arc, BTreeSet, BoxFuture, COLUMNS, CommandMeta, EventLogError, Expected, Guard,
-    NewEvent, NoGuard, OffsetDateTime, PostgresEventStore, PostgresProjections, Projector,
-    StreamId, backend, check_expected, ensure_callback_integrity, lock_identity, new_event_id,
-    parse_uuid, poisoned, publication_gate, read_event, select_versions, timed_out_write, to_i32,
-    to_i64, to_u64,
+    ADVISORY_KEY, AppendResult, Arc, BTreeSet, BoxFuture, COLUMNS, CommandMeta, EventLogError,
+    Expected, Guard, NewEvent, OffsetDateTime, PostgresEventStore, PostgresProjections, Projector,
+    RecordedEvent, STATEMENT_BATCH, StreamId, Window, backend, check_expected,
+    ensure_callback_integrity, lock_coordinates, lock_identity, new_event_id, ordinal, parse_uuid,
+    poisoned, publication_gate, read_event, select_versions, select_windows, set_statement_timeout,
+    timed_out_write, to_i32, to_i64, to_u64,
 };
 use eventlog_core::{
     AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
@@ -18,8 +24,225 @@ fn checkpoint(point: &str) {
     }
 }
 
+/// One event with every coordinate fixed before the statement that writes it.
+struct Planned<'a> {
+    stream: &'a StreamId,
+    version: i64,
+    event_id: uuid::Uuid,
+    event: &'a NewEvent,
+    schema_version: i32,
+    recorded_at: OffsetDateTime,
+}
+
+/// Plan `events` at versions `head + 1 ..`, refusing what one insert per event refused.
+fn plan<'a>(
+    stream: &'a StreamId,
+    head: u64,
+    events: &'a [NewEvent],
+    recorded_at: OffsetDateTime,
+) -> Result<Vec<Planned<'a>>, EventLogError> {
+    let mut planned = Vec::with_capacity(events.len());
+    for (offset, event) in events.iter().enumerate() {
+        let version = head + 1 + u64::try_from(offset).unwrap_or(u64::MAX);
+        planned.push(Planned {
+            stream,
+            version: to_i64(version)?,
+            event_id: parse_uuid(&new_event_id())?,
+            event,
+            schema_version: to_i32(event.schema_version)?,
+            recorded_at,
+        });
+    }
+    Ok(planned)
+}
+
+/// Insert planned events, [`STATEMENT_BATCH`] rows per statement, and return what was stored in
+/// the planned order.
+///
+/// The rows leave the ordered subquery one at a time, so `global_seq` is drawn in planned order,
+/// as it was with one statement per event. Each returned row is placed by its event id.
+async fn insert_events(
+    transaction: &tokio_postgres::Transaction<'_>,
+    prefix: &str,
+    meta: &CommandMeta,
+    planned: &[Planned<'_>],
+) -> Result<Vec<RecordedEvent>, EventLogError> {
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let causation_depth = to_i32(meta.causation_depth)?;
+    let statement = transaction
+        .prepare(&format!(
+            "INSERT INTO {prefix}_events (
+                 tenant_id, stream_type, stream_id, version, event_id, event_name,
+                 event_schema_version, occurred_at, recorded_at, subject, actor, request_id,
+                 trace_id, causation_id, causation_depth, data)
+             SELECT r_tenant, r_type, r_id, r_version, r_event_id, r_name, r_schema,
+                    $10::timestamptz, r_recorded, $11::text, $12::text, $13::text, $14::text,
+                    $15::text, $16::int4, r_data
+             FROM (SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::int8[],
+                                        $5::uuid[], $6::text[], $7::int4[],
+                                        $8::timestamptz[], $9::jsonb[])
+                       WITH ORDINALITY AS u(r_tenant, r_type, r_id, r_version, r_event_id,
+                                            r_name, r_schema, r_recorded, r_data, ord)
+                   ORDER BY ord) AS r
+             RETURNING {COLUMNS}"
+        ))
+        .await
+        .map_err(backend)?;
+    let mut written = Vec::with_capacity(planned.len());
+    for chunk in planned.chunks(STATEMENT_BATCH) {
+        let tenants: Vec<&str> = chunk.iter().map(|p| p.stream.tenant().as_str()).collect();
+        let types: Vec<&str> = chunk.iter().map(|p| p.stream.stream_type()).collect();
+        let ids: Vec<&str> = chunk.iter().map(|p| p.stream.stream_id()).collect();
+        let versions: Vec<i64> = chunk.iter().map(|p| p.version).collect();
+        let event_ids: Vec<uuid::Uuid> = chunk.iter().map(|p| p.event_id).collect();
+        let names: Vec<&str> = chunk.iter().map(|p| p.event.name.as_str()).collect();
+        let schemas: Vec<i32> = chunk.iter().map(|p| p.schema_version).collect();
+        let recorded: Vec<OffsetDateTime> = chunk.iter().map(|p| p.recorded_at).collect();
+        let data: Vec<&serde_json::Value> = chunk.iter().map(|p| &p.event.data).collect();
+        let rows = transaction
+            .query(
+                &statement,
+                &[
+                    &tenants,
+                    &types,
+                    &ids,
+                    &versions,
+                    &event_ids,
+                    &names,
+                    &schemas,
+                    &recorded,
+                    &data,
+                    &meta.occurred_at,
+                    &meta.subject,
+                    &meta.actor,
+                    &meta.request_id,
+                    &meta.trace_id,
+                    &meta.causation_id,
+                    &causation_depth,
+                ],
+            )
+            .await
+            .map_err(backend)?;
+        let positions: HashMap<uuid::Uuid, usize> = event_ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (*id, position))
+            .collect();
+        let mut slots: Vec<Option<RecordedEvent>> = chunk.iter().map(|_| None).collect();
+        for row in &rows {
+            let id: uuid::Uuid = row.get(5);
+            let slot = positions
+                .get(&id)
+                .and_then(|position| slots.get_mut(*position))
+                .ok_or_else(|| {
+                    EventLogError::Backend("batched insert returned a stranger".into())
+                })?;
+            *slot = Some(read_event(row)?);
+        }
+        for slot in slots {
+            written.push(
+                slot.ok_or_else(|| EventLogError::Backend("batched insert lost a row".into()))?,
+            );
+        }
+    }
+    Ok(written)
+}
+
+/// Take every stream's append lock, in the set's order, [`STATEMENT_BATCH`] per statement.
+///
+/// The coordinates are [`lock_identity`]'s and the key expression is [`ADVISORY_KEY`] itself, so
+/// these are the very locks a single append takes; the ordered subquery keeps the acquisition
+/// order that prevents two groups from deadlocking.
+///
+/// One statement waits for up to 1,000 locks in turn, so `statement_timeout` would add up waits
+/// that one statement per lock bounded each on its own. Each lock statement may therefore run
+/// for the rest of the group's `deadline`; `lock_timeout` still bounds every single wait. The
+/// session's `statement_timeout` is restored for the statements after it.
+async fn lock_streams(
+    transaction: &tokio_postgres::Transaction<'_>,
+    prefix: &str,
+    streams: &BTreeSet<&StreamId>,
+    deadline: tokio::time::Instant,
+    statement_timeout: std::time::Duration,
+) -> Result<(), EventLogError> {
+    let identities = streams
+        .iter()
+        .map(|stream| {
+            lock_coordinates(
+                prefix,
+                "stream",
+                &[
+                    stream.tenant().as_str(),
+                    stream.stream_type(),
+                    stream.stream_id(),
+                ],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = ADVISORY_KEY.replace("$1", "r.identity");
+    let statement = transaction
+        .prepare(&format!(
+            "SELECT pg_advisory_xact_lock({key})
+             FROM (SELECT identity FROM unnest($1::text[]) WITH ORDINALITY AS u(identity, ord)
+                   ORDER BY ord) AS r"
+        ))
+        .await
+        .map_err(backend)?;
+    for chunk in identities.chunks(STATEMENT_BATCH) {
+        set_statement_timeout(
+            transaction,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?;
+        transaction
+            .execute(&statement, &[&chunk])
+            .await
+            .map_err(backend)?;
+    }
+    set_statement_timeout(transaction, statement_timeout).await
+}
+
+/// Every stream's current head, 0 for a stream not yet written, [`STATEMENT_BATCH`] per statement.
+async fn stream_heads<'s>(
+    transaction: &tokio_postgres::Transaction<'_>,
+    prefix: &str,
+    streams: &BTreeSet<&'s StreamId>,
+) -> Result<BTreeMap<&'s StreamId, u64>, EventLogError> {
+    let statement = transaction
+        .prepare(&format!(
+            "SELECT r.ord, (SELECT MAX(version) FROM {prefix}_events
+                            WHERE tenant_id = r.r_tenant AND stream_type = r.r_type
+                              AND stream_id = r.r_id)
+             FROM unnest($1::text[], $2::text[], $3::text[])
+                 WITH ORDINALITY AS r(r_tenant, r_type, r_id, ord)"
+        ))
+        .await
+        .map_err(backend)?;
+    let ordered: Vec<&StreamId> = streams.iter().copied().collect();
+    let mut heads = BTreeMap::new();
+    for chunk in ordered.chunks(STATEMENT_BATCH) {
+        let tenants: Vec<&str> = chunk.iter().map(|s| s.tenant().as_str()).collect();
+        let types: Vec<&str> = chunk.iter().map(|s| s.stream_type()).collect();
+        let ids: Vec<&str> = chunk.iter().map(|s| s.stream_id()).collect();
+        let rows = transaction
+            .query(&statement, &[&tenants, &types, &ids])
+            .await
+            .map_err(backend)?;
+        for row in rows {
+            let stream = chunk
+                .get(ordinal(row.get(0))?)
+                .ok_or_else(|| EventLogError::Backend("batched head out of range".into()))?;
+            let head: Option<i64> = row.get(1);
+            heads.insert(*stream, head.map(to_u64).transpose()?.unwrap_or(0));
+        }
+    }
+    Ok(heads)
+}
+
 impl PostgresEventStore {
-    // Both ports share event writing, guards and projectors; only command bookkeeping differs.
+    /// A single append: command and claim bookkeeping, then its events in batched statements.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn append_in_transaction(
         &self,
@@ -29,93 +252,88 @@ impl PostgresEventStore {
         events: &[NewEvent],
         meta: &CommandMeta,
         admission: &dyn Guard,
-        record_command: bool,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<AppendResult, EventLogError> {
         let prefix = self.prefix.clone();
-        if record_command {
-            if let Some(claim) = &meta.claim {
-                lock_identity(
-                    transaction,
-                    &prefix,
-                    "claim",
-                    &[stream.tenant().as_str(), &claim.scope, &claim.key],
-                )
-                .await?;
-                let prior=transaction.query_opt(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=$1 AND scope=$2 AND claim_key=$3"), &[&stream.tenant().as_str(),&claim.scope,&claim.key]).await.map_err(backend)?;
-                if let Some(row) = prior {
-                    if row.get::<_, String>(0) != claim.digest {
-                        return Err(EventLogError::IdempotencyMismatch {
-                            key: claim.key.clone(),
-                        });
-                    }
-                    let original = StreamId::new(
-                        stream.tenant().clone(),
-                        row.get::<_, String>(1),
-                        row.get::<_, String>(2),
-                    )?;
-                    let first: i64 = row.get(3);
-                    let last: i64 = row.get(4);
-                    let events =
-                        select_versions(transaction, &prefix, &original, first, last).await?;
-
-                    return Ok(AppendResult {
-                        first_version: to_u64(first)?,
-                        last_version: to_u64(last)?,
-                        events,
-                        deduplicated: true,
-                    });
-                }
-            }
+        if let Some(claim) = &meta.claim {
             lock_identity(
                 transaction,
                 &prefix,
-                "stream",
-                &[
-                    stream.tenant().as_str(),
-                    stream.stream_type(),
-                    stream.stream_id(),
-                ],
+                "claim",
+                &[stream.tenant().as_str(), &claim.scope, &claim.key],
             )
             .await?;
-
-            let recorded = transaction
-                .query_opt(
-                    &format!(
-                        "SELECT request_hash, first_version, last_version FROM {prefix}_commands
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
-                           AND idempotency_key = $4"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &meta.idempotency_key,
-                    ],
-                )
-                .await
-                .map_err(backend)?;
-
-            if let Some(row) = recorded {
-                let request_hash: String = row.get(0);
-                let first_version: i64 = row.get(1);
-                let last_version: i64 = row.get(2);
-                if request_hash != meta.request_hash {
+            let prior=transaction.query_opt(&format!("SELECT request_digest,stream_type,stream_id,first_version,last_version FROM {prefix}_claims WHERE tenant_id=$1 AND scope=$2 AND claim_key=$3"), &[&stream.tenant().as_str(),&claim.scope,&claim.key]).await.map_err(backend)?;
+            if let Some(row) = prior {
+                if row.get::<_, String>(0) != claim.digest {
                     return Err(EventLogError::IdempotencyMismatch {
-                        key: meta.idempotency_key.clone(),
+                        key: claim.key.clone(),
                     });
                 }
-                let stored =
-                    select_versions(transaction, &prefix, stream, first_version, last_version)
-                        .await?;
+                let original = StreamId::new(
+                    stream.tenant().clone(),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                )?;
+                let first: i64 = row.get(3);
+                let last: i64 = row.get(4);
+                let events = select_versions(transaction, &prefix, &original, first, last).await?;
 
                 return Ok(AppendResult {
-                    first_version: to_u64(first_version)?,
-                    last_version: to_u64(last_version)?,
-                    events: stored,
+                    first_version: to_u64(first)?,
+                    last_version: to_u64(last)?,
+                    events,
                     deduplicated: true,
                 });
             }
+        }
+        lock_identity(
+            transaction,
+            &prefix,
+            "stream",
+            &[
+                stream.tenant().as_str(),
+                stream.stream_type(),
+                stream.stream_id(),
+            ],
+        )
+        .await?;
+
+        let recorded = transaction
+            .query_opt(
+                &format!(
+                    "SELECT request_hash, first_version, last_version FROM {prefix}_commands
+                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
+                           AND idempotency_key = $4"
+                ),
+                &[
+                    &stream.tenant().as_str(),
+                    &stream.stream_type(),
+                    &stream.stream_id(),
+                    &meta.idempotency_key,
+                ],
+            )
+            .await
+            .map_err(backend)?;
+
+        if let Some(row) = recorded {
+            let request_hash: String = row.get(0);
+            let first_version: i64 = row.get(1);
+            let last_version: i64 = row.get(2);
+            if request_hash != meta.request_hash {
+                return Err(EventLogError::IdempotencyMismatch {
+                    key: meta.idempotency_key.clone(),
+                });
+            }
+            let stored =
+                select_versions(transaction, &prefix, stream, first_version, last_version).await?;
+
+            return Ok(AppendResult {
+                first_version: to_u64(first_version)?,
+                last_version: to_u64(last_version)?,
+                events: stored,
+                deduplicated: true,
+            });
         }
         let head: Option<i64> = transaction
             .query_one(
@@ -163,75 +381,32 @@ impl PostgresEventStore {
         }
 
         let now = OffsetDateTime::now_utc();
-        let mut written = Vec::with_capacity(events.len());
-        for (offset, event) in events.iter().enumerate() {
-            let version = head + 1 + u64::try_from(offset).unwrap_or(u64::MAX);
-            let event_id = new_event_id();
-            let uuid = parse_uuid(&event_id)?;
-            let row = transaction
-                .query_one(
-                    &format!(
-                        "INSERT INTO {prefix}_events (
-                                 tenant_id, stream_type, stream_id, version, event_id, event_name,
-                                 event_schema_version, occurred_at, recorded_at, subject, actor,
-                                 request_id, trace_id, causation_id, causation_depth, data)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                                     $15, $16)
-                             RETURNING {COLUMNS}"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &to_i64(version)?,
-                        &uuid,
-                        &event.name,
-                        &to_i32(event.schema_version)?,
-                        &meta.occurred_at,
-                        &now,
-                        &meta.subject,
-                        &meta.actor,
-                        &meta.request_id,
-                        &meta.trace_id,
-                        &meta.causation_id,
-                        &to_i32(meta.causation_depth)?,
-                        &event.data,
-                    ],
-                )
-                .await
-                .map_err(backend)?;
-            #[cfg(test)]
-            if !record_command && offset == 0 {
-                checkpoint("group-event-1");
-            }
-            written.push(read_event(&row)?);
-        }
+        let planned = plan(stream, head, events, now)?;
+        let written = insert_events(transaction, &prefix, meta, &planned).await?;
 
         let first_version = head + 1;
         let last_version = head + u64::try_from(events.len()).unwrap_or(u64::MAX);
-        if record_command {
-            transaction
-                .execute(
-                    &format!(
-                        "INSERT INTO {prefix}_commands (
-                             tenant_id, stream_type, stream_id, idempotency_key, request_hash,
-                             first_version, last_version, recorded_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-                    ),
-                    &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &meta.idempotency_key,
-                        &meta.request_hash,
-                        &to_i64(first_version)?,
-                        &to_i64(last_version)?,
-                        &now,
-                    ],
-                )
-                .await
-                .map_err(backend)?;
-        }
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}_commands (
+                         tenant_id, stream_type, stream_id, idempotency_key, request_hash,
+                         first_version, last_version, recorded_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                ),
+                &[
+                    &stream.tenant().as_str(),
+                    &stream.stream_type(),
+                    &stream.stream_id(),
+                    &meta.idempotency_key,
+                    &meta.request_hash,
+                    &to_i64(first_version)?,
+                    &to_i64(last_version)?,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(backend)?;
         let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
         for projector in &projectors {
             let mut projections = PostgresProjections {
@@ -288,6 +463,7 @@ impl PostgresEventStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn group_in_transaction(
         &self,
         transaction: &tokio_postgres::Transaction<'_>,
@@ -296,6 +472,7 @@ impl PostgresEventStore {
         blobs: &[BlobWrite],
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
+        deadline: tokio::time::Instant,
     ) -> Result<AppendGroupResult, EventLogError> {
         let prefix = &self.prefix;
         lock_identity(
@@ -316,25 +493,36 @@ impl PostgresEventStore {
             }
             let ranges: Vec<GroupRange> = serde_json::from_value(row.get(1))
                 .map_err(|_| EventLogError::Invalid("invalid stored group ranges".into()))?;
-            let mut appends = Vec::with_capacity(ranges.len());
-            for range in ranges {
+            let mut windows = Vec::with_capacity(ranges.len());
+            for range in &ranges {
                 if range.stream.tenant() != &group.tenant {
                     return Err(EventLogError::Invalid(
                         "stored group crosses tenants".into(),
                     ));
                 }
-                let events = select_versions(
-                    transaction,
-                    prefix,
-                    &range.stream,
-                    to_i64(range.first_version)?,
-                    to_i64(range.last_version)?,
-                )
-                .await?;
+                // `select_versions`' inclusive range, as a window.
+                let after = to_i64(range.first_version)?.saturating_sub(1);
+                let through = to_i64(range.last_version)?;
+                windows.push(Window {
+                    stream: &range.stream,
+                    after,
+                    through,
+                    fetch: through.saturating_sub(after).max(0),
+                });
+            }
+            let stored = select_windows(
+                transaction,
+                prefix,
+                &windows.iter().collect::<Vec<_>>(),
+                None,
+            )
+            .await?;
+            let mut appends = Vec::with_capacity(ranges.len());
+            for (range, rows) in ranges.iter().zip(stored) {
                 appends.push(AppendResult {
                     first_version: range.first_version,
                     last_version: range.last_version,
-                    events,
+                    events: rows.iter().map(read_event).collect::<Result<_, _>>()?,
                     deduplicated: true,
                 });
             }
@@ -344,19 +532,14 @@ impl PostgresEventStore {
             });
         }
         let streams: BTreeSet<_> = group.appends.iter().map(|a| &a.stream).collect();
-        for stream in streams {
-            lock_identity(
-                transaction,
-                prefix,
-                "stream",
-                &[
-                    stream.tenant().as_str(),
-                    stream.stream_type(),
-                    stream.stream_id(),
-                ],
-            )
-            .await?;
-        }
+        lock_streams(
+            transaction,
+            prefix,
+            &streams,
+            deadline,
+            self.pool.options.statement_timeout,
+        )
+        .await?;
         for blob in blobs {
             // Row/unique locking also serializes the existing standalone blob ports.
             // Advisory locks alone cannot protect against writers that do not take them.
@@ -419,23 +602,72 @@ impl PostgresEventStore {
                 ));
             }
         }
-        let mut appends = Vec::with_capacity(group.appends.len());
-        let mut ranges = Vec::with_capacity(group.appends.len());
+        // Every member is planned against the heads read under the stream locks, each later
+        // member of a stream starting where the earlier one ended. The first member the store
+        // refuses ends the plan; the members before it are still written and projected, as they
+        // were one member at a time, before the refusal returns and rolls the group back.
+        let mut heads = stream_heads(transaction, prefix, &streams).await?;
+        let mut planned = Vec::new();
+        let mut members = Vec::with_capacity(group.appends.len());
+        let mut refusal = None;
+        for entry in &group.appends {
+            let head = heads.get(&entry.stream).copied().unwrap_or(0);
+            let member = check_expected(entry.expected, head).and_then(|()| {
+                plan(
+                    &entry.stream,
+                    head,
+                    &entry.events,
+                    OffsetDateTime::now_utc(),
+                )
+            });
+            match member {
+                Ok(events) => {
+                    let last = head + u64::try_from(events.len()).unwrap_or(u64::MAX);
+                    heads.insert(&entry.stream, last);
+                    members.push((entry, head + 1, last, events.len()));
+                    planned.extend(events);
+                }
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut written = insert_events(transaction, prefix, &group.meta, &planned)
+            .await?
+            .into_iter();
+        #[cfg(test)]
+        if !planned.is_empty() {
+            checkpoint("group-event-1");
+        }
+        let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
+        let mut appends = Vec::with_capacity(members.len());
+        let mut ranges = Vec::with_capacity(members.len());
         #[cfg(test)]
         let mut member = 0;
-        for entry in &group.appends {
-            let result = self
-                .append_in_transaction(
-                    transaction,
-                    &entry.stream,
-                    entry.expected,
-                    &entry.events,
-                    &group.meta,
-                    &NoGuard,
-                    false,
-                    callback_failed,
-                )
-                .await?;
+        for (entry, first_version, last_version, count) in members {
+            let events: Vec<RecordedEvent> = written.by_ref().take(count).collect();
+            for projector in &projectors {
+                let mut projections = PostgresProjections {
+                    client: transaction,
+                    blob_prefix: prefix,
+                    projection_prefix: prefix,
+                    lock_prefix: prefix,
+                    inline: &self.inline_names,
+                    tenant: entry.stream.tenant(),
+                    admission: None,
+                    reservation_pending: false,
+                    callback_failed: Arc::clone(callback_failed),
+                    verified: &self.verified,
+                    selected: None,
+                };
+                for recorded in &events {
+                    let result = projector.apply(recorded, &mut projections).await;
+                    ensure_callback_integrity(callback_failed)?;
+                    result?;
+                }
+            }
+            ensure_callback_integrity(callback_failed)?;
             #[cfg(test)]
             {
                 member += 1;
@@ -443,10 +675,18 @@ impl PostgresEventStore {
             }
             ranges.push(GroupRange {
                 stream: entry.stream.clone(),
-                first_version: result.first_version,
-                last_version: result.last_version,
+                first_version,
+                last_version,
             });
-            appends.push(result);
+            appends.push(AppendResult {
+                first_version,
+                last_version,
+                events,
+                deduplicated: false,
+            });
+        }
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
         transaction.execute(&format!("INSERT INTO {prefix}_append_groups (tenant_id,idempotency_key,request_hash,ranges) VALUES ($1,$2,$3,$4)"),
             &[&group.tenant.as_str(),&group.meta.idempotency_key,&fingerprint,&serde_json::to_value(&ranges).map_err(|_| EventLogError::Invalid("invalid group ranges".into()))?]).await.map_err(backend)?;
@@ -470,7 +710,8 @@ impl AtomicEventStore for PostgresEventStore {
             let fingerprint = group.fingerprint()?;
             self.freeze().await;
             let commit_started = std::sync::atomic::AtomicBool::new(false);
-            tokio::time::timeout(self.pool.options.transaction_timeout, async {
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
+            tokio::time::timeout_at(deadline, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
@@ -484,6 +725,7 @@ impl AtomicEventStore for PostgresEventStore {
                         &[],
                         admission.as_ref(),
                         &callback_failed,
+                        deadline,
                     )
                     .await;
                 match result {
@@ -525,7 +767,8 @@ impl AtomicBlobEventStore for PostgresEventStore {
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
             self.freeze().await;
             let commit_started = std::sync::atomic::AtomicBool::new(false);
-            let outcome = tokio::time::timeout(self.pool.options.transaction_timeout, async {
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
+            let outcome = tokio::time::timeout_at(deadline, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
@@ -539,6 +782,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
                         &request.blobs,
                         admission.as_ref(),
                         &callback_failed,
+                        deadline,
                     )
                     .await;
                 match result {
