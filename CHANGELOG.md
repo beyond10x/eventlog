@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.3 — 2026-11-11
+
 ### Changed
 
 - PostgreSQL: `read_many` answers a batch in one REPEATABLE READ snapshot, with one statement per
