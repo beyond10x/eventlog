@@ -5,6 +5,14 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Security
+
+- SQLite: `rusqlite` moves from 0.40.2 to 0.41.0, which brings `libsqlite3-sys` 0.39.1 and
+  bundled SQLite 3.54.1. This fixes RUSTSEC-2026-0459 (CVE-2026-119375): SQLite before 3.54.0
+  can return uninitialized page-cache memory when it opens a database file together with a
+  `-wal` file whose page size differs. The SQLite provider's API and on-disk format are
+  unchanged.
+
 ## 0.9.3 — 2026-11-11
 
 ### Changed

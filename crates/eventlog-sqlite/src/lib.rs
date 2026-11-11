@@ -251,7 +251,7 @@ impl SqliteEventStore {
     pub async fn image(&self) -> Result<Vec<u8>, EventLogError> {
         let inner = Arc::clone(&self.inner);
         run_blocking(move || {
-            let connection = inner.connection.lock().map_err(poisoned)?;
+            let mut connection = inner.connection.lock().map_err(poisoned)?;
             let data = connection.serialize("main").map_err(backend)?;
             Ok(data.to_vec())
         })
