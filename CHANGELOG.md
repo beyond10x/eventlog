@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.9.4 — 2026-11-11
+
 ### Security
 
 - SQLite: `rusqlite` moves from 0.40.2 to 0.41.0, which brings `libsqlite3-sys` 0.39.1 and
