@@ -544,13 +544,17 @@ impl EventStore for PostgresEventStore {
     /// [`EventStore::read_stream`] or [`EventStore::get_blob`] shapes it.
     ///
     /// A read that the separate call would refuse before reaching the store (a version past
-    /// `i64::MAX`) ends the batch there, unless an earlier read's own refusal comes first. The
-    /// store-operation deadline bounds the batch as a whole.
+    /// `i64::MAX`) ends the batch there, unless an earlier read's own refusal comes first.
+    ///
+    /// Deadlines follow the separate calls, not the batch: each statement gets the
+    /// store-operation deadline and the statement timeout of one read times the reads it carries,
+    /// so a batch is never refused for its size when each of its reads would have fit alone.
     fn read_many<'a>(
         &'a self,
         reads: &'a [Read],
     ) -> BoxFuture<'a, Result<Vec<ReadResult>, EventLogError>> {
-        self.bounded(async move {
+        Box::pin(async move {
+            let one = Pace::of(&self.pool.options);
             let mut windows = Vec::new();
             let mut blobs = Vec::new();
             let mut refused = None;
@@ -587,22 +591,29 @@ impl EventStore for PostgresEventStore {
                     None => Ok(Vec::new()),
                 };
             }
-            let mut client = self.pool.acquire().await?;
-            let transaction = client
-                .build_transaction()
-                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-                .read_only(true)
-                .start()
-                .await
-                .map_err(backend)?;
+            let mut client = paced(Some(one.deadline), self.pool.acquire()).await?;
+            let transaction = paced(Some(one.deadline), async {
+                client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true)
+                    .start()
+                    .await
+                    .map_err(backend)
+            })
+            .await?;
             let stream_rows = select_windows(
                 &transaction,
                 &self.prefix,
                 &windows.iter().map(|(_, window)| window).collect::<Vec<_>>(),
+                Some(one),
             )
             .await?;
-            let blob_rows = select_blobs(&transaction, &self.prefix, &blobs).await?;
-            transaction.commit().await.map_err(backend)?;
+            let blob_rows = select_blobs(&transaction, &self.prefix, &blobs, one).await?;
+            paced(Some(one.deadline), async {
+                transaction.commit().await.map_err(backend)
+            })
+            .await?;
             client.settled();
 
             let mut answers: Vec<Option<Result<ReadResult, EventLogError>>> =
@@ -1878,18 +1889,23 @@ struct Window<'a> {
 /// Each window is the statement [`select_versions`] and `read_stream` issue for one stream, run
 /// as a lateral subquery per array element; the element's ordinal is appended after
 /// [`COLUMNS`], so [`read_event`] reads the rows unchanged.
+///
+/// With a `pace`, each statement runs under that pace times the windows it carries; without
+/// one, under whatever already bounds the caller's transaction.
 async fn select_windows<C: GenericClient>(
     client: &C,
     prefix: &str,
     windows: &[&Window<'_>],
+    pace: Option<Pace>,
 ) -> Result<Vec<Vec<Row>>, EventLogError> {
     let mut answers: Vec<Vec<Row>> = windows.iter().map(|_| Vec::new()).collect();
     if windows.is_empty() {
         return Ok(answers);
     }
-    let statement = client
-        .prepare(&format!(
-            "SELECT e.*, r.ord FROM unnest($1::text[], $2::text[], $3::text[], $4::int8[],
+    let statement = paced(pace.map(|one| one.deadline), async {
+        client
+            .prepare(&format!(
+                "SELECT e.*, r.ord FROM unnest($1::text[], $2::text[], $3::text[], $4::int8[],
                                           $5::int8[], $6::int8[])
                  WITH ORDINALITY AS r(r_tenant, r_type, r_id, r_after, r_through, r_fetch, ord)
              CROSS JOIN LATERAL (
@@ -1898,9 +1914,11 @@ async fn select_windows<C: GenericClient>(
                    AND version > r.r_after AND version <= r.r_through
                  ORDER BY version LIMIT r.r_fetch) AS e
              ORDER BY r.ord, e.version"
-        ))
-        .await
-        .map_err(backend)?;
+            ))
+            .await
+            .map_err(backend)
+    })
+    .await?;
     for (batch, chunk) in windows.chunks(STATEMENT_BATCH).enumerate() {
         let tenants: Vec<&str> = chunk.iter().map(|w| w.stream.tenant().as_str()).collect();
         let types: Vec<&str> = chunk.iter().map(|w| w.stream.stream_type()).collect();
@@ -1908,13 +1926,20 @@ async fn select_windows<C: GenericClient>(
         let afters: Vec<i64> = chunk.iter().map(|w| w.after).collect();
         let throughs: Vec<i64> = chunk.iter().map(|w| w.through).collect();
         let fetches: Vec<i64> = chunk.iter().map(|w| w.fetch).collect();
-        let rows = client
-            .query(
-                &statement,
-                &[&tenants, &types, &ids, &afters, &throughs, &fetches],
-            )
-            .await
-            .map_err(backend)?;
+        let pace = pace.map(|one| one.times(chunk.len()));
+        let rows = paced(pace.map(|pace| pace.deadline), async {
+            if let Some(pace) = pace {
+                set_statement_timeout(client, pace.statement).await?;
+            }
+            client
+                .query(
+                    &statement,
+                    &[&tenants, &types, &ids, &afters, &throughs, &fetches],
+                )
+                .await
+                .map_err(backend)
+        })
+        .await?;
         for row in rows {
             let index = batch * STATEMENT_BATCH + ordinal(row.get(COLUMN_COUNT))?;
             answers
@@ -1927,31 +1952,41 @@ async fn select_windows<C: GenericClient>(
 }
 
 /// Each blob's stored row, or `None`, in request order, [`STATEMENT_BATCH`] per statement.
-/// The columns are `get_blob`'s, in its order.
+/// The columns are `get_blob`'s, in its order. Each statement runs under `one` read's pace times
+/// the blobs it carries.
 async fn select_blobs<C: GenericClient>(
     client: &C,
     prefix: &str,
     blobs: &[(usize, &TenantId, &str)],
+    one: Pace,
 ) -> Result<Vec<Option<Row>>, EventLogError> {
     let mut answers: Vec<Option<Row>> = blobs.iter().map(|_| None).collect();
     if blobs.is_empty() {
         return Ok(answers);
     }
-    let statement = client
-        .prepare(&format!(
-            "SELECT b.bytes, b.byte_count, b.integrity_sha256, b.integrity_v1, r.ord
-             FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(r_tenant, r_digest, ord)
-             JOIN {prefix}_blobs b ON b.tenant_id = r.r_tenant AND b.digest = r.r_digest"
-        ))
-        .await
-        .map_err(backend)?;
+    let statement = paced(Some(one.deadline), async {
+        client
+            .prepare(&format!(
+                "SELECT b.bytes, b.byte_count, b.integrity_sha256, b.integrity_v1, r.ord
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(r_tenant, r_digest, ord)
+                 JOIN {prefix}_blobs b ON b.tenant_id = r.r_tenant AND b.digest = r.r_digest"
+            ))
+            .await
+            .map_err(backend)
+    })
+    .await?;
     for (batch, chunk) in blobs.chunks(STATEMENT_BATCH).enumerate() {
         let tenants: Vec<&str> = chunk.iter().map(|(_, tenant, _)| tenant.as_str()).collect();
         let digests: Vec<&str> = chunk.iter().map(|(_, _, digest)| *digest).collect();
-        let rows = client
-            .query(&statement, &[&tenants, &digests])
-            .await
-            .map_err(backend)?;
+        let pace = one.times(chunk.len());
+        let rows = paced(Some(pace.deadline), async {
+            set_statement_timeout(client, pace.statement).await?;
+            client
+                .query(&statement, &[&tenants, &digests])
+                .await
+                .map_err(backend)
+        })
+        .await?;
         for row in rows {
             let index = batch * STATEMENT_BATCH + ordinal(row.get(4))?;
             *answers
@@ -1961,6 +1996,64 @@ async fn select_blobs<C: GenericClient>(
         }
     }
     Ok(answers)
+}
+
+/// What one separate read may spend: the store-operation deadline it runs under on the client,
+/// and the statement timeout the server holds it to.
+#[derive(Clone, Copy)]
+struct Pace {
+    deadline: std::time::Duration,
+    statement: std::time::Duration,
+}
+
+impl Pace {
+    fn of(options: &PoolOptions) -> Self {
+        Self {
+            deadline: options.transaction_timeout,
+            statement: options.statement_timeout,
+        }
+    }
+
+    /// What `reads` separate reads would have had between them.
+    fn times(self, reads: usize) -> Self {
+        let reads = u32::try_from(reads).unwrap_or(u32::MAX);
+        Self {
+            deadline: self.deadline.saturating_mul(reads),
+            statement: self.statement.saturating_mul(reads),
+        }
+    }
+}
+
+/// Run `work` inside `budget` when there is one, refusing as the store-operation deadline does.
+async fn paced<T>(
+    budget: Option<std::time::Duration>,
+    work: impl std::future::Future<Output = Result<T, EventLogError>>,
+) -> Result<T, EventLogError> {
+    match budget {
+        None => work.await,
+        Some(budget) => {
+            tokio::time::timeout(budget, work)
+                .await
+                .map_err(|_| EventLogError::Deadline {
+                    operation: "store operation",
+                })?
+        }
+    }
+}
+
+/// Hold the rest of the current transaction's statements to `timeout`, at least 1 ms (0 would
+/// mean none) and at most what the setting accepts.
+async fn set_statement_timeout<C: GenericClient>(
+    client: &C,
+    timeout: std::time::Duration,
+) -> Result<(), EventLogError> {
+    let millis = timeout
+        .as_millis()
+        .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+    client
+        .batch_execute(&format!("SET LOCAL statement_timeout = {millis}"))
+        .await
+        .map_err(backend)
 }
 
 /// How many columns [`COLUMNS`] names; a batched statement appends its ordinal after them.

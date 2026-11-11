@@ -337,12 +337,23 @@ async fn read_many_answers_in_bounded_statements_inside_one_snapshot() {
         "2,500 stream reads and 3 blob reads took {} statements",
         binds(&sent)
     );
-    let simple: Vec<&String> = sent.iter().filter(|m| m.starts_with("Q:")).collect();
+    // Besides opening and closing the one transaction, the batch only paces its statements: each
+    // gets the statement timeout of the reads it carries (1,000 x the default 5 s, then 500 x,
+    // then 3 x for the blobs).
+    let control: Vec<&String> = sent
+        .iter()
+        .filter(|m| m.starts_with("Q:") && !m.starts_with("Q:SET LOCAL statement_timeout = "))
+        .collect();
     assert_eq!(
-        simple.len(),
+        control.len(),
         2,
-        "one transaction, opened and closed: {simple:?}"
+        "one transaction, opened and closed: {control:?}"
     );
+    let paces: Vec<&str> = sent
+        .iter()
+        .filter_map(|m| m.strip_prefix("Q:SET LOCAL statement_timeout = "))
+        .collect();
+    assert_eq!(paces, ["5000000", "5000000", "2500000", "15000"]);
     assert!(
         sent.first()
             .is_some_and(|m| m.starts_with("Q:START TRANSACTION") && m.contains("REPEATABLE READ")),

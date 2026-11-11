@@ -9,8 +9,8 @@ use super::{
     Expected, Guard, NewEvent, OffsetDateTime, PostgresEventStore, PostgresProjections, Projector,
     RecordedEvent, STATEMENT_BATCH, StreamId, Window, backend, check_expected,
     ensure_callback_integrity, lock_coordinates, lock_identity, new_event_id, ordinal, parse_uuid,
-    poisoned, publication_gate, read_event, select_versions, select_windows, timed_out_write,
-    to_i32, to_i64, to_u64,
+    poisoned, publication_gate, read_event, select_versions, select_windows, set_statement_timeout,
+    timed_out_write, to_i32, to_i64, to_u64,
 };
 use eventlog_core::{
     AppendGroup, AppendGroupResult, AtomicBlobEventStore, AtomicEventStore, BlobAppendGroup,
@@ -155,10 +155,17 @@ async fn insert_events(
 /// The coordinates are [`lock_identity`]'s and the key expression is [`ADVISORY_KEY`] itself, so
 /// these are the very locks a single append takes; the ordered subquery keeps the acquisition
 /// order that prevents two groups from deadlocking.
+///
+/// One statement waits for up to 1,000 locks in turn, so `statement_timeout` would add up waits
+/// that one statement per lock bounded each on its own. Each lock statement may therefore run
+/// for the rest of the group's `deadline`; `lock_timeout` still bounds every single wait. The
+/// session's `statement_timeout` is restored for the statements after it.
 async fn lock_streams(
     transaction: &tokio_postgres::Transaction<'_>,
     prefix: &str,
     streams: &BTreeSet<&StreamId>,
+    deadline: tokio::time::Instant,
+    statement_timeout: std::time::Duration,
 ) -> Result<(), EventLogError> {
     let identities = streams
         .iter()
@@ -184,12 +191,17 @@ async fn lock_streams(
         .await
         .map_err(backend)?;
     for chunk in identities.chunks(STATEMENT_BATCH) {
+        set_statement_timeout(
+            transaction,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?;
         transaction
             .execute(&statement, &[&chunk])
             .await
             .map_err(backend)?;
     }
-    Ok(())
+    set_statement_timeout(transaction, statement_timeout).await
 }
 
 /// Every stream's current head, 0 for a stream not yet written, [`STATEMENT_BATCH`] per statement.
@@ -451,6 +463,7 @@ impl PostgresEventStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn group_in_transaction(
         &self,
         transaction: &tokio_postgres::Transaction<'_>,
@@ -459,6 +472,7 @@ impl PostgresEventStore {
         blobs: &[BlobWrite],
         admission: &dyn Guard,
         callback_failed: &Arc<std::sync::atomic::AtomicBool>,
+        deadline: tokio::time::Instant,
     ) -> Result<AppendGroupResult, EventLogError> {
         let prefix = &self.prefix;
         lock_identity(
@@ -496,8 +510,13 @@ impl PostgresEventStore {
                     fetch: through.saturating_sub(after).max(0),
                 });
             }
-            let stored =
-                select_windows(transaction, prefix, &windows.iter().collect::<Vec<_>>()).await?;
+            let stored = select_windows(
+                transaction,
+                prefix,
+                &windows.iter().collect::<Vec<_>>(),
+                None,
+            )
+            .await?;
             let mut appends = Vec::with_capacity(ranges.len());
             for (range, rows) in ranges.iter().zip(stored) {
                 appends.push(AppendResult {
@@ -513,7 +532,14 @@ impl PostgresEventStore {
             });
         }
         let streams: BTreeSet<_> = group.appends.iter().map(|a| &a.stream).collect();
-        lock_streams(transaction, prefix, &streams).await?;
+        lock_streams(
+            transaction,
+            prefix,
+            &streams,
+            deadline,
+            self.pool.options.statement_timeout,
+        )
+        .await?;
         for blob in blobs {
             // Row/unique locking also serializes the existing standalone blob ports.
             // Advisory locks alone cannot protect against writers that do not take them.
@@ -684,7 +710,8 @@ impl AtomicEventStore for PostgresEventStore {
             let fingerprint = group.fingerprint()?;
             self.freeze().await;
             let commit_started = std::sync::atomic::AtomicBool::new(false);
-            tokio::time::timeout(self.pool.options.transaction_timeout, async {
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
+            tokio::time::timeout_at(deadline, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
@@ -698,6 +725,7 @@ impl AtomicEventStore for PostgresEventStore {
                         &[],
                         admission.as_ref(),
                         &callback_failed,
+                        deadline,
                     )
                     .await;
                 match result {
@@ -739,7 +767,8 @@ impl AtomicBlobEventStore for PostgresEventStore {
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
             self.freeze().await;
             let commit_started = std::sync::atomic::AtomicBool::new(false);
-            let outcome = tokio::time::timeout(self.pool.options.transaction_timeout, async {
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
+            let outcome = tokio::time::timeout_at(deadline, async {
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
@@ -753,6 +782,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
                         &request.blobs,
                         admission.as_ref(),
                         &callback_failed,
+                        deadline,
                     )
                     .await;
                 match result {
