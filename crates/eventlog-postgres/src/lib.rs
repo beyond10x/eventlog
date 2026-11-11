@@ -24,10 +24,10 @@ use std::{
 use eventlog_core::{
     AppendResult, BlobMigrationReport, BoxFuture, CatchUpProgress, Claim, ClaimedCommand,
     CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
-    MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
-    Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, VerifiedContent,
-    blob_integrity_sha256, bounded_limit, indexed_value, new_event_id, redaction_tombstone,
-    validate_append, validate_field,
+    MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, Read,
+    ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId,
+    VerifiedContent, blob_integrity_sha256, bounded_limit, indexed_value, new_event_id,
+    redaction_tombstone, validate_append, validate_field,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -53,6 +53,12 @@ const COLUMNS: &str = "global_seq, tenant_id, stream_type, stream_id, version, e
 
 /// The predicate that keeps a feed reader behind anything still in flight.
 const WATERMARK: &str = "committed_xid < pg_snapshot_xmin(pg_current_snapshot())";
+
+/// How many reads, stream locks, heads or event rows one batched statement carries.
+///
+/// One statement per item costs a round trip each, about 0.6 ms on localhost: 10,000 stream reads
+/// took 6.7 s and a group of 20,000 events did not finish inside the 10 s deadline.
+const STATEMENT_BATCH: usize = 1_000;
 
 /// One owner's event tables in one PostgreSQL database.
 pub struct PostgresEventStore {
@@ -381,7 +387,6 @@ impl EventStore for PostgresEventStore {
                         events,
                         meta,
                         admission.as_ref(),
-                        true,
                         &callback_failed,
                     )
                     .await;
@@ -530,18 +535,104 @@ impl EventStore for PostgresEventStore {
                 .await
                 .map_err(backend)?;
             client.settled();
-            let mut events = rows
-                .iter()
-                .map(read_event)
-                .collect::<Result<Vec<_>, EventLogError>>()?;
-            let end_of_stream = events.len() <= limit;
-            events.truncate(limit);
-            let next_version = events.last().map_or(after_version, |event| event.version);
-            Ok(StreamSlice {
-                events,
-                next_version,
-                end_of_stream,
-            })
+            stream_slice(&rows, after_version, limit)
+        })
+    }
+
+    /// One REPEATABLE READ snapshot answers the batch: stream reads in statements of
+    /// [`STATEMENT_BATCH`], blob reads likewise, each result shaped exactly as
+    /// [`EventStore::read_stream`] or [`EventStore::get_blob`] shapes it.
+    ///
+    /// A read that the separate call would refuse before reaching the store (a version past
+    /// `i64::MAX`) ends the batch there, unless an earlier read's own refusal comes first. The
+    /// store-operation deadline bounds the batch as a whole.
+    fn read_many<'a>(
+        &'a self,
+        reads: &'a [Read],
+    ) -> BoxFuture<'a, Result<Vec<ReadResult>, EventLogError>> {
+        self.bounded(async move {
+            let mut windows = Vec::new();
+            let mut blobs = Vec::new();
+            let mut refused = None;
+            for (index, read) in reads.iter().enumerate() {
+                match read {
+                    Read::Stream {
+                        stream,
+                        after_version,
+                        limit,
+                    } => match to_i64(*after_version) {
+                        Ok(after) => {
+                            let limit = bounded_limit(*limit);
+                            windows.push((
+                                (index, *after_version, limit),
+                                Window {
+                                    stream,
+                                    after,
+                                    through: i64::MAX,
+                                    fetch: to_i64(limit as u64 + 1)?,
+                                },
+                            ));
+                        }
+                        Err(error) => {
+                            refused = Some((index, error));
+                            break;
+                        }
+                    },
+                    Read::Blob { tenant, digest } => blobs.push((index, tenant, digest.as_str())),
+                }
+            }
+            if windows.is_empty() && blobs.is_empty() {
+                return match refused {
+                    Some((_, error)) => Err(error),
+                    None => Ok(Vec::new()),
+                };
+            }
+            let mut client = self.pool.acquire().await?;
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await
+                .map_err(backend)?;
+            let stream_rows = select_windows(
+                &transaction,
+                &self.prefix,
+                &windows.iter().map(|(_, window)| window).collect::<Vec<_>>(),
+            )
+            .await?;
+            let blob_rows = select_blobs(&transaction, &self.prefix, &blobs).await?;
+            transaction.commit().await.map_err(backend)?;
+            client.settled();
+
+            let mut answers: Vec<Option<Result<ReadResult, EventLogError>>> =
+                (0..reads.len()).map(|_| None).collect();
+            for (((index, after_version, limit), _), rows) in windows.iter().zip(stream_rows) {
+                answers[*index] =
+                    Some(stream_slice(&rows, *after_version, *limit).map(ReadResult::Stream));
+            }
+            for ((index, _, _), row) in blobs.iter().zip(blob_rows) {
+                answers[*index] = Some(
+                    row.map(|row| {
+                        self.verified.check_stored(
+                            row.get(0),
+                            row.get(1),
+                            row.get(2),
+                            i64::from(row.get::<_, i32>(3)),
+                        )
+                    })
+                    .transpose()
+                    .map(ReadResult::Blob),
+                );
+            }
+            if let Some((index, error)) = refused {
+                answers[index] = Some(Err(error));
+            }
+            let mut results = Vec::with_capacity(reads.len());
+            for answer in answers.into_iter().map_while(|answer| answer) {
+                results.push(answer?);
+            }
+            Ok(results)
         })
     }
 
@@ -1754,6 +1845,135 @@ async fn select_versions<C: GenericClient>(
     rows.iter().map(read_event).collect()
 }
 
+/// The page `read_stream` returns from up to `limit + 1` rows read past `after_version`.
+fn stream_slice(
+    rows: &[Row],
+    after_version: u64,
+    limit: usize,
+) -> Result<StreamSlice, EventLogError> {
+    let mut events = rows
+        .iter()
+        .map(read_event)
+        .collect::<Result<Vec<_>, EventLogError>>()?;
+    let end_of_stream = events.len() <= limit;
+    events.truncate(limit);
+    let next_version = events.last().map_or(after_version, |event| event.version);
+    Ok(StreamSlice {
+        events,
+        next_version,
+        end_of_stream,
+    })
+}
+
+/// One stream's versions in `(after, through]`, at most `fetch` of them, in version order.
+struct Window<'a> {
+    stream: &'a StreamId,
+    after: i64,
+    through: i64,
+    fetch: i64,
+}
+
+/// Every window's rows, in request order, [`STATEMENT_BATCH`] windows per statement.
+///
+/// Each window is the statement [`select_versions`] and `read_stream` issue for one stream, run
+/// as a lateral subquery per array element; the element's ordinal is appended after
+/// [`COLUMNS`], so [`read_event`] reads the rows unchanged.
+async fn select_windows<C: GenericClient>(
+    client: &C,
+    prefix: &str,
+    windows: &[&Window<'_>],
+) -> Result<Vec<Vec<Row>>, EventLogError> {
+    let mut answers: Vec<Vec<Row>> = windows.iter().map(|_| Vec::new()).collect();
+    if windows.is_empty() {
+        return Ok(answers);
+    }
+    let statement = client
+        .prepare(&format!(
+            "SELECT e.*, r.ord FROM unnest($1::text[], $2::text[], $3::text[], $4::int8[],
+                                          $5::int8[], $6::int8[])
+                 WITH ORDINALITY AS r(r_tenant, r_type, r_id, r_after, r_through, r_fetch, ord)
+             CROSS JOIN LATERAL (
+                 SELECT {COLUMNS} FROM {prefix}_events
+                 WHERE tenant_id = r.r_tenant AND stream_type = r.r_type AND stream_id = r.r_id
+                   AND version > r.r_after AND version <= r.r_through
+                 ORDER BY version LIMIT r.r_fetch) AS e
+             ORDER BY r.ord, e.version"
+        ))
+        .await
+        .map_err(backend)?;
+    for (batch, chunk) in windows.chunks(STATEMENT_BATCH).enumerate() {
+        let tenants: Vec<&str> = chunk.iter().map(|w| w.stream.tenant().as_str()).collect();
+        let types: Vec<&str> = chunk.iter().map(|w| w.stream.stream_type()).collect();
+        let ids: Vec<&str> = chunk.iter().map(|w| w.stream.stream_id()).collect();
+        let afters: Vec<i64> = chunk.iter().map(|w| w.after).collect();
+        let throughs: Vec<i64> = chunk.iter().map(|w| w.through).collect();
+        let fetches: Vec<i64> = chunk.iter().map(|w| w.fetch).collect();
+        let rows = client
+            .query(
+                &statement,
+                &[&tenants, &types, &ids, &afters, &throughs, &fetches],
+            )
+            .await
+            .map_err(backend)?;
+        for row in rows {
+            let index = batch * STATEMENT_BATCH + ordinal(row.get(COLUMN_COUNT))?;
+            answers
+                .get_mut(index)
+                .ok_or_else(|| EventLogError::Backend("batched read out of range".into()))?
+                .push(row);
+        }
+    }
+    Ok(answers)
+}
+
+/// Each blob's stored row, or `None`, in request order, [`STATEMENT_BATCH`] per statement.
+/// The columns are `get_blob`'s, in its order.
+async fn select_blobs<C: GenericClient>(
+    client: &C,
+    prefix: &str,
+    blobs: &[(usize, &TenantId, &str)],
+) -> Result<Vec<Option<Row>>, EventLogError> {
+    let mut answers: Vec<Option<Row>> = blobs.iter().map(|_| None).collect();
+    if blobs.is_empty() {
+        return Ok(answers);
+    }
+    let statement = client
+        .prepare(&format!(
+            "SELECT b.bytes, b.byte_count, b.integrity_sha256, b.integrity_v1, r.ord
+             FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(r_tenant, r_digest, ord)
+             JOIN {prefix}_blobs b ON b.tenant_id = r.r_tenant AND b.digest = r.r_digest"
+        ))
+        .await
+        .map_err(backend)?;
+    for (batch, chunk) in blobs.chunks(STATEMENT_BATCH).enumerate() {
+        let tenants: Vec<&str> = chunk.iter().map(|(_, tenant, _)| tenant.as_str()).collect();
+        let digests: Vec<&str> = chunk.iter().map(|(_, _, digest)| *digest).collect();
+        let rows = client
+            .query(&statement, &[&tenants, &digests])
+            .await
+            .map_err(backend)?;
+        for row in rows {
+            let index = batch * STATEMENT_BATCH + ordinal(row.get(4))?;
+            *answers
+                .get_mut(index)
+                .ok_or_else(|| EventLogError::Backend("batched read out of range".into()))? =
+                Some(row);
+        }
+    }
+    Ok(answers)
+}
+
+/// How many columns [`COLUMNS`] names; a batched statement appends its ordinal after them.
+const COLUMN_COUNT: usize = 18;
+
+/// A 1-based `WITH ORDINALITY` value as a 0-based index.
+fn ordinal(value: i64) -> Result<usize, EventLogError> {
+    value
+        .checked_sub(1)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| EventLogError::Backend("batched ordinal out of range".into()))
+}
+
 fn read_event(row: &Row) -> Result<RecordedEvent, EventLogError> {
     let global_seq: i64 = row.get(0);
     let tenant: String = row.get(1);
@@ -1905,14 +2125,18 @@ fn publication_identity(prefix: &str) -> Result<String, EventLogError> {
 }
 
 // JSON arrays encode string components injectively; hash collisions serialize unrelated work only.
+fn lock_coordinates(prefix: &str, kind: &str, fields: &[&str]) -> Result<String, EventLogError> {
+    serde_json::to_string(&(prefix, kind, fields))
+        .map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))
+}
+
 async fn lock_identity(
     transaction: &Transaction<'_>,
     prefix: &str,
     kind: &str,
     fields: &[&str],
 ) -> Result<(), EventLogError> {
-    let identity = serde_json::to_string(&(prefix, kind, fields))
-        .map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))?;
+    let identity = lock_coordinates(prefix, kind, fields)?;
     transaction
         .query_one(
             &format!("SELECT pg_advisory_xact_lock({ADVISORY_KEY})"),

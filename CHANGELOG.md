@@ -5,6 +5,26 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Changed
+
+- PostgreSQL: `read_many` answers a batch in one REPEATABLE READ snapshot, with one statement per
+  1,000 stream reads and one per 1,000 blob reads, instead of one statement per read. Each result
+  is what `read_stream` or `get_blob` returns for the same arguments. The store-operation deadline
+  now bounds the batch as a whole rather than each read.
+- PostgreSQL: `append_group` takes its stream locks, reads its stream heads and inserts its events
+  with one statement per 1,000 streams or events, instead of up to three statements per member;
+  a group's retry reads its stored ranges the same way. A single `append` inserts its events in
+  one statement per 1,000. Version checks, guards, claims, commands, inline projections and
+  atomicity are unchanged, and so is the order positions are drawn in. On PostgreSQL 17 on
+  localhost, release build: 10,000 single-row reads through `read_many` fall from 5.0–7.3 s to
+  0.1–0.15 s; a group of 1,000 events from about 2 s to 0.07–0.2 s; a group of 20,000 events
+  on 4,000 streams, which missed the 10 s deadline, commits in 0.8–2.4 s.
+- A group still takes one transaction-scoped advisory lock per distinct stream. With PostgreSQL's
+  default `max_connections` (100) and `max_locks_per_transaction` (64) the shared lock table holds
+  about 7,000 such locks, so a group over 20,000 distinct streams fails with SQLSTATE 53200 (out
+  of shared memory) instead of reaching the deadline; a server that must commit such a group
+  needs a larger `max_locks_per_transaction`.
+
 ## 0.9.2 — 2026-10-31
 
 ### Changed
