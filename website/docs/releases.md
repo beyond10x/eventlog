@@ -6,6 +6,15 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.9.4 — November 11, 2026
+
+- SQLite: the bundled SQLite moves to 3.54.1 through `rusqlite` 0.41.0. This fixes
+  RUSTSEC-2026-0459, where SQLite before 3.54.0 could return uninitialized memory when it opened
+  a database with a `-wal` file of a different page size.
+- The SQLite provider's API and on-disk format are unchanged.
+
+Read the [0.9.4 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.4).
+
 ## 0.9.3 — November 11, 2026
 
 - PostgreSQL: `read_many` answers stream reads in statements of up to 1,000 reads inside one

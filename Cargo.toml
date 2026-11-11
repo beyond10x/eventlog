@@ -18,7 +18,7 @@ license = "Apache-2.0"
 repository = "https://github.com/beyond10x/eventlog"
 homepage = "https://github.com/beyond10x/eventlog"
 rust-version = "1.91"
-version = "0.9.3"
+version = "0.9.4"
 publish = false
 
 [workspace.dependencies]
@@ -32,7 +32,7 @@ eventlog-tree = { path = "crates/eventlog-tree" }
 # features stay off: its default `exact-numbers` enables `serde_json/arbitrary_precision`, which
 # Cargo would unify into every crate here and which changes every stored `request_hash`.
 eventlog-capture-types = { path = "ess/capture-generated", default-features = false }
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+rusqlite = { version = "=0.41.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
