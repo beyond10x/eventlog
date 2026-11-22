@@ -16,6 +16,7 @@ mod capture;
 mod durable_capture;
 mod inline_admin;
 mod inspection;
+mod table_owners;
 mod tracked_capture;
 mod verified;
 pub use inspection::SqliteHistoryInspector;
@@ -2548,6 +2549,7 @@ impl Inner {
         begin_immediate(&guard)?;
         let result = (|| {
             for spec in projector.projections() {
+                table_owners::claim_projection(&guard, prefix, spec.name)?;
                 let table = projection_table(prefix, spec.name);
                 let body = projection_table_body(spec.indexed.len());
                 guard

@@ -1,8 +1,9 @@
 //! Owner namespaces stay confined when one SQLite file hosts several owners: legacy erasure,
-//! rebuild staging and the projection index.
+//! physical projection table names, rebuild staging and the projection index.
 use eventlog_core::{
-    CaptureLimits, ConsistentTenantCapture, EventLogError, EventStore, Expected,
-    InlineProjectionAdmin, StreamId, TenantId,
+    BoxFuture, CaptureLimits, ConsistentTenantCapture, EventLogError, EventStore, Expected,
+    InlineProjectionAdmin, ProjectionSpec, ProjectionStore, Projector, RecordedEvent, StreamId,
+    TenantId,
 };
 use eventlog_sqlite::SqliteEventStore;
 use std::sync::Arc;
@@ -99,6 +100,223 @@ async fn ambiguous_legacy_namespace_refuses_and_rolls_back_all_erasure() {
         )
         .expect("rolled back source and receipts");
     assert_eq!(counts, (1, 1, 1));
+}
+
+/// One projection under a chosen name, writing one row per event.
+struct Named {
+    name: &'static str,
+    specs: &'static [ProjectionSpec],
+}
+
+const P_B: &[ProjectionSpec] = &[ProjectionSpec {
+    name: "p_b",
+    indexed: &[],
+}];
+const B: &[ProjectionSpec] = &[ProjectionSpec {
+    name: "b",
+    indexed: &[],
+}];
+const X_EVENTS: &[ProjectionSpec] = &[ProjectionSpec {
+    name: "x_events",
+    indexed: &[],
+}];
+const TALLY_ONLY: &[ProjectionSpec] = &[ProjectionSpec {
+    name: "tally",
+    indexed: &[],
+}];
+
+impl Projector for Named {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn projections(&self) -> &'static [ProjectionSpec] {
+        self.specs
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a RecordedEvent,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            store
+                .upsert(
+                    &self.specs[0],
+                    &event.tenant,
+                    &event.stream_id,
+                    &serde_json::json!({ "owner": self.name }),
+                )
+                .await
+        })
+    }
+}
+
+fn registered(path: &std::path::Path, prefix: &str) -> Vec<String> {
+    let sql = rusqlite::Connection::open(path).expect("fixture connection");
+    let mut statement = sql
+        .prepare(&format!(
+            "SELECT projection_name FROM {prefix}_projection_registry ORDER BY projection_name"
+        ))
+        .expect("registry");
+    statement
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("names")
+}
+
+fn refusal(result: Result<(), EventLogError>) -> String {
+    match result {
+        Err(EventLogError::Invalid(message)) => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn two_owners_cannot_share_one_physical_projection_table() {
+    let directory = tempfile::tempdir().expect("assigned TMPDIR");
+    let database = directory.path().join("shared-name.sqlite");
+    let path = database.to_str().expect("path");
+    let short = SqliteEventStore::open(path, "a").await.expect("owner a");
+    short
+        .register_inline(Arc::new(Named {
+            name: "pb",
+            specs: P_B,
+        }))
+        .await
+        .expect("owner a's projection p_b is table a_p_p_b while no owner a_p exists");
+    let long = SqliteEventStore::open(path, "a_p")
+        .await
+        .expect("owner a_p");
+    let message = refusal(
+        long.register_inline(Arc::new(Named {
+            name: "b",
+            specs: B,
+        }))
+        .await,
+    );
+    assert!(
+        message.contains("a_p_p_b") && message.contains("owner a's projection p_b"),
+        "the refusal names the table and the owner that has it: {message}"
+    );
+    assert_eq!(
+        registered(&database, "a_p"),
+        Vec::<String>::new(),
+        "the refused registration rolled back"
+    );
+
+    // The same collision in the other order: the longer owner claims first.
+    let directory = tempfile::tempdir().expect("assigned TMPDIR");
+    let database = directory.path().join("shared-name-reversed.sqlite");
+    let path = database.to_str().expect("path");
+    let short = SqliteEventStore::open(path, "a").await.expect("owner a");
+    let long = SqliteEventStore::open(path, "a_p")
+        .await
+        .expect("owner a_p");
+    long.register_inline(Arc::new(Named {
+        name: "b",
+        specs: B,
+    }))
+    .await
+    .expect("owner a_p's projection b is table a_p_p_b");
+    let message = refusal(
+        short
+            .register_inline(Arc::new(Named {
+                name: "pb",
+                specs: P_B,
+            }))
+            .await,
+    );
+    assert!(
+        message.contains("a_p_p_b") && message.contains("owner a_p's projection b"),
+        "{message}"
+    );
+    assert_eq!(registered(&database, "a"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_collision_made_before_the_roster_existed_is_refused_at_the_next_registration() {
+    for (first, second, holder) in [
+        ("a", "a_p", "owner a's projection p_b"),
+        ("a_p", "a", "owner a_p's projection b"),
+    ] {
+        let directory = tempfile::tempdir().expect("assigned TMPDIR");
+        let database = directory.path().join("before-roster.sqlite");
+        let path = database.to_str().expect("path");
+        let projector = |prefix: &str| -> Arc<dyn Projector> {
+            if prefix == "a" {
+                Arc::new(Named {
+                    name: "pb",
+                    specs: P_B,
+                })
+            } else {
+                Arc::new(Named {
+                    name: "b",
+                    specs: B,
+                })
+            }
+        };
+        let earlier = SqliteEventStore::open(path, first)
+            .await
+            .expect("first owner");
+        earlier
+            .register_inline(projector(first))
+            .await
+            .expect("first registration");
+        // A file written by a kit without the roster: the table exists, nobody claimed it.
+        rusqlite::Connection::open(&database)
+            .expect("fixture connection")
+            .execute_batch("DROP TABLE eventlog_table_owners")
+            .expect("no roster yet");
+        let later = SqliteEventStore::open(path, second)
+            .await
+            .expect("second owner");
+        let message = refusal(later.register_inline(projector(second)).await);
+        assert!(
+            message.contains("a_p_p_b") && message.contains(holder),
+            "{first} then {second}: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_projection_table_cannot_take_another_owners_table_name() {
+    let directory = tempfile::tempdir().expect("assigned TMPDIR");
+    let database = directory.path().join("core-name.sqlite");
+    let path = database.to_str().expect("path");
+    drop(
+        SqliteEventStore::open(path, "a_p_x")
+            .await
+            .expect("owner a_p_x"),
+    );
+    let short = SqliteEventStore::open(path, "a").await.expect("owner a");
+    let message = refusal(
+        short
+            .register_inline(Arc::new(Named {
+                name: "xevents",
+                specs: X_EVENTS,
+            }))
+            .await,
+    );
+    assert!(
+        message.contains("a_p_x_events") && message.contains("namespace of owner a_p_x"),
+        "{message}"
+    );
+
+    // A nested owner whose tables cannot meet this name does not block it.
+    drop(
+        SqliteEventStore::open(path, "a_p")
+            .await
+            .expect("owner a_p"),
+    );
+    short
+        .register_inline(Arc::new(Named {
+            name: "tally",
+            specs: TALLY_ONLY,
+        }))
+        .await
+        .expect("a_p_tally is no table owner a_p can have");
 }
 
 /// An owner named like the rebuild's staging prefix had its live and staging tables under one
