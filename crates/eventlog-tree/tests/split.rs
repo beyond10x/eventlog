@@ -396,6 +396,74 @@ async fn deleting_a_blob_removes_the_texts_only_it_named(layout: TreeLayout) {
     assert_eq!(served(root, "sha256:two").await, Some(two));
 }
 
+/// The manifest file of split blob `name` (`sha256:<name>`).
+fn manifest_of(root: &Path, name: &str) -> PathBuf {
+    let suffix = format!("%3A{name}.json");
+    files_under(root, "split-blobs")
+        .into_iter()
+        .find(|path| path.to_string_lossy().ends_with(&suffix))
+        .expect("no manifest")
+}
+
+/// For each fault put into the manifest of `broken` (`one` is the blob deleted, `two` another
+/// blob sharing a text with it), deleting `one` is refused as an incomplete cleanup, removes no
+/// file, and leaves the open store serving `one`.
+async fn a_manifest_fault_refuses_the_deletion_and_removes_nothing(
+    layout: TreeLayout,
+    broken: &str,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let shared = body("shared");
+    let one = serde_json::to_vec(&json!({ "a": shared, "b": body("own") })).unwrap();
+    let two = document("two", &shared);
+    write(
+        root,
+        layout,
+        &[("sha256:one", one.clone()), ("sha256:two", two.clone())],
+    )
+    .await;
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
+    let manifest = manifest_of(root, broken);
+    let good = fs::read(&manifest).unwrap();
+    let faults: [&[u8]; 3] = [
+        b"not json",
+        br#"{"blob":"x","parts":"not a list"}"#,
+        br#"{"blob":"x","parts":[{"text":"sha256:short"}]}"#,
+    ];
+    for fault in faults {
+        fs::write(&manifest, fault).unwrap();
+        let before = snapshot(root);
+        let refused = store
+            .delete_blob(&tenant(), "sha256:one")
+            .await
+            .expect_err("a deletion over a faulty manifest succeeded");
+        assert!(
+            refused.to_string().contains("incomplete blob cleanup"),
+            "{refused}"
+        );
+        assert_eq!(snapshot(root), before, "a file was removed");
+        assert_eq!(
+            store.get_blob(&tenant(), "sha256:one").await.unwrap(),
+            Some(one.clone()),
+            "the refused deletion left the store without the blob"
+        );
+    }
+    fs::write(&manifest, &good).unwrap();
+    store.delete_blob(&tenant(), "sha256:one").await.unwrap();
+    drop(store);
+    assert_eq!(served(root, "sha256:one").await, None);
+    assert_eq!(served(root, "sha256:two").await, Some(two));
+}
+
+async fn a_faulty_manifest_of_the_deleted_blob_refuses_the_deletion(layout: TreeLayout) {
+    a_manifest_fault_refuses_the_deletion_and_removes_nothing(layout, "one").await;
+}
+
+async fn a_faulty_manifest_of_another_blob_refuses_the_deletion(layout: TreeLayout) {
+    a_manifest_fault_refuses_the_deletion_and_removes_nothing(layout, "two").await;
+}
+
 async fn verify_reports_a_blob_the_head_serves_with_other_bytes_than_its_base(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("store");
@@ -430,5 +498,7 @@ each_layout!(
     a_changed_text_is_refused_on_open_and_by_verify,
     a_v1_store_holding_split_files_and_an_unknown_format_are_refused_by_name,
     deleting_a_blob_removes_the_texts_only_it_named,
+    a_faulty_manifest_of_the_deleted_blob_refuses_the_deletion,
+    a_faulty_manifest_of_another_blob_refuses_the_deletion,
     verify_reports_a_blob_the_head_serves_with_other_bytes_than_its_base,
 );

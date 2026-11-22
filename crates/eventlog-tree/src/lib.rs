@@ -1253,10 +1253,12 @@ impl EventStore for TreeEventStore {
                 return Err(EventLogError::Closed);
             }
             let _lock = self.writer_lock()?;
-            state.engine.delete_blob(tenant, digest).await?;
             // A split blob takes with it every text no other blob of the tenant names, so a
-            // deleted blob's content is gone from the tree and not only its manifest.
-            if let Err(error) = split::delete_blob(&self.root, tenant.as_str(), digest) {
+            // deleted blob's content is gone from the tree and not only its manifest. Every
+            // manifest is read before anything is removed: a fault refuses the whole deletion.
+            let deletion = split::plan_delete(&self.root, tenant.as_str(), digest)?;
+            state.engine.delete_blob(tenant, digest).await?;
+            if let Err(error) = deletion.apply() {
                 state.poisoned = true;
                 return Err(error);
             }

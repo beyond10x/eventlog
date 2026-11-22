@@ -343,30 +343,47 @@ fn expand(
     Ok(())
 }
 
-/// Every text a manifest's parts name.
-fn referenced(parts: &[Value], into: &mut BTreeSet<String>) {
+/// Every text a manifest's parts name, refusing a part that is not one a reader expands: a part
+/// this walk skipped could name a text it would then not count.
+fn referenced(parts: &[Value], into: &mut BTreeSet<String>) -> Result<(), &'static str> {
     for part in parts {
-        if let Value::Object(map) = part {
-            if let Some(hex) = map.get("text").and_then(Value::as_str).and_then(text_hex) {
-                into.insert(hex.to_owned());
+        match part {
+            Value::String(_) => {}
+            Value::Object(map) if map.len() == 1 => {
+                if let Some(reference) = map.get("text").and_then(Value::as_str) {
+                    into.insert(text_hex(reference).ok_or("a text named badly")?.to_owned());
+                } else if let Some(nested) = map.get("hex").and_then(Value::as_array) {
+                    referenced(nested, into)?;
+                } else {
+                    return Err("an unknown part");
+                }
             }
-            if let Some(nested) = map.get("hex").and_then(Value::as_array) {
-                referenced(nested, into);
-            }
+            _ => return Err("an unknown part"),
         }
     }
+    Ok(())
 }
 
-fn manifest_parts(path: &Path) -> Vec<Value> {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-        .and_then(|mut map| map.remove("parts"))
-        .and_then(|parts| match parts {
-            Value::Array(parts) => Some(parts),
-            _ => None,
-        })
-        .unwrap_or_default()
+/// Every text the manifest at `path` names. A manifest that cannot be read or decoded is an
+/// error, never an empty list: deleting by an empty list would keep a deleted blob's text, or
+/// remove a text a blob still names.
+fn manifest_texts(path: &Path) -> Result<BTreeSet<String>, EventLogError> {
+    let incomplete = |why: &str| {
+        backend(format!(
+            "incomplete blob cleanup: the split blob {} {why}; nothing was removed",
+            path.display()
+        ))
+    };
+    let bytes = fs::read(path).map_err(|error| incomplete(&format!("cannot be read ({error})")))?;
+    let map = serde_json::from_slice::<Map<String, Value>>(&bytes)
+        .map_err(|_| incomplete("is not a JSON object"))?;
+    let parts = map
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| incomplete("has no parts"))?;
+    let mut texts = BTreeSet::new();
+    referenced(parts, &mut texts).map_err(|why| incomplete(&format!("holds {why}")))?;
+    Ok(texts)
 }
 
 /// The bytes the tree holds for blob `digest` of `tenant`, in whichever form it holds them.
@@ -429,25 +446,60 @@ pub(crate) fn write_blob(
     }
 }
 
-/// Remove blob `digest` of `tenant` in both forms, and every text only it named.
-pub(crate) fn delete_blob(root: &Path, tenant: &str, digest: &str) -> Result<(), EventLogError> {
-    remove_if_present(&blob_path(root, tenant, digest))?;
+/// The files deleting one blob removes, resolved before any of them is: the blob in both forms
+/// and every text only it names.
+pub(crate) struct BlobDeletion {
+    files: Vec<PathBuf>,
+}
+
+impl BlobDeletion {
+    /// Remove every file of the plan.
+    pub(crate) fn apply(self) -> Result<(), EventLogError> {
+        for path in &self.files {
+            remove_if_present(path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve what deleting blob `digest` of `tenant` removes, reading every split-blob manifest of
+/// the tenant and removing nothing.
+///
+/// # Errors
+/// An incomplete-cleanup error when the blob's own manifest or any other manifest of the tenant
+/// cannot be read, decoded or walked, or the manifests cannot be listed: the set of texts still
+/// named is then unknown, so no text may be judged unused.
+pub(crate) fn plan_delete(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+) -> Result<BlobDeletion, EventLogError> {
+    let incomplete = |what: &str, error: &dyn std::fmt::Display| {
+        backend(format!(
+            "incomplete blob cleanup: {what} ({error}); nothing was removed"
+        ))
+    };
+    let mut files = vec![blob_path(root, tenant, digest)];
     let manifest = split_path(root, tenant, digest);
-    if !manifest.exists() {
-        return Ok(());
+    // `exists` answers false when the manifest cannot be looked up; that is not an absence.
+    let present = manifest
+        .try_exists()
+        .map_err(|error| incomplete("the split blob cannot be looked up", &error))?;
+    if !present {
+        return Ok(BlobDeletion { files });
     }
-    let mut named = BTreeSet::new();
-    referenced(&manifest_parts(&manifest), &mut named);
-    remove_if_present(&manifest)?;
-    for other in split_files(root, tenant)? {
-        let mut still = BTreeSet::new();
-        referenced(&manifest_parts(&other.1), &mut still);
-        named.retain(|hex| !still.contains(hex));
+    let mut named = manifest_texts(&manifest)?;
+    let others = split_files(root, tenant)
+        .map_err(|error| incomplete("the split blobs cannot be listed", &error))?;
+    for (_, other) in others {
+        if other != manifest {
+            let still = manifest_texts(&other)?;
+            named.retain(|hex| !still.contains(hex));
+        }
     }
-    for hex in named {
-        remove_if_present(&text_path(root, tenant, &hex))?;
-    }
-    Ok(())
+    files.push(manifest);
+    files.extend(named.iter().map(|hex| text_path(root, tenant, hex)));
+    Ok(BlobDeletion { files })
 }
 
 fn remove_if_present(path: &Path) -> Result<(), EventLogError> {
