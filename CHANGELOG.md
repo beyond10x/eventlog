@@ -21,6 +21,9 @@ under bare-version tags such as `0.1.0`.
 - File: a blob batch finds digests it already binds through an index instead of scanning the batch,
   so 1,024 distinct digests no longer cost 523,776 comparisons. A repeated digest with different
   bytes still refuses the group.
+- File: `projection_find` reads an in-memory index by tenant, projection, field, value and row
+  key instead of every row of the projection, so a lookup of a value no row holds visits no row
+  (it used to evaluate the field of every row: 512 for 512 rows). The journal format is unchanged.
 
 ## 0.9.4 — 2026-11-11
 

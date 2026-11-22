@@ -3411,4 +3411,175 @@ mod steady_state_cost {
             "the first call after the open did not resume its view: {resumed:?}"
         );
     }
+
+    /// One group appending one event to each of `count` streams of `kind`.
+    fn streams(owner: &TenantId, kind: &str, count: usize) -> AppendGroup {
+        AppendGroup {
+            tenant: owner.clone(),
+            meta: meta(&format!("{kind}-{count}"), &json!({ "kind": kind })),
+            appends: (0..count)
+                .map(|i| eventlog_core::StreamAppend {
+                    stream: StreamId::new(owner.clone(), kind, format!("s{i:04}")).unwrap(),
+                    expected: Expected::NoStream,
+                    events: vec![event("added", 1)],
+                })
+                .collect(),
+        }
+    }
+
+    /// The row index the handle's next transaction holds, and the one its rows call for.
+    async fn row_index(store: &FileEventStore) -> (crate::state::RowIndex, crate::state::RowIndex) {
+        store
+            .transaction(|tx| {
+                Box::pin(async move {
+                    Ok((
+                        tx.state.row_index.clone(),
+                        crate::state::RowIndex::of(&tx.state.rows, &tx.state.projections),
+                    ))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// An indexed lookup visits the rows it returns, not the rows of the projection: a value no
+    /// row holds took 128 field evaluations for 128 rows and 512 for 512. The index stays the one
+    /// the rows call for through catch-up, a rebuild, a tenant's erasure and a replay from the
+    /// journal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_indexed_lookup_visits_the_rows_it_returns_not_the_projection() {
+        let owner = tenant("find");
+        let other = tenant("find-other");
+        let tally = Arc::new(Tally);
+        for rows in [32_usize, 256] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let store = FileEventStore::open(root).await.unwrap();
+            store.create_projections(tally.clone()).await.unwrap();
+            for tenant in [&owner, &other] {
+                store
+                    .append_group(&streams(tenant, "item", rows))
+                    .await
+                    .unwrap();
+                store
+                    .append_group(&streams(tenant, "rare", 2))
+                    .await
+                    .unwrap();
+                store
+                    .run_catch_up(tally.clone(), tenant, 10_000)
+                    .await
+                    .unwrap();
+            }
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(held, called_for, "{rows} rows: after catch-up");
+
+            let find = |value: &'static str, limit| {
+                let (store, owner) = (&store, &owner);
+                async move {
+                    let before = crate::cost::of(root).projection_rows_visited;
+                    let found = store
+                        .projection_find(&eventlog_conformance::TALLY, owner, "kind", value, limit)
+                        .await
+                        .unwrap();
+                    let kinds: Vec<_> = found
+                        .iter()
+                        .map(|row| row["kind"].as_str().unwrap().to_owned())
+                        .collect();
+                    (
+                        kinds,
+                        crate::cost::of(root).projection_rows_visited - before,
+                    )
+                }
+            };
+            assert_eq!(
+                find("missing", 1).await,
+                (vec![], 0),
+                "{rows} rows: no match"
+            );
+            assert_eq!(
+                find("item", 1).await,
+                (vec!["item".to_owned()], 1),
+                "{rows} rows: one of many"
+            );
+            assert_eq!(
+                find("rare", 10).await,
+                (vec!["rare".to_owned(); 2], 2),
+                "{rows} rows: every match"
+            );
+
+            // A row whose indexed value changes, a deleted row and a cleared projection, written
+            // as the ops a projector's upsert, delete and a rebuild record.
+            let (moved_owner, other_tenant) = (owner.clone(), other.clone());
+            store
+                .transaction(move |tx| {
+                    Box::pin(async move {
+                        tx.record(Op::Row {
+                            tenant: moved_owner.clone(),
+                            name: "tally".into(),
+                            key: "item/s0000".into(),
+                            body: Some(json!({ "kind": "moved", "count": 1 })),
+                        })?;
+                        tx.record(Op::Row {
+                            tenant: moved_owner,
+                            name: "tally".into(),
+                            key: "item/s0001".into(),
+                            body: None,
+                        })?;
+                        tx.record(Op::ClearRows {
+                            tenant: other_tenant,
+                            name: "tally".into(),
+                        })
+                    })
+                })
+                .await
+                .unwrap();
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(
+                held, called_for,
+                "{rows} rows: after a change, a delete and a clear"
+            );
+            assert_eq!(
+                find("moved", 10).await,
+                (vec!["moved".to_owned()], 1),
+                "{rows} rows: the changed value"
+            );
+            assert_eq!(
+                held.keys(owner.as_str(), "tally", "kind", "item").count(),
+                rows - 2,
+                "{rows} rows: the old value of the changed row and the deleted row"
+            );
+
+            store
+                .rebuild_projection(tally.clone(), &owner)
+                .await
+                .unwrap();
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(held, called_for, "{rows} rows: after a rebuild");
+            store.forget_tenant(&other).await.unwrap();
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(held, called_for, "{rows} rows: after an erasure");
+            assert!(
+                held.keys(other.as_str(), "tally", "kind", "item")
+                    .next()
+                    .is_none(),
+                "the erased tenant's rows are still indexed"
+            );
+            drop(store);
+            let reopened = FileEventStore::open(root).await.unwrap();
+            let (replayed, called_for) = row_index(&reopened).await;
+            assert_eq!(replayed, called_for, "{rows} rows: after a replay");
+            assert_eq!(
+                replayed, held,
+                "{rows} rows: a replay rebuilt another index"
+            );
+            assert_eq!(
+                reopened
+                    .projection_find(&eventlog_conformance::TALLY, &owner, "kind", "rare", 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
 }

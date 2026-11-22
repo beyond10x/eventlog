@@ -3,7 +3,7 @@ use eventlog_core::{EventLogError, GroupRange, RecordedEvent, StreamId, TenantId
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::{Bound, RangeBounds},
 };
 
@@ -237,10 +237,99 @@ pub(crate) struct State {
     pub projections: BTreeMap<String, Vec<String>>,
     pub dirty_views: std::collections::BTreeSet<(String, String)>,
     pub rows: BTreeMap<(String, String, String), Value>,
+    /// `rows` by declared indexed field. Written only beside `rows`, in [`State::apply`].
+    pub row_index: RowIndex,
     pub cursors: BTreeMap<(String, String), u64>,
     pub blobs: BTreeMap<(String, String), Blob>,
     pub next_position: u64,
     pub counters: BTreeMap<String, i64>,
+}
+
+/// Every projection row by tenant, projection, declared indexed field, that field's value and row
+/// key — what lets `find` cost the rows it returns rather than every row of the projection.
+///
+/// It holds an entry for each field the projection was registered with whose
+/// [`indexed_value`](eventlog_core::indexed_value) is present, the same extraction a scan made.
+/// [`State::apply`] is its only writer, at the three places that change `rows` (a row written or
+/// deleted, a projection cleared, a projection registered over rows it already has), so a state
+/// replayed from the journal, one folded onto a cached view and one rebuilt after an erasure or a
+/// redaction rewrite hold the same index for the same rows. Nothing here is serialized.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub(crate) struct RowIndex(BTreeSet<(String, String, String, String, String)>);
+
+impl RowIndex {
+    fn entries<'a>(
+        fields: &'a [String],
+        (tenant, name, key): &'a (String, String, String),
+        body: &'a Value,
+    ) -> impl Iterator<Item = (String, String, String, String, String)> + 'a {
+        fields.iter().filter_map(move |field| {
+            eventlog_core::indexed_value(body, field).map(|value| {
+                (
+                    tenant.clone(),
+                    name.clone(),
+                    field.clone(),
+                    value,
+                    key.clone(),
+                )
+            })
+        })
+    }
+    fn insert(&mut self, fields: &[String], row: &(String, String, String), body: &Value) {
+        self.0.extend(Self::entries(fields, row, body));
+    }
+    fn remove(&mut self, fields: &[String], row: &(String, String, String), body: &Value) {
+        for entry in Self::entries(fields, row, body) {
+            self.0.remove(&entry);
+        }
+    }
+    fn clear(&mut self, tenant: &str, name: &str) {
+        self.0.retain(|(t, n, ..)| t != tenant || n != name);
+    }
+    /// The keys of `tenant`'s rows of `name` whose `field` is `value`, in key order. Visits only
+    /// the entries it yields, and the one past them that ends the walk.
+    pub fn keys<'a>(
+        &'a self,
+        tenant: &str,
+        name: &str,
+        field: &str,
+        value: &str,
+    ) -> impl Iterator<Item = &'a str> + use<'a> {
+        let prefix = (
+            tenant.to_owned(),
+            name.to_owned(),
+            field.to_owned(),
+            value.to_owned(),
+        );
+        let from = (
+            prefix.0.clone(),
+            prefix.1.clone(),
+            prefix.2.clone(),
+            prefix.3.clone(),
+            String::new(),
+        );
+        self.0
+            .range((Bound::Included(from), Bound::Unbounded))
+            .take_while(move |(t, n, f, v, _)| {
+                (t, n, f, v) == (&prefix.0, &prefix.1, &prefix.2, &prefix.3)
+            })
+            .map(|(.., key)| key.as_str())
+    }
+    /// The index `rows` and `projections` call for, built from scratch. Test-only: what an
+    /// incrementally maintained index is compared against.
+    #[cfg(test)]
+    pub fn of(
+        rows: &BTreeMap<(String, String, String), Value>,
+        projections: &BTreeMap<String, Vec<String>>,
+    ) -> Self {
+        let mut index = Self::default();
+        for (row, body) in rows {
+            if let Some(fields) = projections.get(&row.1) {
+                index.insert(fields, row, body);
+            }
+        }
+        index
+    }
 }
 
 pub(crate) fn key(parts: &[&str]) -> String {
@@ -368,6 +457,12 @@ impl State {
                 {
                     return Err(backend("projection registration shape changed"));
                 }
+                if !self.projections.contains_key(&name) {
+                    // Rows written before the registration gain their entries now.
+                    for (row, body) in self.rows.iter().filter(|((_, n, _), _)| n == &name) {
+                        self.row_index.insert(&indexed, row, body);
+                    }
+                }
                 self.projections.insert(name, indexed);
             }
             Op::Row {
@@ -377,15 +472,22 @@ impl State {
                 body,
             } => {
                 let coordinate = (tenant.as_str().into(), name, key);
+                let fields = self
+                    .projections
+                    .get(&coordinate.1)
+                    .map_or(&[][..], Vec::as_slice);
+                if let Some(old) = self.rows.remove(&coordinate) {
+                    self.row_index.remove(fields, &coordinate, &old);
+                }
                 if let Some(body) = body {
+                    self.row_index.insert(fields, &coordinate, &body);
                     self.rows.insert(coordinate, body);
-                } else {
-                    self.rows.remove(&coordinate);
                 }
             }
             Op::ClearRows { tenant, name } => {
                 self.rows
                     .retain(|(t, n, _), _| t != tenant.as_str() || n != &name);
+                self.row_index.clear(tenant.as_str(), &name);
             }
             Op::Cursor {
                 tenant,
