@@ -305,9 +305,12 @@ impl FileEventStore {
                     journal::checkpoint("group-postcommit");
                 }
             }
-            // Disposal belongs to the writer that changed what is referenced.
+            // Disposal belongs to the writer that changed what is referenced. A commit that binds
+            // and unbinds nothing — an event-only append, a cursor, a row — leaves the live set as
+            // it was, so it neither lists nor synchronizes the object directory; objects a crash
+            // left behind wait for the next commit that changes bindings or the complete opener.
             let committed = tx.privacy || !tx.pending.is_empty();
-            if committed {
+            if committed && tx.changes_bindings() {
                 tx.clean_blobs().map_err(|error| {
                     if tx.atomic_content && !tx.pending.is_empty() {
                         EventLogError::UnknownCommit
@@ -989,6 +992,16 @@ impl Transaction {
         fs::File::open(directory)
             .and_then(|f| f.sync_all())
             .map_err(backend)
+    }
+    /// Whether committing this transaction can change which object files are live: it binds or
+    /// unbinds a blob, wrote or staged an object, carries atomic content, or rewrites history for
+    /// privacy. Only such a commit sweeps the object directory.
+    fn changes_bindings(&self) -> bool {
+        self.privacy
+            || self.atomic_content
+            || !self.written.is_empty()
+            || !self.staged_blobs.is_empty()
+            || self.pending.iter().any(|op| matches!(op, Op::Blob { .. }))
     }
     fn clean_blobs(&self) -> Result<(), EventLogError> {
         let directory = self.root.join("blobs");
@@ -3144,6 +3157,55 @@ mod steady_state_cost {
             (after.applied, after.position),
             (0, 3),
             "the moved cursor was committed"
+        );
+    }
+
+    /// An event-only commit does not sweep the object directory. The sweep listed every object
+    /// file and synchronized the directory on each append (64 objects listed and one directory
+    /// `fsync` for one appended event). An object file no frame names, as a crash leaves one, is
+    /// therefore still there after event-only appends, and is disposed of by the next commit that
+    /// changes bindings and by the complete opener.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_only_append_does_not_sweep_the_object_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let owner = tenant("sweep");
+        let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.put_blob(&owner, "kept", b"kept").await.unwrap();
+        let orphan = root.join("blobs").join(new_event_id());
+        let plant = || fs::write(&orphan, b"left by a crash").unwrap();
+
+        plant();
+        for n in 1..=3 {
+            store
+                .append(
+                    &stream,
+                    Expected::Any,
+                    &[event("added", n)],
+                    &meta(&format!("event-{n}"), &json!({ "n": n })),
+                )
+                .await
+                .unwrap();
+        }
+        let tally = Arc::new(Tally);
+        store.create_projections(tally.clone()).await.unwrap();
+        store.run_catch_up(tally, &owner, 100).await.unwrap();
+        assert!(
+            orphan.exists(),
+            "an event-only commit swept the object directory"
+        );
+
+        store.put_blob(&owner, "bound", b"bound").await.unwrap();
+        assert!(!orphan.exists(), "a binding commit sweeps the directory");
+
+        plant();
+        drop(store);
+        let reopened = FileEventStore::open(root).await.unwrap();
+        assert!(!orphan.exists(), "the complete opener sweeps the directory");
+        assert_eq!(
+            reopened.get_blob(&owner, "kept").await.unwrap().as_deref(),
+            Some(&b"kept"[..])
         );
     }
 

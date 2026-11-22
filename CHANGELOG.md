@@ -15,6 +15,9 @@ under bare-version tags such as `0.1.0`.
   records its first one.
 - File: opening a store reads, chains and replays its journal once instead of twice, under the
   writer lock of that open; recovery, snapshot and object disposal and object hashing are unchanged.
+- File: a commit that binds or unbinds no blob no longer lists and synchronizes the blob directory.
+  Objects a crash leaves behind are disposed of by the next commit that changes bindings and by the
+  complete opener.
 
 ## 0.9.4 — 2026-11-11
 
