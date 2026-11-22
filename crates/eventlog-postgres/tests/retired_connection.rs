@@ -115,6 +115,7 @@ async fn fresh(observer: &tokio_postgres::Client, prefix: &str, application: &st
     for suffix in [
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",

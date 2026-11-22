@@ -73,6 +73,9 @@ pub struct PostgresEventStore {
     /// Blob content this handle has verified or hashed at write time; see
     /// [`eventlog_core::VerifiedContent`].
     verified: VerifiedContent,
+    /// Stored blob rows a group binding read back because the digest was already bound.
+    #[cfg(test)]
+    blob_read_backs: std::sync::atomic::AtomicUsize,
 }
 
 impl PostgresEventStore {
@@ -258,6 +261,8 @@ impl PostgresEventStore {
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
             verified: VerifiedContent::default(),
+            #[cfg(test)]
+            blob_read_backs: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     /// Issue the owner host's transaction-admission grant before handing the store to domains.
@@ -353,6 +358,7 @@ impl PostgresEventStore {
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {prefix}_events;
                  DROP TABLE IF EXISTS {prefix}_append_groups;
+                 DROP TABLE IF EXISTS {prefix}_group_batches;
                  DROP TABLE IF EXISTS {prefix}_commands;
                  DROP TABLE IF EXISTS {prefix}_claims;
                  DROP TABLE IF EXISTS {prefix}_snapshots;
@@ -943,6 +949,7 @@ impl EventStore for PostgresEventStore {
             for table in [
                 "events",
                 "append_groups",
+                "group_batches",
                 "commands",
                 "claims",
                 "identity",
@@ -981,14 +988,9 @@ impl EventStore for PostgresEventStore {
                     .await
                     .map_err(backend)?;
             }
-            let coordinate_prefix = format!("t{}:{}", tenant.as_str().len(), tenant.as_str());
+            let (from, until) = tenant_counters(tenant);
             transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {prefix}_scope_counters WHERE left(coordinate,length($1))=$1"
-                    ),
-                    &[&coordinate_prefix],
-                )
+                .execute(&forget_counters(&prefix), &[&from, &until])
                 .await
                 .map_err(backend)?;
             commit_started.store(true, Ordering::Release);
@@ -1850,6 +1852,25 @@ fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
 }
 
+/// The byte range holding every admission counter of `tenant`: its coordinates are
+/// `t{len}:{tenant}{keylen}:{key}`, so each starts with the tenant part and continues with an
+/// ASCII digit, which sorts below `:` byte-wise.
+fn tenant_counters(tenant: &TenantId) -> (String, String) {
+    let from = format!("t{}:{}", tenant.as_str().len(), tenant.as_str());
+    let until = format!("{from}:");
+    (from, until)
+}
+
+/// Erasure's counter cleanup: a byte-wise range the owner's `scope_counters_bytes` index answers,
+/// under the exclusive publication lock, instead of reading every counter of every tenant. The
+/// exact prefix test stays as a recheck.
+fn forget_counters(prefix: &str) -> String {
+    format!(
+        "DELETE FROM {prefix}_scope_counters WHERE (coordinate COLLATE \"C\") >= $1 \
+         AND (coordinate COLLATE \"C\") < $2 AND left(coordinate,length($1))=$1"
+    )
+}
+
 async fn select_versions<C: GenericClient>(
     client: &C,
     prefix: &str,
@@ -2367,6 +2388,7 @@ mod blob_migration_tests {
     const BASE_TABLES_FOR_TEST: &[&str] = &[
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",
@@ -2378,4 +2400,189 @@ mod blob_migration_tests {
         "schema_version",
         "projection_registry",
     ];
+}
+
+#[cfg(test)]
+mod publication_boundary_tests {
+    use super::{COLUMNS, PostgresEventStore, WATERMARK, watermarked_source};
+
+    /// Every plan node of `plan` that reads `relation` sequentially.
+    fn sequential_reads(plan: &serde_json::Value, relation: &str, found: &mut Vec<String>) {
+        if plan["Node Type"] == "Seq Scan" && plan["Relation Name"] == relation {
+            found.push(plan.to_string());
+        }
+        for child in plan["Plans"].as_array().into_iter().flatten() {
+            sequential_reads(child, relation, found);
+        }
+    }
+
+    /// The feed's publication boundary (`MIN(global_seq)` over events whose transaction is not
+    /// yet visible) is answered from the owner's index on `(committed_xid, global_seq)`, not by
+    /// reading every event of every tenant for each page.
+    #[tokio::test]
+    async fn a_feed_page_finds_the_publication_boundary_without_scanning_the_history() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let prefix: String = std::iter::once("pb_".to_owned())
+            .chain(
+                nanos
+                    .to_string()
+                    .bytes()
+                    .rev()
+                    .take(12)
+                    .map(|digit| char::from(b'a' + digit - b'0').to_string()),
+            )
+            .collect();
+        let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        sql.batch_execute(&format!(
+            "INSERT INTO {prefix}_events (tenant_id,stream_type,stream_id,version,event_id,event_name,
+                 event_schema_version,occurred_at,recorded_at,subject,actor,request_id,trace_id,data)
+             SELECT 'tenant-' || (n % 8), 'item', 'subject-' || (n % 8), n / 8 + 1,
+                 gen_random_uuid(), 'item.changed', 1, now(), now(), 's', 'a', 'r', 't', '{{}}'
+             FROM generate_series(0, 8191) AS n;
+             ANALYZE {prefix}_events;"
+        ))
+        .await
+        .unwrap();
+        let feed = format!(
+            "SELECT {COLUMNS} FROM {}
+             WHERE tenant_id = 'tenant-3' AND global_seq > 8000 AND {WATERMARK}
+               AND (first_unsettled IS NULL OR global_seq < first_unsettled)
+             ORDER BY global_seq LIMIT 2",
+            watermarked_source(&prefix)
+        );
+        let plan: serde_json::Value = sql
+            .query_one(&format!("EXPLAIN (FORMAT JSON) {feed}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut found = Vec::new();
+        sequential_reads(&plan[0]["Plan"], &format!("{prefix}_events"), &mut found);
+        assert!(
+            found.is_empty(),
+            "a feed page read the owner's events sequentially: {found:?}"
+        );
+        assert_eq!(
+            sql.query(&feed, &[]).await.unwrap().len(),
+            2,
+            "the page still returns the settled rows"
+        );
+        store.drop_tables().await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod counter_cleanup_tests {
+    use super::{PostgresEventStore, forget_counters, tenant_counters};
+    use eventlog_core::{EventStore, TenantId};
+
+    fn sequential_reads(plan: &serde_json::Value, relation: &str, found: &mut Vec<String>) {
+        if plan["Node Type"] == "Seq Scan" && plan["Relation Name"] == relation {
+            found.push(plan.to_string());
+        }
+        for child in plan["Plans"].as_array().into_iter().flatten() {
+            sequential_reads(child, relation, found);
+        }
+    }
+
+    /// Erasure removes one tenant's admission counters through the owner's byte-wise coordinate
+    /// index, not by reading every counter while it holds the exclusive publication lock, and
+    /// removes exactly that tenant's counters.
+    #[tokio::test]
+    async fn erasure_removes_one_tenants_counters_without_scanning_all_of_them() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let prefix: String = std::iter::once("cc_".to_owned())
+            .chain(
+                nanos
+                    .to_string()
+                    .bytes()
+                    .rev()
+                    .take(12)
+                    .map(|digit| char::from(b'a' + digit - b'0').to_string()),
+            )
+            .collect();
+        let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        // 64 tenants of 64 counters each, named `tenant-NN` (nine bytes), plus deployment
+        // counters, and one tenant whose name starts with another tenant's name.
+        sql.batch_execute(&format!(
+            "INSERT INTO {prefix}_scope_counters (coordinate,held)
+             SELECT 't9:tenant-' || lpad((n % 64)::text, 2, '0') || length('k' || n) || ':k' || n, 1
+             FROM generate_series(0, 4095) AS n;
+             INSERT INTO {prefix}_scope_counters (coordinate,held)
+             SELECT 'd' || length('k' || n) || ':k' || n, 1 FROM generate_series(0, 1023) AS n;
+             INSERT INTO {prefix}_scope_counters (coordinate,held) VALUES ('t10:tenant-033' || '2:kk', 1);
+             ANALYZE {prefix}_scope_counters;"
+        ))
+        .await
+        .unwrap();
+        let tenant = TenantId::new("tenant-03").unwrap();
+        let (from, until) = tenant_counters(&tenant);
+        let plan: serde_json::Value = sql
+            .query_one(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    forget_counters(&prefix)
+                        .replace("$1", &format!("'{from}'"))
+                        .replace("$2", &format!("'{until}'"))
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let mut found = Vec::new();
+        sequential_reads(
+            &plan[0]["Plan"],
+            &format!("{prefix}_scope_counters"),
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "erasure read every admission counter sequentially: {found:?}"
+        );
+        store.forget_tenant(&tenant).await.unwrap();
+        let count = |pattern: &'static str| {
+            let sql = &sql;
+            let prefix = &prefix;
+            async move {
+                sql.query_one(
+                    &format!(
+                        "SELECT count(*) FROM {prefix}_scope_counters WHERE coordinate LIKE $1"
+                    ),
+                    &[&pattern],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+            }
+        };
+        assert_eq!(
+            count("t9:tenant-03%").await,
+            0,
+            "the tenant's counters are gone"
+        );
+        assert_eq!(
+            count("t9:tenant-%").await,
+            63 * 64,
+            "other tenants keep theirs"
+        );
+        assert_eq!(count("d%").await, 1024, "deployment counters stay");
+        assert_eq!(
+            count("t10:%").await,
+            1,
+            "a longer tenant name is another tenant"
+        );
+        store.drop_tables().await.unwrap();
+        store.shutdown().await.unwrap();
+    }
 }

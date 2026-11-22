@@ -234,7 +234,7 @@ async fn hosted_schema_admission_refuses_rewrite_rules() {
     )
     .await
     .unwrap();
-    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
+    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON review_rules_hosted.kit_schema_version, review_rules_hosted.kit_projection_registry FROM eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
     let admitted = PostgresEventStore::open(
         PostgresConfig::verified(&app_url, "review_rules_hosted", "kit", roots).unwrap(),
         PoolOptions::default(),
@@ -792,6 +792,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
     for suffix in [
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",
@@ -1361,6 +1362,51 @@ async fn verified_tls_requires_matching_server_and_separate_application_role() {
     sql.batch_execute("GRANT USAGE ON SCHEMA hosted_owner TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_owner TO eventlog_test_application; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_owner TO eventlog_test_application").await.expect("DML-only role grants");
     let config = PostgresConfig::verified(&app_url, "hosted_owner", "kit", roots.clone())
         .expect("verified application config");
+    // Migration metadata is the migration role's: an application role that can write the
+    // projection roster can unregister a projection, and erasure then skips its rows.
+    for table in ["kit_schema_version", "kit_projection_registry"] {
+        match PostgresEventStore::open(config.clone(), PoolOptions::default(), 16, 2, 8).await {
+            Err(EventLogError::Invalid(reason)) => assert_eq!(
+                reason,
+                "hosted application role can write migration metadata reserved for the migration role",
+                "{table}"
+            ),
+            Err(other) => panic!("{table}: refused for another reason: {other:?}"),
+            Ok(store) => {
+                store.shutdown().await.unwrap();
+                panic!("{table}: admitted an application role that can write migration metadata");
+            }
+        }
+        sql.batch_execute(&format!(
+            "REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_owner.{table} FROM eventlog_test_application"
+        ))
+        .await
+        .expect("migration metadata becomes read-only");
+    }
+    for privilege in ["DELETE", "TRUNCATE"] {
+        sql.batch_execute(&format!(
+            "GRANT {privilege} ON hosted_owner.kit_projection_registry TO eventlog_test_application"
+        ))
+        .await
+        .unwrap();
+        match PostgresEventStore::open(config.clone(), PoolOptions::default(), 16, 2, 8).await {
+            Err(EventLogError::Invalid(reason)) => assert_eq!(
+                reason,
+                "hosted application role can write migration metadata reserved for the migration role",
+                "{privilege}"
+            ),
+            Err(other) => panic!("{privilege}: refused for another reason: {other:?}"),
+            Ok(store) => {
+                store.shutdown().await.unwrap();
+                panic!("{privilege}: admitted a role that can empty the projection roster");
+            }
+        }
+        sql.batch_execute(&format!(
+            "REVOKE {privilege} ON hosted_owner.kit_projection_registry FROM eventlog_test_application"
+        ))
+        .await
+        .unwrap();
+    }
     sql.batch_execute(
         "REVOKE UPDATE ON hosted_owner.kit_snapshot_generations FROM eventlog_test_application",
     )
@@ -2311,7 +2357,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
     original.shutdown().await.expect("old writer stopped");
     let sql = client(&url).await;
     downgrade_blob_table(&sql, "schema_upgrade").await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("exact original populated schema");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches").await.expect("exact original populated schema");
     let config = PostgresConfig::isolated(&url, "schema_upgrade").expect("config");
     let (a, b) = tokio::join!(
         PostgresEventStore::migrate(config.clone(), PoolOptions::default(), &[]),
@@ -2341,7 +2387,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
         "unknown version/checksum refuses before serving"
     );
     downgrade_blob_table(&sql, "schema_upgrade").await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("restore old fixture");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches").await.expect("restore old fixture");
     PostgresEventStore::migrate(
         PostgresConfig::isolated(&url, "schema_upgrade").expect("config"),
         PoolOptions::default(),

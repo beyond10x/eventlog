@@ -19,10 +19,13 @@ const BASE: &[&str] = &[
 const ADDED: &[&str] = &["scope_counters", "schema_version", "projection_registry"];
 const SNAPSHOT_ADDED: &[&str] = &["snapshot_generations"];
 const GROUP_ADDED: &[&str] = &["append_groups"];
+const BATCH_ADDED: &[&str] = &["group_batches"];
 const LEGACY_CHECKSUM: &str = "68bf4ddeee1655b94ea9b30bab82641b898bdaaa413ce46e1e384697e6e24841";
 const SNAPSHOT_CHECKSUM: &str = "f91f4eadc46ca90544177b2a3fdb8bd7b727400601effb8d274bc9ce2a8e6358";
 const ATOMIC_GROUP_CHECKSUM: &str =
     "9d31a95af97bbdb3f675197383851f73758e1459166837171ef367c46530aa1f";
+const BLOB_INTEGRITY_CHECKSUM: &str =
+    "3d101321a8cc49dbca39a7d2305fb82dafe0550789fc87612f95dd232359ad0d";
 
 fn legacy_base_ddl(prefix: &str) -> String {
     format!(
@@ -150,17 +153,64 @@ fn group_additions(prefix: &str) -> String {
     )
 }
 
+/// The sorted digests a guarded blob-bearing group bound, beside its receipt: a retry carrying a
+/// batch is the committed request only when it carries exactly these, whether or not each is
+/// still bound.
+fn batch_additions(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_group_batches (tenant_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,digests JSONB NOT NULL,PRIMARY KEY(tenant_id,idempotency_key));"
+    )
+}
+
+/// The feed's publication boundary — the first position whose transaction is not yet visible —
+/// reads `committed_xid >= xmin`. Without this index that is a scan of the owner's whole history
+/// for every feed page; with it, a range scan over the transactions still in flight.
+fn watermark_index(prefix: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {prefix}_events_publication ON {prefix}_events (committed_xid, global_seq);"
+    )
+}
+
+/// Tenant erasure removes the counters whose coordinate starts with the tenant's prefix. The
+/// primary key orders coordinates by the database collation, in which one prefix's strings need
+/// not be contiguous; in byte order they are, so this index lets the erasure read only that range
+/// instead of every counter of the owner while it holds the exclusive publication gate.
+fn counter_index(prefix: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {prefix}_scope_counters_bytes ON {prefix}_scope_counters ((coordinate COLLATE \"C\"));"
+    )
+}
+
+/// Every table of the current edition, in admission order.
+fn every_table() -> Vec<&'static str> {
+    BASE.iter()
+        .chain(ADDED)
+        .chain(SNAPSHOT_ADDED)
+        .chain(GROUP_ADDED)
+        .chain(BATCH_ADDED)
+        .copied()
+        .collect()
+}
+
 fn checksum() -> String {
     format!(
         "{:x}",
         Sha256::digest(format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             base_ddl("owner"),
             additions("owner"),
             snapshot_additions("owner"),
-            group_additions("owner")
+            group_additions("owner"),
+            batch_additions("owner"),
+            watermark_index("owner"),
+            counter_index("owner")
         ))
     )
+}
+
+/// The edition with blob integrity columns and atomic groups, before the batch record.
+fn blob_integrity_checksum() -> String {
+    BLOB_INTEGRITY_CHECKSUM.into()
 }
 
 fn atomic_group_checksum() -> String {
@@ -178,33 +228,134 @@ async fn exists<C: GenericClient>(client: &C, table: &str) -> Result<bool, Event
         .map_err(backend)?
         .get(0))
 }
-async fn shape<C: GenericClient>(
+/// Each relation's physical shape, in the order asked, gathered with four catalog queries for the
+/// whole list rather than seven per relation.
+///
+/// Every relation is judged exactly as one at a time would be — a missing relation has the empty
+/// shape; then a rewrite rule, the relation kind and security, a trigger, policy, generated
+/// column or nondeterministic collation, and inheritance each refuse in that order — and its
+/// refusal is returned in its own slot, so a caller walking the list meets the same first error
+/// it met when each relation cost seven round trips.
+async fn shapes<C: GenericClient>(
     client: &C,
-    table: &str,
-    prefix: &str,
-) -> Result<Vec<String>, EventLogError> {
-    let relation=client.query_opt("SELECT c.relkind::text,c.relrowsecurity,c.relforcerowsecurity,c.relpersistence::text,c.relispartition FROM pg_class c WHERE c.oid=to_regclass($1)",&[&table]).await.map_err(backend)?;
-    let Some(relation) = relation else {
-        return Ok(Vec::new());
-    };
-    let rewritten: bool = client
-        .query_one(
-            "SELECT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=to_regclass($1))",
-            &[&table],
+    tables: &[(String, &str)],
+) -> Result<Vec<Result<Vec<String>, EventLogError>>, EventLogError> {
+    let names: Vec<&str> = tables.iter().map(|(table, _)| table.as_str()).collect();
+    let mut relations: Vec<Option<tokio_postgres::Row>> = (0..tables.len()).map(|_| None).collect();
+    for row in client.query("SELECT n.ord, c.relkind::text, c.relrowsecurity, c.relforcerowsecurity, c.relpersistence::text, c.relispartition, \
+            EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid), \
+            EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) OR EXISTS(SELECT FROM pg_policy WHERE polrelid=c.oid) OR EXISTS(SELECT FROM pg_attribute WHERE attrelid=c.oid AND (attgenerated<>'' OR attidentity<>'')) OR EXISTS(SELECT FROM pg_attribute a JOIN pg_collation co ON co.oid=a.attcollation WHERE a.attrelid=c.oid AND NOT co.collisdeterministic), \
+            EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) \
+            FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) JOIN pg_class c ON c.oid=to_regclass(n.name)", &[&names]).await.map_err(backend)? {
+        let position = ordinal_slot(row.get(0), tables.len())?;
+        relations[position] = Some(row);
+    }
+    let mut columns: Vec<Vec<String>> = vec![Vec::new(); tables.len()];
+    for row in client.query("SELECT n.ord, a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, COALESCE(pg_get_expr(d.adbin,d.adrelid),''), a.attcollation::text \
+            FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) \
+            JOIN pg_attribute a ON a.attrelid=to_regclass(n.name) \
+            LEFT JOIN pg_attrdef d ON a.attrelid=d.adrelid AND a.attnum=d.adnum \
+            WHERE a.attnum>0 AND NOT a.attisdropped ORDER BY n.ord, a.attnum", &[&names]).await.map_err(backend)? {
+        let position = ordinal_slot(row.get(0), tables.len())?;
+        let prefix = tables[position].1;
+        let default: String = row.get(4);
+        // PostgreSQL qualifies sequences when the temporary expected schema shadows search_path.
+        let default = default.replace(prefix, "OWNER").replace("pg_temp_", "");
+        let default = if default.starts_with("nextval(") { "owned-sequence".to_owned() } else { default };
+        columns[position].push(format!("column:{}:{}:{}:{}:{}", row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, bool>(3), default, row.get::<_, String>(5)));
+    }
+    let mut constraints: Vec<Vec<String>> = vec![Vec::new(); tables.len()];
+    for row in client
+        .query(
+            "SELECT n.ord, co.contype::text, pg_get_constraintdef(co.oid, true), co.convalidated \
+            FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) \
+            JOIN pg_constraint co ON co.conrelid=to_regclass(n.name) \
+            ORDER BY n.ord, co.contype, pg_get_constraintdef(co.oid, true)",
+            &[&names],
         )
         .await
         .map_err(backend)?
-        .get(0);
-    if rewritten {
+    {
+        let position = ordinal_slot(row.get(0), tables.len())?;
+        constraints[position].push(format!(
+            "constraint:{}:{}:{}",
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, bool>(3)
+        ));
+    }
+    let mut indexes: Vec<Vec<Result<String, EventLogError>>> =
+        (0..tables.len()).map(|_| Vec::new()).collect();
+    for row in client
+        .query(
+            "SELECT n.ord, pg_get_indexdef(i.indexrelid), i.indisvalid, i.indisready \
+            FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) \
+            JOIN pg_index i ON i.indrelid=to_regclass(n.name)",
+            &[&names],
+        )
+        .await
+        .map_err(backend)?
+    {
+        let position = ordinal_slot(row.get(0), tables.len())?;
+        let definition: String = row.get(1);
+        let unique = definition.starts_with("CREATE UNIQUE INDEX");
+        indexes[position].push(
+            definition
+                .split_once(" USING ")
+                .map(|(_, columns)| {
+                    format!(
+                        "index:{unique}:{columns}:{}:{}",
+                        row.get::<_, bool>(2),
+                        row.get::<_, bool>(3)
+                    )
+                })
+                .ok_or_else(|| {
+                    EventLogError::Invalid("unrecognized PostgreSQL index definition".into())
+                }),
+        );
+    }
+    let mut answers = Vec::with_capacity(tables.len());
+    for (((((table, prefix), relation), columns), constraints), indexes) in tables
+        .iter()
+        .zip(relations)
+        .zip(columns)
+        .zip(constraints)
+        .zip(indexes)
+    {
+        answers.push(judge(
+            table,
+            prefix,
+            relation.as_ref(),
+            columns,
+            constraints,
+            indexes,
+        ));
+    }
+    Ok(answers)
+}
+
+/// One relation's admission, in the order a single relation was always judged.
+fn judge(
+    table: &str,
+    prefix: &str,
+    relation: Option<&tokio_postgres::Row>,
+    columns: Vec<String>,
+    constraints: Vec<String>,
+    indexes: Vec<Result<String, EventLogError>>,
+) -> Result<Vec<String>, EventLogError> {
+    let Some(relation) = relation else {
+        return Ok(Vec::new());
+    };
+    if relation.get::<_, bool>(6) {
         return Err(EventLogError::Invalid(format!(
             "unadmitted rewrite rule: {table}"
         )));
     }
-    if relation.get::<_, String>(0) != "r"
-        || relation.get::<_, bool>(1)
+    if relation.get::<_, String>(1) != "r"
         || relation.get::<_, bool>(2)
-        || relation.get::<_, bool>(4)
-        || relation.get::<_, String>(3)
+        || relation.get::<_, bool>(3)
+        || relation.get::<_, bool>(5)
+        || relation.get::<_, String>(4)
             != if prefix == "eventlog_expected" {
                 "t"
             } else {
@@ -215,68 +366,60 @@ async fn shape<C: GenericClient>(
             "unsupported relation/security shape: {table}"
         )));
     }
-    let hidden:bool=client.query_one("SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass($1) AND NOT tgisinternal) OR EXISTS(SELECT FROM pg_policy WHERE polrelid=to_regclass($1)) OR EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass($1) AND (attgenerated<>'' OR attidentity<>'')) OR EXISTS(SELECT FROM pg_attribute a JOIN pg_collation c ON c.oid=a.attcollation WHERE a.attrelid=to_regclass($1) AND NOT c.collisdeterministic)",&[&table]).await.map_err(backend)?.get(0);
-    if hidden {
+    if relation.get::<_, bool>(7) {
         return Err(EventLogError::Invalid(format!(
             "unadmitted trigger, policy or generated column: {table}"
         )));
     }
-    let inherited: bool = client
-        .query_one(
-            "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=to_regclass($1) OR inhparent=to_regclass($1))",
-            &[&table],
-        )
-        .await
-        .map_err(backend)?
-        .get(0);
-    if inherited {
+    if relation.get::<_, bool>(8) {
         return Err(EventLogError::Invalid(format!(
             "unsupported inherited relation: {table}"
         )));
     }
-    let mut shape = Vec::new();
-    for row in client.query("SELECT a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, COALESCE(pg_get_expr(d.adbin,d.adrelid),''),a.attcollation::text FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE a.attrelid=to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum", &[&table]).await.map_err(backend)? {
-        let default: String = row.get(3);
-        // PostgreSQL qualifies sequences when the temporary expected schema shadows search_path.
-        let default = default.replace(prefix,"OWNER").replace("pg_temp_", "");
-        let default = if default.starts_with("nextval(") { "owned-sequence".to_owned() } else { default };
-        shape.push(format!("column:{}:{}:{}:{}:{}",row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,bool>(2),default,row.get::<_,String>(4)));
-    }
-    for row in client.query("SELECT contype::text, pg_get_constraintdef(oid, true), convalidated FROM pg_constraint WHERE conrelid=to_regclass($1) ORDER BY contype, pg_get_constraintdef(oid,true)", &[&table]).await.map_err(backend)? { shape.push(format!("constraint:{}:{}:{}",row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,bool>(2))); }
-    let mut indexes = Vec::new();
-    for row in client.query("SELECT pg_get_indexdef(indexrelid), indisvalid, indisready FROM pg_index WHERE indrelid=to_regclass($1)", &[&table]).await.map_err(backend)? {
-        let definition: String = row.get(0);
-        let unique = definition.starts_with("CREATE UNIQUE INDEX");
-        let columns = definition.split_once(" USING ").ok_or_else(|| EventLogError::Invalid("unrecognized PostgreSQL index definition".into()))?.1;
-        indexes.push(format!("index:{unique}:{columns}:{}:{}",row.get::<_,bool>(1),row.get::<_,bool>(2)));
-    }
+    let mut shape = columns;
+    shape.extend(constraints);
+    let mut indexes = indexes.into_iter().collect::<Result<Vec<_>, _>>()?;
     indexes.sort();
     shape.extend(indexes);
     Ok(shape)
 }
+
+/// The zero-based slot of a 1-based `WITH ORDINALITY` position.
+fn ordinal_slot(ordinal: i64, len: usize) -> Result<usize, EventLogError> {
+    usize::try_from(ordinal)
+        .ok()
+        .and_then(|ordinal| ordinal.checked_sub(1))
+        .filter(|slot| *slot < len)
+        .ok_or_else(|| EventLogError::Backend("catalog answered an unknown relation".into()))
+}
+
 async fn compare(
     transaction: &Transaction<'_>,
     prefix: &str,
     suffixes: &[&str],
 ) -> Result<(), EventLogError> {
+    let mut tables = Vec::with_capacity(suffixes.len() * 2);
+    for suffix in suffixes {
+        tables.push((format!("{prefix}_{suffix}"), prefix));
+        tables.push((format!("eventlog_expected_{suffix}"), "eventlog_expected"));
+    }
+    let mut shapes = shapes(transaction, &tables).await?.into_iter();
     for suffix in suffixes {
         let table = format!("{prefix}_{suffix}");
-        if shape(transaction, &table, prefix).await?
-            != shape(
-                transaction,
-                &format!("eventlog_expected_{suffix}"),
-                "eventlog_expected",
-            )
-            .await?
-        {
+        let (Some(actual), Some(expected)) = (shapes.next(), shapes.next()) else {
+            return Err(EventLogError::Backend(
+                "catalog answered too few relations".into(),
+            ));
+        };
+        if actual? != expected? {
             return Err(EventLogError::Invalid(format!(
                 "incompatible PostgreSQL schema: {table}; explicit supported migration required"
             )));
         }
         // A replaced sequence/default or user trigger is not part of the admitted durable shape.
         if *suffix == "events" {
-            let owns: bool = transaction.query_one("SELECT EXISTS(SELECT FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum JOIN pg_depend dependency ON dependency.classid='pg_attrdef'::regclass AND dependency.objid=d.oid AND dependency.refclassid='pg_class'::regclass WHERE d.adrelid=to_regclass($1) AND a.attname='global_seq' AND dependency.refobjid=to_regclass(pg_get_serial_sequence($1,'global_seq')) AND pg_get_expr(d.adbin,d.adrelid)=format('nextval(%L::regclass)',to_regclass(pg_get_serial_sequence($1,'global_seq'))::text)) AND (SELECT count(*) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum JOIN pg_depend dependency ON dependency.classid='pg_attrdef'::regclass AND dependency.objid=d.oid AND dependency.refclassid='pg_class'::regclass WHERE d.adrelid=to_regclass($1) AND a.attname='global_seq' AND dependency.refobjid IN (SELECT oid FROM pg_class WHERE relkind='S'))=1", &[&table]).await.map_err(backend)?.get(0);
-            let sequence_shape:bool=transaction.query_one("SELECT COALESCE(bool_and(s.seqtypid='bigint'::regtype AND s.seqstart=1 AND s.seqincrement=1 AND s.seqmin=1 AND s.seqmax=9223372036854775807 AND s.seqcache=1 AND NOT s.seqcycle AND c.relpersistence='p'),false) FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid WHERE s.seqrelid=to_regclass(pg_get_serial_sequence($1,'global_seq'))",&[&table]).await.map_err(backend)?.get(0);
+            let row = transaction.query_one("SELECT EXISTS(SELECT FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum JOIN pg_depend dependency ON dependency.classid='pg_attrdef'::regclass AND dependency.objid=d.oid AND dependency.refclassid='pg_class'::regclass WHERE d.adrelid=to_regclass($1) AND a.attname='global_seq' AND dependency.refobjid=to_regclass(pg_get_serial_sequence($1,'global_seq')) AND pg_get_expr(d.adbin,d.adrelid)=format('nextval(%L::regclass)',to_regclass(pg_get_serial_sequence($1,'global_seq'))::text)) AND (SELECT count(*) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum JOIN pg_depend dependency ON dependency.classid='pg_attrdef'::regclass AND dependency.objid=d.oid AND dependency.refclassid='pg_class'::regclass WHERE d.adrelid=to_regclass($1) AND a.attname='global_seq' AND dependency.refobjid IN (SELECT oid FROM pg_class WHERE relkind='S'))=1, (SELECT COALESCE(bool_and(s.seqtypid='bigint'::regtype AND s.seqstart=1 AND s.seqincrement=1 AND s.seqmin=1 AND s.seqmax=9223372036854775807 AND s.seqcache=1 AND NOT s.seqcycle AND c.relpersistence='p'),false) FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid WHERE s.seqrelid=to_regclass(pg_get_serial_sequence($1,'global_seq')))", &[&table]).await.map_err(backend)?;
+            let (owns, sequence_shape): (bool, bool) = (row.get(0), row.get(1));
             if !owns || !sequence_shape {
                 return Err(EventLogError::Invalid(
                     "events sequence must retain its owned persistent BIGSERIAL shape with CACHE 1"
@@ -291,11 +434,14 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
     transaction
         .batch_execute(
             &format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}{}{}",
                 base_ddl("eventlog_expected"),
                 additions("eventlog_expected"),
                 snapshot_additions("eventlog_expected"),
-                group_additions("eventlog_expected")
+                group_additions("eventlog_expected"),
+                batch_additions("eventlog_expected"),
+                watermark_index("eventlog_expected"),
+                counter_index("eventlog_expected")
             )
             .replace("CREATE TABLE IF NOT EXISTS", "CREATE TEMP TABLE"),
         )
@@ -310,22 +456,17 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
         .map_err(backend)
 }
 async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
-    for suffix in BASE
+    let drops: String = BASE
         .iter()
         .chain(ADDED)
         .chain(SNAPSHOT_ADDED)
         .chain(GROUP_ADDED)
-    {
-        transaction
-            .batch_execute(&format!("DROP TABLE pg_temp.eventlog_expected_{suffix}"))
-            .await
-            .map_err(backend)?;
-    }
-    transaction
-        .batch_execute("DROP TABLE pg_temp.eventlog_expected_legacy_blobs")
-        .await
-        .map_err(backend)?;
-    Ok(())
+        .chain(BATCH_ADDED)
+        .chain(["legacy_blobs"].iter())
+        .map(|suffix| format!("DROP TABLE pg_temp.eventlog_expected_{suffix};"))
+        .collect::<Vec<_>>()
+        .concat();
+    transaction.batch_execute(&drops).await.map_err(backend)
 }
 async fn version(
     transaction: &Transaction<'_>,
@@ -360,18 +501,30 @@ async fn blob_shape(
     transaction: &Transaction<'_>,
     prefix: &str,
 ) -> Result<PostgresBlobShape, EventLogError> {
-    let actual = shape(transaction, &format!("{prefix}_blobs"), prefix).await?;
-    let current = shape(transaction, "eventlog_expected_blobs", "eventlog_expected").await?;
-    if actual == current {
+    let mut shapes = shapes(
+        transaction,
+        &[
+            (format!("{prefix}_blobs"), prefix),
+            ("eventlog_expected_blobs".to_owned(), "eventlog_expected"),
+            (
+                "eventlog_expected_legacy_blobs".to_owned(),
+                "eventlog_expected",
+            ),
+        ],
+    )
+    .await?
+    .into_iter();
+    let (Some(actual), Some(current), Some(legacy)) = (shapes.next(), shapes.next(), shapes.next())
+    else {
+        return Err(EventLogError::Backend(
+            "catalog answered too few relations".into(),
+        ));
+    };
+    let actual = actual?;
+    if actual == current? {
         return Ok(PostgresBlobShape::Current);
     }
-    let legacy = shape(
-        transaction,
-        "eventlog_expected_legacy_blobs",
-        "eventlog_expected",
-    )
-    .await?;
-    if actual == legacy {
+    if actual == legacy? {
         return Ok(PostgresBlobShape::Legacy);
     }
     Err(EventLogError::Invalid(format!(
@@ -464,16 +617,36 @@ pub(crate) async fn migrate_with_blob_migration(
         )));
     }
     if existing != 0 {
-        for suffix in BASE.iter().copied().filter(|suffix| *suffix != "blobs") {
-            compare(&transaction, prefix, &[suffix]).await?;
-        }
+        // The publication-boundary index is the one addition to an existing table; every edition
+        // before it has the same events table without it. It is created here, in the migration
+        // transaction, so the existing owner compares against the current shape and a refusal
+        // below rolls the index back with everything else.
+        transaction
+            .batch_execute(&watermark_index(prefix))
+            .await
+            .map_err(backend)?;
+        let unblobbed: Vec<&str> = BASE
+            .iter()
+            .copied()
+            .filter(|suffix| *suffix != "blobs")
+            .collect();
+        compare(&transaction, prefix, &unblobbed).await?;
     }
     let ledger = exists(&transaction, &format!("{prefix}_schema_version")).await?;
     let generations = exists(&transaction, &format!("{prefix}_snapshot_generations")).await?;
     let groups = exists(&transaction, &format!("{prefix}_append_groups")).await?;
     let counters = exists(&transaction, &format!("{prefix}_scope_counters")).await?;
     let registry = exists(&transaction, &format!("{prefix}_projection_registry")).await?;
-    if existing == 0 && (ledger || generations || groups || counters || registry) {
+    let batches = exists(&transaction, &format!("{prefix}_group_batches")).await?;
+    if existing != 0 && counters {
+        // As the publication index above: the counter table of every earlier edition is this
+        // one without the index, so it gains it before it is compared.
+        transaction
+            .batch_execute(&counter_index(prefix))
+            .await
+            .map_err(backend)?;
+    }
+    if existing == 0 && (ledger || generations || groups || counters || registry || batches) {
         return Err(EventLogError::Invalid(
             "partial PostgreSQL admission migration".into(),
         ));
@@ -481,6 +654,12 @@ pub(crate) async fn migrate_with_blob_migration(
     if groups && (!ledger || !generations) {
         return Err(EventLogError::Invalid(
             "partial PostgreSQL group migration".into(),
+        ));
+    }
+    // A batch record without the receipts it sits beside would answer for groups nobody holds.
+    if batches && !groups {
+        return Err(EventLogError::Invalid(
+            "partial PostgreSQL group batch migration".into(),
         ));
     }
     let prior_checksum = if groups {
@@ -504,13 +683,21 @@ pub(crate) async fn migrate_with_blob_migration(
         compare(&transaction, prefix, ADDED).await?;
         compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
         compare(&transaction, prefix, GROUP_ADDED).await?;
-        version(&transaction, prefix, &checksum()).await?;
+        if batches {
+            compare(&transaction, prefix, BATCH_ADDED).await?;
+            version(&transaction, prefix, &checksum()).await?;
+        } else {
+            version(&transaction, prefix, &blob_integrity_checksum()).await?;
+        }
     } else if ledger {
         compare(&transaction, prefix, ADDED).await?;
         if generations {
             compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
             if groups {
                 compare(&transaction, prefix, GROUP_ADDED).await?;
+            }
+            if batches {
+                compare(&transaction, prefix, BATCH_ADDED).await?;
             }
             version(&transaction, prefix, &prior_checksum).await?;
         } else {
@@ -611,11 +798,14 @@ pub(crate) async fn migrate_with_blob_migration(
 
     transaction
         .batch_execute(&format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             base_ddl(prefix),
             additions(prefix),
             snapshot_additions(prefix),
-            group_additions(prefix)
+            group_additions(prefix),
+            batch_additions(prefix),
+            watermark_index(prefix),
+            counter_index(prefix)
         ))
         .await
         .map_err(backend)?;
@@ -627,7 +817,14 @@ pub(crate) async fn migrate_with_blob_migration(
             )
             .await
             .map_err(backend)?;
-    } else if prior_blob_shape == Some(PostgresBlobShape::Legacy) {
+    } else if prior_blob_shape == Some(PostgresBlobShape::Legacy)
+        || (prior_blob_shape == Some(PostgresBlobShape::Current) && !batches)
+    {
+        let prior_checksum = if prior_blob_shape == Some(PostgresBlobShape::Current) {
+            blob_integrity_checksum()
+        } else {
+            prior_checksum
+        };
         transaction
             .execute(
                 &format!(
@@ -650,10 +847,7 @@ pub(crate) async fn migrate_with_blob_migration(
             ));
         }
     }
-    compare(&transaction, prefix, BASE).await?;
-    compare(&transaction, prefix, ADDED).await?;
-    compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
-    compare(&transaction, prefix, GROUP_ADDED).await?;
+    compare(&transaction, prefix, &every_table()).await?;
     version(&transaction, prefix, &checksum()).await?;
     if report.upgraded {
         validate_all_postgres_blobs(&transaction, prefix).await?;
@@ -673,29 +867,52 @@ pub(crate) async fn validate(client: &mut Client, prefix: &str) -> Result<(), Ev
     expected(&transaction)
         .await
         .map_err(|error| EventLogError::Invalid(format!("expected schema: {error}")))?;
-    compare(&transaction, prefix, BASE).await?;
-    compare(&transaction, prefix, ADDED).await?;
-    compare(&transaction, prefix, SNAPSHOT_ADDED).await?;
-    compare(&transaction, prefix, GROUP_ADDED).await?;
+    compare(&transaction, prefix, &every_table()).await?;
     version(&transaction, prefix, &checksum()).await?;
     drop_expected(&transaction)
         .await
         .map_err(|error| EventLogError::Invalid(format!("expected schema: {error}")))?;
     transaction.commit().await.map_err(backend)
 }
+/// The migration metadata: the schema ledger and the projection roster. Only the migration role
+/// writes them; hosted traffic reads the ledger at admission and the roster at registration and
+/// erasure. An application role that could write the roster could remove a projection from it,
+/// and erasure, which deletes a tenant from every registered projection, would then leave that
+/// tenant's rows behind in the unregistered table.
+const MIGRATION_METADATA: &[&str] = &["schema_version", "projection_registry"];
+
 pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), EventLogError> {
-    let tables: Vec<_> = BASE
+    let durable: Vec<_> = BASE
         .iter()
         .chain(ADDED)
         .chain(SNAPSHOT_ADDED)
         .chain(GROUP_ADDED)
+        .chain(BATCH_ADDED)
+        .filter(|suffix| !MIGRATION_METADATA.contains(suffix))
         .map(|suffix| format!("{prefix}_{suffix}"))
         .collect();
-    let admitted:bool=client.query_one("SELECT COALESCE(bool_and(has_table_privilege(current_user,to_regclass(name),'SELECT') AND has_table_privilege(current_user,to_regclass(name),'INSERT') AND has_table_privilege(current_user,to_regclass(name),'UPDATE') AND has_table_privilege(current_user,to_regclass(name),'DELETE')),false) FROM unnest($1::text[]) AS name",&[&tables]).await.map_err(backend)?.get(0);
+    let metadata: Vec<_> = MIGRATION_METADATA
+        .iter()
+        .map(|suffix| format!("{prefix}_{suffix}"))
+        .collect();
+    let admitted:bool=client.query_one("SELECT COALESCE(bool_and(has_table_privilege(current_user,to_regclass(name),'SELECT') AND has_table_privilege(current_user,to_regclass(name),'INSERT') AND has_table_privilege(current_user,to_regclass(name),'UPDATE') AND has_table_privilege(current_user,to_regclass(name),'DELETE')),false) FROM unnest($1::text[]) AS name",&[&durable]).await.map_err(backend)?.get(0);
     let sequence = format!("{prefix}_events");
     let sequence_admitted:bool=client.query_one("SELECT COALESCE(has_sequence_privilege(current_user,to_regclass(pg_get_serial_sequence($1,'global_seq')),'USAGE'),false) AND has_database_privilege(current_user,current_database(),'TEMP')",&[&sequence]).await.map_err(backend)?.get(0);
     if !admitted || !sequence_admitted {
         return Err(EventLogError::Invalid("hosted application role lacks required durable DML, sequence usage or temporary-table rights".into()));
+    }
+    let readable:bool=client.query_one("SELECT COALESCE(bool_and(has_table_privilege(current_user,to_regclass(name),'SELECT')),false) FROM unnest($1::text[]) AS name",&[&metadata]).await.map_err(backend)?.get(0);
+    if !readable {
+        return Err(EventLogError::Invalid(
+            "hosted application role cannot read the migration metadata".into(),
+        ));
+    }
+    let writable:bool=client.query_one("SELECT COALESCE(bool_or(has_table_privilege(current_user,to_regclass(name),'INSERT') OR has_table_privilege(current_user,to_regclass(name),'UPDATE') OR has_table_privilege(current_user,to_regclass(name),'DELETE') OR has_table_privilege(current_user,to_regclass(name),'TRUNCATE')),true) FROM unnest($1::text[]) AS name",&[&metadata]).await.map_err(backend)?.get(0);
+    if writable {
+        return Err(EventLogError::Invalid(
+            "hosted application role can write migration metadata reserved for the migration role"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -716,13 +933,31 @@ pub(crate) fn projection_columns(spec: &ProjectionSpec) -> Vec<(String, &'static
     columns
 }
 
-/// The one name a declared field's index is created and recognised under.
+/// The one name a declared field's index is created under.
+///
+/// A name that fits PostgreSQL's 63-byte identifier limit is the table name and the field's
+/// position, as it always was. One that would not fit keeps as much of the table name as fits
+/// beside a digest of the whole table name and the position: PostgreSQL would otherwise truncate
+/// the position away, so every field of a long table would share one name and `IF NOT EXISTS`
+/// would create only the first index.
 pub(crate) fn projection_index(table: &str, position: usize) -> String {
-    format!("{table}_idx_{position}")
+    let plain = format!("{table}_idx_{position}");
+    if plain.len() <= 63 {
+        return plain;
+    }
+    let digest = format!("{:x}", Sha256::digest(table.as_bytes()));
+    let suffix = format!("_{}_idx_{position}", &digest[..8]);
+    let kept = table
+        .char_indices()
+        .map(|(at, _)| at)
+        .take_while(|at| at + suffix.len() <= 63)
+        .last()
+        .unwrap_or(0);
+    format!("{}{suffix}", &table[..kept])
 }
 
-pub(crate) async fn create_projection<C: GenericClient>(
-    client: &C,
+pub(crate) async fn create_projection(
+    transaction: &Transaction<'_>,
     prefix: &str,
     spec: &ProjectionSpec,
 ) -> Result<(), EventLogError> {
@@ -741,16 +976,88 @@ pub(crate) async fn create_projection<C: GenericClient>(
         })
         .collect();
     let columns = declarations.join(",");
-    let indexes = super::joined(spec.indexed.len(), |position| {
-        let index = projection_index(&table, position);
-        format!("CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});")
+    transaction
+        .batch_execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {table} ({columns},PRIMARY KEY(tenant_id,row_key));"
+        ))
+        .await
+        .map_err(backend)?;
+    // An index is missing when no index of the table has its definition, whatever its name: an
+    // existing table may hold one created under an older, truncated name, and creating it again
+    // would leave two where the admitted shape has one.
+    let installed: Vec<String> = transaction
+        .query(
+            "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid=to_regclass($1)",
+            &[&table],
+        )
+        .await
+        .map_err(backend)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let missing = super::joined(spec.indexed.len(), |position| {
+        let definition = format!(" USING btree (tenant_id, idx_{position})");
+        if installed.iter().any(|index| index.ends_with(&definition)) {
+            String::new()
+        } else {
+            let index = projection_index(&table, position);
+            format!("CREATE INDEX {index} ON {table} (tenant_id, idx_{position});")
+        }
     });
-    client.batch_execute(&format!("CREATE TABLE IF NOT EXISTS {table} ({columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
-    // Migration admits existing projection tables too; IF NOT EXISTS alone does not
-    // reject hidden behavior that can discard projection writes before registration.
-    shape(client, &table, prefix).await?;
+    if !missing.is_empty() {
+        transaction.batch_execute(&missing).await.map_err(backend)?;
+    }
+    // Migration admits existing projection tables too: the stored table must have exactly the
+    // shape a fresh one would, and IF NOT EXISTS alone does not refuse hidden behavior that can
+    // discard projection writes before registration.
+    compare_projection(transaction, prefix, spec).await
+}
+
+/// Refuse a stored projection table whose physical shape differs from the declared one, compared
+/// against a temporary table made from the same declaration: the application role needs TEMP, not
+/// owner-schema CREATE.
+async fn compare_projection(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    spec: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let table = super::projection_table(prefix, spec.name);
+    let columns = super::joined(spec.indexed.len(), |position| {
+        format!(", idx_{position} TEXT")
+    });
+    let indexes = super::joined(spec.indexed.len(), |position| {
+        format!("CREATE INDEX ON eventlog_expected_projection (tenant_id,idx_{position});")
+    });
+    transaction.batch_execute(&format!("CREATE TEMP TABLE eventlog_expected_projection (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
+    let answered = shapes(
+        transaction,
+        &[
+            (table.clone(), prefix),
+            (
+                "eventlog_expected_projection".to_owned(),
+                "eventlog_expected",
+            ),
+        ],
+    )
+    .await;
+    transaction
+        .batch_execute("DROP TABLE pg_temp.eventlog_expected_projection")
+        .await
+        .map_err(backend)?;
+    let mut answered = answered?.into_iter();
+    let (Some(actual), Some(expected)) = (answered.next(), answered.next()) else {
+        return Err(EventLogError::Backend(
+            "catalog answered too few relations".into(),
+        ));
+    };
+    if actual? != expected? {
+        return Err(EventLogError::Invalid(format!(
+            "incompatible PostgreSQL projection: {table}"
+        )));
+    }
     Ok(())
 }
+
 pub(crate) async fn validate_projection(
     client: &mut Client,
     prefix: &str,
@@ -776,37 +1083,13 @@ pub(crate) async fn validate_projection(
         ));
     }
     let table = super::projection_table(prefix, spec.name);
-    // The expected projection is temporary: an application role needs TEMP, not owner-schema CREATE.
     let allowed:bool=transaction.query_one("SELECT COALESCE(has_table_privilege(current_user,to_regclass($1),'SELECT') AND has_table_privilege(current_user,to_regclass($1),'INSERT') AND has_table_privilege(current_user,to_regclass($1),'UPDATE') AND has_table_privilege(current_user,to_regclass($1),'DELETE'),false)",&[&table]).await.map_err(backend)?.get(0);
     if !allowed {
         return Err(EventLogError::Invalid(
             "declared projection lacks required application DML permissions".into(),
         ));
     }
-    let columns = super::joined(spec.indexed.len(), |position| {
-        format!(", idx_{position} TEXT")
-    });
-    transaction.batch_execute(&format!("CREATE TEMP TABLE eventlog_expected_projection (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key)) ON COMMIT DROP;")).await.map_err(backend)?;
-    for position in 0..spec.indexed.len() {
-        transaction
-            .batch_execute(&format!(
-                "CREATE INDEX ON eventlog_expected_projection (tenant_id,idx_{position})"
-            ))
-            .await
-            .map_err(backend)?;
-    }
-    if shape(&transaction, &table, prefix).await?
-        != shape(
-            &transaction,
-            "eventlog_expected_projection",
-            "eventlog_expected",
-        )
-        .await?
-    {
-        return Err(EventLogError::Invalid(format!(
-            "incompatible PostgreSQL projection: {table}"
-        )));
-    }
+    compare_projection(&transaction, prefix, spec).await?;
     transaction.commit().await.map_err(backend)
 }
 
@@ -832,16 +1115,32 @@ async fn downgrade_blob_fixture(client: &Client, prefix: &str) {
 #[cfg(test)]
 mod blob_integrity_tests {
     use super::{
-        ATOMIC_GROUP_CHECKSUM, LEGACY_CHECKSUM, SNAPSHOT_CHECKSUM, atomic_group_checksum, checksum,
-        legacy_checksum, snapshot_checksum,
+        ATOMIC_GROUP_CHECKSUM, BLOB_INTEGRITY_CHECKSUM, LEGACY_CHECKSUM, SNAPSHOT_CHECKSUM,
+        additions, atomic_group_checksum, base_ddl, blob_integrity_checksum, checksum,
+        group_additions, legacy_checksum, snapshot_additions, snapshot_checksum,
     };
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn historical_editions_and_old_reader_are_frozen() {
         assert_eq!(legacy_checksum(), LEGACY_CHECKSUM);
         assert_eq!(snapshot_checksum(), SNAPSHOT_CHECKSUM);
         assert_eq!(atomic_group_checksum(), ATOMIC_GROUP_CHECKSUM);
+        assert_eq!(blob_integrity_checksum(), BLOB_INTEGRITY_CHECKSUM);
+        // The blob integrity edition is the current DDL without the batch record.
+        let blob_integrity = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{}{}{}{}",
+                base_ddl("owner"),
+                additions("owner"),
+                snapshot_additions("owner"),
+                group_additions("owner")
+            ))
+        );
+        assert_eq!(blob_integrity, BLOB_INTEGRITY_CHECKSUM);
         assert_ne!(checksum(), ATOMIC_GROUP_CHECKSUM);
+        assert_ne!(checksum(), BLOB_INTEGRITY_CHECKSUM);
     }
 }
 
@@ -869,6 +1168,7 @@ mod snapshot_tests {
             .chain(ADDED)
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
+            .chain(BATCH_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
                 .await
@@ -887,7 +1187,7 @@ mod snapshot_tests {
             .unwrap();
         store.shutdown().await.unwrap();
         downgrade_blob_fixture(&sql, prefix).await;
-        sql.batch_execute("INSERT INTO snapshot_upgrade_snapshots VALUES ('tenant','item','one',1,1,'{\"total\":999}',now()); DROP TABLE snapshot_upgrade_snapshot_generations; DROP TABLE snapshot_upgrade_append_groups").await.unwrap();
+        sql.batch_execute("INSERT INTO snapshot_upgrade_snapshots VALUES ('tenant','item','one',1,1,'{\"total\":999}',now()); DROP TABLE snapshot_upgrade_snapshot_generations; DROP TABLE snapshot_upgrade_append_groups; DROP TABLE snapshot_upgrade_group_batches").await.unwrap();
         sql.execute(
             "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
             &[&legacy_checksum()],
@@ -965,9 +1265,11 @@ mod snapshot_tests {
             migrate(&mut sql, prefix, &[]).await.is_err(),
             "new checksum without table is partial"
         );
-        sql.batch_execute("DROP TABLE snapshot_upgrade_append_groups")
-            .await
-            .unwrap();
+        sql.batch_execute(
+            "DROP TABLE snapshot_upgrade_append_groups; DROP TABLE snapshot_upgrade_group_batches",
+        )
+        .await
+        .unwrap();
         downgrade_blob_fixture(&sql, prefix).await;
         sql.execute(
             "UPDATE snapshot_upgrade_schema_version SET checksum=$1",
@@ -987,6 +1289,7 @@ mod snapshot_tests {
             .chain(ADDED)
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
+            .chain(BATCH_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
                 .await
@@ -1016,6 +1319,7 @@ mod group_migration_tests {
             .chain(ADDED)
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
+            .chain(BATCH_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
                 .await
@@ -1034,9 +1338,11 @@ mod group_migration_tests {
             .unwrap();
         store.shutdown().await.unwrap();
         downgrade_blob_fixture(&sql, prefix).await;
-        sql.batch_execute("DROP TABLE group_upgrade_append_groups")
-            .await
-            .unwrap();
+        sql.batch_execute(
+            "DROP TABLE group_upgrade_append_groups; DROP TABLE group_upgrade_group_batches",
+        )
+        .await
+        .unwrap();
         sql.execute(
             "UPDATE group_upgrade_schema_version SET checksum=$1",
             &[&snapshot_checksum()],
@@ -1073,10 +1379,233 @@ mod group_migration_tests {
             .chain(ADDED)
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
+            .chain(BATCH_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
                 .await
                 .unwrap();
         }
+    }
+
+    /// The blob-integrity edition gains the batch record through `migrate` alone: the hosted
+    /// application role cannot create it, so `open` refuses that edition until the migration role
+    /// has run, and a ledger naming the batch edition without its table is refused as partial.
+    #[tokio::test]
+    async fn blob_integrity_edition_migrates_to_the_batch_record_and_refuses_it_half_done() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let (mut sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let prefix = "batch_upgrade";
+        let drop_all: String = BASE
+            .iter()
+            .chain(ADDED)
+            .chain(SNAPSHOT_ADDED)
+            .chain(GROUP_ADDED)
+            .chain(BATCH_ADDED)
+            .map(|suffix| format!("DROP TABLE IF EXISTS {prefix}_{suffix};"))
+            .collect::<Vec<_>>()
+            .concat();
+        sql.batch_execute(&drop_all).await.unwrap();
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        let stream = StreamId::new(TenantId::new("tenant").unwrap(), "item", "one").unwrap();
+        let original = store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.created", 1)],
+                &eventlog_conformance::meta("created", &serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+
+        sql.batch_execute(
+            "DROP TABLE batch_upgrade_group_batches; DROP INDEX batch_upgrade_events_publication",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            migrate(&mut sql, prefix, &[]).await,
+            Err(EventLogError::Invalid(
+                "unknown PostgreSQL schema version/checksum".into()
+            )),
+            "the batch edition's checksum without its table is partial"
+        );
+
+        sql.execute(
+            "UPDATE batch_upgrade_schema_version SET checksum=$1",
+            &[&blob_integrity_checksum()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                validate(&mut sql, prefix).await,
+                Err(EventLogError::Invalid(_))
+            ),
+            "an application open refuses the previous edition"
+        );
+        migrate(&mut sql, prefix, &[]).await.unwrap();
+        validate(&mut sql, prefix).await.unwrap();
+        assert_eq!(
+            sql.query_one("SELECT checksum FROM batch_upgrade_schema_version", &[])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            checksum()
+        );
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        assert_eq!(
+            store.read_stream(&stream, 0, 100).await.unwrap().events,
+            original.events
+        );
+        store.shutdown().await.unwrap();
+
+        sql.batch_execute("ALTER TABLE batch_upgrade_group_batches ALTER COLUMN digests TYPE TEXT")
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                migrate(&mut sql, prefix, &[]).await,
+                Err(EventLogError::Invalid(_))
+            ),
+            "a foreign batch record shape is refused"
+        );
+        sql.batch_execute(
+            "ALTER TABLE batch_upgrade_group_batches ALTER COLUMN digests TYPE JSONB USING digests::jsonb; \
+             DROP TABLE batch_upgrade_append_groups",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            migrate(&mut sql, prefix, &[]).await,
+            Err(EventLogError::Invalid(
+                "partial PostgreSQL group batch migration".into()
+            )),
+            "a batch record without the receipts it sits beside is refused"
+        );
+        sql.batch_execute(&drop_all).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod projection_index_tests {
+    use super::*;
+
+    const PREFIX: &str = "projidx_upgrade";
+    const LONG: ProjectionSpec = ProjectionSpec {
+        name: "assignments_by_queue_and_skill_and_agent",
+        indexed: &["queue", "skill"],
+    };
+
+    #[test]
+    fn a_long_table_names_each_field_index_apart_within_the_identifier_limit() {
+        let short = "owner_p_items";
+        assert_eq!(projection_index(short, 3), "owner_p_items_idx_3");
+        let table = crate::projection_table(PREFIX, LONG.name);
+        assert_eq!(table.len(), 58, "the fixture is the long case");
+        let names: Vec<String> = (0..8).map(|at| projection_index(&table, at)).collect();
+        for name in &names {
+            assert!(
+                name.len() <= 63,
+                "{name} exceeds PostgreSQL's identifier limit"
+            );
+        }
+        let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            8,
+            "every field has its own index name: {names:?}"
+        );
+    }
+
+    async fn secondary_indexes(sql: &Client, table: &str) -> Vec<String> {
+        sql.query(
+            "SELECT pg_get_indexdef(indexrelid) FROM pg_index
+             WHERE indrelid=to_regclass($1) AND NOT indisprimary ORDER BY 1",
+            &[&table],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+    }
+
+    /// A projection whose `{table}_idx_{p}` name would pass 63 bytes gets one index per declared
+    /// field, and migration repairs a table that an older release left with only the first one
+    /// (PostgreSQL truncated every name to the same identifier and `IF NOT EXISTS` skipped the
+    /// rest), which admission now refuses.
+    #[tokio::test]
+    async fn a_long_projection_gets_every_index_and_migration_repairs_the_missing_ones() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let (mut sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let table = crate::projection_table(PREFIX, LONG.name);
+        let drop_all: String = every_table()
+            .iter()
+            .map(|suffix| format!("DROP TABLE IF EXISTS {PREFIX}_{suffix};"))
+            .chain(std::iter::once(format!("DROP TABLE IF EXISTS {table};")))
+            .collect::<Vec<_>>()
+            .concat();
+        sql.batch_execute(&drop_all).await.unwrap();
+
+        migrate(&mut sql, PREFIX, &[LONG]).await.unwrap();
+        let fresh = secondary_indexes(&sql, &table).await;
+        assert_eq!(fresh.len(), 2, "one index per declared field: {fresh:?}");
+        validate_projection(&mut sql, PREFIX, &LONG).await.unwrap();
+
+        // The state an older release left: every field's name truncated to one identifier, so
+        // only the first field's index exists.
+        let names: String = fresh
+            .iter()
+            .map(|definition| {
+                let name = definition
+                    .trim_start_matches("CREATE INDEX ")
+                    .split(' ')
+                    .next()
+                    .unwrap();
+                format!("DROP INDEX {name};")
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        sql.batch_execute(&format!(
+            "{names}CREATE INDEX {table}_idx_0 ON {table} (tenant_id, idx_0);"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(secondary_indexes(&sql, &table).await.len(), 1);
+        let refused = validate_projection(&mut sql, PREFIX, &LONG)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, EventLogError::Invalid(message)
+                if message == &format!("incompatible PostgreSQL projection: {table}")),
+            "{refused:?}"
+        );
+
+        migrate(&mut sql, PREFIX, &[LONG]).await.unwrap();
+        let repaired = secondary_indexes(&sql, &table).await;
+        assert_eq!(
+            repaired.len(),
+            2,
+            "migration adds the missing index: {repaired:?}"
+        );
+        assert!(
+            repaired
+                .iter()
+                .any(|index| index.ends_with(" USING btree (tenant_id, idx_1)")),
+            "{repaired:?}"
+        );
+        validate_projection(&mut sql, PREFIX, &LONG).await.unwrap();
+        sql.batch_execute(&drop_all).await.unwrap();
     }
 }

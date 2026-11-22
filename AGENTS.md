@@ -183,7 +183,9 @@ Keep internal plans, stories, ADRs, decisions, worklogs, security material, and 
 Hosted traffic uses verified TLS, explicit migration/application roles and a declared replica plus
 reserve connection budget. The supported application role is dedicated, has no memberships or
 DDL ownership/creation powers, and has a finite server connection limit within its pool share.
-Schema and projection admission compares actual physical shape and the persisted migration roster.
+It reads and never writes the migration metadata (`schema_version`, `projection_registry`):
+erasure deletes a tenant from every registered projection, so a role that could edit the roster
+could make erasure skip a table. Schema and projection admission compares actual physical shape and the persisted migration roster.
 Never broaden that profile silently or treat a checksum alone as schema compatibility.
 
 Registration freezes before traffic. A cancelled/unsettled connection stays quarantined until its

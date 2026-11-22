@@ -35,7 +35,10 @@ second command. Record the exact refusal and preserve the source before investig
 1. Provide verified TLS roots or an explicitly owned transport authority.
 2. Run `PostgresEventStore::migrate` with the migration role and complete projection roster.
 3. Open traffic with a dedicated application login that owns no durable schema objects, has no
-   role memberships or elevated privileges, and has no schema CREATE grant.
+   role memberships or elevated privileges, and has no schema CREATE grant. It needs `SELECT`,
+   `INSERT`, `UPDATE` and `DELETE` on the owner's durable tables and only `SELECT` on the
+   migration metadata (`<prefix>_schema_version`, `<prefix>_projection_registry`). Admission
+   refuses a role that can write or truncate the migration metadata.
 4. Set a finite role connection limit and budget replicas plus reserved connections together:
    `replicas * max_connections + reserved_connections <= database_connections`.
 5. Register projections before traffic and fence old binaries during a protocol cutover.

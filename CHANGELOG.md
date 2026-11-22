@@ -5,10 +5,53 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Security
+
+- PostgreSQL: hosted `open` requires only `SELECT` on the migration metadata
+  (`<prefix>_schema_version`, `<prefix>_projection_registry`) and refuses an application role
+  that can `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` them. Erasure deletes a tenant from every
+  registered projection, so a role that could edit the roster could make erasure skip a table.
+  Existing deployments that granted DML on all tables must revoke it on these two tables:
+  `REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON <prefix>_schema_version, <prefix>_projection_registry
+  FROM <application role>`.
+
+### Added
+
+- PostgreSQL implements `AtomicEventStore::append_group_guarded_with_blobs`: admission, the
+  batch's blob bindings, the members and the receipt commit in one transaction, so a refused
+  guard binds no blob and a batch costs one commit instead of one per blob. The sorted digests are
+  recorded in the new table `<prefix>_group_batches`; retries follow the shared contract of File
+  and SQLite. This is a new schema edition: run `PostgresEventStore::migrate` with the migration
+  role before opening with the application role (hosted `open` refuses the previous edition), and
+  grant the application role `SELECT, INSERT, UPDATE, DELETE` on the new table.
+- PostgreSQL: the same edition adds the index `<prefix>_events_publication` on
+  `(committed_xid, global_seq)`. A feed, catch-up or rebuild page finds the first position still
+  in flight with an index range scan instead of reading every event of the owner. `migrate`
+  builds it inside its transaction, so the events table is locked against writes while it builds.
+- PostgreSQL: the same edition adds the index `<prefix>_scope_counters_bytes` on the byte order of
+  the admission counter coordinates. Tenant erasure removes the tenant's counters with an index
+  range scan instead of reading every counter while it holds the exclusive publication lock.
+
+### Changed
+
+- PostgreSQL: schema admission (`open`, `migrate`, projection validation) reads each catalog
+  property for all of a check's relations in one query: hosted `open` makes about 14 round trips
+  for its schema and privilege checks instead of about 190. Every admission requirement and every
+  refusal message is unchanged.
+- PostgreSQL: `AtomicBlobEventStore` hashes each blob once (the fingerprint's SHA-256 is the
+  integrity column), binds from the caller's bytes without copying the request, and reads a
+  stored blob back only when its digest was already bound.
+
 ### Fixed
 
 - PostgreSQL: a redaction or tenant erasure whose deadline fires after `COMMIT` was sent returns
   `UnknownCommit` instead of `Deadline`, as append does; the change may have been applied.
+- PostgreSQL: a projection whose `<table>_idx_<n>` index name would exceed 63 bytes gets one
+  index per declared field under a shortened name with a digest of the table name. Before,
+  PostgreSQL truncated every such name to the same identifier, only the first field was indexed,
+  `migrate` succeeded and `open` refused the table. `migrate` now creates the indexes missing by
+  definition, whatever their stored names, and compares the table's whole shape before it
+  commits, as `open` does.
 
 ## 0.9.4 — 2026-11-11
 

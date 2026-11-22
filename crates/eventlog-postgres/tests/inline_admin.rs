@@ -327,6 +327,8 @@ async fn restricted_application_role_attaches_existing_shapes_without_ddl() {
         .batch_execute(&format!(
             "GRANT USAGE ON SCHEMA {schema} TO eventlog_test_application; \
              GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA {schema} TO eventlog_test_application; \
+             REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON {schema}.kit_schema_version, {schema}.kit_projection_registry \
+                 FROM eventlog_test_application; \
              GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO eventlog_test_application"
         ))
         .await
