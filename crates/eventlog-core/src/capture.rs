@@ -336,13 +336,16 @@ impl DeferredTenantCapture {
     ///
     /// # Errors
     /// Whatever [`DeferredBlob::bytes`] returns for the first binding that cannot be read.
+    ///
+    /// Content the value already holds moves into the result; only a deferred binding is read.
     pub fn load(self) -> Result<TenantCapture, CaptureError> {
         let mut blobs = Vec::with_capacity(self.blobs.len());
-        for blob in &self.blobs {
-            blobs.push(CapturedBlob {
-                digest: blob.digest.clone(),
-                bytes: blob.bytes()?,
-            });
+        for DeferredBlob { digest, source } in self.blobs {
+            let bytes = match source {
+                DeferredSource::Held(bytes) => bytes,
+                DeferredSource::Read(source) => source.read(&digest)?,
+            };
+            blobs.push(CapturedBlob { digest, bytes });
         }
         Ok(TenantCapture {
             tenant: self.tenant,
@@ -1181,6 +1184,61 @@ mod tests {
         assert!(
             validate_captured_branchable_order(&tenant, &history).is_err(),
             "a parent on another stream was accepted"
+        );
+    }
+
+    #[test]
+    fn loading_moves_held_content_and_reads_only_deferred_bindings() {
+        #[derive(Debug)]
+        struct Reader(std::sync::atomic::AtomicUsize);
+        impl BoundBlobs for Reader {
+            fn read(&self, digest: &str) -> Result<Vec<u8>, CaptureError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match digest {
+                    "deferred" => Ok(b"read later".to_vec()),
+                    _ => Err(CaptureError::Corrupt {
+                        material: CaptureMaterial::Blob,
+                    }),
+                }
+            }
+        }
+        let held = vec![7_u8; 4096];
+        let held_buffer = held.as_ptr();
+        let reader = Arc::new(Reader(std::sync::atomic::AtomicUsize::new(0)));
+        let capture = |blobs| DeferredTenantCapture {
+            tenant: TenantId::new("tenant-1").unwrap(),
+            stream_identity: "identity".into(),
+            events: Vec::new(),
+            blobs,
+            projections: Vec::new(),
+        };
+        let loaded = capture(vec![
+            DeferredBlob::held("held".into(), held),
+            DeferredBlob::deferred("deferred".into(), reader.clone()),
+        ])
+        .load()
+        .unwrap();
+        assert_eq!(loaded.blobs[0].digest, "held");
+        assert_eq!(loaded.blobs[0].bytes, vec![7_u8; 4096]);
+        assert_eq!(
+            loaded.blobs[0].bytes.as_ptr(),
+            held_buffer,
+            "held content was copied instead of moved into the result"
+        );
+        assert_eq!(loaded.blobs[1].digest, "deferred");
+        assert_eq!(loaded.blobs[1].bytes, b"read later");
+        assert_eq!(reader.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let refused = capture(vec![
+            DeferredBlob::held("held".into(), vec![1]),
+            DeferredBlob::deferred("gone".into(), reader.clone()),
+        ])
+        .load();
+        assert_eq!(
+            refused.err(),
+            Some(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            })
         );
     }
 
