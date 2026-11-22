@@ -138,7 +138,81 @@ async fn a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_n
     assert!(rules(&verify(rewritten.path(), Some(base.path()))).contains(&"V2"));
 }
 
+/// The findings of rule `incomplete` whose detail contains `reason`.
+fn incomplete_because(findings: &[eventlog_tree::Finding], reason: &str) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.rule == "incomplete" && finding.detail.contains(reason))
+}
+
+async fn a_base_file_that_cannot_be_read_makes_the_comparison_incomplete(layout: TreeLayout) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    written(base.path(), layout).await;
+    let tree = tempfile::tempdir().unwrap();
+    copy(base.path(), tree.path());
+
+    // Permission bits do not hold for root; each case runs only where they do.
+    let group = find(base.path(), "groups");
+    fs::set_permissions(&group, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&group).is_err() {
+        let findings = verify(tree.path(), Some(base.path()));
+        assert!(
+            incomplete_because(&findings, "a file of the base that cannot be read"),
+            "{findings:?}"
+        );
+    }
+    fs::set_permissions(&group, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let streams = base.path().join("tenants").join("tenant-a").join("streams");
+    fs::set_permissions(&streams, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&streams).is_err() {
+        let findings = verify(tree.path(), Some(base.path()));
+        assert!(
+            incomplete_because(&findings, "a directory that cannot be listed"),
+            "{findings:?}"
+        );
+    }
+    fs::set_permissions(&streams, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(verify(tree.path(), Some(base.path())), Vec::new());
+}
+
+async fn a_base_that_names_no_store_or_another_store_is_incomplete(layout: TreeLayout) {
+    let base = tempfile::tempdir().unwrap();
+    written(base.path(), layout).await;
+    let tree = tempfile::tempdir().unwrap();
+    copy(base.path(), tree.path());
+
+    let empty = tempfile::tempdir().unwrap();
+    let findings = verify(tree.path(), Some(empty.path()));
+    assert!(
+        incomplete_because(&findings, "the base names no tree store"),
+        "an empty base passed: {findings:?}"
+    );
+
+    let directory_in_place = tempfile::tempdir().unwrap();
+    copy(base.path(), directory_in_place.path());
+    let store_json = directory_in_place.path().join("store.json");
+    fs::remove_file(&store_json).unwrap();
+    fs::create_dir(&store_json).unwrap();
+    let findings = verify(tree.path(), Some(directory_in_place.path()));
+    assert!(
+        incomplete_because(&findings, "the base names no tree store"),
+        "a base whose store.json is a directory passed: {findings:?}"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    written(other.path(), layout).await;
+    let findings = verify(tree.path(), Some(other.path()));
+    assert!(
+        incomplete_because(&findings, "the base is another store"),
+        "{findings:?}"
+    );
+}
+
 each_layout!(
+    a_base_file_that_cannot_be_read_makes_the_comparison_incomplete,
+    a_base_that_names_no_store_or_another_store_is_incomplete,
     a_tree_the_store_wrote_has_no_finding,
     a_file_outside_the_layout_is_v1,
     an_event_no_group_commits_is_v3,

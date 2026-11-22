@@ -10,18 +10,27 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The rule of a finding that says the check itself is incomplete: a directory or file it had to
+/// read could not be read, or the base is not the store the tree is. It names no defect of the
+/// tree, and it is never a pass: the tree was not proved against what was asked.
+const INCOMPLETE: &str = "incomplete";
+
 /// One broken rule, with the file it was found in.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Finding {
-    /// `V1` to `V5`, as the design names them.
+    /// `V1` to `V5`, as the design names them, or `incomplete` when the check could not read a
+    /// directory or file it had to, or the base is not the tree's store. An `incomplete` finding
+    /// is never a pass.
     pub rule: &'static str,
     pub path: PathBuf,
     pub detail: String,
 }
 
 /// Check the tree at `root`: its layout (V1), torn writes (V3), digests and parents (V4) and
-/// canonical bytes (V5). When `base` names the same store as the merge base holds it, also check
-/// that no committed file was deleted or changed except by redaction (V2).
+/// canonical bytes (V5). When `base` is given, also check that no committed file was deleted or
+/// changed except by redaction (V2). The base must name the same store as `root`; a base that
+/// names another store, names none, or holds a directory or file that cannot be read is an
+/// `incomplete` finding, never a pass against a partial baseline.
 ///
 /// An empty result is a valid tree. Findings are sorted, so two runs over one tree print the same.
 #[must_use]
@@ -57,16 +66,42 @@ fn relative(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_owned()
 }
 
+fn incomplete(path: PathBuf, detail: String) -> Finding {
+    Finding {
+        rule: INCOMPLETE,
+        path,
+        detail,
+    }
+}
+
 /// Every file under `root`, relative to it, except the writer lock and `.cache/`, which are not
 /// history. The check never reads a cache: whoever can write one can write the files it names.
-fn files(root: &Path) -> Vec<PathBuf> {
+/// A directory that cannot be listed is an `incomplete` finding naming it, not an empty one.
+fn files(root: &Path, findings: &mut Vec<Finding>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_owned()];
     while let Some(directory) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                findings.push(incomplete(
+                    directory,
+                    format!("a directory that cannot be listed: {error}"),
+                ));
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    findings.push(incomplete(
+                        directory.clone(),
+                        format!("a directory that cannot be listed: {error}"),
+                    ));
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.is_dir() {
                 if path != root.join(".cache") {
@@ -88,7 +123,7 @@ fn files(root: &Path) -> Vec<PathBuf> {
 /// to an `eventlog-tree/2` store.
 fn layout(root: &Path, findings: &mut Vec<Finding>) {
     let splits = crate::layout::store_format(root).is_ok_and(StoreFormat::splits);
-    for path in files(root) {
+    for path in files(root, findings) {
         let parts: Vec<String> = path
             .components()
             .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -136,24 +171,49 @@ fn is_json(name: &str) -> bool {
         .is_some_and(|extension| extension == "json")
 }
 
+/// What `list` finds in `directory`; a directory that cannot be listed is an `incomplete`
+/// finding. An absent directory lists as empty.
+fn listed(
+    directory: &Path,
+    list: fn(&Path) -> Result<Vec<PathBuf>, eventlog_core::EventLogError>,
+    findings: &mut Vec<Finding>,
+) -> Vec<PathBuf> {
+    list(directory).unwrap_or_else(|error| {
+        findings.push(incomplete(
+            directory.to_owned(),
+            format!("a directory that cannot be listed: {error}"),
+        ));
+        Vec::new()
+    })
+}
+
 /// V5: every JSON file is in its one canonical encoding.
 fn canonical_bytes(root: &Path, findings: &mut Vec<Finding>) {
     let mut directories = vec![root.to_owned()];
-    for tenant in subdirectories(&root.join("tenants")).unwrap_or_default() {
+    for tenant in listed(&root.join("tenants"), subdirectories, findings) {
         directories.push(tenant.clone());
-        for shard in subdirectories(&tenant.join("groups")).unwrap_or_default() {
-            directories.push(shard);
-        }
-        for shard in subdirectories(&tenant.join("split-blobs")).unwrap_or_default() {
-            directories.push(shard);
-        }
-        for kind in subdirectories(&tenant.join("streams")).unwrap_or_default() {
-            directories.extend(subdirectories(&kind).unwrap_or_default());
+        directories.extend(listed(&tenant.join("groups"), subdirectories, findings));
+        directories.extend(listed(
+            &tenant.join("split-blobs"),
+            subdirectories,
+            findings,
+        ));
+        for kind in listed(&tenant.join("streams"), subdirectories, findings) {
+            directories.extend(listed(&kind, subdirectories, findings));
         }
     }
     for directory in directories {
-        for path in json_files(&directory).unwrap_or_default() {
-            let Ok(bytes) = fs::read(&path) else { continue };
+        for path in listed(&directory, json_files, findings) {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    findings.push(incomplete(
+                        path,
+                        format!("a file that cannot be read: {error}"),
+                    ));
+                    continue;
+                }
+            };
             let canonical_form = serde_json::from_slice(&bytes)
                 .ok()
                 .map(|value: serde_json::Value| canonical(&value));
@@ -176,11 +236,45 @@ fn canonical_bytes(root: &Path, findings: &mut Vec<Finding>) {
 ///   tree still serves that digest with exactly the base's bytes (the `eventlog-tree/2`
 ///   migration);
 /// - `store.json` moving from `eventlog-tree/1` to `eventlog-tree/2` with its identity unchanged.
+///
+/// The comparison is made only against a base that names the same store as `root`, and a base
+/// directory or file that cannot be read is an `incomplete` finding: a baseline with a hole in it
+/// cannot show that what the hole held is unchanged.
 fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
+    let base_identity = match store_identity(base) {
+        Ok(identity) => identity,
+        Err(why) => {
+            findings.push(incomplete(
+                base.join("store.json"),
+                format!("the base names no tree store, so nothing was compared: {why}"),
+            ));
+            return;
+        }
+    };
+    // A tree whose own `store.json` is gone or broken is compared all the same: the comparison
+    // then reports that file as deleted or changed.
+    if let Ok(identity) = store_identity(root)
+        && identity != base_identity
+    {
+        findings.push(incomplete(
+            base.join("store.json"),
+            format!(
+                "the base is another store (identity {base_identity:?}, the tree's is \
+                 {identity:?}), so nothing was compared"
+            ),
+        ));
+        return;
+    }
     let mut before: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
-    for path in files(base) {
-        if let Ok(bytes) = fs::read(base.join(&path)) {
-            before.insert(path, bytes);
+    for path in files(base, findings) {
+        match fs::read(base.join(&path)) {
+            Ok(bytes) => {
+                before.insert(path, bytes);
+            }
+            Err(error) => findings.push(incomplete(
+                base.join(&path),
+                format!("a file of the base that cannot be read: {error}"),
+            )),
         }
     }
     for (path, old) in before {
@@ -242,6 +336,18 @@ fn blob_served_alike(base: &Path, root: &Path, path: &Path) -> Option<bool> {
     let old = split::read_blob(base, &tenant, &digest).ok().flatten();
     let new = split::read_blob(root, &tenant, &digest).ok().flatten();
     Some(old.is_some() && old == new)
+}
+
+/// The identity the `store.json` under `root` declares.
+fn store_identity(root: &Path) -> Result<String, String> {
+    let bytes = fs::read(root.join("store.json")).map_err(|error| error.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "store.json is not JSON".to_owned())?;
+    value
+        .get("identity")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "store.json declares no identity".to_owned())
 }
 
 /// `store.json` changed only from `eventlog-tree/1` to `eventlog-tree/2`, keeping its identity.
