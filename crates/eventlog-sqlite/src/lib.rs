@@ -3685,6 +3685,39 @@ mod tests {
     };
 
     #[test]
+    fn capture_continuation_pages_seek_the_feed_index_on_tenant_and_position() {
+        let (inner, _) = super::Inner::in_memory("pages").expect("an in-memory store");
+        let connection = inner.connection.lock().expect("the connection");
+        let plan = |continued: bool| -> String {
+            let sql = super::capture::events_page_sql("pages", continued);
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("a plan");
+            let detail = |row: &rusqlite::Row<'_>| row.get::<_, String>(3);
+            let rows = if continued {
+                statement.query_map(rusqlite::params!["tenant", 1_000_i64, 1_000_i64], detail)
+            } else {
+                statement.query_map(rusqlite::params!["tenant", 1_000_i64], detail)
+            };
+            let details = rows
+                .expect("plan rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan details");
+            details.join(" | ")
+        };
+        let continued = plan(true);
+        assert!(
+            continued.contains("pages_events_feed (tenant_id=? AND global_seq>?)"),
+            "a continuation page filters positions instead of seeking them: {continued}"
+        );
+        let first = plan(false);
+        assert!(
+            first.contains("pages_events_feed (tenant_id=?)") && !first.contains("TEMP B-TREE"),
+            "the first page does not walk the feed index in order: {first}"
+        );
+    }
+
+    #[test]
     fn a_file_database_hashes_a_blob_again_and_an_in_memory_one_checks_its_metadata() {
         use eventlog_core::blob_integrity_sha256;
         let directory = tempfile::tempdir().expect("a scratch directory");
