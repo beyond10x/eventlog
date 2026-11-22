@@ -2743,7 +2743,7 @@ impl Inner {
         let callback_failed = Arc::new(AtomicBool::new(false));
         let result = (|| {
             for spec in projector.projections() {
-                let shadow = projection_table("eventlog_rebuild", spec.name);
+                let shadow = projection_table(REBUILD_STAGING, spec.name);
                 let columns = joined(spec.indexed.len(), |position| {
                     format!(",idx_{position} TEXT")
                 });
@@ -2774,7 +2774,7 @@ impl Inner {
                     blob_prefix: &self.prefix,
                     verified: &self.verified,
                     tracked: &self.tracked,
-                    projection_prefix: "eventlog_rebuild",
+                    projection_prefix: REBUILD_STAGING,
                     inline: &self.inline_names,
                     tenant,
                     admission: None,
@@ -2790,8 +2790,8 @@ impl Inner {
                 }
             }
             for spec in projector.projections() {
-                let active = projection_table(&self.prefix, spec.name);
-                let shadow = projection_table("eventlog_rebuild", spec.name);
+                let active = durable_projection_table(&self.prefix, spec.name);
+                let shadow = projection_table(REBUILD_STAGING, spec.name);
                 connection
                     .execute(
                         &format!("DELETE FROM {active} WHERE tenant_id=?1"),
@@ -3366,6 +3366,19 @@ fn joined(count: usize, render: impl Fn(usize) -> String) -> String {
 
 fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
+}
+
+/// Where a rebuild stages its rows: the connection's `temp` schema, named with the schema.
+///
+/// `eventlog_rebuild` is also a valid owner prefix. Unqualified, an owner of that name has live
+/// tables whose names equal the staging tables, SQLite resolves the name to `temp` first, and the
+/// publication step would empty and refill the staging table while the live view stayed as it was.
+const REBUILD_STAGING: &str = "temp.eventlog_rebuild";
+
+/// The live projection table a rebuild publishes into, named with the `main` schema so it can never
+/// resolve to a staging table of the same name.
+fn durable_projection_table(prefix: &str, name: &str) -> String {
+    format!("main.{}", projection_table(prefix, name))
 }
 
 /// The one `CREATE TABLE` body every projection table in this kit is written with.

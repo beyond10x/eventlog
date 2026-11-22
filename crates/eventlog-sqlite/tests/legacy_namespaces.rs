@@ -1,5 +1,8 @@
-//! Legacy erasure must remain confined when one SQLite file hosts several owners.
-use eventlog_core::{EventLogError, EventStore, Expected, StreamId, TenantId};
+//! Owner namespaces stay confined when one SQLite file hosts several owners: legacy erasure and
+//! rebuild staging.
+use eventlog_core::{
+    EventLogError, EventStore, Expected, InlineProjectionAdmin, StreamId, TenantId,
+};
 use eventlog_sqlite::SqliteEventStore;
 use std::sync::Arc;
 
@@ -95,4 +98,83 @@ async fn ambiguous_legacy_namespace_refuses_and_rolls_back_all_erasure() {
         )
         .expect("rolled back source and receipts");
     assert_eq!(counts, (1, 1, 1));
+}
+
+/// An owner named like the rebuild's staging prefix had its live and staging tables under one
+/// unqualified name; SQLite resolved the publication to the staging table and the rebuild reported
+/// success while the live view stayed as it was.
+#[tokio::test]
+async fn a_rebuild_publishes_into_the_live_view_when_the_owner_is_named_like_its_staging() {
+    let directory = tempfile::tempdir().expect("assigned TMPDIR");
+    let database = directory.path().join("staging-name.sqlite");
+    let path = database.to_str().expect("path");
+    let tenant = TenantId::new("staging-tenant").expect("tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "one").expect("stream");
+
+    let store = SqliteEventStore::open(path, "eventlog_rebuild")
+        .await
+        .expect("owner");
+    store
+        .create_projections(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("catch-up tables");
+    for key in ["one", "two"] {
+        store
+            .append(
+                &stream,
+                Expected::Any,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta(key, &serde_json::json!({})),
+            )
+            .await
+            .expect("append");
+    }
+    let applied = store
+        .rebuild_projection(Arc::new(eventlog_conformance::Tally), &tenant)
+        .await
+        .expect("rebuild");
+    assert_eq!(applied, 2);
+    let row = store
+        .projection_get(&eventlog_conformance::TALLY, &tenant, "item/one")
+        .await
+        .expect("readable")
+        .expect("the rebuilt row is in the live table");
+    assert_eq!(row["count"], 2);
+
+    // The inline administration rebuild stages the same way.
+    let directory = tempfile::tempdir().expect("assigned TMPDIR");
+    let database = directory.path().join("staging-name-inline.sqlite");
+    let path = database.to_str().expect("path");
+    let store = SqliteEventStore::open(path, "eventlog_rebuild")
+        .await
+        .expect("owner");
+    store
+        .register_inline(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("inline tables");
+    for key in ["one", "two"] {
+        store
+            .append(
+                &stream,
+                Expected::Any,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta(key, &serde_json::json!({})),
+            )
+            .await
+            .expect("append");
+    }
+    rusqlite::Connection::open(&database)
+        .expect("fixture connection")
+        .execute_batch("UPDATE eventlog_rebuild_p_tally SET body = json_set(body, '$.count', 99)")
+        .expect("drifted live row");
+    store
+        .rebuild_inline_projection("tally", &tenant)
+        .await
+        .expect("inline rebuild");
+    let row = store
+        .projection_get(&eventlog_conformance::TALLY, &tenant, "item/one")
+        .await
+        .expect("readable")
+        .expect("row");
+    assert_eq!(row["count"], 2, "the rebuild replaced the drifted live row");
 }
