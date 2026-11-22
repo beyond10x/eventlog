@@ -2296,10 +2296,13 @@ impl Inner {
         projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
+        // No cursor is the first page, which starts at the empty key itself: `> ''` would skip
+        // a row keyed by the empty string. A supplied cursor, even an empty one, is exclusive.
+        let bound = if after_key.is_some() { ">" } else { ">=" };
         let mut statement = guard
             .prepare(&format!(
                 "SELECT row_key, body FROM {table}
-                 WHERE tenant_id = ?1 AND row_key > ?2
+                 WHERE tenant_id = ?1 AND row_key {bound} ?2
                  ORDER BY row_key LIMIT ?3"
             ))
             .map_err(backend)?;
@@ -2856,6 +2859,7 @@ impl Inner {
         projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
+        refuse_stale_declaration(&guard, &self.prefix, projection)?;
         let mut statement = guard
             .prepare(&format!(
                 "SELECT body FROM {table}
@@ -3381,6 +3385,38 @@ fn projection_table_body(indexed: usize) -> String {
 /// The one name a declared field's index is created and recognised under.
 fn projection_index(table: &str, position: usize) -> String {
     format!("{table}_idx_{position}")
+}
+
+/// Refuse a reader whose declared field order differs from the projection's registration.
+///
+/// `idx_N` is the N-th field of the registered declaration. A reader that swaps two field names
+/// passes syntax validation, and the position taken from its declaration would query the other
+/// field's column. A projection with no registry row (a file older than the registry that no
+/// registration has touched) has nothing to compare against and is read as declared.
+fn refuse_stale_declaration(
+    connection: &Connection,
+    prefix: &str,
+    projection: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"
+            ),
+            params![projection.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let declared = serde_json::to_string(projection.indexed)
+        .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+    match recorded {
+        Some(recorded) if recorded != declared => Err(EventLogError::Invalid(format!(
+            "projection {} is read with indexed fields {declared} but registered with {recorded}",
+            projection.name
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn select_versions(
