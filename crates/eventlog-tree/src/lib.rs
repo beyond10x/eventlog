@@ -1185,28 +1185,42 @@ impl EventStore for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
-            let identity = state.engine.stream_identity(tenant).await?;
-            if !state.identities.contains(tenant.as_str()) {
-                let _lock = self.writer_lock()?;
-                let path = identity_path(&self.root, tenant.as_str());
-                // Another writer may have named this tenant first; the replay after a merge would
-                // then refuse two identities, so the first one on disk wins here too.
-                if let Ok(bytes) = fs::read(&path) {
+            if state.identities.contains(tenant.as_str()) {
+                return state.engine.stream_identity(tenant).await;
+            }
+            // Under the writer lock, before the engine makes one up: another handle may have named
+            // this tenant since this one opened, and the first identity on disk is the tenant's
+            // (the replay after a merge would refuse two).
+            let _lock = self.writer_lock()?;
+            let path = identity_path(&self.root, tenant.as_str());
+            let identity = match fs::read(&path) {
+                Ok(bytes) => {
                     let value: Value =
                         serde_json::from_slice(&bytes).map_err(|_| corrupt("tenant identity"))?;
                     let stored = value
                         .get("stream_identity")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| corrupt("tenant identity"))?;
-                    if stored != identity {
-                        state.poisoned = true;
-                        return Err(corrupt("another writer named this tenant's identity"));
+                        .ok_or_else(|| corrupt("tenant identity"))?
+                        .to_owned();
+                    // Refused only when this handle's engine already holds another identity.
+                    match state.engine.restore_stream_identity(tenant, &stored).await {
+                        Ok(()) => {}
+                        Err(EventLogError::Invalid(_)) => {
+                            state.poisoned = true;
+                            return Err(corrupt("another writer named this tenant's identity"));
+                        }
+                        Err(other) => return Err(other),
                     }
-                } else {
-                    write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
+                    stored
                 }
-                state.identities.insert(tenant.as_str().to_owned());
-            }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let identity = state.engine.stream_identity(tenant).await?;
+                    write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
+                    identity
+                }
+                Err(error) => return Err(backend(error)),
+            };
+            state.identities.insert(tenant.as_str().to_owned());
             Ok(identity)
         })
     }

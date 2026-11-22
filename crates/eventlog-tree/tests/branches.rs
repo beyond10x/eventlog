@@ -463,6 +463,30 @@ async fn a_second_handle_sees_the_first_handles_commit_before_it_writes(layout: 
     ));
 }
 
+async fn a_second_handle_adopts_the_tenant_identity_the_first_handle_wrote(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let first = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    let second = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    let tenant = TenantId::new("tenant-a").unwrap();
+    let written = first.stream_identity(&tenant).await.unwrap();
+    assert_eq!(
+        second.stream_identity(&tenant).await.unwrap(),
+        written,
+        "the second handle served an identity of its own"
+    );
+    assert_eq!(second.stream_identity(&tenant).await.unwrap(), written);
+    let other = StreamId::new(TenantId::new("tenant-b").unwrap(), "item", "y").unwrap();
+    assert_eq!(
+        second.stream_version(&other).await.unwrap(),
+        None,
+        "the second handle closed itself"
+    );
+}
+
 async fn a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     {
@@ -538,6 +562,7 @@ each_layout!(
     a_merge_expectation_on_a_linear_stream_is_refused,
     an_event_file_edited_behind_the_store_is_refused_on_open,
     a_second_handle_sees_the_first_handles_commit_before_it_writes,
+    a_second_handle_adopts_the_tenant_identity_the_first_handle_wrote,
     a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds,
     two_members_of_one_group_on_one_stream_chain_and_reopen,
 );
