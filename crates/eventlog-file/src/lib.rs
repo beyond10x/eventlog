@@ -1012,11 +1012,12 @@ impl Transaction {
         if self.inline.iter().any(|p| p.name() == projector.name()) {
             return Err(EventLogError::Invalid("projection is driven inline".into()));
         }
-        let position = *self
+        let cursor = self
             .state
             .cursors
             .get(&(tenant.as_str().into(), projector.name().into()))
-            .unwrap_or(&0);
+            .copied();
+        let position = cursor.unwrap_or(0);
         let mut events: Vec<_> = self
             .state
             .events
@@ -1041,11 +1042,16 @@ impl Transaction {
                 .await?;
         }
         let position = events.last().map_or(position, |e| e.global_seq);
-        self.record(Op::Cursor {
-            tenant: tenant.clone(),
-            name: projector.name().into(),
-            position,
-        })?;
+        // A caught-up poll whose cursor already stands at `position` records nothing, so it
+        // commits no frame: the journal grows only when the projection moves. A projector with no
+        // cursor yet still records its first one, at 0 when the tenant has no events.
+        if cursor != Some(position) {
+            self.record(Op::Cursor {
+                tenant: tenant.clone(),
+                name: projector.name().into(),
+                position,
+            })?;
+        }
         Ok(CatchUpProgress {
             applied: events.len() as u64,
             position,
@@ -3015,6 +3021,101 @@ mod stamped_resume_cost {
         assert!(
             spent.prefix_bytes_compared > 0,
             "a fresh write was not re-read: {spent:?}"
+        );
+    }
+}
+
+/// What a store costs while nothing changes: an idle projector poll and an ordinary open.
+#[cfg(test)]
+mod steady_state_cost {
+    use super::*;
+    use eventlog_conformance::{Tally, event, meta};
+    use serde_json::json;
+
+    fn tenant(case: &str) -> TenantId {
+        TenantId::new(format!("steady-{case}")).unwrap()
+    }
+
+    fn journal_length(root: &Path) -> u64 {
+        fs::metadata(root.join("events.jsonl")).unwrap().len()
+    }
+
+    /// A caught-up projector polled again commits nothing: twenty idle polls used to add twenty
+    /// cursor frames at the position the cursor already held (369 → 7,901 bytes, no event
+    /// applied). The first poll of a projector that has no cursor still records one, at 0 on a
+    /// tenant with no events, and a poll that applies events still moves it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_catch_up_polls_leave_the_journal_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        let tally = Arc::new(Tally);
+        store.create_projections(tally.clone()).await.unwrap();
+
+        let empty = tenant("empty");
+        let before = journal_length(root);
+        let first = store
+            .run_catch_up(tally.clone(), &empty, 100)
+            .await
+            .unwrap();
+        assert_eq!((first.applied, first.position), (0, 0));
+        assert!(
+            journal_length(root) > before,
+            "the first poll of a projector without a cursor records it"
+        );
+
+        let busy = tenant("busy");
+        let stream = StreamId::new(busy.clone(), "item", "one").unwrap();
+        store
+            .append(
+                &stream,
+                Expected::Any,
+                &[event("added", 1), event("added", 2)],
+                &meta("seed", &json!({ "seed": true })),
+            )
+            .await
+            .unwrap();
+        let caught = store.run_catch_up(tally.clone(), &busy, 100).await.unwrap();
+        assert_eq!(caught.applied, 2);
+
+        let length = journal_length(root);
+        let barriers = crate::cost::of(root).durability_barriers;
+        for tenant in [&empty, &busy].into_iter().cycle().take(20) {
+            let idle = store
+                .run_catch_up(tally.clone(), tenant, 100)
+                .await
+                .unwrap();
+            assert_eq!(idle.applied, 0, "an idle poll of {tenant:?}");
+        }
+        assert_eq!(
+            journal_length(root),
+            length,
+            "20 idle polls grew the journal"
+        );
+        assert_eq!(
+            crate::cost::of(root).durability_barriers - barriers,
+            0,
+            "20 idle polls committed frames"
+        );
+
+        store
+            .append(
+                &stream,
+                Expected::Any,
+                &[event("added", 3)],
+                &meta("more", &json!({ "more": true })),
+            )
+            .await
+            .unwrap();
+        let moved = store.run_catch_up(tally.clone(), &busy, 100).await.unwrap();
+        assert_eq!((moved.applied, moved.position), (1, 3));
+        drop(store);
+        let reopened = FileEventStore::open(root).await.unwrap();
+        let after = reopened.run_catch_up(tally, &busy, 100).await.unwrap();
+        assert_eq!(
+            (after.applied, after.position),
+            (0, 3),
+            "the moved cursor was committed"
         );
     }
 }
