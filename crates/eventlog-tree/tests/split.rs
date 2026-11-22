@@ -464,6 +464,75 @@ async fn a_faulty_manifest_of_another_blob_refuses_the_deletion(layout: TreeLayo
     a_manifest_fault_refuses_the_deletion_and_removes_nothing(layout, "two").await;
 }
 
+/// Move the one file under `kind` into a sibling shard directory `zz`, as a restore that put it
+/// in the wrong place would.
+fn misplace(root: &Path, kind: &str) {
+    let files = files_under(root, kind);
+    assert_eq!(files.len(), 1, "{kind}: {files:?}");
+    let shard = files[0].parent().unwrap().parent().unwrap().join("zz");
+    fs::create_dir_all(&shard).unwrap();
+    fs::rename(&files[0], shard.join(files[0].file_name().unwrap())).unwrap();
+}
+
+async fn a_blob_file_outside_its_shard_is_refused_by_open_and_reported_by_verify(
+    layout: TreeLayout,
+) {
+    for (kind, bytes) in [
+        ("blobs", b"raw bytes, not JSON".to_vec()),
+        ("split-blobs", document("one", &body("one"))),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write(root, layout, &[("sha256:one", bytes)]).await;
+        assert_eq!(verify(root, None), Vec::new());
+        misplace(root, kind);
+        let findings = verify(root, None);
+        assert!(
+            findings.iter().any(|finding| finding.rule == "V1"
+                && finding.detail.contains("outside the path its digest names")),
+            "{kind}: {findings:?}"
+        );
+        let _ = fs::remove_dir_all(root.join(".cache"));
+        let refused = TreeEventStore::open(root)
+            .await
+            .err()
+            .expect("a store whose only copy of a blob is misplaced opened");
+        assert!(
+            refused
+                .to_string()
+                .contains("outside the path its digest names"),
+            "{kind}: {refused}"
+        );
+    }
+}
+
+async fn a_group_whose_blob_was_deleted_still_opens_and_verifies(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let group = eventlog_core::AppendGroup {
+        tenant: tenant(),
+        appends: vec![eventlog_core::StreamAppend {
+            stream: StreamId::new(tenant(), "item", "x").unwrap(),
+            expected: Expected::NoStream,
+            events: vec![event("item.received", 1)],
+        }],
+        meta: meta("one", &json!({})),
+    };
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
+    eventlog_core::AtomicEventStore::append_group_guarded_with_blobs(
+        &store,
+        &group,
+        std::sync::Arc::new(eventlog_core::NoGuard),
+        &[("sha256:one".to_owned(), b"raw bytes".to_vec())],
+    )
+    .await
+    .unwrap();
+    store.delete_blob(&tenant(), "sha256:one").await.unwrap();
+    drop(store);
+    assert_eq!(verify(root, None), Vec::new());
+    assert_eq!(served(root, "sha256:one").await, None);
+}
+
 async fn verify_reports_a_blob_the_head_serves_with_other_bytes_than_its_base(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("store");
@@ -500,5 +569,7 @@ each_layout!(
     deleting_a_blob_removes_the_texts_only_it_named,
     a_faulty_manifest_of_the_deleted_blob_refuses_the_deletion,
     a_faulty_manifest_of_another_blob_refuses_the_deletion,
+    a_blob_file_outside_its_shard_is_refused_by_open_and_reported_by_verify,
+    a_group_whose_blob_was_deleted_still_opens_and_verifies,
     verify_reports_a_blob_the_head_serves_with_other_bytes_than_its_base,
 );

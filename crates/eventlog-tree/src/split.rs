@@ -526,6 +526,10 @@ fn files_under(directory: &Path) -> Result<Vec<(String, PathBuf)>, EventLogError
 }
 
 /// Every split-blob manifest of `tenant`, with the digest its file name spells.
+///
+/// # Errors
+/// Refuses a manifest that is not at the path its digest names: every reader looks a blob up at
+/// that path only, so a file elsewhere would be skipped, and its blob silently missing.
 pub(crate) fn split_files(
     root: &Path,
     tenant: &str,
@@ -535,19 +539,34 @@ pub(crate) fn split_files(
         let Some(stem) = name.strip_suffix(".json") else {
             return Err(corrupt("a split blob file"));
         };
-        found.push((crate::history::unescape(stem)?, path));
+        let digest = crate::history::unescape(stem)?;
+        if split_path(root, tenant, &digest) != path {
+            return Err(corrupt(
+                "a split blob file outside the path its digest names",
+            ));
+        }
+        found.push((digest, path));
     }
     Ok(found)
 }
 
 /// Every raw blob file of `tenant`, with the digest its file name spells.
+///
+/// # Errors
+/// Refuses a blob file that is not at the path its digest names, as [`split_files`] does.
 pub(crate) fn raw_files(
     root: &Path,
     tenant: &str,
 ) -> Result<Vec<(String, PathBuf)>, EventLogError> {
     files_under(&tenant_dir(root, tenant).join("blobs"))?
         .into_iter()
-        .map(|(name, path)| Ok((crate::history::unescape(&name)?, path)))
+        .map(|(name, path)| {
+            let digest = crate::history::unescape(&name)?;
+            if blob_path(root, tenant, &digest) != path {
+                return Err(corrupt("a blob file outside the path its digest names"));
+            }
+            Ok((digest, path))
+        })
         .collect()
 }
 

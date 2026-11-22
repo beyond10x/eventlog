@@ -128,12 +128,21 @@ fn layout(root: &Path, findings: &mut Vec<Finding>) {
             .components()
             .map(|part| part.as_os_str().to_string_lossy().into_owned())
             .collect();
-        let known = match parts
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        // A reader looks a blob up only at the path its digest names, so a blob file anywhere
+        // else is never served: the blob would be silently missing from the reopened store.
+        if let ["tenants", tenant, kind @ ("blobs" | "split-blobs"), _, file] = parts.as_slice()
+            && !file.starts_with('.')
+            && !blob_at_its_path(root, &path, tenant, file, *kind == "split-blobs")
         {
+            findings.push(Finding {
+                rule: "V1",
+                path,
+                detail: "a blob file outside the path its digest names".into(),
+            });
+            continue;
+        }
+        let known = match parts.as_slice() {
             ["store.json"] | ["tenants", _, "identity.json"] => true,
             ["tenants", _, "streams", _, _, file] => is_json(file) && !file.starts_with('.'),
             ["tenants", _, "groups", shard, file] => {
@@ -162,6 +171,31 @@ fn layout(root: &Path, findings: &mut Vec<Finding>) {
             });
         }
     }
+}
+
+/// Whether the blob file at `path` (relative to `root`), in the directory of tenant segment
+/// `tenant` and named `file`, is where the store puts the blob its name spells.
+fn blob_at_its_path(root: &Path, path: &Path, tenant: &str, file: &str, split: bool) -> bool {
+    let Ok(tenant) = history::unescape(tenant) else {
+        return false;
+    };
+    let stem = if split {
+        let Some(stem) = file.strip_suffix(".json") else {
+            return false;
+        };
+        stem
+    } else {
+        file
+    };
+    let Ok(digest) = history::unescape(stem) else {
+        return false;
+    };
+    let expected = if split {
+        split::split_path(root, &tenant, &digest)
+    } else {
+        crate::layout::blob_path(root, &tenant, &digest)
+    };
+    expected == root.join(path)
 }
 
 /// This crate names its files, always with a lower-case `.json`.

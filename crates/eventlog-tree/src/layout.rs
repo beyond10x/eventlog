@@ -181,11 +181,9 @@ pub(crate) fn group_path(root: &Path, tenant: &str, key_digest: &str) -> PathBuf
 }
 
 pub(crate) fn blob_path(root: &Path, tenant: &str, digest: &str) -> PathBuf {
-    let shard = if digest.len() >= 2 {
-        &digest[..2]
-    } else {
-        "__"
-    };
+    // The first two bytes, or `__` when there are fewer or they end inside a character: a name
+    // read back from a file may be any string, and slicing it must not panic.
+    let shard = digest.get(..2).unwrap_or("__");
     tenant_dir(root, tenant)
         .join("blobs")
         .join(segment(shard))
