@@ -589,11 +589,7 @@ impl Inner {
                     let row = if let Some((tenant, digest)) = &after {
                         transaction
                             .query_row(
-                                &format!(
-                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
-                             WHERE tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)
-                             ORDER BY tenant_id,digest LIMIT 1"
-                        ),
+                                &legacy_blob_cursor_sql(&table),
                                 params![tenant, digest],
                                 read,
                             )
@@ -3678,11 +3674,73 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
 }
 
+/// The next legacy blob after a `(tenant_id, digest)` cursor, one row per query.
+///
+/// The row-value comparison is a single range on the primary key. The expanded
+/// `tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)` form rescanned the current tenant's
+/// earlier digests on every step, quadratic in a tenant's blob count.
+fn legacy_blob_cursor_sql(table: &str) -> String {
+    format!(
+        "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+         WHERE (tenant_id, digest) > (?1, ?2)
+         ORDER BY tenant_id,digest LIMIT 1"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, recognized_sqlite_blob_shape,
+        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, legacy_blob_cursor_sql,
+        recognized_sqlite_blob_shape,
     };
+
+    #[test]
+    fn the_legacy_blob_cursor_walks_every_key_in_order_in_linear_steps() {
+        let connection = rusqlite::Connection::open_in_memory().expect("a database");
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_blobs (tenant_id TEXT NOT NULL, digest TEXT NOT NULL,
+                     bytes BLOB NOT NULL, byte_count INTEGER NOT NULL, recorded_at TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, digest));",
+            )
+            .expect("a legacy table");
+        let mut expected = Vec::new();
+        for tenant in ["a", "b"] {
+            for i in 0..512 {
+                let digest = format!("item-{i:06}");
+                connection
+                    .execute(
+                        "INSERT INTO legacy_blobs VALUES (?1, ?2, x'616263', 3, '1970-01-01T00:00:00Z')",
+                        rusqlite::params![tenant, digest],
+                    )
+                    .expect("a row");
+                expected.push((tenant.to_owned(), digest));
+            }
+        }
+        let mut statement = connection
+            .prepare(&legacy_blob_cursor_sql("legacy_blobs"))
+            .expect("a statement");
+        let mut walked = vec![expected[0].clone()];
+        loop {
+            let (tenant, digest) = walked.last().expect("a cursor").clone();
+            let next: Option<(String, String)> = rusqlite::OptionalExtension::optional(
+                statement.query_row(rusqlite::params![tenant, digest], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                }),
+            )
+            .expect("a step");
+            let Some(next) = next else { break };
+            walked.push(next);
+        }
+        assert_eq!(
+            walked, expected,
+            "every key once, in key order, across tenants"
+        );
+        let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+        // A range seek per row is a few dozen VM steps; the expanded OR predicate rescans the
+        // tenant's earlier keys and takes millions here.
+        assert!(steps < 200_000, "{steps} VM steps for 1,024 rows");
+    }
 
     #[test]
     fn a_file_database_hashes_a_blob_again_and_an_in_memory_one_checks_its_metadata() {

@@ -5,6 +5,12 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- SQLite: the populated legacy blob migration walks its `(tenant_id, digest)` cursor with one
+  row-value range on the primary key instead of an expanded `OR` that rescanned the tenant's
+  earlier digests on every row. Transaction, byte-count and integrity checks are unchanged.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security
