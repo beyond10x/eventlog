@@ -920,6 +920,9 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Cache a fold only if its observed history still exists unchanged by redaction/erasure.
     /// Returns `false` when the observation is stale; no snapshot is written in that case.
+    /// Within one generation the cached revision never moves back: a save older than the cache
+    /// leaves the newer one in place and returns `true`. A cache from an earlier generation is
+    /// always replaced.
     ///
     /// # Errors
     /// Returns a store error, or [`EventLogError::Invalid`] for unsupported implementations.
@@ -936,6 +939,10 @@ pub trait EventStore: Send + Sync + 'static {
         })
     }
 
+    /// The stream's cached fold, only while its persisted provenance still matches the stream's
+    /// history; a cache from before a redaction or erasure is never returned.
+    /// [`Repository::load`] reads it without capturing a generation, so a read writes nothing.
+    ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
     fn load_snapshot<'a>(

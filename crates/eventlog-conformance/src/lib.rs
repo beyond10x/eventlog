@@ -960,6 +960,98 @@ pub async fn run_snapshot_generations(store: std::sync::Arc<dyn EventStore>) {
     );
 }
 
+/// Exercise the cached revision: within one generation it never moves back, and a cache from an
+/// earlier generation is replaced by a save at any revision.
+///
+/// # Panics
+/// Panics when a delayed older save moves the replay point back, or when a save in a new
+/// generation cannot replace the previous generation's cache.
+pub async fn run_snapshot_revision_is_monotonic(store: &dyn EventStore) {
+    let tenant = TenantId::new("snapshot-monotonic").unwrap();
+    let stream = StreamId::new(tenant, "item", "one").unwrap();
+    let events: Vec<NewEvent> = (1..=4).map(|value| event("item.counted", value)).collect();
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &events,
+            &meta("monotonic", &json!({})),
+        )
+        .await
+        .unwrap();
+    let at = |version: u64| Snapshot {
+        version,
+        state_schema_version: 1,
+        state: json!({ "version": version }),
+        recorded_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    let observed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(3), &observed)
+            .await
+            .unwrap()
+    );
+    // A save of an older fold of the same history finishes late.
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(1), &observed)
+            .await
+            .unwrap(),
+        "an older fold of current history is not a stale observation"
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        3,
+        "the replay point does not move back within a generation"
+    );
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(4), &observed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        4
+    );
+
+    // A redaction after the cached revision starts a new generation and leaves that cache in
+    // place but unproven; the first save of the new generation replaces it whatever its revision.
+    store
+        .append(
+            &stream,
+            Expected::Exact(4),
+            &[event("item.counted", 5)],
+            &meta("monotonic-5", &json!({})),
+        )
+        .await
+        .unwrap();
+    store.redact(&stream, 5, "erased").await.unwrap();
+    assert_eq!(
+        store
+            .load_snapshot(&stream)
+            .await
+            .unwrap()
+            .map(|s| s.version),
+        None,
+        "the revision 4 cache is not proven in the new generation"
+    );
+    let renewed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    assert_ne!(renewed, observed);
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(1), &renewed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        1,
+        "a new generation replaces the previous generation's cache"
+    );
+}
+
 async fn redaction_keeps_the_place_and_drops_the_snapshot(
     store: &dyn EventStore,
     stream: &StreamId,

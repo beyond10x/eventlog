@@ -2075,11 +2075,18 @@ impl Inner {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
         let before = tracked_capture::Stamp::read(&transaction).ok();
-        let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation.as_uuid().to_string()]).map_err(backend)?;
-        if accepted == 0 {
+        let generation = generation.as_uuid().to_string();
+        // Whether the cached snapshot was proven in this generation, read before this save
+        // proves its own; the immediate transaction keeps the two in one write.
+        let Some(prior) = transaction.query_row(&format!("SELECT cached_generation FROM {prefix}_snapshot_generations WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation],|row| row.get::<_, Option<String>>(0)).optional().map_err(backend)? else {
             transaction.rollback().map_err(backend)?;
             return Ok(false);
-        }
+        };
+        let replace_any = prior.as_deref() != Some(generation.as_str());
+        transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation]).map_err(backend)?;
+        // Within one generation the cached revision only moves forward: a delayed save of an
+        // older fold must not move the replay point back. A cache from an earlier generation is
+        // not proven and is always replaced.
         transaction
             .execute(
                 &format!(
@@ -2091,7 +2098,8 @@ impl Inner {
                          version = excluded.version,
                          state_schema_version = excluded.state_schema_version,
                          state = excluded.state,
-                         recorded_at = excluded.recorded_at"
+                         recorded_at = excluded.recorded_at
+                     WHERE ?8 OR {prefix}_snapshots.version <= excluded.version"
                 ),
                 params![
                     stream.tenant().as_str(),
@@ -2101,6 +2109,7 @@ impl Inner {
                     i64::from(snapshot.state_schema_version),
                     snapshot.state.to_string(),
                     format_time(snapshot.recorded_at)?,
+                    replace_any,
                 ],
             )
             .map_err(backend)?;

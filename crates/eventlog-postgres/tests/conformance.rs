@@ -2842,6 +2842,68 @@ async fn committed_commands_survive_snapshot_storage_failure() {
     sql.batch_execute("DROP TRIGGER cache_failure_injected ON cache_failure_snapshots; DROP FUNCTION cache_failure_injected()").await.unwrap();
 }
 #[tokio::test]
+async fn loading_an_absent_aggregate_writes_no_storage_rows() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("absent_reads").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let store = std::sync::Arc::new(adapter);
+    let sql = client(&url().unwrap()).await;
+    let repository =
+        eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone());
+    let tenant = TenantId::new("tenant").unwrap();
+    for i in 0..3 {
+        assert!(
+            repository
+                .load(&tenant, &format!("absent-{i}"))
+                .await
+                .unwrap()
+                .is_new
+        );
+    }
+    assert_eq!(
+        sql.query_one(
+            "SELECT count(*) FROM absent_reads_snapshot_generations",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0,
+        "a read leaves nothing behind"
+    );
+    repository
+        .handle(
+            &tenant,
+            "present",
+            &(),
+            &eventlog_conformance::meta("present", &serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+    repository.snapshot_now(&tenant, "present").await.unwrap();
+    assert_eq!(
+        repository
+            .load(&tenant, "present")
+            .await
+            .unwrap()
+            .state
+            .total,
+        1,
+        "a read still folds from the proven cache"
+    );
+}
+#[tokio::test]
+async fn a_delayed_older_snapshot_does_not_move_the_replay_point_back() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("snapshot_monotonic").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    eventlog_conformance::run_snapshot_revision_is_monotonic(&adapter).await;
+}
+#[tokio::test]
 async fn snapshot_capture_waits_for_complete_tenant_erasure() {
     let _exclusive = EXCLUSIVE.lock().await;
     let Some(adapter) = store("snapshot_erasure").await else {

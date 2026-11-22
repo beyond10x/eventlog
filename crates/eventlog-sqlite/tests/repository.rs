@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use eventlog_core::{
-    Aggregate, Applied, CommandMeta, DomainEvent, EventLogError, EventStore, Expected, NewEvent,
-    Repository, SnapshotPolicy, StreamId, TenantId, request_hash,
+    Aggregate, Applied, Claim, CommandMeta, DomainEvent, EventLogError, EventStore, Expected,
+    NewEvent, Repository, SnapshotPolicy, StreamId, TenantId, request_hash,
 };
 use eventlog_sqlite::SqliteEventStore;
 use serde::{Deserialize, Serialize};
@@ -532,4 +532,307 @@ async fn committed_commands_survive_snapshot_storage_failure() {
         1
     );
     assert_eq!(sql.query_row("SELECT count(*) FROM cache_failure_snapshot_generations WHERE cached_generation IS NOT NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "failed cache write rolls back its proof");
+}
+
+fn claimed(key: &str, claim_key: &str) -> CommandMeta {
+    CommandMeta {
+        claim: Some(Claim::new("caller-1", claim_key, "create-digest").expect("valid claim")),
+        ..meta(key)
+    }
+}
+
+#[tokio::test]
+async fn a_claimed_retry_under_a_new_id_answers_with_the_recorded_stream() {
+    let (store, tenant) = fixture().await;
+    let repository = Repository::<Counter>::new(Arc::clone(&store) as Arc<dyn EventStore>)
+        .with_policy(SnapshotPolicy { every: 1 });
+    let first = repository
+        .handle(
+            &tenant,
+            "minted-1",
+            &Command::Add(3),
+            &claimed("create", "create"),
+        )
+        .await
+        .expect("handled");
+
+    // The caller lost the answer and retried; the owner minted a fresh id for the retry.
+    let retry = repository
+        .handle(
+            &tenant,
+            "minted-2",
+            &Command::Add(3),
+            &claimed("create", "create"),
+        )
+        .await
+        .expect("answered");
+    assert!(retry.deduplicated);
+    assert_eq!(retry.events[0].stream_id, "minted-1");
+    assert_eq!(
+        retry.state, first.state,
+        "the answer is the recorded stream's state, not its events folded into the retry id"
+    );
+    assert_eq!(retry.version, first.version);
+
+    let retry_stream = repository.stream(&tenant, "minted-2").expect("valid");
+    assert!(
+        store
+            .load_snapshot(&retry_stream)
+            .await
+            .expect("readable")
+            .is_none(),
+        "no cache is written under an id that holds no events"
+    );
+    let unwritten = repository
+        .load(&tenant, "minted-2")
+        .await
+        .expect("loadable");
+    assert!(unwritten.is_new, "the retry id still holds nothing");
+    assert_eq!(unwritten.state.total, 0);
+}
+
+#[tokio::test]
+async fn a_claim_recorded_for_another_aggregate_type_is_refused_not_folded() {
+    let (store, tenant) = fixture().await;
+    Repository::<Counter>::new(Arc::clone(&store) as Arc<dyn EventStore>)
+        .handle(
+            &tenant,
+            "minted-1",
+            &Command::Add(3),
+            &claimed("create", "create"),
+        )
+        .await
+        .expect("handled");
+    let other = Repository::<eventlog_conformance::SnapshotCounter>::new(
+        Arc::clone(&store) as Arc<dyn EventStore>
+    );
+    let error = other
+        .handle(&tenant, "minted-2", &(), &claimed("create", "create"))
+        .await
+        .expect_err("a counter's events are not a snapshot counter's history");
+    assert_eq!(
+        error,
+        EventLogError::IdempotencyMismatch {
+            key: "create".to_owned()
+        }
+    );
+}
+
+/// An aggregate whose command decides `n` events, with a per-thread count of folded events so a
+/// test can see whether a load started from a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Batch {
+    total: u64,
+}
+
+thread_local! {
+    static BATCH_FOLDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn batch_folds() -> u64 {
+    BATCH_FOLDS.with(std::cell::Cell::get)
+}
+
+impl Aggregate for Batch {
+    type Command = usize;
+    type Event = eventlog_conformance::SnapshotIncrement;
+    type Error = EventLogError;
+    const TYPE: &'static str = "batch";
+    const STATE_SCHEMA_VERSION: u32 = 1;
+    fn empty(_: &str) -> Self {
+        Self { total: 0 }
+    }
+    fn apply(&mut self, _: &Applied<'_, Self::Event>) {
+        BATCH_FOLDS.with(|folds| folds.set(folds.get() + 1));
+        self.total += 1;
+    }
+    fn decide(&self, n: &usize) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok((0..*n)
+            .map(|_| eventlog_conformance::SnapshotIncrement)
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn multi_event_commands_that_cross_the_interval_write_a_snapshot() {
+    let (store, tenant) = fixture().await;
+    let repository = Repository::<Batch>::new(Arc::clone(&store) as Arc<dyn EventStore>)
+        .with_policy(SnapshotPolicy { every: 4 });
+    // Revisions 1, 3, 5, 7, 9: no command ends on a multiple of 4.
+    for (step, n) in [1_usize, 2, 2, 2, 2].into_iter().enumerate() {
+        repository
+            .handle(&tenant, "b-1", &n, &meta(&format!("batch-{step}")))
+            .await
+            .expect("handled");
+    }
+    let stream = repository.stream(&tenant, "b-1").expect("valid");
+    let snapshot = store
+        .load_snapshot(&stream)
+        .await
+        .expect("readable")
+        .expect("crossing the interval wrote one");
+    assert_eq!(snapshot.version, 9, "written at the committed revision");
+
+    let before = batch_folds();
+    let loaded = repository.load(&tenant, "b-1").await.expect("loadable");
+    assert_eq!((loaded.version, loaded.state.total), (9, 9));
+    assert_eq!(
+        batch_folds() - before,
+        0,
+        "the load started from the snapshot"
+    );
+}
+
+#[tokio::test]
+async fn loading_an_absent_aggregate_writes_no_storage_rows() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("reads.db");
+    let store = Arc::new(
+        SqliteEventStore::open(path.to_str().expect("utf-8"), "reads")
+            .await
+            .expect("a store"),
+    );
+    let tenant = TenantId::new("tenant-a").expect("valid tenant");
+    let repository = Repository::<Batch>::new(Arc::clone(&store) as Arc<dyn EventStore>);
+    for i in 0..3 {
+        let loaded = repository
+            .load(&tenant, &format!("absent-{i}"))
+            .await
+            .expect("loadable");
+        assert!(loaded.is_new);
+    }
+    let sql = rusqlite::Connection::open(&path).expect("readable");
+    let generations: i64 = sql
+        .query_row(
+            "SELECT count(*) FROM reads_snapshot_generations",
+            [],
+            |row| row.get(0),
+        )
+        .expect("countable");
+    assert_eq!(generations, 0, "a read leaves nothing behind");
+
+    // A read still starts from a proven cache.
+    repository
+        .handle(&tenant, "present", &3, &meta("present"))
+        .await
+        .expect("handled");
+    repository
+        .snapshot_now(&tenant, "present")
+        .await
+        .expect("snapshotted");
+    let before = batch_folds();
+    let loaded = repository.load(&tenant, "present").await.expect("loadable");
+    assert_eq!(loaded.state.total, 3);
+    assert_eq!(
+        batch_folds() - before,
+        0,
+        "the load started from the snapshot"
+    );
+}
+
+#[tokio::test]
+async fn a_delayed_older_snapshot_does_not_move_the_replay_point_back() {
+    let (store, _) = fixture().await;
+    eventlog_conformance::run_snapshot_revision_is_monotonic(store.as_ref()).await;
+}
+
+/// What a concurrent writer does between this aggregate's load and its append.
+type Race = Box<dyn FnOnce() + Send>;
+static RACE: std::sync::Mutex<Option<Race>> = std::sync::Mutex::new(None);
+
+/// A counter whose `decide` runs the pending race once, so a test can commit other events after
+/// the repository loaded the stream and before it appends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Raced {
+    total: i64,
+}
+
+impl Aggregate for Raced {
+    type Command = i64;
+    type Event = Tally;
+    type Error = EventLogError;
+    const TYPE: &'static str = "raced";
+    const STATE_SCHEMA_VERSION: u32 = 1;
+    fn empty(_: &str) -> Self {
+        Self { total: 0 }
+    }
+    fn apply(&mut self, applied: &Applied<'_, Self::Event>) {
+        if let Applied::Happened {
+            event: Tally::Added(amount),
+            ..
+        } = applied
+        {
+            self.total += amount;
+        }
+    }
+    fn decide(&self, amount: &i64) -> Result<Vec<Self::Event>, Self::Error> {
+        let race = RACE.lock().expect("unpoisoned").take();
+        if let Some(race) = race {
+            race();
+        }
+        Ok(vec![Tally::Added(*amount)])
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_stream_duplicate_after_a_concurrent_write_answers_the_whole_history() {
+    let (store, tenant) = fixture().await;
+    let repository = Repository::<Raced>::new(Arc::clone(&store) as Arc<dyn EventStore>)
+        .with_policy(SnapshotPolicy { every: 3 });
+    repository
+        .handle(&tenant, "r-1", &1, &meta("r-first"))
+        .await
+        .expect("handled");
+
+    // After this caller loads revision 1, another writer commits revision 2, and a retry of this
+    // very command commits revision 3. The append then answers with the recorded revision 3.
+    let stream = repository.stream(&tenant, "r-1").expect("valid");
+    let writer = Arc::clone(&store);
+    *RACE.lock().expect("unpoisoned") = Some(Box::new(move || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                writer
+                    .append(
+                        &stream,
+                        Expected::Exact(1),
+                        &[
+                            NewEvent::new("tally.added", 1, json!({ "amount": 10 }))
+                                .expect("valid"),
+                        ],
+                        &meta("r-other"),
+                    )
+                    .await
+                    .expect("the other writer commits revision 2");
+                writer
+                    .append(
+                        &stream,
+                        Expected::Exact(2),
+                        &[NewEvent::new("tally.added", 1, json!({ "amount": 5 })).expect("valid")],
+                        &meta("r-retried"),
+                    )
+                    .await
+                    .expect("the retry commits revision 3");
+            });
+        });
+    }));
+    let outcome = repository
+        .handle(&tenant, "r-1", &5, &meta("r-retried"))
+        .await
+        .expect("answered");
+    assert!(outcome.deduplicated);
+    assert_eq!(outcome.version, 3);
+    assert_eq!(
+        outcome.state.total, 16,
+        "revision 2 is part of the answer, not skipped by folding revision 3 onto revision 1"
+    );
+    assert_eq!(
+        repository
+            .load(&tenant, "r-1")
+            .await
+            .expect("loadable")
+            .state
+            .total,
+        16,
+        "no cache of the incomplete fold was written"
+    );
 }

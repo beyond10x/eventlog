@@ -115,8 +115,18 @@ pub struct Outcome<A> {
 /// How often a fold is cached.
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotPolicy {
-    /// Write a snapshot once this many events have accumulated since the last one.
+    /// Write a snapshot once this many events have accumulated since the last one, at the
+    /// revision the command committed. Zero writes none.
     pub every: u64,
+}
+
+/// A fold, what it observed before reading, and the revision of the cache it started from.
+struct Observed<A> {
+    loaded: Loaded<A>,
+    /// Captured before any read when the caller may write a snapshot; `None` otherwise.
+    generation: Option<SnapshotGeneration>,
+    /// The snapshot revision the fold started from, 0 when it started from nothing.
+    cached: u64,
 }
 
 impl Default for SnapshotPolicy {
@@ -156,28 +166,41 @@ impl<A: Aggregate> Repository<A> {
         StreamId::new(tenant.clone(), A::TYPE, id)
     }
 
-    /// Fold one aggregate: newest snapshot, then everything after it.
+    /// Fold one aggregate: newest proven snapshot, then everything after it.
+    ///
+    /// A read writes nothing. It captures no snapshot generation, which is a durable row in the
+    /// SQL providers; it relies on [`EventStore::load_snapshot`] returning only a cache whose
+    /// provenance still matches the stream's history. Only a caller that may write a snapshot
+    /// captures a generation, before it reads anything.
     ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable, or
     /// [`EventLogError::Invalid`] when a stored body cannot be read as this aggregate's event.
     pub async fn load(&self, tenant: &TenantId, id: &str) -> Result<Loaded<A>, EventLogError> {
-        self.load_observed(tenant, id)
+        self.load_observed(tenant, id, false)
             .await
-            .map(|(loaded, _)| loaded)
+            .map(|observed| observed.loaded)
     }
 
+    /// Fold one aggregate. With `capture`, the snapshot generation is observed first, as a
+    /// snapshot write requires; without it the fold is read-only.
     async fn load_observed(
         &self,
         tenant: &TenantId,
         id: &str,
-    ) -> Result<(Loaded<A>, Option<SnapshotGeneration>), EventLogError> {
+        capture: bool,
+    ) -> Result<Observed<A>, EventLogError> {
         let stream = self.stream(tenant, id)?;
-        let generation = self.store.snapshot_generation(&stream).await?;
-        let snapshot = if generation.is_some() {
-            self.store.load_snapshot(&stream).await?
+        let (generation, snapshot) = if capture {
+            let generation = self.store.snapshot_generation(&stream).await?;
+            let snapshot = if generation.is_some() {
+                self.store.load_snapshot(&stream).await?
+            } else {
+                None
+            };
+            (generation, snapshot)
         } else {
-            None
+            (None, self.store.load_snapshot(&stream).await?)
         };
         let (mut state, mut version) = match snapshot {
             Some(snapshot) if snapshot.state_schema_version == A::STATE_SCHEMA_VERSION => {
@@ -190,6 +213,7 @@ impl<A: Aggregate> Repository<A> {
             }
             _ => (A::empty(id), 0),
         };
+        let cached = version;
         let mut seen_any = version > 0;
         loop {
             let slice = self
@@ -208,14 +232,15 @@ impl<A: Aggregate> Repository<A> {
                 break;
             }
         }
-        Ok((
-            Loaded {
+        Ok(Observed {
+            loaded: Loaded {
                 state,
                 version,
                 is_new: !seen_any,
             },
             generation,
-        ))
+            cached,
+        })
     }
 
     /// Load, decide, and write what was decided.
@@ -260,22 +285,19 @@ impl<A: Aggregate> Repository<A> {
             .recorded_command(&stream, &meta.idempotency_key, &meta.request_hash)
             .await?
         {
-            let loaded = self.load(tenant, id).await?;
-            return Ok(Outcome {
-                state: loaded.state,
-                version: loaded.version,
-                events: recorded.events,
-                deduplicated: true,
-            });
+            return Ok(self.answer_recorded(tenant, id, recorded, meta).await?);
         }
         let mut attempt = 0;
         loop {
-            let (loaded, generation) = self.load_observed(tenant, id).await?;
+            let observed = self
+                .load_observed(tenant, id, self.policy.every > 0)
+                .await?;
+            let loaded = &observed.loaded;
             let decided = loaded.state.decide(command)?;
             if decided.is_empty() {
                 return Ok(Outcome {
-                    state: loaded.state,
-                    version: loaded.version,
+                    state: observed.loaded.state,
+                    version: observed.loaded.version,
                     events: Vec::new(),
                     deduplicated: false,
                 });
@@ -292,7 +314,7 @@ impl<A: Aggregate> Repository<A> {
                 .await
             {
                 Ok(result) => {
-                    return Ok(self.finish(loaded, generation, result, tenant, id).await?);
+                    return Ok(self.finish(observed, result, tenant, id, meta).await?);
                 }
                 Err(EventLogError::Conflict { .. }) if attempt == 0 => {
                     attempt += 1;
@@ -302,14 +324,58 @@ impl<A: Aggregate> Repository<A> {
         }
     }
 
+    /// Answer a command the store had already recorded, from the stream it was recorded on.
+    ///
+    /// A tenant-wide claim matches a command recorded under another id when the owner minted a
+    /// fresh id for the retry, so the recorded events are never folded into the aggregate loaded
+    /// for this call, and nothing is cached under this call's id. A claim recorded on a stream of
+    /// another aggregate type has no state of this type to answer with and is refused.
+    async fn answer_recorded(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        recorded: AppendResult,
+        meta: &CommandMeta,
+    ) -> Result<Outcome<A>, EventLogError> {
+        let recorded_id = match recorded.events.first() {
+            None => id.to_owned(),
+            Some(event) if event.tenant == *tenant && event.stream_type == A::TYPE => {
+                event.stream_id.clone()
+            }
+            Some(_) => {
+                return Err(EventLogError::IdempotencyMismatch {
+                    key: meta
+                        .claim
+                        .as_ref()
+                        .map_or_else(|| meta.idempotency_key.clone(), |claim| claim.key.clone()),
+                });
+            }
+        };
+        let loaded = self.load(tenant, &recorded_id).await?;
+        Ok(Outcome {
+            state: loaded.state,
+            version: loaded.version,
+            events: recorded.events,
+            deduplicated: true,
+        })
+    }
+
     async fn finish(
         &self,
-        loaded: Loaded<A>,
-        generation: Option<SnapshotGeneration>,
+        observed: Observed<A>,
         result: AppendResult,
         tenant: &TenantId,
         id: &str,
+        meta: &CommandMeta,
     ) -> Result<Outcome<A>, EventLogError> {
+        if result.deduplicated {
+            return self.answer_recorded(tenant, id, result, meta).await;
+        }
+        let Observed {
+            loaded,
+            generation,
+            cached,
+        } = observed;
         let mut state = loaded.state;
         let mut version = loaded.version;
         for recorded in &result.events {
@@ -318,8 +384,10 @@ impl<A: Aggregate> Repository<A> {
                 version = recorded.version;
             }
         }
+        // A command of several events can step over every multiple of the interval, so the
+        // policy counts the events since the cache this fold started from, not the revision.
         if self.policy.every > 0
-            && version.is_multiple_of(self.policy.every)
+            && version.saturating_sub(cached) >= self.policy.every
             && let Some(generation) = generation
             && let Ok(serialized) = serde_json::to_value(&state)
         {
@@ -341,7 +409,7 @@ impl<A: Aggregate> Repository<A> {
             state,
             version,
             events: result.events,
-            deduplicated: result.deduplicated,
+            deduplicated: false,
         })
     }
 
@@ -352,7 +420,9 @@ impl<A: Aggregate> Repository<A> {
     /// or history changes during both attempts.
     pub async fn snapshot_now(&self, tenant: &TenantId, id: &str) -> Result<u64, EventLogError> {
         for _ in 0..2 {
-            let (loaded, generation) = self.load_observed(tenant, id).await?;
+            let Observed {
+                loaded, generation, ..
+            } = self.load_observed(tenant, id, true).await?;
             let generation = generation.ok_or_else(|| {
                 EventLogError::Invalid("checked snapshots are unsupported".into())
             })?;

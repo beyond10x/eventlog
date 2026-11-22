@@ -7,6 +7,25 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- Repository: a command the store answers as already recorded is answered from the stream it was
+  recorded on. A tenant-wide claim retried under a freshly minted id used to fold the original
+  stream's events into the retry id's aggregate and could cache that state under the retry id;
+  the outcome now carries the recorded stream's state, nothing is cached for the retry id, and a
+  claim recorded on a stream of another aggregate type is refused with `IdempotencyMismatch`.
+  The same holds on one stream: a duplicate answered after other writers moved the stream past
+  the revision this call loaded no longer skips their events.
+- Repository: `load` is read-only. It no longer captures a snapshot generation, which wrote a
+  durable generation row for every absent stream read on SQLite and PostgreSQL. It still starts
+  from a cache only when the provider's provenance check accepts it; `handle` captures a
+  generation only when its policy can write a snapshot, and `snapshot_now` always does.
+- Repository: automatic snapshots count the events since the cache a command started from, and
+  write at the committed revision. A command of several events used to step over the exact
+  multiple and skip the snapshot, so a stream of two-event commands could be folded from zero on
+  every command. The generation check is unchanged.
+- SQLite and PostgreSQL: within one snapshot generation the cached revision never moves back. A
+  delayed checked save of an older fold used to replace a newer cache and move the replay point
+  back; it now leaves the newer cache and returns `true`. A cache from an earlier generation is
+  still replaced at any revision. Shared exercise `run_snapshot_revision_is_monotonic`.
 - SQLite: the populated legacy blob migration walks its `(tenant_id, digest)` cursor with one
   row-value range on the primary key instead of an expanded `OR` that rescanned the tenant's
   earlier digests on every row. Transaction, byte-count and integrity checks are unchanged.
