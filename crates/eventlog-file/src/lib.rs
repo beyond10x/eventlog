@@ -881,13 +881,20 @@ impl Transaction {
         self.binds = true;
         let directory = self.root.join("blobs");
         let mut fresh: Vec<(Blob, String)> = Vec::new();
+        // The digests `fresh` already binds, each to its entry there: `fresh` keeps the batch's
+        // order for the frame, and this answers membership without scanning it, so a batch of n
+        // new digests costs O(n log n) comparisons rather than n(n-1)/2.
+        let mut seen: std::collections::BTreeMap<BatchDigest<'_>, usize> =
+            std::collections::BTreeMap::new();
+        #[cfg(test)]
+        let compared = batch_digest::compared();
         let mut objects: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
         for (digest, bytes) in blobs {
             validate_field("blob digest", digest)?;
             // A digest repeated inside one batch binds once, and disagrees with itself exactly as
             // it would disagree with a binding the committed history already carries.
-            if let Some((earlier, _)) = fresh.iter().find(|(_, name)| name == digest) {
-                if earlier.hash != hash(bytes) {
+            if let Some(&index) = seen.get(&BatchDigest(digest)) {
+                if fresh[index].0.hash != hash(bytes) {
                     return Err(EventLogError::Invalid(
                         "blob digest already names different content".into(),
                     ));
@@ -909,7 +916,14 @@ impl Transaction {
             // This handle hashed these exact bytes; a write that does not commit forgets them.
             self.content.remember(&blob.hash, bytes);
             objects.push((blob.id.clone(), directory.join(&blob.id), bytes.clone()));
+            seen.insert(BatchDigest(digest), fresh.len());
             fresh.push((blob, digest.clone()));
+        }
+        drop(seen);
+        #[cfg(test)]
+        {
+            let compared = batch_digest::compared() - compared;
+            cost::charge(&self.root, |cost| cost.digest_comparisons += compared);
         }
         if fresh.is_empty() {
             return Ok(());
@@ -1198,6 +1212,51 @@ fn complete(
         tx.object(&TenantId::new(tenant)?, digest, false)?;
     }
     Ok(tx)
+}
+
+/// A blob digest as [`Transaction::bind_blobs`] indexes one batch by it.
+///
+/// Its own type so a test build can count the comparisons the index makes: every equality and
+/// ordering goes through [`Ord::cmp`] below, which charges the thread's tally. The count is made
+/// by the comparison itself, so an index that compared more would charge more.
+struct BatchDigest<'a>(&'a str);
+
+impl Ord for BatchDigest<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(test)]
+        batch_digest::charge();
+        self.0.cmp(other.0)
+    }
+}
+impl PartialOrd for BatchDigest<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for BatchDigest<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for BatchDigest<'_> {}
+
+/// Comparisons between [`BatchDigest`]s made on this thread. Test-only. `bind_blobs` reads it
+/// before and after its synchronous loop and charges the difference to the store root.
+#[cfg(test)]
+mod batch_digest {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COMPARED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn charge() {
+        COMPARED.with(|compared| compared.set(compared.get() + 1));
+    }
+
+    pub(super) fn compared() -> u64 {
+        COMPARED.with(Cell::get)
+    }
 }
 
 /// One store root, resolved the same way for the ordinary opener and the read-only handle.
@@ -3206,6 +3265,90 @@ mod steady_state_cost {
         assert_eq!(
             reopened.get_blob(&owner, "kept").await.unwrap().as_deref(),
             Some(&b"kept"[..])
+        );
+    }
+
+    fn blob_group(owner: &TenantId, key: &str) -> AppendGroup {
+        AppendGroup {
+            tenant: owner.clone(),
+            meta: meta(key, &json!({ "key": key })),
+            appends: vec![eventlog_core::StreamAppend {
+                stream: StreamId::new(owner.clone(), "item", key).unwrap(),
+                expected: Expected::NoStream,
+                events: vec![event("added", 1)],
+            }],
+        }
+    }
+
+    fn object_files(root: &Path) -> usize {
+        fs::read_dir(root.join("blobs")).map_or(0, Iterator::count)
+    }
+
+    /// A batch of new digests finds the ones it already binds through an index, not by scanning
+    /// every earlier entry: 512 distinct digests cost 130,816 comparisons scanned pairwise
+    /// (1,024 cost 523,776). The index keeps the batch's rules: a digest repeated with the same
+    /// bytes binds once, and one repeated with different bytes refuses the whole group.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_batch_finds_repeated_digests_without_scanning_the_batch() {
+        const DISTINCT: u64 = 512;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let owner = tenant("batch-index");
+        let store = FileEventStore::open(root).await.unwrap();
+
+        let batch: Vec<_> = (0..DISTINCT)
+            .map(|i| (format!("digest-{i:04}"), i.to_le_bytes().to_vec()))
+            .collect();
+        let before = crate::cost::of(root).digest_comparisons;
+        store
+            .append_group_with_blobs(&blob_group(&owner, "distinct"), &batch)
+            .await
+            .unwrap();
+        let compared = crate::cost::of(root).digest_comparisons - before;
+        assert!(compared > 0, "the batch index compared nothing");
+        // Well under the n(n-1)/2 = 130,816 of a pairwise scan; a B-tree lookup plus insert per
+        // digest stays far below 64 comparisons each at this size.
+        assert!(
+            compared <= 64 * DISTINCT,
+            "{DISTINCT} distinct digests took {compared} comparisons"
+        );
+        assert_eq!(object_files(root), usize::try_from(DISTINCT).unwrap());
+
+        let repeated = vec![
+            ("same".to_owned(), b"one".to_vec()),
+            ("other".to_owned(), b"two".to_vec()),
+            ("same".to_owned(), b"one".to_vec()),
+        ];
+        store
+            .append_group_with_blobs(&blob_group(&owner, "repeated"), &repeated)
+            .await
+            .unwrap();
+        assert_eq!(
+            object_files(root),
+            usize::try_from(DISTINCT).unwrap() + 2,
+            "a digest repeated with the same bytes binds once"
+        );
+
+        let differing = vec![
+            ("fresh".to_owned(), b"first".to_vec()),
+            ("second".to_owned(), b"second".to_vec()),
+            ("fresh".to_owned(), b"changed".to_vec()),
+        ];
+        let refused = store
+            .append_group_with_blobs(&blob_group(&owner, "differing"), &differing)
+            .await
+            .expect_err("a digest repeated with different bytes refuses");
+        assert!(
+            matches!(&refused, EventLogError::Invalid(reason)
+                if reason == "blob digest already names different content"),
+            "{refused:?}"
+        );
+        assert_eq!(store.get_blob(&owner, "fresh").await.unwrap(), None);
+        assert_eq!(store.get_blob(&owner, "second").await.unwrap(), None);
+        assert_eq!(
+            object_files(root),
+            usize::try_from(DISTINCT).unwrap() + 2,
+            "the refused group left objects behind"
         );
     }
 

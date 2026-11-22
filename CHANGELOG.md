@@ -18,6 +18,9 @@ under bare-version tags such as `0.1.0`.
 - File: a commit that binds or unbinds no blob no longer lists and synchronizes the blob directory.
   Objects a crash leaves behind are disposed of by the next commit that changes bindings and by the
   complete opener.
+- File: a blob batch finds digests it already binds through an index instead of scanning the batch,
+  so 1,024 distinct digests no longer cost 523,776 comparisons. A repeated digest with different
+  bytes still refuses the group.
 
 ## 0.9.4 — 2026-11-11
 

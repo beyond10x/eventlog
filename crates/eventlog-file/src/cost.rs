@@ -70,6 +70,10 @@ pub(crate) struct Cost {
     /// not. It is the number of object-level synchronizations, not the process's `fsync` total:
     /// the commit sequence's own synchronizations are charged as `durability_barriers`.
     pub object_syncs: u64,
+    /// Comparisons between digests of one blob batch made to find a digest the batch already
+    /// binds. Charged by the comparisons themselves (`crate::BatchDigest`'s `Ord`), so a lookup
+    /// that scans the batch charges every entry it passes.
+    pub digest_comparisons: u64,
 }
 
 impl std::ops::Sub for Cost {
@@ -85,6 +89,7 @@ impl std::ops::Sub for Cost {
             blobs_hashed: self.blobs_hashed - earlier.blobs_hashed,
             durability_barriers: self.durability_barriers - earlier.durability_barriers,
             object_syncs: self.object_syncs - earlier.object_syncs,
+            digest_comparisons: self.digest_comparisons - earlier.digest_comparisons,
         }
     }
 }
