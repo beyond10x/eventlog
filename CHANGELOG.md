@@ -5,6 +5,11 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- PostgreSQL: a redaction or tenant erasure whose deadline fires after `COMMIT` was sent returns
+  `UnknownCommit` instead of `Deadline`, as append does; the change may have been applied.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security

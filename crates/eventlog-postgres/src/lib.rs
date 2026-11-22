@@ -317,6 +317,26 @@ impl PostgresEventStore {
         })
     }
 
+    /// [`Self::bounded`] for a write that commits. `write` is handed the flag it sets right
+    /// before sending `COMMIT`: a deadline that fires after that cannot say whether the change was
+    /// applied and reports [`EventLogError::UnknownCommit`], as append does ([`timed_out_write`]);
+    /// one that fires before it reports the deadline.
+    fn bounded_commit<'a, T: Send + 'a, F>(
+        &'a self,
+        write: impl FnOnce(Arc<AtomicBool>) -> F,
+    ) -> BoxFuture<'a, Result<T, EventLogError>>
+    where
+        F: std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
+    {
+        let commit_started = Arc::new(AtomicBool::new(false));
+        let write = write(Arc::clone(&commit_started));
+        Box::pin(async move {
+            tokio::time::timeout(self.pool.options.transaction_timeout, write)
+                .await
+                .map_err(|_| timed_out_write(&commit_started))?
+        })
+    }
+
     /// Drop this owner's tables, cursors included. For test setup only.
     ///
     /// Leaving the cursors behind is not a small omission: a cursor that outlives its events sits
@@ -728,7 +748,7 @@ impl EventStore for PostgresEventStore {
         version: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
-        self.bounded(async move {
+        self.bounded_commit(move |commit_started| async move {
             validate_field("redaction reason", reason)?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
@@ -782,6 +802,7 @@ impl EventStore for PostgresEventStore {
                 to_i64(version)?,
             )
             .await?;
+            commit_started.store(true, Ordering::Release);
             transaction
                 .commit()
                 .await
@@ -913,7 +934,7 @@ impl EventStore for PostgresEventStore {
         &'a self,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.forgetting(self.bounded(async move {
+        self.forgetting(self.bounded_commit(move |commit_started| async move {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -970,6 +991,7 @@ impl EventStore for PostgresEventStore {
                 )
                 .await
                 .map_err(backend)?;
+            commit_started.store(true, Ordering::Release);
             transaction
                 .commit()
                 .await
