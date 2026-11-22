@@ -578,13 +578,15 @@ pub fn validate_effect_boundary_inventory(
 
 /// A stable digest of a command body, for the idempotency check.
 ///
+/// The compact JSON bytes are written straight into the hasher: the same bytes `to_vec` would
+/// produce, without holding a copy of the whole body.
+///
 /// # Errors
 /// Returns [`EventLogError::Invalid`] when the value cannot be serialised.
 pub fn request_hash<T: Serialize>(value: &T) -> Result<String, EventLogError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| EventLogError::Invalid(format!("command is not serialisable: {error}")))?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    serde_json::to_writer(&mut hasher, value)
+        .map_err(|error| EventLogError::Invalid(format!("command is not serialisable: {error}")))?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
