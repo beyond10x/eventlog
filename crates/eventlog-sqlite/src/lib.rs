@@ -538,10 +538,14 @@ impl Inner {
                  indexed_fields TEXT NOT NULL
              );
              {}
+             {}
+             {}
              {}",
             atomic_group::ddl(prefix),
             origins_ddl(prefix),
-            atomic_group::batches_ddl(prefix)
+            atomic_group::batches_ddl(prefix),
+            capture::malformed_tenant_index(&format!("{prefix}_identity")),
+            capture::malformed_tenant_index(&format!("{prefix}_events")),
         );
         let mut connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
