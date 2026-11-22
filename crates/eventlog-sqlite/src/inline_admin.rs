@@ -194,6 +194,8 @@ impl Inner {
                     events.push(event);
                 }
             }
+            #[cfg(feature = "kpi-counters")]
+            crate::kpi::rebuild_retained(events.len());
             validate_captured_order(tenant, &events).map_err(capture_error)?;
             let mut projections = SqliteProjections {
                 connection: &mut connection,

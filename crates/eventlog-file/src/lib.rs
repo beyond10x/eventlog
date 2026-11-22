@@ -8,6 +8,8 @@ mod cost;
 mod inline_admin;
 mod inspection;
 mod journal;
+#[cfg(feature = "kpi-counters")]
+pub mod kpi;
 pub use inspection::FileHistoryInspector;
 #[cfg(test)]
 mod measure_segmented;
@@ -987,6 +989,8 @@ impl Transaction {
         let live: BTreeSet<_> = self.state.blobs.values().map(|b| b.id.as_str()).collect();
         for entry in fs::read_dir(&directory).map_err(backend)? {
             let entry = entry.map_err(backend)?;
+            #[cfg(feature = "kpi-counters")]
+            kpi::blob_dir_entry();
             let name = entry.file_name();
             let name = name
                 .to_str()
@@ -999,6 +1003,8 @@ impl Transaction {
                 fs::remove_file(entry.path()).map_err(backend)?;
             }
         }
+        #[cfg(feature = "kpi-counters")]
+        kpi::blob_dir_sync();
         fs::File::open(directory)
             .and_then(|f| f.sync_all())
             .map_err(backend)
@@ -1561,10 +1567,10 @@ impl EventStore for FileEventStore {
         let tenant = tenant.clone();
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
-                let mut events: Vec<_> = tx
-                    .state
-                    .events
-                    .values()
+                let values = tx.state.events.values();
+                #[cfg(feature = "kpi-counters")]
+                let values = values.inspect(|_| kpi::feed_visit());
+                let mut events: Vec<_> = values
                     .filter(|e| e.tenant == tenant && e.global_seq > after)
                     .take(bounded_limit(limit) + 1)
                     .cloned()

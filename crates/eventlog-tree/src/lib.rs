@@ -47,6 +47,8 @@
 mod copy;
 mod fold;
 mod history;
+#[cfg(feature = "kpi-counters")]
+pub mod kpi;
 mod layout;
 mod migrate;
 mod split;

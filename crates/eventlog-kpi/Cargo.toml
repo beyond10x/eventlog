@@ -1,0 +1,38 @@
+[package]
+name = "eventlog-kpi"
+description = "The KPI gate: deterministic work counters against a committed baseline, and timing A/B between two revisions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[features]
+counters = [
+    "eventlog-file/kpi-counters",
+    "eventlog-sqlite/kpi-counters",
+    "eventlog-tree/kpi-counters",
+    "dep:stats_alloc",
+]
+
+[dependencies]
+clap.workspace = true
+eventlog-conformance.workspace = true
+eventlog-core.workspace = true
+eventlog-file = { path = "../eventlog-file" }
+eventlog-postgres.workspace = true
+eventlog-sqlite.workspace = true
+eventlog-tree.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+stats_alloc = { version = "=0.1.10", optional = true }
+tempfile.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
+tokio-postgres.workspace = true
+
+[lints]
+workspace = true

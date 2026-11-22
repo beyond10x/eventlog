@@ -18,6 +18,9 @@ serde_json = { workspace = true, features = ["raw_value"] }
 time.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
+[features]
+kpi-counters = ["rusqlite/trace"]
+
 [dev-dependencies]
 # `hooks` lets a unit test count the commits, and so the WAL barriers, one call takes.
 rusqlite = { workspace = true, features = ["hooks"] }

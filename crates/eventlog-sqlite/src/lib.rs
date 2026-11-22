@@ -16,6 +16,8 @@ mod capture;
 mod durable_capture;
 mod inline_admin;
 mod inspection;
+#[cfg(feature = "kpi-counters")]
+pub mod kpi;
 mod tracked_capture;
 mod verified;
 pub use inspection::SqliteHistoryInspector;
@@ -351,6 +353,12 @@ impl Inner {
     }
 
     fn new(connection: Connection, prefix: &str) -> Self {
+        #[cfg(feature = "kpi-counters")]
+        let connection = {
+            let mut connection = connection;
+            kpi::instrument(&mut connection);
+            connection
+        };
         Self {
             connection: Mutex::new(connection),
             prefix: prefix.to_owned(),

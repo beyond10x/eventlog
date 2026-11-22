@@ -5,6 +5,13 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- KPI gate: `kpi/kpis.json` defines deterministic work counters and timings per provider,
+  `kpi/baseline.json` records them, and the `eventlog-kpi` runner checks the counters
+  (`bash scripts/gate.sh --kpi`) and A/B-compares timings between two revisions. The providers'
+  counters exist only behind the non-default `kpi-counters` feature; no public API changes.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security

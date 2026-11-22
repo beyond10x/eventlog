@@ -277,6 +277,8 @@ impl EventRecord {
 
     /// The digest that names the file and that children name as their parent.
     pub fn digest(&self) -> Result<String, EventLogError> {
+        #[cfg(feature = "kpi-counters")]
+        crate::kpi::event_digest();
         Ok(sha256_hex(&canonical(&self.envelope()?)))
     }
 
@@ -413,6 +415,8 @@ pub(crate) fn group_files(root: &Path) -> Result<BTreeSet<PathBuf>, EventLogErro
             found.extend(json_files(&shard)?);
         }
     }
+    #[cfg(feature = "kpi-counters")]
+    crate::kpi::group_files_listed(found.len());
     Ok(found)
 }
 

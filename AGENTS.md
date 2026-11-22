@@ -92,8 +92,9 @@ bash scripts/gate.sh
 
 The compatibility shell entry point delegates argument parsing and selection to the Rust `gate`
 example. In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --locked -- -D warnings`.
-Green here is the bar for `main`.
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and the same clippy for
+`eventlog-kpi --features counters`, which compiles the providers' KPI counters.
+Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate).
 
 The required shared Gates check covers common security/privacy rules. Install coordinated local
 hooks with `b10x-gates --repository beyond10x/eventlog install`; they inspect the index, messages
@@ -121,6 +122,39 @@ pipeline's (`gate.sh 2>&1 | tail` reports `tail`'s status, not the gate's).
 Gates enforces forbidden identifiers through a private policy overlay. Exceptions require an exact
 rule, bounded location and content digest in trusted policy. Candidate ignore files and inline
 suppression comments cannot disable organization rules.
+
+## The KPI gate
+
+What the kit costs is part of what must not break. `kpi/kpis.json` defines every KPI (id, what it
+measures, unit, direction, fixture, tolerance) and `kpi/baseline.json` holds the recorded numbers.
+The runner is `crates/eventlog-kpi` (`publish = false`).
+
+- **Counters** are deterministic work counts on small fixtures: bytes read and written
+  (`/proc/self/io`), SQLite VM steps, fold calls, feed map visits, blob-directory entries, Tree
+  group files and digests, snapshot-generation rows, allocation bytes, PostgreSQL round trips
+  (a counting proxy), write transactions (transaction ids) and buffers (`EXPLAIN ANALYZE`).
+  `bash scripts/gate.sh --kpi` compares each with the baseline and fails on a regression beyond
+  its tolerance. This is the gate.
+- **Timings** (latency p50/p95, batch throughput) are never compared with a number from another
+  machine. `eventlog-kpi ab --base <rev> --head <rev>` builds both revisions with the current
+  runner, runs them interleaved for several rounds on the same machine and fails when a median
+  is worse than `ab.max_ratio`. The baseline's timings are the recording machine's, for reading.
+- Counters inside a provider (`eventlog-file`, `eventlog-sqlite`, `eventlog-tree`, module `kpi`)
+  compile only with their non-default `kpi-counters` feature, enabled by the runner's `counters`
+  feature; no product build carries them. A change that rewrites a counted path keeps its
+  counter call in the rewritten code. The PostgreSQL `EXPLAIN` KPIs run a copy of the library's
+  feed and capture-preflight statements (`crates/eventlog-kpi/src/counter.rs`); a change to
+  either statement changes the copy in the same commit.
+- Allocation counts use `stats_alloc` (the workspace forbids the `unsafe` a counting allocator
+  needs), linked only with `counters`.
+- PostgreSQL KPIs run only with `EVENTLOG_TEST_POSTGRES_URL` set and say so when skipped.
+- An improvement beyond tolerance is reported, not ratcheted. Re-record in the same change, on a
+  quiet machine with a disposable PostgreSQL:
+  `cargo run --release --locked -p eventlog-kpi --features counters -- record`. Never edit the
+  baseline by hand and never re-record to absorb a regression.
+- CI: the `KPI gate` job of `.github/workflows/kpi.yml` runs the counters and, on a pull request,
+  the A/B against the base. A change of only `.engineering/` or Markdown skips it
+  (`eventlog-kpi ci-scope`).
 
 ## Releases
 

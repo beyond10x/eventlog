@@ -6,6 +6,7 @@ members = [
     "crates/eventlog-conformance",
     "crates/eventlog-file",
     "crates/eventlog-tree",
+    "crates/eventlog-kpi",
 ]
 resolver = "3"
 # `ess generate types` writes the capture crate with its own `[workspace]` table, so it is a path
