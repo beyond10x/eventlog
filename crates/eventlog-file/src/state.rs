@@ -160,6 +160,14 @@ impl Events {
             .filter_map(|(_, position)| self.by_position.get(position))
             .map(visit)
     }
+    /// Every event past global position `after`, in global order. Visits none at or before it,
+    /// so a reader that pages through the store pays for each page and not for what it already
+    /// read; events of other tenants past `after` are still visited.
+    pub fn after(&self, after: u64) -> impl Iterator<Item = &RecordedEvent> {
+        self.by_position
+            .range((Bound::Excluded(after), Bound::Unbounded))
+            .map(|(_, event)| visit(event))
+    }
     /// Every event in global order: the tenant-wide reads, which pay for the whole store.
     pub fn values(&self) -> impl DoubleEndedIterator<Item = &RecordedEvent> + ExactSizeIterator {
         self.by_position.values().map(visit)
@@ -789,5 +797,68 @@ mod tests {
                 "turn {turn}: the events"
             );
         }
+    }
+
+    /// Paging a tenant's feed visits each page, plus the one event it reads past to know whether
+    /// more follow, and none of the events earlier pages already returned. A scan from the start
+    /// of the store visited `8k + 9` events for page `k`: 1,103 for these 16 pages of 8.
+    ///
+    /// A caught-up projector polls the same way, from its cursor, so an idle poll visits nothing.
+    #[tokio::test]
+    async fn feed_pages_and_idle_catch_up_visit_only_events_past_the_requested_position() {
+        const EVENTS: u64 = 128;
+        const PAGE: usize = 8;
+        let root = tempfile::tempdir().unwrap();
+        let tenant = tenant("feed-page");
+        let store = FileEventStore::open(root.path()).await.unwrap();
+        let events: Vec<_> = (0..EVENTS)
+            .map(|i| event("added", i64::try_from(i).unwrap()))
+            .collect();
+        store
+            .append(
+                &stream(&tenant, 0),
+                Expected::Any,
+                &events,
+                &meta("batch", &json!({ "count": EVENTS })),
+            )
+            .await
+            .unwrap();
+
+        let before = visits::of(&tenant);
+        let (mut cursor, mut pages, mut positions) = (0, 0_u64, Vec::new());
+        loop {
+            let page = store.read_feed(&tenant, cursor, PAGE).await.unwrap();
+            pages += 1;
+            positions.extend(page.events.iter().map(|e| e.global_seq));
+            cursor = page.next_position;
+            if !page.has_more {
+                break;
+            }
+        }
+        let visited = visits::of(&tenant) - before;
+        assert_eq!(pages, EVENTS / PAGE as u64);
+        assert_eq!(
+            positions,
+            (1..=EVENTS).collect::<Vec<_>>(),
+            "every event once, in order"
+        );
+        // Every page but the last reads one event past itself.
+        assert_eq!(visited, EVENTS + pages - 1, "{pages} feed pages visited");
+
+        let tally = std::sync::Arc::new(eventlog_conformance::Tally);
+        store.create_projections(tally.clone()).await.unwrap();
+        let caught = store
+            .run_catch_up(tally.clone(), &tenant, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(caught.applied, EVENTS);
+        let before = visits::of(&tenant);
+        let idle = store.run_catch_up(tally, &tenant, 1_000).await.unwrap();
+        assert_eq!(idle.applied, 0);
+        assert_eq!(
+            visits::of(&tenant) - before,
+            0,
+            "an idle poll from the cursor"
+        );
     }
 }

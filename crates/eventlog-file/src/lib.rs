@@ -1020,8 +1020,8 @@ impl Transaction {
         let mut events: Vec<_> = self
             .state
             .events
-            .values()
-            .filter(|e| &e.tenant == tenant && e.global_seq > position)
+            .after(position)
+            .filter(|e| &e.tenant == tenant)
             .take(bounded_limit(batch) + 1)
             .cloned()
             .collect();
@@ -1564,8 +1564,8 @@ impl EventStore for FileEventStore {
                 let mut events: Vec<_> = tx
                     .state
                     .events
-                    .values()
-                    .filter(|e| e.tenant == tenant && e.global_seq > after)
+                    .after(after)
+                    .filter(|e| e.tenant == tenant)
                     .take(bounded_limit(limit) + 1)
                     .cloned()
                     .collect();

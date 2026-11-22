@@ -5,6 +5,12 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Performance
+
+- File: `read_feed` and catch-up start at the requested position instead of walking the store
+  from its first event. Paging 128 events in pages of 8 visits 143 events instead of 1,103, and an
+  idle catch-up poll visits none.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security
