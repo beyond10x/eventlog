@@ -13,6 +13,8 @@ under bare-version tags such as `0.1.0`.
 - File: an idle `run_catch_up` poll whose cursor is already current commits nothing. Twenty idle
   polls used to add twenty journal frames (369 to 7,901 bytes); a projector without a cursor still
   records its first one.
+- File: opening a store reads, chains and replays its journal once instead of twice, under the
+  writer lock of that open; recovery, snapshot and object disposal and object hashing are unchanged.
 
 ## 0.9.4 — 2026-11-11
 

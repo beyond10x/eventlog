@@ -157,27 +157,39 @@ impl FileEventStore {
     ) -> Result<Self, EventLogError> {
         let root = root_path(path)?;
         let path = root.clone();
-        let journal = blocking(move || match layout {
-            Some(layout) => Journal::open_with_layout(&path, layout),
-            None => Journal::open_existing(&path),
+        let permit = AdmissionPermit::default();
+        let content: Arc<VerifiedContent> = Arc::default();
+        let (opener_permit, opener_content) = (permit.clone(), Arc::clone(&content));
+        // One complete transaction over the journal this open verified, under the writer lock that
+        // open took: it replays the whole history once, hashes every active object and disposes
+        // of what nothing references, then leaves its view as the handle's verified cache. The
+        // lock is released only when that view is taken apart below.
+        let (manifest, transactions, state, kept) = blocking(move || {
+            let journal = match layout {
+                Some(layout) => Journal::open_with_layout(&path, layout),
+                None => Journal::open_existing(&path),
+            }?;
+            let tx = complete(&path, journal, Vec::new(), opener_permit, opener_content)?;
+            let state = tx.state;
+            let (manifest, transactions, kept) = tx.journal.into_parts();
+            Ok((manifest, transactions, state, kept))
         })
         .await?;
-        State::replay(&journal.transactions)?;
-        let observed = Some(journal.manifest.clone());
-        drop(journal);
-        let store = Self {
+        Ok(Self {
             root,
             runtime: Mutex::new(Runtime {
-                observed,
+                observed: Some(manifest.clone()),
+                verified: Some(Verified {
+                    manifest,
+                    transactions,
+                    state,
+                    content: kept,
+                }),
                 ..Runtime::default()
             }),
-            permit: AdmissionPermit::default(),
-            content: Arc::default(),
-        };
-        // The cache starts empty, so this transaction is the complete one: it rereads and chains
-        // the whole history, hashes every active object and disposes of what nothing references.
-        store.transaction(|_| Box::pin(async { Ok(()) })).await?;
-        Ok(store)
+            permit,
+            content,
+        })
     }
     async fn transaction<T, F>(&self, work: F) -> Result<T, EventLogError>
     where
@@ -1137,6 +1149,22 @@ fn enter(
         ));
     }
     journal.adopt(reader);
+    complete(root, journal, inline, permit, content)
+}
+
+/// The complete transaction over a journal opened from scratch: replay its whole history once,
+/// dispose of snapshots and objects nothing references, and hash every active object.
+///
+/// Shared by [`enter`]'s complete path and by [`FileEventStore::open_with_creation`], which hands
+/// in the journal it has just opened — still holding the writer lock taken by that open and with
+/// any pending intent already recovered — instead of dropping it and opening it again.
+fn complete(
+    root: &Path,
+    journal: Journal,
+    inline: Vec<Arc<dyn Projector>>,
+    permit: AdmissionPermit,
+    content: Arc<VerifiedContent>,
+) -> Result<Transaction, EventLogError> {
     let tx = Transaction {
         state: State::replay(&journal.transactions)?,
         journal,
@@ -3116,6 +3144,66 @@ mod steady_state_cost {
             (after.applied, after.position),
             (0, 3),
             "the moved cursor was committed"
+        );
+    }
+
+    /// Opening an existing store chains its history once. The opener used to verify and replay
+    /// the journal, drop it, and open and replay it again in a complete transaction: two passes
+    /// over the same bytes on every ordinary open. Every active object is still hashed once, and
+    /// the next transaction resumes from the view the open verified instead of opening again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_an_existing_store_chains_its_history_once() {
+        const FRAMES: u64 = 8;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let owner = tenant("open");
+        let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
+        {
+            let store = FileEventStore::open(root).await.unwrap();
+            store.put_blob(&owner, "blob-1", b"bytes").await.unwrap();
+            for frame in 1..FRAMES {
+                store
+                    .append(
+                        &stream,
+                        Expected::Any,
+                        &[event("added", i64::try_from(frame).unwrap())],
+                        &meta(&format!("frame-{frame}"), &json!({ "frame": frame })),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let frames = Journal::open(root).unwrap().transactions.len() as u64;
+        assert_eq!(frames, FRAMES);
+        let length = journal_length(root);
+
+        let before = crate::cost::of(root);
+        let store = FileEventStore::open(root).await.unwrap();
+        let opened = crate::cost::of(root) - before;
+        assert_eq!(
+            opened.frames_chained, frames,
+            "an open chained the journal more than once: {opened:?}"
+        );
+        assert!(
+            opened.journal_bytes_hashed <= length,
+            "an open hashed {} bytes of a {length}-byte journal",
+            opened.journal_bytes_hashed
+        );
+        assert_eq!(
+            opened.blobs_hashed, 1,
+            "the open hashes every active object"
+        );
+
+        let before = crate::cost::of(root);
+        assert_eq!(
+            store.stream_version(&stream).await.unwrap(),
+            Some(FRAMES - 1)
+        );
+        let resumed = crate::cost::of(root) - before;
+        assert_eq!(
+            (resumed.frames_chained, resumed.blobs_hashed),
+            (0, 0),
+            "the first call after the open did not resume its view: {resumed:?}"
         );
     }
 }
