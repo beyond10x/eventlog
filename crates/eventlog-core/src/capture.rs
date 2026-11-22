@@ -732,9 +732,31 @@ impl CaptureBudget {
 }
 
 /// The compact UTF-8 length of one stored body. Object key order does not change it.
+///
+/// The same serializer as `to_vec` writes into a counter, so the length is exact and no second
+/// copy of the body is built only to be measured.
 fn compact_len(value: &Value, material: CaptureMaterial) -> Result<u64, CaptureError> {
-    let encoded = serde_json::to_vec(value).map_err(|_| CaptureError::Corrupt { material })?;
-    u64::try_from(encoded.len()).map_err(|_| CaptureError::Corrupt { material })
+    let mut counter = ByteCount(0);
+    serde_json::to_writer(&mut counter, value).map_err(|_| CaptureError::Corrupt { material })?;
+    Ok(counter.0)
+}
+
+/// A writer that keeps only how many bytes it was given.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let len = u64::try_from(bytes.len()).map_err(|_| std::io::ErrorKind::InvalidData)?;
+        self.0 = self
+            .0
+            .checked_add(len)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Check one stored event's constructor-level envelope invariants.
@@ -1160,6 +1182,37 @@ mod tests {
             validate_captured_branchable_order(&tenant, &history).is_err(),
             "a parent on another stream was accepted"
         );
+    }
+
+    #[test]
+    fn payload_length_is_the_exact_compact_encoding_of_escapes_numbers_and_non_ascii() {
+        let bodies = [
+            json!({}),
+            json!({"value": 1}),
+            json!({"zeta":1,"alpha":"quote \" slash \\ tab \t nl \n ctl \u{1} del \u{7f}"}),
+            json!({"name":"Grüße, 世界 😀","nested":{"y":[1,-2,3.5,1e300,0.1],"x":null}}),
+            json!({"max":u64::MAX,"min":i64::MIN,"list":[[],{},true,false]}),
+            json!({"long":"b".repeat(70_000)}),
+        ];
+        for body in bodies {
+            let encoded = serde_json::to_vec(&body).unwrap().len() as u64;
+            assert_eq!(
+                compact_len(&body, CaptureMaterial::Projection).unwrap(),
+                encoded,
+                "counted length differs from the encoding of {body}"
+            );
+        }
+        let exact = json!({"long":"b".repeat(70_000)});
+        let bytes = serde_json::to_vec(&exact).unwrap().len() as u64;
+        let mut budget = CaptureBudget::new(CaptureLimits {
+            max_events: 0,
+            max_blobs: 0,
+            max_projection_rows: 2,
+            max_payload_bytes: bytes * 2,
+        });
+        budget.admit_projection_row(&exact).unwrap();
+        budget.admit_projection_row(&exact).unwrap();
+        assert_eq!(budget.usage().payload_bytes, bytes * 2);
     }
 
     #[test]
