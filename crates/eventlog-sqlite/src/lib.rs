@@ -1213,6 +1213,18 @@ impl EventStore for SqliteEventStore {
         }))
     }
 
+    /// One read transaction answers the batch, so a group committed by another handle on the
+    /// same database is seen whole or not at all. Each result is shaped exactly as
+    /// [`EventStore::read_stream`] or [`EventStore::get_blob`] shapes it.
+    fn read_many<'a>(
+        &'a self,
+        reads: &'a [eventlog_core::Read],
+    ) -> BoxFuture<'a, Result<Vec<eventlog_core::ReadResult>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let reads = reads.to_vec();
+        Box::pin(run_blocking(move || inner.read_many(&reads)))
+    }
+
     fn stream_version<'a>(
         &'a self,
         stream: &'a StreamId,
@@ -1877,10 +1889,52 @@ impl Inner {
         after_version: u64,
         limit: usize,
     ) -> Result<StreamSlice, EventLogError> {
+        let guard = self.connection.lock().map_err(poisoned)?;
+        self.read_stream_on(&guard, stream, after_version, limit)
+    }
+
+    /// Every read of the batch inside one deferred transaction: SQLite fixes the snapshot at the
+    /// first statement, and a commit by another connection after it stays invisible until the end.
+    fn read_many(
+        &self,
+        reads: &[eventlog_core::Read],
+    ) -> Result<Vec<eventlog_core::ReadResult>, EventLogError> {
+        let mut guard = self.connection.lock().map_err(poisoned)?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(backend)?;
+        let mut results = Vec::with_capacity(reads.len());
+        for read in reads {
+            results.push(match read {
+                eventlog_core::Read::Stream {
+                    stream,
+                    after_version,
+                    limit,
+                } => eventlog_core::ReadResult::Stream(self.read_stream_on(
+                    &transaction,
+                    stream,
+                    *after_version,
+                    *limit,
+                )?),
+                eventlog_core::Read::Blob { tenant, digest } => eventlog_core::ReadResult::Blob(
+                    self.get_blob_on(&transaction, tenant, digest)?,
+                ),
+            });
+        }
+        transaction.commit().map_err(backend)?;
+        Ok(results)
+    }
+
+    fn read_stream_on(
+        &self,
+        connection: &Connection,
+        stream: &StreamId,
+        after_version: u64,
+        limit: usize,
+    ) -> Result<StreamSlice, EventLogError> {
         let limit = bounded_limit(limit);
         let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
-        let mut statement = guard
+        let mut statement = connection
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM {prefix}_events
                  WHERE tenant_id = ?1 AND stream_type = ?2 AND stream_id = ?3 AND version > ?4
@@ -2489,9 +2543,18 @@ impl Inner {
     }
 
     fn get_blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError> {
-        let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
-        let stored = guard
+        self.get_blob_on(&guard, tenant, digest)
+    }
+
+    fn get_blob_on(
+        &self,
+        connection: &Connection,
+        tenant: &TenantId,
+        digest: &str,
+    ) -> Result<Option<Vec<u8>>, EventLogError> {
+        let prefix = &self.prefix;
+        let stored = connection
             .query_row(
                 &format!(
                     "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs
@@ -2511,7 +2574,7 @@ impl Inner {
             .map_err(backend)?;
         stored
             .map(|(bytes, count, hash, version)| {
-                self.verified.check(&guard, bytes, count, hash, version)
+                self.verified.check(connection, bytes, count, hash, version)
             })
             .transpose()
     }
