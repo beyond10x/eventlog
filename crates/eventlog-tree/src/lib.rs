@@ -799,15 +799,16 @@ async fn replay(
 }
 
 /// The engine commits blob-bearing groups through its blob entry point, whose request fingerprint
-/// covers the bytes; a replay goes through the same one so a retry still matches.
-fn blob_group(group: AppendGroup, blobs: &[(String, Vec<u8>)]) -> BlobAppendGroup {
+/// covers the bytes; a replay goes through the same one so a retry still matches. The copy it
+/// makes lives only for this one group's append.
+fn blob_group(group: AppendGroup, blobs: &[(String, impl AsRef<[u8]>)]) -> BlobAppendGroup {
     BlobAppendGroup {
         group,
         blobs: blobs
             .iter()
             .map(|(digest, bytes)| BlobWrite {
                 digest: digest.clone(),
-                bytes: bytes.clone(),
+                bytes: bytes.as_ref().to_vec(),
             })
             .collect(),
     }

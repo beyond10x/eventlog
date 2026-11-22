@@ -97,7 +97,7 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
         let blobs: BTreeMap<&str, &[u8]> = before.tenants[tenant]
             .blobs
             .iter()
-            .map(|(digest, bytes)| (digest.as_str(), bytes.as_slice()))
+            .map(|(digest, bytes)| (digest.as_str(), &**bytes))
             .collect();
         for (digest, _) in split::raw_files(root, tenant)? {
             if splits.contains(&digest) {
@@ -165,7 +165,7 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
             .blobs
             .iter()
             .find(|(held, _)| held == digest)
-            .map(|(_, bytes)| bytes.as_slice())
+            .map(|(_, bytes)| &**bytes)
             .ok_or_else(|| crate::layout::corrupt("a blob the replay did not read"))?;
         split::convert(root, tenant, digest, bytes, cut)?;
     }

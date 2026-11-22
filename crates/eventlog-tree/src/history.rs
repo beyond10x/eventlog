@@ -10,6 +10,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -369,7 +370,7 @@ pub(crate) struct Committed {
     /// One list per member, in the member's order.
     pub events: Vec<Vec<EventRecord>>,
     /// The bytes of each blob the group committed that is still present.
-    pub blobs: Vec<(String, Vec<u8>)>,
+    pub blobs: Vec<(String, Arc<[u8]>)>,
 }
 
 /// One tenant's history as the tree holds it.
@@ -378,7 +379,7 @@ pub(crate) struct TenantHistory {
     pub identity: Option<String>,
     pub groups: Vec<Committed>,
     /// Every blob file, whether a group bound it or `put_blob` stored it alone.
-    pub blobs: Vec<(String, Vec<u8>)>,
+    pub blobs: Vec<(String, Arc<[u8]>)>,
 }
 
 /// What an open found.
@@ -450,7 +451,13 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
             ));
         }
         // Every blob, in whichever form it is held.
-        let tenant_blobs = crate::split::tenant_blobs(root, &segment_name)?;
+        // Shared, never copied: every group that names a blob holds the same bytes as the tenant,
+        // so a blob a hundred groups name is held once, not a hundred and one times.
+        let tenant_blobs: BTreeMap<String, Arc<[u8]>> =
+            crate::split::tenant_blobs(root, &segment_name)?
+                .into_iter()
+                .map(|(digest, bytes)| (digest, Arc::from(bytes)))
+                .collect();
         let identity_file = tenant_directory.join("identity.json");
         if identity_file.exists() {
             let value = read_json(&identity_file)?;
@@ -535,9 +542,9 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
             let mut blobs = Vec::new();
             for digest in &record.blobs {
                 let held = if record.tenant == segment_name {
-                    tenant_blobs.get(digest).cloned()
+                    tenant_blobs.get(digest).map(Arc::clone)
                 } else {
-                    crate::split::read_blob(root, &record.tenant, digest)?
+                    crate::split::read_blob(root, &record.tenant, digest)?.map(Arc::from)
                 };
                 if let Some(bytes) = held {
                     blobs.push((digest.clone(), bytes));
@@ -776,6 +783,74 @@ mod tests {
             .map(|tenant| tenant.groups.len())
             .sum();
         assert_eq!(groups, 2);
+    }
+
+    /// The bytes of blobs a load holds, counting each allocation once however many groups share it.
+    fn retained_blob_bytes(loaded: &super::Loaded) -> usize {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0;
+        for tenant in loaded.tenants.values() {
+            let all = tenant
+                .blobs
+                .iter()
+                .chain(tenant.groups.iter().flat_map(|group| group.blobs.iter()));
+            for (_, bytes) in all {
+                if seen.insert(bytes.as_ptr() as usize) {
+                    total += bytes.len();
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn a_blob_many_groups_name_is_held_once_by_a_load() {
+        const GROUPS: usize = 20;
+        const SIZE: usize = 64 * 1024;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let bytes = vec![7_u8; SIZE];
+        runtime.block_on(async {
+            let store = TreeEventStore::open_in(&root, TreeLayout::Hashed)
+                .await
+                .unwrap();
+            for index in 0..GROUPS {
+                let id = format!("x{index}");
+                let group = eventlog_core::AppendGroup {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    appends: vec![eventlog_core::StreamAppend {
+                        stream: stream(&id),
+                        expected: Expected::NoStream,
+                        events: vec![event("item.received", 1)],
+                    }],
+                    meta: meta(&id, &json!({})),
+                };
+                eventlog_core::AtomicEventStore::append_group_guarded_with_blobs(
+                    &store,
+                    &group,
+                    Arc::new(eventlog_core::NoGuard),
+                    &[("blob-1".to_owned(), bytes.clone())],
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let loaded = load(&root).unwrap();
+
+        let tenant = &loaded.tenants["tenant-a"];
+        let binding = tenant
+            .groups
+            .iter()
+            .filter(|group| group.blobs.iter().any(|(_, held)| **held == *bytes))
+            .count();
+        assert_eq!(binding, GROUPS, "every group keeps its binding to the blob");
+        assert_eq!(
+            retained_blob_bytes(&loaded),
+            SIZE,
+            "the load held the blob more than once ({GROUPS} groups name it)"
+        );
     }
 
     #[test]
