@@ -1,7 +1,8 @@
-//! Owner namespaces stay confined when one SQLite file hosts several owners: legacy erasure and
-//! rebuild staging.
+//! Owner namespaces stay confined when one SQLite file hosts several owners: legacy erasure,
+//! rebuild staging and the projection index.
 use eventlog_core::{
-    EventLogError, EventStore, Expected, InlineProjectionAdmin, StreamId, TenantId,
+    CaptureLimits, ConsistentTenantCapture, EventLogError, EventStore, Expected,
+    InlineProjectionAdmin, StreamId, TenantId,
 };
 use eventlog_sqlite::SqliteEventStore;
 use std::sync::Arc;
@@ -177,4 +178,118 @@ async fn a_rebuild_publishes_into_the_live_view_when_the_owner_is_named_like_its
         .expect("readable")
         .expect("row");
     assert_eq!(row["count"], 2, "the rebuild replaced the drifted live row");
+}
+
+fn index_columns(sql: &rusqlite::Connection, index: &str) -> Vec<String> {
+    let mut statement = sql
+        .prepare(&format!("PRAGMA index_info({index})"))
+        .expect("index info");
+    statement
+        .query_map([], |row| row.get(2))
+        .expect("columns")
+        .collect::<Result<_, _>>()
+        .expect("names")
+}
+
+/// The VM steps of the query `projection_find` runs, on the review's fixture: 1,001 rows of which
+/// the last 10 match.
+fn find_steps(sql: &rusqlite::Connection, table: &str) -> (usize, i32) {
+    let tx = sql.unchecked_transaction().expect("fixture transaction");
+    for index in 0..1_001 {
+        let kind = if index + 10 >= 1_001 { "item" } else { "other" };
+        tx.execute(
+            &format!("INSERT INTO {table}(tenant_id,row_key,body,idx_0) VALUES ('owner',?1,?2,?3)"),
+            rusqlite::params![
+                format!("key-{index:05}"),
+                serde_json::json!({ "kind": kind }).to_string(),
+                kind
+            ],
+        )
+        .expect("fixture row");
+    }
+    tx.commit().expect("fixture");
+    let mut statement = sql
+        .prepare(&format!(
+            "SELECT body FROM {table}
+             WHERE tenant_id = ?1 AND idx_0 = ?2
+             ORDER BY row_key LIMIT ?3"
+        ))
+        .expect("find query");
+    let mut rows = statement
+        .query(rusqlite::params!["owner", "item", 10])
+        .expect("query");
+    let mut returned = 0;
+    while rows.next().expect("row").is_some() {
+        returned += 1;
+    }
+    drop(rows);
+    (
+        returned,
+        statement.get_status(rusqlite::StatementStatus::VmStep),
+    )
+}
+
+#[tokio::test]
+async fn the_projection_index_serves_find_in_row_key_order_and_old_indexes_are_upgraded() {
+    let directory = tempfile::tempdir().expect("assigned TMPDIR");
+    let database = directory.path().join("index.sqlite");
+    let path = database.to_str().expect("path");
+    let store = SqliteEventStore::open(path, "owner").await.expect("owner");
+    store
+        .create_projections(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("tables");
+    let sql = rusqlite::Connection::open(&database).expect("fixture connection");
+    assert_eq!(
+        index_columns(&sql, "owner_p_tally_idx_0"),
+        ["tenant_id", "idx_0", "row_key"]
+    );
+    let (returned, steps) = find_steps(&sql, "owner_p_tally");
+    eprintln!("projection_find fixture: returned={returned} vm_steps={steps}");
+    assert_eq!(returned, 10);
+    assert!(
+        steps < 500,
+        "the index ends the ordered scan at the limit; {steps} VM steps visited every row"
+    );
+
+    // A file made before row_key joined the index: capture still admits it read-only, and the
+    // next registration upgrades it in place.
+    sql.execute_batch(
+        "DROP INDEX owner_p_tally_idx_0;
+         CREATE INDEX owner_p_tally_idx_0 ON owner_p_tally (tenant_id, idx_0);",
+    )
+    .expect("an index of the earlier shape");
+    let tenant = TenantId::new("owner").expect("tenant");
+    store
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    store
+        .capture_tenant(
+            &tenant,
+            &[eventlog_conformance::TALLY],
+            CaptureLimits {
+                max_events: 8,
+                max_blobs: 8,
+                max_projection_rows: 2_000,
+                max_payload_bytes: 1 << 20,
+            },
+        )
+        .await
+        .expect("an index of the earlier shape is still the declared shape");
+    assert_eq!(
+        index_columns(&sql, "owner_p_tally_idx_0"),
+        ["tenant_id", "idx_0"],
+        "a capture changes nothing"
+    );
+    let reopened = SqliteEventStore::open(path, "owner").await.expect("owner");
+    reopened
+        .create_projections(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("registration");
+    assert_eq!(
+        index_columns(&sql, "owner_p_tally_idx_0"),
+        ["tenant_id", "idx_0", "row_key"],
+        "registration upgraded the index"
+    );
 }

@@ -2546,17 +2546,18 @@ impl Inner {
             for spec in projector.projections() {
                 let table = projection_table(prefix, spec.name);
                 let body = projection_table_body(spec.indexed.len());
+                guard
+                    .execute_batch(&format!("CREATE TABLE IF NOT EXISTS {table} ({body});"))
+                    .map_err(backend)?;
+                for position in 0..spec.indexed.len() {
+                    upgrade_projection_index(&guard, &table, position)?;
+                }
                 let indexes: String = joined(spec.indexed.len(), |position| {
                     let index = projection_index(&table, position);
-                    format!(
-                        "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
-                    )
+                    let columns = projection_index_columns(position).join(", ");
+                    format!("CREATE INDEX IF NOT EXISTS {index} ON {table} ({columns});")
                 });
-                guard
-                    .execute_batch(&format!(
-                        "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
-                    ))
-                    .map_err(backend)?;
+                guard.execute_batch(&indexes).map_err(backend)?;
                 durable_capture::cover_projection(&guard, prefix, &table)?;
             }
             for spec in projector.projections() {
@@ -3430,6 +3431,79 @@ fn refuse_stale_declaration(
         ))),
         _ => Ok(()),
     }
+}
+
+/// The columns of a declared field's index: the filter, then the order `projection_find` returns.
+///
+/// With `row_key` in the index, `WHERE tenant_id = ? AND idx_N = ? ORDER BY row_key LIMIT ?`
+/// walks the index in order and stops at the limit; without it SQLite visits every match.
+fn projection_index_columns(position: usize) -> [String; 3] {
+    [
+        String::from("tenant_id"),
+        format!("idx_{position}"),
+        String::from("row_key"),
+    ]
+}
+
+/// The columns a declared field's index had before `row_key` joined it. Capture still admits
+/// them, read-only, on a file no registration has upgraded yet.
+fn legacy_projection_index_columns(position: usize) -> [String; 2] {
+    [String::from("tenant_id"), format!("idx_{position}")]
+}
+
+/// Replace a declared field's index that still has those earlier columns.
+///
+/// An index holds no data of its own, so this changes no table, row or column: the index is
+/// dropped and created again under the same name, inside the registration transaction. Any other
+/// shape under that name is left for capture admission to refuse.
+fn upgrade_projection_index(
+    connection: &Connection,
+    table: &str,
+    position: usize,
+) -> Result<(), EventLogError> {
+    let index = projection_index(table, position);
+    // Only the plain index this kit created: not unique, not partial, made by CREATE INDEX.
+    let plain = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut plain = false;
+        for row in rows {
+            let (name, unique, origin, partial) = row.map_err(backend)?;
+            if name == index {
+                plain = !unique && origin == "c" && !partial;
+            }
+        }
+        plain
+    };
+    if !plain {
+        return Ok(());
+    }
+    let columns: Vec<String> = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_info({index})"))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)?
+    };
+    if columns == legacy_projection_index_columns(position) {
+        connection
+            .execute_batch(&format!("DROP INDEX {index};"))
+            .map_err(backend)?;
+    }
+    Ok(())
 }
 
 fn select_versions(
