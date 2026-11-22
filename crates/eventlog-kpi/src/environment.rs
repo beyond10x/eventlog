@@ -9,7 +9,7 @@ pub struct Environment {
     pub cpu: String,
     pub cpus: usize,
     pub kernel: String,
-    /// `/proc/loadavg`'s 1, 5 and 15 minute averages when recording started.
+    /// `/proc/loadavg`'s 1, 5 and 15 minute averages when the baseline was written.
     pub load_average: String,
     pub rustc: String,
     pub profile: String,
