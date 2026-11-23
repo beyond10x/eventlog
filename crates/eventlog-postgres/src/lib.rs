@@ -54,6 +54,15 @@ const COLUMNS: &str = "global_seq, tenant_id, stream_type, stream_id, version, e
 /// The predicate that keeps a feed reader behind anything still in flight.
 const WATERMARK: &str = "committed_xid < pg_snapshot_xmin(pg_current_snapshot())";
 
+/// The watermark above the settlement floor of [`watermarked_source`]: a position at or below the
+/// floor was settled by `migrate` after a restore, whatever transaction id it carries.
+const SETTLED: &str =
+    "(global_seq <= settled_through OR committed_xid < pg_snapshot_xmin(pg_current_snapshot()))";
+
+/// A visible row whose transaction id this cluster has not handed out yet was not written here:
+/// a logical restore copied it from another cluster's clock.
+const FOREIGN: &str = "committed_xid >= pg_snapshot_xmax(pg_current_snapshot())";
+
 /// How many reads, stream locks, heads or event rows one batched statement carries.
 ///
 /// One statement per item costs a round trip each, about 0.6 ms on localhost: 10,000 stream reads
@@ -130,6 +139,7 @@ impl PostgresEventStore {
             let mut client = pool.acquire().await?;
             let report =
                 schema::migrate_with_blob_migration(&mut client, &prefix, &[], migration).await?;
+            settle_restored_history(&mut client, &prefix).await?;
             client.settled();
             report
         };
@@ -180,6 +190,7 @@ impl PostgresEventStore {
             let report =
                 schema::migrate_with_blob_migration(&mut client, prefix, projections, migration)
                     .await?;
+            settle_restored_history(&mut client, prefix).await?;
             client.settled();
             Ok(report)
         }
@@ -228,6 +239,13 @@ impl PostgresEventStore {
             role.admit(share)?;
             schema::validate(&mut client, &prefix).await?;
             schema::permissions(&client, &prefix).await?;
+            if first_foreign(&*client, &prefix).await?.is_some() {
+                return Err(EventLogError::Invalid(
+                    "PostgreSQL events carry another cluster's transaction ids (a restored \
+                     history); run migrate with the migration role before opening"
+                        .into(),
+                ));
+            }
             client.settled();
             pool.bind_hosted(role.principal, share);
         }
@@ -351,7 +369,8 @@ impl PostgresEventStore {
                  DROP TABLE IF EXISTS {prefix}_identity;
                  DROP TABLE IF EXISTS {prefix}_scope_counters;
                  DROP TABLE IF EXISTS {prefix}_schema_version;
-                 DROP TABLE IF EXISTS {prefix}_projection_registry;"
+                 DROP TABLE IF EXISTS {prefix}_projection_registry;
+                 DROP TABLE IF EXISTS {prefix}_settlement_floor;"
             ))
             .await
             .map_err(backend)
@@ -699,7 +718,7 @@ impl EventStore for PostgresEventStore {
                 .query(
                     &format!(
                         "SELECT {COLUMNS} FROM {}
-                         WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK}
+                         WHERE tenant_id = $1 AND global_seq > $2 AND {SETTLED}
                            AND (first_unsettled IS NULL OR global_seq < first_unsettled)
                          ORDER BY global_seq LIMIT $3",
                         watermarked_source(prefix)
@@ -1330,7 +1349,7 @@ impl EventStore for PostgresEventStore {
                 .query(
                     &format!(
                         "SELECT {COLUMNS} FROM {}
-                         WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK}
+                         WHERE tenant_id = $1 AND global_seq > $2 AND {SETTLED}
                            AND (first_unsettled IS NULL OR global_seq < first_unsettled)
                          ORDER BY global_seq LIMIT $3",
                         watermarked_source(&prefix)
@@ -1429,7 +1448,7 @@ impl EventStore for PostgresEventStore {
             }
             // Rebuild the same contiguous eligible prefix used by feed and catch-up. An unrelated
             // transaction can hold xmin between two already-committed append XIDs.
-            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND {WATERMARK} AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
+            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND {SETTLED} AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
             let mut position=0_i64; let mut applied=0_u64;
             loop {
                 let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
@@ -2328,12 +2347,67 @@ async fn reserve_ordered(
 // Evaluate both the row watermark and the first withheld position in one statement snapshot.
 // The publication gate settles owner writers, but unrelated transactions can still hold xmin
 // between committed XIDs. Never publish a higher position past such a withheld lower position.
+// Positions at or below the settlement floor are settled; the watermark applies above it.
 fn watermarked_source(prefix: &str) -> String {
     format!(
         "{prefix}_events CROSS JOIN \
+         (SELECT COALESCE(MAX(settled_through), 0) AS settled_through \
+          FROM {prefix}_settlement_floor) AS settlement_floor CROSS JOIN \
          (SELECT MIN(global_seq) AS first_unsettled FROM {prefix}_events \
-          WHERE NOT ({WATERMARK})) AS publication_prefix"
+          WHERE NOT ({WATERMARK}) AND global_seq > \
+          (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)) \
+         AS publication_prefix"
     )
+}
+
+/// The first position above the settlement floor whose transaction id comes from another
+/// cluster, if any.
+async fn first_foreign<C: GenericClient>(
+    client: &C,
+    prefix: &str,
+) -> Result<Option<i64>, EventLogError> {
+    client
+        .query_one(
+            &format!(
+                "SELECT MIN(global_seq) FROM {prefix}_events \
+                 WHERE {FOREIGN} AND global_seq > \
+                 (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)"
+            ),
+            &[],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(backend)
+}
+
+/// After a logical restore every event carries the source cluster's transaction id, and the
+/// watermark would withhold the restored history, and every later event, until this cluster's
+/// clock passed it. When a restored id is found, record the highest position as settled, under
+/// the exclusive publication gate so no append is in flight below it. Runs after the migration
+/// committed: the gate must be taken before every other owner lock.
+async fn settle_restored_history(
+    client: &mut tokio_postgres::Client,
+    prefix: &str,
+) -> Result<(), EventLogError> {
+    if first_foreign(&*client, prefix).await?.is_none() {
+        return Ok(());
+    }
+    let transaction = client.transaction().await.map_err(backend)?;
+    publication_gate(&transaction, prefix, true).await?;
+    if first_foreign(&transaction, prefix).await?.is_some() {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}_settlement_floor (settled_through, recorded_at) \
+                     SELECT MAX(global_seq), now() FROM {prefix}_events \
+                     ON CONFLICT (settled_through) DO NOTHING"
+                ),
+                &[],
+            )
+            .await
+            .map_err(backend)?;
+    }
+    transaction.commit().await.map_err(backend)
 }
 
 // Transaction publication gate: XID order can differ from global sequence allocation order.
@@ -2441,12 +2515,13 @@ mod blob_migration_tests {
         "scope_counters",
         "schema_version",
         "projection_registry",
+        "settlement_floor",
     ];
 }
 
 #[cfg(test)]
 mod publication_boundary_tests {
-    use super::{COLUMNS, PostgresEventStore, WATERMARK, watermarked_source};
+    use super::{COLUMNS, PostgresEventStore, SETTLED, watermarked_source};
 
     /// Every plan node of `plan` that reads `relation` sequentially.
     fn sequential_reads(plan: &serde_json::Value, relation: &str, found: &mut Vec<String>) {
@@ -2492,7 +2567,7 @@ mod publication_boundary_tests {
         .unwrap();
         let feed = format!(
             "SELECT {COLUMNS} FROM {}
-             WHERE tenant_id = 'tenant-3' AND global_seq > 8000 AND {WATERMARK}
+             WHERE tenant_id = 'tenant-3' AND global_seq > 8000 AND {SETTLED}
                AND (first_unsettled IS NULL OR global_seq < first_unsettled)
              ORDER BY global_seq LIMIT 2",
             watermarked_source(&prefix)
@@ -2508,11 +2583,17 @@ mod publication_boundary_tests {
             found.is_empty(),
             "a feed page read the owner's events sequentially: {found:?}"
         );
-        assert_eq!(
-            sql.query(&feed, &[]).await.unwrap().len(),
-            2,
-            "the page still returns the settled rows"
-        );
+        // The watermark is cluster-wide: a transaction open anywhere in the instance withholds the
+        // rows just inserted, so one read asks whether the machine happened to be idle.
+        let mut rows = 0;
+        for _ in 0..200 {
+            rows = sql.query(&feed, &[]).await.unwrap().len();
+            if rows == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rows, 2, "the page still returns the settled rows");
         store.drop_tables().await.unwrap();
         store.shutdown().await.unwrap();
     }

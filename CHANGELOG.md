@@ -8,12 +8,14 @@ under bare-version tags such as `0.1.0`.
 ### Security
 
 - PostgreSQL: hosted `open` requires only `SELECT` on the migration metadata
-  (`<prefix>_schema_version`, `<prefix>_projection_registry`) and refuses an application role
-  that can `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` them. Erasure deletes a tenant from every
-  registered projection, so a role that could edit the roster could make erasure skip a table.
-  Existing deployments that granted DML on all tables must revoke it on these two tables:
-  `REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON <prefix>_schema_version, <prefix>_projection_registry
-  FROM <application role>`.
+  (`<prefix>_schema_version`, `<prefix>_projection_registry`, `<prefix>_settlement_floor`) and
+  refuses an application role that can `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` them. Erasure
+  deletes a tenant from every registered projection, so a role that could edit the roster could
+  make erasure skip a table; a role that could raise the settlement floor could let a feed cursor
+  pass an append still in flight. Existing deployments that granted DML on all tables must revoke
+  it on these three tables after `migrate`: `REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON
+  <prefix>_schema_version, <prefix>_projection_registry, <prefix>_settlement_floor FROM
+  <application role>`.
 - PostgreSQL: a hosted pool holds every physical session it opens after `open` to the database,
   role and schema that admission saw, and to the hosted role rules (no DDL powers, a finite
   connection limit within the replica share). A caller-owned authority that reconnects as another
@@ -36,6 +38,8 @@ under bare-version tags such as `0.1.0`.
 - PostgreSQL: the same edition adds the index `<prefix>_scope_counters_bytes` on the byte order of
   the admission counter coordinates. Tenant erasure removes the tenant's counters with an index
   range scan instead of reading every counter while it holds the exclusive publication lock.
+- PostgreSQL: the same edition adds the table `<prefix>_settlement_floor`, written only by
+  `migrate` (see Fixed). Grant the application role `SELECT` on it, nothing more.
 - `eventlog_core::MAX_INDEXED_VALUE_BYTES` (2,048) and `indexed_values`: every provider refuses a
   projection row whose indexed field value is longer, before writing, with the new
   `EventLogError::IndexedValueTooLarge { field, bytes, limit }`. On PostgreSQL such a value could
@@ -69,6 +73,16 @@ under bare-version tags such as `0.1.0`.
 - PostgreSQL: a positive pool timeout under a whole millisecond is sent to the session rounded up
   (500 µs becomes 1 ms). Before, it was truncated to 0, which PostgreSQL reads as no statement,
   lock or idle-transaction limit.
+- PostgreSQL: an owner restored from a logical backup delivers its feed again after `migrate`.
+  Restored events keep the source cluster's transaction ids; one id ahead of this cluster's clock
+  withheld the restored history and every later event of the owner, in every tenant, from feed,
+  catch-up and rebuild until the clock passed it. `migrate` now finds a visible event whose
+  transaction id this cluster has not handed out yet and records the highest position as settled
+  in `<prefix>_settlement_floor`, under the exclusive publication gate; positions at or below the
+  floor count as settled and the watermark applies above it. Hosted `open` refuses such an owner
+  until then with `Invalid("PostgreSQL events carry another cluster's transaction ids (a restored
+  history); run migrate with the migration role before opening")`. The restore procedure is:
+  restore, then run `migrate`.
 
 ## 0.9.4 — 2026-11-11
 

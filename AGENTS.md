@@ -183,9 +183,10 @@ Keep internal plans, stories, ADRs, decisions, worklogs, security material, and 
 Hosted traffic uses verified TLS, explicit migration/application roles and a declared replica plus
 reserve connection budget. The supported application role is dedicated, has no memberships or
 DDL ownership/creation powers, and has a finite server connection limit within its pool share.
-It reads and never writes the migration metadata (`schema_version`, `projection_registry`):
-erasure deletes a tenant from every registered projection, so a role that could edit the roster
-could make erasure skip a table. Schema and projection admission compares actual physical shape and the persisted migration roster.
+It reads and never writes the migration metadata (`schema_version`, `projection_registry`,
+`settlement_floor`): erasure deletes a tenant from every registered projection, so a role that
+could edit the roster could make erasure skip a table, and a role that could raise the floor could
+let a feed cursor pass an append still in flight. Schema and projection admission compares actual physical shape and the persisted migration roster.
 Never broaden that profile silently or treat a checksum alone as schema compatibility.
 
 Registration freezes before traffic. A cancelled/unsettled connection stays quarantined until its
@@ -206,7 +207,19 @@ predicate and stop before its first withheld global position in that same statem
 unrelated transactions can hold xmin between already committed owner XIDs. A rowwise filter can
 otherwise leave a hole even while no owner writer is active. Keep both reversed-XID/position
 regressions, including the unrelated-xmin case, plus the original late-commit
-mutation case. Sequence CACHE 1 and deterministic column collations are admission requirements.
+mutation case.
+
+A logical restore copies each event's `committed_xid` from the source cluster's clock, and the
+watermark would withhold the restored history and every later event of the owner until this
+cluster's clock passed it. Timo, 2026-11-23 03:56 CET: L61 = A (settlement floor). Positions at or
+below the highest `<prefix>_settlement_floor.settled_through` count as settled; the watermark and
+the first withheld position apply above it, in the same statement snapshot. Only `migrate` writes
+the floor: after its schema transaction commits it looks for a visible event above the floor whose
+`committed_xid` is at or past this snapshot's xmax (no native row can be) and, if one exists,
+records `MAX(global_seq)` under the exclusive publication gate. Hosted `open` refuses an owner with
+such a row, and the floor is migration metadata the application role may only read. The restore
+procedure is "restore, then run migrate". Never rewrite `committed_xid` to settle a restore: the
+only UPDATE on events is redaction. Sequence CACHE 1 and deterministic column collations are admission requirements.
 Mixed protocol generations require a fenced cutover; retaining physical old-reader formats does
 not authorize concurrent old writer/feed binaries.
 

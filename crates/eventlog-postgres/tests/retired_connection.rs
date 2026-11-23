@@ -126,6 +126,7 @@ async fn fresh(observer: &tokio_postgres::Client, prefix: &str, application: &st
         "scope_counters",
         "schema_version",
         "projection_registry",
+        "settlement_floor",
         "p_tally",
     ] {
         observer

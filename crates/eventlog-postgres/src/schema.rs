@@ -20,6 +20,7 @@ const ADDED: &[&str] = &["scope_counters", "schema_version", "projection_registr
 const SNAPSHOT_ADDED: &[&str] = &["snapshot_generations"];
 const GROUP_ADDED: &[&str] = &["append_groups"];
 const BATCH_ADDED: &[&str] = &["group_batches"];
+const FLOOR_ADDED: &[&str] = &["settlement_floor"];
 const LEGACY_CHECKSUM: &str = "68bf4ddeee1655b94ea9b30bab82641b898bdaaa413ce46e1e384697e6e24841";
 const SNAPSHOT_CHECKSUM: &str = "f91f4eadc46ca90544177b2a3fdb8bd7b727400601effb8d274bc9ce2a8e6358";
 const ATOMIC_GROUP_CHECKSUM: &str =
@@ -162,6 +163,17 @@ fn batch_additions(prefix: &str) -> String {
     )
 }
 
+/// The settlement floor: the highest position `migrate` recorded as settled after it found a
+/// restored history. A logical restore copies each event's `committed_xid` from the source
+/// cluster, and the feed would compare that foreign transaction id with this cluster's clock and
+/// withhold the restored events, and every later one, until the clock passed it. Positions at or
+/// below the highest floor count as settled; the watermark applies above it. One row per restore.
+fn floor_additions(prefix: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {prefix}_settlement_floor (settled_through BIGINT PRIMARY KEY CHECK (settled_through > 0),recorded_at TIMESTAMPTZ NOT NULL);"
+    )
+}
+
 /// The feed's publication boundary — the first position whose transaction is not yet visible —
 /// reads `committed_xid >= xmin`. Without this index that is a scan of the owner's whole history
 /// for every feed page; with it, a range scan over the transactions still in flight.
@@ -188,6 +200,7 @@ fn every_table() -> Vec<&'static str> {
         .chain(SNAPSHOT_ADDED)
         .chain(GROUP_ADDED)
         .chain(BATCH_ADDED)
+        .chain(FLOOR_ADDED)
         .copied()
         .collect()
 }
@@ -196,12 +209,13 @@ fn checksum() -> String {
     format!(
         "{:x}",
         Sha256::digest(format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             base_ddl("owner"),
             additions("owner"),
             snapshot_additions("owner"),
             group_additions("owner"),
             batch_additions("owner"),
+            floor_additions("owner"),
             watermark_index("owner"),
             counter_index("owner")
         ))
@@ -434,12 +448,13 @@ async fn expected(transaction: &Transaction<'_>) -> Result<(), EventLogError> {
     transaction
         .batch_execute(
             &format!(
-                "{}{}{}{}{}{}{}",
+                "{}{}{}{}{}{}{}{}",
                 base_ddl("eventlog_expected"),
                 additions("eventlog_expected"),
                 snapshot_additions("eventlog_expected"),
                 group_additions("eventlog_expected"),
                 batch_additions("eventlog_expected"),
+                floor_additions("eventlog_expected"),
                 watermark_index("eventlog_expected"),
                 counter_index("eventlog_expected")
             )
@@ -462,6 +477,7 @@ async fn drop_expected(transaction: &Transaction<'_>) -> Result<(), EventLogErro
         .chain(SNAPSHOT_ADDED)
         .chain(GROUP_ADDED)
         .chain(BATCH_ADDED)
+        .chain(FLOOR_ADDED)
         .chain(["legacy_blobs"].iter())
         .map(|suffix| format!("DROP TABLE pg_temp.eventlog_expected_{suffix};"))
         .collect::<Vec<_>>()
@@ -638,6 +654,7 @@ pub(crate) async fn migrate_with_blob_migration(
     let counters = exists(&transaction, &format!("{prefix}_scope_counters")).await?;
     let registry = exists(&transaction, &format!("{prefix}_projection_registry")).await?;
     let batches = exists(&transaction, &format!("{prefix}_group_batches")).await?;
+    let floor = exists(&transaction, &format!("{prefix}_settlement_floor")).await?;
     if existing != 0 && counters {
         // As the publication index above: the counter table of every earlier edition is this
         // one without the index, so it gains it before it is compared.
@@ -646,7 +663,9 @@ pub(crate) async fn migrate_with_blob_migration(
             .await
             .map_err(backend)?;
     }
-    if existing == 0 && (ledger || generations || groups || counters || registry || batches) {
+    if existing == 0
+        && (ledger || generations || groups || counters || registry || batches || floor)
+    {
         return Err(EventLogError::Invalid(
             "partial PostgreSQL admission migration".into(),
         ));
@@ -798,12 +817,13 @@ pub(crate) async fn migrate_with_blob_migration(
 
     transaction
         .batch_execute(&format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             base_ddl(prefix),
             additions(prefix),
             snapshot_additions(prefix),
             group_additions(prefix),
             batch_additions(prefix),
+            floor_additions(prefix),
             watermark_index(prefix),
             counter_index(prefix)
         ))
@@ -874,12 +894,14 @@ pub(crate) async fn validate(client: &mut Client, prefix: &str) -> Result<(), Ev
         .map_err(|error| EventLogError::Invalid(format!("expected schema: {error}")))?;
     transaction.commit().await.map_err(backend)
 }
-/// The migration metadata: the schema ledger and the projection roster. Only the migration role
-/// writes them; hosted traffic reads the ledger at admission and the roster at registration and
-/// erasure. An application role that could write the roster could remove a projection from it,
-/// and erasure, which deletes a tenant from every registered projection, would then leave that
-/// tenant's rows behind in the unregistered table.
-const MIGRATION_METADATA: &[&str] = &["schema_version", "projection_registry"];
+/// The migration metadata: the schema ledger, the projection roster and the settlement floor.
+/// Only the migration role writes them; hosted traffic reads the ledger at admission, the roster
+/// at registration and erasure, and the floor in every feed. An application role that could write
+/// the roster could remove a projection from it, and erasure, which deletes a tenant from every
+/// registered projection, would then leave that tenant's rows behind in the unregistered table.
+/// One that could raise the floor could declare an event still in flight settled, and a feed
+/// cursor would pass it.
+const MIGRATION_METADATA: &[&str] = &["schema_version", "projection_registry", "settlement_floor"];
 
 pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), EventLogError> {
     let durable: Vec<_> = BASE
@@ -888,6 +910,7 @@ pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), Eve
         .chain(SNAPSHOT_ADDED)
         .chain(GROUP_ADDED)
         .chain(BATCH_ADDED)
+        .chain(FLOOR_ADDED)
         .filter(|suffix| !MIGRATION_METADATA.contains(suffix))
         .map(|suffix| format!("{prefix}_{suffix}"))
         .collect();
@@ -1169,6 +1192,7 @@ mod snapshot_tests {
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
             .chain(BATCH_ADDED)
+            .chain(FLOOR_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
                 .await
@@ -1290,6 +1314,7 @@ mod snapshot_tests {
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
             .chain(BATCH_ADDED)
+            .chain(FLOOR_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
                 .await
@@ -1320,6 +1345,7 @@ mod group_migration_tests {
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
             .chain(BATCH_ADDED)
+            .chain(FLOOR_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
                 .await
@@ -1380,6 +1406,7 @@ mod group_migration_tests {
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
             .chain(BATCH_ADDED)
+            .chain(FLOOR_ADDED)
         {
             sql.batch_execute(&format!("DROP TABLE {prefix}_{suffix}"))
                 .await
@@ -1406,6 +1433,7 @@ mod group_migration_tests {
             .chain(SNAPSHOT_ADDED)
             .chain(GROUP_ADDED)
             .chain(BATCH_ADDED)
+            .chain(FLOOR_ADDED)
             .map(|suffix| format!("DROP TABLE IF EXISTS {prefix}_{suffix};"))
             .collect::<Vec<_>>()
             .concat();
@@ -1424,7 +1452,7 @@ mod group_migration_tests {
         store.shutdown().await.unwrap();
 
         sql.batch_execute(
-            "DROP TABLE batch_upgrade_group_batches; DROP INDEX batch_upgrade_events_publication",
+            "DROP TABLE batch_upgrade_group_batches; DROP TABLE batch_upgrade_settlement_floor; DROP INDEX batch_upgrade_events_publication",
         )
         .await
         .unwrap();

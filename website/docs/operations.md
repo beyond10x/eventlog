@@ -37,14 +37,24 @@ second command. Record the exact refusal and preserve the source before investig
 3. Open traffic with a dedicated application login that owns no durable schema objects, has no
    role memberships or elevated privileges, and has no schema CREATE grant. It needs `SELECT`,
    `INSERT`, `UPDATE` and `DELETE` on the owner's durable tables and only `SELECT` on the
-   migration metadata (`<prefix>_schema_version`, `<prefix>_projection_registry`). Admission
-   refuses a role that can write or truncate the migration metadata.
+   migration metadata (`<prefix>_schema_version`, `<prefix>_projection_registry`,
+   `<prefix>_settlement_floor`). Admission refuses a role that can write or truncate the
+   migration metadata.
 4. Set a finite role connection limit and budget replicas plus reserved connections together:
    `replicas * max_connections + reserved_connections <= database_connections`.
 5. Register projections before traffic and fence old binaries during a protocol cutover.
 
 Admission checks physical schema shape, migration checksums, projection roster, sequence behavior
 and deterministic collations. A checksum alone is insufficient.
+
+To restore an owner from a logical backup (`pg_dump`, `pg_restore`), restore, then run
+`PostgresEventStore::migrate` with the migration role before opening traffic. Restored events keep
+the source cluster's transaction ids, and the feed would withhold them, and every later event of
+the owner, until this cluster's clock passed them. `migrate` finds them and records the highest
+restored position in `<prefix>_settlement_floor` as settled. Until then hosted `open` refuses the
+owner with `Invalid("PostgreSQL events carry another cluster's transaction ids (a restored
+history); run migrate with the migration role before opening")`. A physical restore or replica
+keeps the transaction ids and needs no step.
 
 Pool defaults are four connections, 32 waiting acquisitions, two-second acquisition and connection
 deadlines, five-second statements, two-second locks, ten-second operations and five-second shutdown.

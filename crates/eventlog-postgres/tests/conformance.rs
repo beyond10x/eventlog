@@ -234,7 +234,7 @@ async fn hosted_schema_admission_refuses_rewrite_rules() {
     )
     .await
     .unwrap();
-    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON review_rules_hosted.kit_schema_version, review_rules_hosted.kit_projection_registry FROM eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
+    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON review_rules_hosted.kit_schema_version, review_rules_hosted.kit_projection_registry, review_rules_hosted.kit_settlement_floor FROM eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
     let admitted = PostgresEventStore::open(
         PostgresConfig::verified(&app_url, "review_rules_hosted", "kit", roots).unwrap(),
         PoolOptions::default(),
@@ -803,6 +803,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
         "scope_counters",
         "schema_version",
         "projection_registry",
+        "settlement_floor",
     ] {
         sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
             .await
@@ -1629,7 +1630,11 @@ async fn verified_tls_requires_matching_server_and_separate_application_role() {
         .expect("verified application config");
     // Migration metadata is the migration role's: an application role that can write the
     // projection roster can unregister a projection, and erasure then skips its rows.
-    for table in ["kit_schema_version", "kit_projection_registry"] {
+    for table in [
+        "kit_schema_version",
+        "kit_projection_registry",
+        "kit_settlement_floor",
+    ] {
         match PostgresEventStore::open(config.clone(), PoolOptions::default(), 16, 2, 8).await {
             Err(EventLogError::Invalid(reason)) => assert_eq!(
                 reason,
@@ -1913,7 +1918,7 @@ async fn a_hosted_pool_refuses_a_reconnected_session_of_another_principal() {
     sql.batch_execute(
         "GRANT USAGE ON SCHEMA hosted_rebind TO eventlog_test_rebind; \
          GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_rebind TO eventlog_test_rebind; \
-         REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_rebind.kit_schema_version, hosted_rebind.kit_projection_registry FROM eventlog_test_rebind; \
+         REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_rebind.kit_schema_version, hosted_rebind.kit_projection_registry, hosted_rebind.kit_settlement_floor FROM eventlog_test_rebind; \
          GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_rebind TO eventlog_test_rebind",
     )
     .await
@@ -1994,6 +1999,252 @@ async fn a_hosted_pool_refuses_a_reconnected_session_of_another_principal() {
     );
     assert!(authority.calls.load(Ordering::Acquire) >= 3);
     store.shutdown().await.unwrap();
+}
+
+/// Review L61, decided by Timo on 2026-11-23 (settlement floor). A logical restore copies each
+/// event's `committed_xid` from the source cluster. One restored event 100,000 transaction ids
+/// ahead of this cluster withholds every later event of the owner, in every tenant, from every
+/// feed. A hosted `open` refuses such a store; `migrate` records the settlement floor under the
+/// exclusive publication gate, and the feed then delivers the restored and the native events.
+#[tokio::test]
+async fn a_restored_history_is_settled_by_migrate_and_refused_by_open_until_then() {
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    async fn floor(sql: &tokio_postgres::Client) -> (i64, i64) {
+        let row = sql
+            .query_one(
+                "SELECT COUNT(*), COALESCE(MAX(settled_through), 0) \
+                 FROM hosted_restore.kit_settlement_floor",
+                &[],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1))
+    }
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url).await;
+    sql.batch_execute(
+        "DROP SCHEMA IF EXISTS hosted_restore CASCADE; CREATE SCHEMA hosted_restore; \
+         DO $$ BEGIN IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname='eventlog_test_restore') \
+         THEN CREATE ROLE eventlog_test_restore LOGIN CONNECTION LIMIT 8; END IF; END $$; \
+         ALTER ROLE eventlog_test_restore CONNECTION LIMIT 8;",
+    )
+    .await
+    .expect("isolated role and schema");
+    let owner: tokio_postgres::Config = url.parse().unwrap();
+    let mut application = owner.clone();
+    application.user("eventlog_test_restore");
+    let as_principal = |principal: &tokio_postgres::Config| {
+        PostgresConfig::caller_owned(
+            "hosted_restore",
+            "kit",
+            Arc::new(ReconnectingAuthority {
+                principals: vec![principal.clone()],
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap()
+    };
+    let migrate = || PostgresEventStore::migrate(as_principal(&owner), PoolOptions::default(), &[]);
+    let open =
+        || PostgresEventStore::open(as_principal(&application), PoolOptions::default(), 16, 2, 8);
+    migrate().await.expect("migration role applies the schema");
+    sql.batch_execute(
+        "GRANT USAGE ON SCHEMA hosted_restore TO eventlog_test_restore; \
+         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_restore TO eventlog_test_restore; \
+         REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_restore.kit_schema_version, hosted_restore.kit_projection_registry, hosted_restore.kit_settlement_floor FROM eventlog_test_restore; \
+         GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_restore TO eventlog_test_restore",
+    )
+    .await
+    .expect("DML-only grants");
+    assert_eq!(
+        floor(&sql).await,
+        (0, 0),
+        "a native history records no floor"
+    );
+    let writer = open().await.expect("admitted before the restore");
+    let append = |tenant: &'static str| {
+        let stream = StreamId::new(TenantId::new(tenant).unwrap(), "item", "one").unwrap();
+        let writer = &writer;
+        async move {
+            writer
+                .append(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(tenant, &serde_json::json!({})),
+                )
+                .await
+                .expect("appended")
+                .events[0]
+                .global_seq
+        }
+    };
+    let restored = append("restored").await;
+    // The restore: the event keeps the source cluster's transaction id, 100,000 ahead of ours.
+    let moved = sql
+        .execute(
+            "UPDATE hosted_restore.kit_events SET committed_xid = \
+             (pg_snapshot_xmax(pg_current_snapshot())::text::bigint + 100000)::text::xid8 \
+             WHERE global_seq = $1",
+            &[&i64::try_from(restored).unwrap()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+    let first = append("tenant-a").await;
+    let second = append("tenant-b").await;
+    assert!(restored < first && first < second);
+    // Until the native appends pass this cluster's watermark an empty feed proves nothing.
+    let mut passed = false;
+    for _ in 0..200 {
+        passed = sql
+            .query_one(
+                "SELECT bool_and(committed_xid < pg_snapshot_xmin(pg_current_snapshot())) \
+                 FROM hosted_restore.kit_events WHERE global_seq > $1",
+                &[&i64::try_from(restored).unwrap()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if passed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(passed, "the native appends never passed the watermark");
+    for tenant in ["restored", "tenant-a", "tenant-b"] {
+        let page = writer
+            .read_feed(&TenantId::new(tenant).unwrap(), 0, 10)
+            .await
+            .unwrap();
+        assert!(
+            page.events.is_empty(),
+            "{tenant}: the restored transaction id no longer withholds the feed before migrate"
+        );
+    }
+    match open().await {
+        Err(EventLogError::Invalid(reason)) => assert_eq!(
+            reason,
+            "PostgreSQL events carry another cluster's transaction ids (a restored history); \
+             run migrate with the migration role before opening"
+        ),
+        Err(other) => panic!("refused for another reason: {other:?}"),
+        Ok(store) => {
+            store.shutdown().await.unwrap();
+            panic!("admitted a restored history before migrate settled it");
+        }
+    }
+    assert_eq!(floor(&sql).await, (0, 0), "open records no floor");
+    // An append still in flight holds the publication gate shared; the floor waits for it, or a
+    // position below the floor could commit after the feed passed it.
+    let holder = client(&url).await;
+    let identity = serde_json::to_string(&["kit", "publication"]).unwrap();
+    let key: i64 = holder
+        .query_one(
+            "SELECT hashtextextended(current_database() || ':' || 'hosted_restore' || $1, 0)",
+            &[&identity],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    holder
+        .execute("SELECT pg_advisory_lock_shared($1)", &[&key])
+        .await
+        .unwrap();
+    let settling = migrate();
+    tokio::pin!(settling);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut settling)
+            .await
+            .is_err(),
+        "migrate recorded the floor while an append held the publication gate"
+    );
+    assert_eq!(floor(&sql).await, (0, 0), "no floor while the gate is held");
+    holder
+        .execute("SELECT pg_advisory_unlock_shared($1)", &[&key])
+        .await
+        .unwrap();
+    settling
+        .await
+        .expect("migrate settles the restored history");
+    let through = i64::try_from(second).unwrap();
+    assert_eq!(floor(&sql).await, (1, through));
+    migrate().await.expect("a second migrate");
+    assert_eq!(
+        floor(&sql).await,
+        (1, through),
+        "nothing foreign is left above the floor"
+    );
+    let reader = open()
+        .await
+        .expect("admitted once migrate settled the restore");
+    for (tenant, position) in [
+        ("restored", restored),
+        ("tenant-a", first),
+        ("tenant-b", second),
+    ] {
+        let delivered = feed_from(&reader, &TenantId::new(tenant).unwrap(), 0, Vec::new(), 1).await;
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|event| event.global_seq)
+                .collect::<Vec<_>>(),
+            vec![position],
+            "{tenant}"
+        );
+    }
+    let later = StreamId::new(TenantId::new("tenant-a").unwrap(), "item", "two").unwrap();
+    let above = reader
+        .append(
+            &later,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("above", &serde_json::json!({})),
+        )
+        .await
+        .unwrap()
+        .events[0]
+        .global_seq;
+    let delivered = feed_from(
+        &reader,
+        &TenantId::new("tenant-a").unwrap(),
+        first,
+        Vec::new(),
+        1,
+    )
+    .await;
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|event| event.global_seq)
+            .collect::<Vec<_>>(),
+        vec![above],
+        "an event above the floor is delivered through the watermark"
+    );
+    // The floor is migration metadata: a role that could raise it could settle an append still in
+    // flight, and a feed cursor would pass it.
+    sql.batch_execute(
+        "GRANT INSERT ON hosted_restore.kit_settlement_floor TO eventlog_test_restore",
+    )
+    .await
+    .unwrap();
+    match open().await {
+        Err(EventLogError::Invalid(reason)) => assert_eq!(
+            reason,
+            "hosted application role can write migration metadata reserved for the migration role"
+        ),
+        Err(other) => panic!("refused for another reason: {other:?}"),
+        Ok(store) => {
+            store.shutdown().await.unwrap();
+            panic!("admitted an application role that can write the settlement floor");
+        }
+    }
+    writer.shutdown().await.unwrap();
+    reader.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2776,7 +3027,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
     original.shutdown().await.expect("old writer stopped");
     let sql = client(&url).await;
     downgrade_blob_table(&sql, "schema_upgrade").await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches").await.expect("exact original populated schema");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches; DROP TABLE schema_upgrade_settlement_floor").await.expect("exact original populated schema");
     let config = PostgresConfig::isolated(&url, "schema_upgrade").expect("config");
     let (a, b) = tokio::join!(
         PostgresEventStore::migrate(config.clone(), PoolOptions::default(), &[]),
@@ -2806,7 +3057,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
         "unknown version/checksum refuses before serving"
     );
     downgrade_blob_table(&sql, "schema_upgrade").await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches").await.expect("restore old fixture");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches; DROP TABLE schema_upgrade_settlement_floor").await.expect("restore old fixture");
     PostgresEventStore::migrate(
         PostgresConfig::isolated(&url, "schema_upgrade").expect("config"),
         PoolOptions::default(),
