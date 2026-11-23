@@ -10,6 +10,16 @@ use tokio_postgres::{Client, NoTls};
 const RELEASE_0_10_0_CHECKSUM: &str =
     "f5989b20d7de8babbd77d3427015b92a70f5f6275982f740616476873d09a7fa";
 
+/// The ledger checksum `main` wrote from 0fe56b5c (pull request 70) until the digest became
+/// FIPS-safe: projection tables indexed by the first 8 bytes of `md5(idx_N)`. Never released, but a
+/// store `main` migrated holds it.
+const MD5_DIGEST_CHECKSUM: &str =
+    "20d998c6771a5b4a4e03df9034ac4bab9479ae72ab908f2bae5ef045c7a6881c";
+
+/// The digest index of `idx_0` in the `MD5_DIGEST_CHECKSUM` edition, as `pg_get_indexdef` prints
+/// its columns.
+const MD5_DIGEST_INDEX: &str = "btree (tenant_id, substr(decode(md5(idx_0), 'hex'::text), 1, 8))";
+
 const ROWS: ProjectionSpec = ProjectionSpec {
     name: "keyed_rows",
     indexed: &["kind"],
@@ -228,7 +238,52 @@ async fn icu_database(url: &str) -> String {
 }
 
 /// The digest index of `idx_0`, as `pg_get_indexdef` prints its columns.
-const DIGEST_INDEX: &str = "btree (tenant_id, substr(decode(md5(idx_0), 'hex'::text), 1, 8))";
+const DIGEST_INDEX: &str = "btree (tenant_id, hashtextextended(idx_0, '0'::bigint))";
+
+/// Every SQL function the text `sql` calls: each identifier directly followed by `(`.
+fn called_functions(sql: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut word = String::new();
+    for character in sql.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            word.push(character);
+        } else {
+            if character == '(' && !word.is_empty() {
+                found.push(word.clone());
+            }
+            word.clear();
+        }
+    }
+    found
+}
+
+/// Story pg-projection-find-back-within-1-05: a PostgreSQL server in FIPS mode refuses `md5()`,
+/// and an index whose expression calls it can be neither built nor read there. The value digest
+/// calls `hashtextextended`, PostgreSQL's own non-cryptographic text hash (the one hash
+/// partitioning uses), which runs no OpenSSL digest and so stays available in FIPS mode.
+#[test]
+fn the_value_digest_calls_only_a_function_fips_mode_allows() {
+    let indexes: Vec<String> = schema::projection_indexes("owner_p_rows", 2)
+        .into_iter()
+        .map(|(_, columns)| columns)
+        .collect();
+    let mut called: Vec<String> = indexes
+        .iter()
+        .map(String::as_str)
+        .chain([
+            schema::projection_find_filter(0).as_str(),
+            schema::projection_find_filter(1).as_str(),
+        ])
+        .flat_map(called_functions)
+        .collect();
+    called.sort();
+    called.dedup();
+    assert_eq!(
+        called,
+        ["hashtextextended"],
+        "the index expressions and the lookup call only the FIPS-safe hash: {indexes:?}"
+    );
+}
 
 /// `length` printable ASCII bytes with no repetition a compressor could use.
 fn incompressible(length: usize, mut state: u64) -> String {
@@ -260,7 +315,7 @@ async fn the_previous_edition_migrates_its_projection_tables_and_fences_the_prev
     let current = secondary_indexes(&sql, &table).await;
     assert_eq!(
         current,
-        ["btree (tenant_id, row_key COLLATE \"C\")", DIGEST_INDEX],
+        [DIGEST_INDEX, "btree (tenant_id, row_key COLLATE \"C\")"],
         "a fresh projection table has the digest index and the bytewise page index"
     );
     sql.batch_execute(&format!(
@@ -368,10 +423,113 @@ async fn the_previous_edition_migrates_its_projection_tables_and_fences_the_prev
     drop_owner(&sql, prefix, &[&ROWS]).await;
 }
 
-/// Two values whose MD5 digests share their first 8 bytes, the digest the indexed-value index
-/// keys on. Found offline by a parallel Pollard rho search over 16-hex-digit strings (about
-/// 2^32 MD5 evaluations); the test below asserts in PostgreSQL that they collide.
-const DIGEST_TWINS: [&str; 2] = ["8ea434a5e947b6ef", "0dec2c651fc63026"];
+/// A store `main` migrated before the digest became FIPS-safe — its ledger checksum and each
+/// projection table's MD5 digest index — is refused by `open` until `migrate` runs. `migrate`
+/// alone moves every registered projection table to the `hashtextextended` digest under the same
+/// index name and the ledger to a checksum that `main`'s binary refuses.
+#[tokio::test]
+async fn the_md5_digest_edition_migrates_to_the_fips_safe_digest_and_is_fenced() {
+    let url = fixture();
+    let mut sql = connect(&url).await;
+    let prefix = "projkey_digest_edition";
+    let table = projection_table(prefix, ROWS.name);
+    let tenant = TenantId::new("tenant").unwrap();
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+    schema::migrate(&mut sql, prefix, &[ROWS]).await.unwrap();
+    let current = secondary_indexes(&sql, &table).await;
+    assert_eq!(
+        current,
+        [DIGEST_INDEX, "btree (tenant_id, row_key COLLATE \"C\")"],
+        "a fresh projection table has the FIPS-safe digest index"
+    );
+    let large = incompressible(8_000, 0x1d87_2b41_9c3e_5a07);
+    sql.execute(
+        &format!(
+            "INSERT INTO {table} (tenant_id, row_key, body, idx_0)
+                 SELECT 'tenant', 'row/' || n, jsonb_build_object('n', n), 'kind'
+                 FROM generate_series(1, 50) AS n
+             UNION ALL SELECT 'tenant', 'large', '{{}}', $1"
+        ),
+        &[&large],
+    )
+    .await
+    .unwrap();
+
+    // `main`'s state: its ledger checksum and the MD5 digest index under the field's index name.
+    let index = schema::projection_index(&table, 0);
+    sql.batch_execute(&format!(
+        "DROP INDEX {index}; CREATE INDEX {index} ON {table} USING {MD5_DIGEST_INDEX}"
+    ))
+    .await
+    .unwrap();
+    sql.execute(
+        &format!("UPDATE {prefix}_schema_version SET checksum=$1"),
+        &[&MD5_DIGEST_CHECKSUM],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        secondary_indexes(&sql, &table).await,
+        ["btree (tenant_id, row_key COLLATE \"C\")", MD5_DIGEST_INDEX],
+        "the fixture holds main's edition"
+    );
+    assert_eq!(
+        schema::validate(&mut sql, prefix).await,
+        Err(EventLogError::Invalid(
+            "unknown PostgreSQL schema version/checksum".into()
+        )),
+        "an application open refuses main's edition until migrate runs"
+    );
+
+    schema::migrate(&mut sql, prefix, &[]).await.unwrap();
+    assert_eq!(
+        secondary_indexes(&sql, &table).await,
+        current,
+        "migrate moved a registered projection it was not given to the FIPS-safe digest"
+    );
+    schema::validate(&mut sql, prefix).await.unwrap();
+    schema::validate_projection(&mut sql, prefix, &ROWS)
+        .await
+        .unwrap();
+    let ledger: String = sql
+        .query_one(
+            &format!("SELECT checksum FROM {prefix}_schema_version"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(
+        ledger, MD5_DIGEST_CHECKSUM,
+        "main's binary requires its own checksum, so it is refused on the migrated schema"
+    );
+    let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+    assert_eq!(
+        store
+            .projection_find(&ROWS, &tenant, "kind", "kind", 100)
+            .await
+            .unwrap()
+            .len(),
+        50,
+        "the migrated table answers the same lookup"
+    );
+    assert_eq!(
+        store
+            .projection_find(&ROWS, &tenant, "kind", &large, 10)
+            .await
+            .unwrap(),
+        [serde_json::json!({})],
+        "the 8,000-byte value is found through the new digest"
+    );
+    store.shutdown().await.unwrap();
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+}
+
+/// Two values with one `hashtextextended(value, 0)`, the 64-bit digest the indexed-value index
+/// keys on (5613642215003777566). Found offline by a parallel Pollard rho search over
+/// 16-hex-digit strings (about 2^32 evaluations of PostgreSQL's `hash_bytes_extended`); the test
+/// below asserts in PostgreSQL that they collide.
+const DIGEST_TWINS: [&str; 2] = ["2b4484988e527c47", "aac8b6a1b2ffc8a6"];
 
 /// A guard that looks one value up inside the append's transaction and keeps what it found.
 struct FindsKind {
@@ -409,9 +567,11 @@ async fn values_sharing_a_digest_are_told_apart_by_the_candidate_check() {
     let [first, second] = DIGEST_TWINS;
     let collide: bool = sql
         .query_one(
-            "SELECT $1::text <> $2::text
-                AND substr(decode(md5($1::text), 'hex'), 1, 8)
-                  = substr(decode(md5($2::text), 'hex'), 1, 8)",
+            &format!(
+                "SELECT $1::text <> $2::text AND {} = {}",
+                schema::indexed_digest("$1::text"),
+                schema::indexed_digest("$2::text")
+            ),
             &[&first, &second],
         )
         .await
