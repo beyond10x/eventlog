@@ -30,6 +30,9 @@ under bare-version tags such as `0.1.0`.
 - Tree: `read_many` serves the whole batch from one observation, so it never shows half of an
   atomic group.
 - Tree: an append hashes each event's envelope once instead of four times.
+- Tree: a guarded group retried with its blobs is admitted again before its receipt answers it,
+  as `AtomicEventStore::append_group_guarded_with_blobs` promises; a guard that refuses now
+  refuses the retry.
 
 ## 0.9.4 — 2026-11-11
 

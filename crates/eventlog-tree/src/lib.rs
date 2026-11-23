@@ -324,7 +324,8 @@ impl TreeEventStore {
     /// Append through the engine and, when it wrote, commit the same facts to the files.
     ///
     /// `members` names each stream and what its caller expected; `call` receives what the engine
-    /// is to expect instead, which differs only for a merge.
+    /// is to expect instead, which differs only for a merge, and whether the files already hold
+    /// this command's receipt.
     async fn commit<'a, F>(
         &'a self,
         kind: Kind,
@@ -338,6 +339,7 @@ impl TreeEventStore {
         F: FnOnce(
             Arc<SqliteEventStore>,
             Vec<Expected>,
+            bool,
         ) -> BoxFuture<'a, Result<(Vec<AppendResult>, bool), EventLogError>>,
     {
         if meta.claim.is_some() {
@@ -410,14 +412,15 @@ impl TreeEventStore {
         // the mark it leaves makes the next operation rebuild from the files instead of serving
         // a write that was never committed.
         state.unsettled = true;
-        let (mut results, deduplicated) = match call(engine, engine_expected.clone()).await {
-            Ok(answer) => answer,
-            Err(error) => {
-                // The engine refused inside its own transaction and holds nothing new.
-                state.unsettled = false;
-                return Err(error);
-            }
-        };
+        let (mut results, deduplicated) =
+            match call(engine, engine_expected.clone(), recorded).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // The engine refused inside its own transaction and holds nothing new.
+                    state.unsettled = false;
+                    return Err(error);
+                }
+            };
         if deduplicated {
             state.unsettled = false;
             for result in &mut results {
@@ -1271,7 +1274,7 @@ impl EventStore for TreeEventStore {
                     &members,
                     meta,
                     &[],
-                    move |engine, passed| {
+                    move |engine, passed, _| {
                         Box::pin(async move {
                             let result = engine
                                 .append_guarded(stream, passed[0], events, meta, guard)
@@ -1556,7 +1559,7 @@ impl TreeEventStore {
                     &members,
                     &group.meta,
                     blobs,
-                    move |engine, passed| {
+                    move |engine, passed, recorded| {
                         Box::pin(async move {
                             let mut rewritten = group.clone();
                             for (append, expected) in rewritten.appends.iter_mut().zip(passed) {
@@ -1564,6 +1567,14 @@ impl TreeEventStore {
                             }
                             let result = if blobs.is_empty() {
                                 engine.append_group_guarded(&rewritten, admission).await?
+                            } else if recorded {
+                                // A retry carrying a batch is admitted again before its receipt
+                                // answers it, as `AtomicEventStore` promises: the blob entry point
+                                // the commit went through answers from its receipt without asking
+                                // the guard. The receipt it recorded is matched all the same.
+                                engine
+                                    .append_group_guarded_with_blobs(&rewritten, admission, blobs)
+                                    .await?
                             } else {
                                 engine
                                     .append_group_with_blobs_guarded(
