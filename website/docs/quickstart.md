@@ -4,7 +4,7 @@ description: Build the released library and exercise File and SQLite in disposab
 ---
 
 Install Git and Rust **1.91 or newer** before running these commands. Cargo downloads the locked
-dependencies on its first run. No database server is needed for these two providers.
+dependencies on its first run, and these two providers need no database server.
 
 ## Run the released providers
 
@@ -19,7 +19,7 @@ cargo test --locked -p eventlog-sqlite -- --test-threads=1
 
 Both commands must finish with successful test results. The suites create disposable directories
 and databases and exercise the provider contracts, including committed history and refused writes.
-This proves the selected local providers; it does not run the PostgreSQL suite.
+They prove the selected local providers and do not run the PostgreSQL suite.
 The commands serialize the released fixtures, including process-lock exercises.
 
 ## Add the library
@@ -41,7 +41,7 @@ The crates are distributed from Git, with `publish = false`. Choose `eventlog-sq
 2. Register required inline projections before traffic.
 3. Construct a `StreamId` from a trusted `TenantId`, stream kind and opaque identifier.
 4. Append with the expected revision and stable command metadata.
-5. Retain the returned receipt; retry an uncertain result with the original command identity.
+5. Retain the returned receipt, and retry an uncertain result with the original command identity.
 
 The [released conformance examples](https://github.com/beyond10x/eventlog/blob/0.10.0/crates/eventlog-conformance/src/lib.rs)
 show event and command construction. Read [guarantees](guarantees.md) before composing multiple
