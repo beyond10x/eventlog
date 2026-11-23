@@ -611,3 +611,40 @@ async fn refusing_check_interval(
         socket.write_all(&reply).await?;
     }
 }
+
+/// An idempotency mismatch is a known answer: the lookup ends its read and keeps the connection,
+/// so the pool neither retires it as an unsettled lease nor opens a replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idempotency_mismatch_keeps_its_pooled_connection() {
+    const PREFIX: &str = "rcr_mismatch_keeps";
+    let Some(url) = url() else {
+        eprintln!("skipped: mismatch retirement proof requires EVENTLOG_TEST_POSTGRES_URL");
+        return;
+    };
+    let observer = connect(&url).await;
+    fresh(&observer, PREFIX).await;
+    let store = seeded_store(&url, PREFIX, PoolOptions::default()).await;
+    let stream = StreamId::new(TenantId::new("review").unwrap(), "item", "held").unwrap();
+    let before = store.pool_churn();
+    for _ in 0..3 {
+        let refused = store
+            .recorded_command(&stream, "seed", "a-different-request-hash")
+            .await;
+        assert!(
+            matches!(&refused, Err(EventLogError::IdempotencyMismatch { key }) if key == "seed"),
+            "the key names a different body: {refused:?}"
+        );
+    }
+    let started = Instant::now();
+    while store.pool_status().checked_out != 0 && started.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after = store.pool_churn();
+    assert_eq!(
+        (after.retired_unsettled_lease, after.opened),
+        (before.retired_unsettled_lease, before.opened),
+        "a mismatch retired a healthy connection and opened a replacement"
+    );
+    store.drop_tables().await.unwrap();
+    store.shutdown().await.unwrap();
+}

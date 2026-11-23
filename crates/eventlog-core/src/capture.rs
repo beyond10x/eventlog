@@ -793,26 +793,61 @@ pub fn validate_captured_order(
     tenant: &TenantId,
     events: &[RecordedEvent],
 ) -> Result<(), CaptureError> {
-    let corrupt = || CaptureError::Corrupt {
-        material: CaptureMaterial::Event,
-    };
-    let mut position = 0_u64;
-    let mut heads: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    let mut order = CapturedOrder::default();
     for event in events {
+        order.observe(tenant, event)?;
+    }
+    Ok(())
+}
+
+/// [`validate_captured_order`] one event at a time, for a reader that pages through history.
+///
+/// Feeding every event of a history to [`CapturedOrder::observe`] in order accepts and refuses
+/// exactly what [`validate_captured_order`] does over the whole slice, while the caller keeps only
+/// one page. What it retains is the last position and one head per stream seen, not the events.
+#[derive(Debug, Default)]
+pub struct CapturedOrder {
+    position: u64,
+    /// Highest version seen, by stream type and then stream id.
+    heads: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+impl CapturedOrder {
+    /// Check the next event of the history after every event observed so far.
+    ///
+    /// # Errors
+    /// Returns [`CaptureError::Corrupt`] for a position that does not rise past the previous one, a
+    /// version that is not one past its stream's previous version, or an event that fails
+    /// [`validate_captured_event`].
+    pub fn observe(
+        &mut self,
+        tenant: &TenantId,
+        event: &RecordedEvent,
+    ) -> Result<(), CaptureError> {
+        let corrupt = || CaptureError::Corrupt {
+            material: CaptureMaterial::Event,
+        };
         validate_captured_event(tenant, event)?;
-        if event.global_seq <= position {
+        if event.global_seq <= self.position {
             return Err(corrupt());
         }
-        position = event.global_seq;
-        let head = heads
-            .entry((event.stream_type.as_str(), event.stream_id.as_str()))
-            .or_insert(0);
+        let streams = match self.heads.get_mut(event.stream_type.as_str()) {
+            Some(streams) => streams,
+            None => self.heads.entry(event.stream_type.clone()).or_default(),
+        };
+        let head = streams.get(event.stream_id.as_str()).copied().unwrap_or(0);
         if head.checked_add(1) != Some(event.version) {
             return Err(corrupt());
         }
-        *head = event.version;
+        match streams.get_mut(event.stream_id.as_str()) {
+            Some(stored) => *stored = event.version,
+            None => {
+                streams.insert(event.stream_id.clone(), event.version);
+            }
+        }
+        self.position = event.global_seq;
+        Ok(())
     }
-    Ok(())
 }
 
 /// [`validate_captured_order`] for a store whose streams can fork.
@@ -1080,6 +1115,65 @@ mod tests {
             parents: parents.iter().map(|parent| (*parent).to_owned()).collect(),
             ..recorded(global_seq, version, "one")
         }
+    }
+
+    /// Observing a history one event at a time accepts and refuses what the whole-slice check
+    /// does, including a version gap or a repeated position that straddles two pages.
+    #[test]
+    fn captured_order_observed_event_by_event_matches_the_whole_history_check() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let histories: [(&str, Vec<RecordedEvent>); 5] = [
+            (
+                "interleaved streams",
+                vec![
+                    recorded(1, 1, "one"),
+                    recorded(3, 1, "two"),
+                    recorded(4, 2, "one"),
+                    recorded(9, 2, "two"),
+                ],
+            ),
+            (
+                "version gap",
+                vec![
+                    recorded(1, 1, "one"),
+                    recorded(2, 1, "two"),
+                    recorded(3, 3, "one"),
+                ],
+            ),
+            (
+                "repeated version",
+                vec![recorded(1, 1, "one"), recorded(2, 1, "one")],
+            ),
+            (
+                "repeated position",
+                vec![recorded(1, 1, "one"), recorded(1, 1, "two")],
+            ),
+            ("first version is not one", vec![recorded(1, 2, "one")]),
+        ];
+        for (case, history) in histories {
+            let mut order = CapturedOrder::default();
+            let mut observed = Ok(());
+            for event in &history {
+                observed = order.observe(&tenant, event);
+                if observed.is_err() {
+                    break;
+                }
+            }
+            assert_eq!(
+                observed,
+                validate_captured_order(&tenant, &history),
+                "{case}: incremental and whole-history checks disagree"
+            );
+        }
+        let mut order = CapturedOrder::default();
+        order.observe(&tenant, &recorded(1, 1, "one")).unwrap();
+        assert_eq!(
+            order.observe(&tenant, &recorded(2, 3, "one")),
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Event
+            }),
+            "a gap after an earlier page is refused as corrupt history"
+        );
     }
 
     #[test]

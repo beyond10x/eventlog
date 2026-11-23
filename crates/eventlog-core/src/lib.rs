@@ -16,7 +16,7 @@ mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod blob_integrity;
 mod verified_content;
-pub use verified_content::{VERIFIED_CONTENT_BUDGET, VerifiedContent};
+pub use verified_content::{ContentGeneration, VERIFIED_CONTENT_BUDGET, VerifiedContent};
 mod capture;
 mod inline_admin;
 pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
@@ -24,12 +24,12 @@ mod projection;
 
 pub use capture::{
     BoundBlobs, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
-    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection,
-    CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture, DeferredBlob,
-    DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal, TenantCapture,
-    TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs, order_rows,
-    validate_capture_request, validate_captured_branchable_order, validate_captured_digest,
-    validate_captured_event, validate_captured_order,
+    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedOrder,
+    CapturedProjection, CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture,
+    DeferredBlob, DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal,
+    TenantCapture, TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs,
+    order_rows, validate_capture_request, validate_captured_branchable_order,
+    validate_captured_digest, validate_captured_event, validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 

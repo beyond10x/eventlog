@@ -5,6 +5,30 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- PostgreSQL: a blob read whose fetch and check are separated by a commit or a statement notes the
+  verified-content generation before it fetches, so a same-handle deletion that settles in between
+  no longer leaves the deleted bytes in the handle's memory. `eventlog-core` adds
+  `VerifiedContent::generation`, `VerifiedContent::check_stored_since` and `ContentGeneration`;
+  `check_stored` is unchanged.
+- PostgreSQL and SQLite: inline rebuild no longer holds the tenant's whole decoded history in one
+  vector. It validates every page first and then folds page by page, both in the same snapshot,
+  so no callback still runs on corrupt history and the shadow-table publication stays atomic.
+  `eventlog-core` adds `CapturedOrder`, the page-at-a-time form of `validate_captured_order`.
+- PostgreSQL: an idempotency mismatch from `recorded_command` rolls back and keeps its pooled
+  connection instead of retiring it as an unsettled lease.
+
+### Changed
+
+- PostgreSQL: `read_stream` and the stream reads of `read_many` still read one row past the page
+  to decide `end_of_stream`, but no longer output, detoast or decode that row's event body; the
+  next page reads it once.
+- Verified blob content: a full memory drops its least recently used entries until a new content
+  fits, instead of clearing every entry. Deletion and erasure through the handle still clear it.
+- PostgreSQL: capture preflight takes the blob count, byte total and invalid-length count from one
+  aggregate, scanning the tenant's blob bindings once instead of three times.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security
