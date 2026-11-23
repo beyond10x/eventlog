@@ -576,16 +576,162 @@ pub fn validate_effect_boundary_inventory(
     Ok(())
 }
 
-/// A stable digest of a command body, for the idempotency check.
+/// A digest of a command body, for the idempotency check.
+///
+/// The compact JSON bytes are written straight into the hasher: the same bytes `to_vec` would
+/// produce, without holding a copy of the whole body.
+///
+/// **The digest depends on the order the body serialises its object keys in.** A struct keeps
+/// its field order, but a `HashMap` iterates in an order chosen per map, so one unchanged body can
+/// hash differently on a retry and be refused as an idempotency mismatch. New idempotency keys
+/// should use [`canonical_request_hash`]. A key already recorded with this digest keeps being
+/// retried with this function: the bytes it hashes never change, so recorded retry identities stay
+/// usable.
 ///
 /// # Errors
 /// Returns [`EventLogError::Invalid`] when the value cannot be serialised.
 pub fn request_hash<T: Serialize>(value: &T) -> Result<String, EventLogError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| EventLogError::Invalid(format!("command is not serialisable: {error}")))?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    serde_json::to_writer(&mut hasher, value)
+        .map_err(|error| EventLogError::Invalid(format!("command is not serialisable: {error}")))?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The version prefix of [`canonical_request_hash`], so its digests never collide with
+/// [`request_hash`]'s unprefixed ones.
+pub const CANONICAL_REQUEST_HASH_PREFIX: &str = "c1:";
+
+/// A digest of a command body that does not depend on object key order.
+///
+/// The body is serialised as compact JSON, then every object's keys are written in ascending
+/// UTF-8 byte order, recursively; arrays keep their order. The sort is done here rather than
+/// left to `serde_json::Value`, whose map order changes when any crate in a build enables
+/// `serde_json/preserve_order`. The result is `c1:` followed by the lower-case SHA-256 of those
+/// canonical bytes.
+///
+/// Migration rule: use it for new idempotency keys only. A key recorded with
+/// [`request_hash`] keeps [`request_hash`]; switching an in-flight key changes its digest and is
+/// refused as an idempotency mismatch.
+///
+/// # Errors
+/// Returns [`EventLogError::Invalid`] when the value cannot be serialised, or nests deeper than
+/// `serde_json` reads back (128 levels).
+pub fn canonical_request_hash<T: Serialize>(value: &T) -> Result<String, EventLogError> {
+    let invalid = |error: &dyn std::fmt::Display| {
+        EventLogError::Invalid(format!("command is not serialisable: {error}"))
+    };
+    let bytes = serde_json::to_vec(value).map_err(|error| invalid(&error))?;
+    let node: CanonicalNode = serde_json::from_slice(&bytes).map_err(|error| invalid(&error))?;
+    drop(bytes);
+    let mut hasher = Sha256::new();
+    node.write(&mut hasher).map_err(|error| invalid(&error))?;
+    Ok(format!(
+        "{CANONICAL_REQUEST_HASH_PREFIX}{:x}",
+        hasher.finalize()
+    ))
+}
+
+/// A JSON value with object entries in document order, so the canonical order is imposed here.
+enum CanonicalNode {
+    Null,
+    Bool(bool),
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+    Text(String),
+    Array(Vec<CanonicalNode>),
+    Object(Vec<(String, CanonicalNode)>),
+}
+
+impl CanonicalNode {
+    fn write(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Null => out.write_all(b"null"),
+            Self::Bool(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Unsigned(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Signed(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Float(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Text(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Array(items) => {
+                out.write_all(b"[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.write_all(b",")?;
+                    }
+                    item.write(out)?;
+                }
+                out.write_all(b"]")
+            }
+            Self::Object(entries) => {
+                let mut sorted: Vec<&(String, CanonicalNode)> = entries.iter().collect();
+                sorted.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+                out.write_all(b"{")?;
+                for (index, (key, value)) in sorted.into_iter().enumerate() {
+                    if index > 0 {
+                        out.write_all(b",")?;
+                    }
+                    serde_json::to_writer(&mut *out, key)?;
+                    out.write_all(b":")?;
+                    value.write(out)?;
+                }
+                out.write_all(b"}")
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CanonicalNode;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Null)
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Bool(value))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Unsigned(value))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Signed(value))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Float(value))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Text(value.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Text(value))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<CanonicalNode, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = sequence.next_element()? {
+                    items.push(item);
+                }
+                Ok(CanonicalNode::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<CanonicalNode, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(CanonicalNode::Object(entries))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// A new event id. Time-ordered, so a debug listing sorts the way history happened.
@@ -1353,6 +1499,61 @@ pub trait BranchableEventStore: EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_request_hash_is_one_digest_for_one_body_whatever_its_key_order() {
+        use std::collections::{BTreeMap, HashMap};
+
+        #[derive(Serialize)]
+        struct Command {
+            zeta: u32,
+            alpha: String,
+            fields: HashMap<String, Value>,
+        }
+        let entries = || {
+            (0..12).map(|index| {
+                (
+                    format!("field-{index:02}"),
+                    json!({"z": index, "a": [index, -1, 0.5], "m": {"y": null, "b": "\u{e9}\"\n"}}),
+                )
+            })
+        };
+        let pinned = canonical_request_hash(&Command {
+            zeta: 1,
+            alpha: "x".into(),
+            fields: entries().collect(),
+        })
+        .unwrap();
+        // Each HashMap draws its own hash keys, so 64 of them iterate in many orders.
+        for _ in 0..64 {
+            let command = Command {
+                zeta: 1,
+                alpha: "x".into(),
+                fields: entries().collect(),
+            };
+            assert_eq!(canonical_request_hash(&command).unwrap(), pinned);
+        }
+        let ordered: BTreeMap<String, Value> = entries().collect();
+        assert_eq!(
+            canonical_request_hash(&json!({"fields": ordered, "alpha": "x", "zeta": 1})).unwrap(),
+            pinned,
+            "a sorted map and a different field order are the same body"
+        );
+        // The canonical bytes, written out: keys sorted at every level, arrays in order.
+        let small = canonical_request_hash(&json!({"b": 1, "a": [{"d": 2, "c": "x"}]})).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(br#"{"a":[{"c":"x","d":2}],"b":1}"#);
+        assert_eq!(small, format!("c1:{:x}", expected.finalize()));
+        assert_eq!(
+            pinned,
+            "c1:3fdc370267345d86916f85eb55fa4ae38e97edb4947554d87f68bfff50176efc"
+        );
+        assert_ne!(
+            request_hash(&json!({"b": 1, "a": [{"d": 2, "c": "x"}]})).unwrap(),
+            small,
+            "canonical digests are versioned apart from the legacy ones"
+        );
+    }
 
     #[test]
     fn a_head_set_digest_ignores_order_and_repeats_but_not_membership() {

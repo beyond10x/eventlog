@@ -336,13 +336,16 @@ impl DeferredTenantCapture {
     ///
     /// # Errors
     /// Whatever [`DeferredBlob::bytes`] returns for the first binding that cannot be read.
+    ///
+    /// Content the value already holds moves into the result; only a deferred binding is read.
     pub fn load(self) -> Result<TenantCapture, CaptureError> {
         let mut blobs = Vec::with_capacity(self.blobs.len());
-        for blob in &self.blobs {
-            blobs.push(CapturedBlob {
-                digest: blob.digest.clone(),
-                bytes: blob.bytes()?,
-            });
+        for DeferredBlob { digest, source } in self.blobs {
+            let bytes = match source {
+                DeferredSource::Held(bytes) => bytes,
+                DeferredSource::Read(source) => source.read(&digest)?,
+            };
+            blobs.push(CapturedBlob { digest, bytes });
         }
         Ok(TenantCapture {
             tenant: self.tenant,
@@ -732,9 +735,31 @@ impl CaptureBudget {
 }
 
 /// The compact UTF-8 length of one stored body. Object key order does not change it.
+///
+/// The same serializer as `to_vec` writes into a counter, so the length is exact and no second
+/// copy of the body is built only to be measured.
 fn compact_len(value: &Value, material: CaptureMaterial) -> Result<u64, CaptureError> {
-    let encoded = serde_json::to_vec(value).map_err(|_| CaptureError::Corrupt { material })?;
-    u64::try_from(encoded.len()).map_err(|_| CaptureError::Corrupt { material })
+    let mut counter = ByteCount(0);
+    serde_json::to_writer(&mut counter, value).map_err(|_| CaptureError::Corrupt { material })?;
+    Ok(counter.0)
+}
+
+/// A writer that keeps only how many bytes it was given.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let len = u64::try_from(bytes.len()).map_err(|_| std::io::ErrorKind::InvalidData)?;
+        self.0 = self
+            .0
+            .checked_add(len)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Check one stored event's constructor-level envelope invariants.
@@ -1160,6 +1185,92 @@ mod tests {
             validate_captured_branchable_order(&tenant, &history).is_err(),
             "a parent on another stream was accepted"
         );
+    }
+
+    #[test]
+    fn loading_moves_held_content_and_reads_only_deferred_bindings() {
+        #[derive(Debug)]
+        struct Reader(std::sync::atomic::AtomicUsize);
+        impl BoundBlobs for Reader {
+            fn read(&self, digest: &str) -> Result<Vec<u8>, CaptureError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match digest {
+                    "deferred" => Ok(b"read later".to_vec()),
+                    _ => Err(CaptureError::Corrupt {
+                        material: CaptureMaterial::Blob,
+                    }),
+                }
+            }
+        }
+        let held = vec![7_u8; 4096];
+        let held_buffer = held.as_ptr();
+        let reader = Arc::new(Reader(std::sync::atomic::AtomicUsize::new(0)));
+        let capture = |blobs| DeferredTenantCapture {
+            tenant: TenantId::new("tenant-1").unwrap(),
+            stream_identity: "identity".into(),
+            events: Vec::new(),
+            blobs,
+            projections: Vec::new(),
+        };
+        let loaded = capture(vec![
+            DeferredBlob::held("held".into(), held),
+            DeferredBlob::deferred("deferred".into(), reader.clone()),
+        ])
+        .load()
+        .unwrap();
+        assert_eq!(loaded.blobs[0].digest, "held");
+        assert_eq!(loaded.blobs[0].bytes, vec![7_u8; 4096]);
+        assert_eq!(
+            loaded.blobs[0].bytes.as_ptr(),
+            held_buffer,
+            "held content was copied instead of moved into the result"
+        );
+        assert_eq!(loaded.blobs[1].digest, "deferred");
+        assert_eq!(loaded.blobs[1].bytes, b"read later");
+        assert_eq!(reader.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let refused = capture(vec![
+            DeferredBlob::held("held".into(), vec![1]),
+            DeferredBlob::deferred("gone".into(), reader.clone()),
+        ])
+        .load();
+        assert_eq!(
+            refused.err(),
+            Some(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            })
+        );
+    }
+
+    #[test]
+    fn payload_length_is_the_exact_compact_encoding_of_escapes_numbers_and_non_ascii() {
+        let bodies = [
+            json!({}),
+            json!({"value": 1}),
+            json!({"zeta":1,"alpha":"quote \" slash \\ tab \t nl \n ctl \u{1} del \u{7f}"}),
+            json!({"name":"Grüße, 世界 😀","nested":{"y":[1,-2,3.5,1e300,0.1],"x":null}}),
+            json!({"max":u64::MAX,"min":i64::MIN,"list":[[],{},true,false]}),
+            json!({"long":"b".repeat(70_000)}),
+        ];
+        for body in bodies {
+            let encoded = serde_json::to_vec(&body).unwrap().len() as u64;
+            assert_eq!(
+                compact_len(&body, CaptureMaterial::Projection).unwrap(),
+                encoded,
+                "counted length differs from the encoding of {body}"
+            );
+        }
+        let exact = json!({"long":"b".repeat(70_000)});
+        let bytes = serde_json::to_vec(&exact).unwrap().len() as u64;
+        let mut budget = CaptureBudget::new(CaptureLimits {
+            max_events: 0,
+            max_blobs: 0,
+            max_projection_rows: 2,
+            max_payload_bytes: bytes * 2,
+        });
+        budget.admit_projection_row(&exact).unwrap();
+        budget.admit_projection_row(&exact).unwrap();
+        assert_eq!(budget.usage().payload_bytes, bytes * 2);
     }
 
     #[test]

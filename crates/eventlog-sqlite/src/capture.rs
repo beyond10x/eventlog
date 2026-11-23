@@ -520,18 +520,21 @@ fn read_events(
 ) -> Result<Vec<RecordedEvent>, CaptureError> {
     let mut events = Vec::new();
     let mut after: Option<i64> = None;
+    let mut first = connection
+        .prepare(&events_page_sql(prefix, false))
+        .map_err(operational)?;
+    let mut continued = connection
+        .prepare(&events_page_sql(prefix, true))
+        .map_err(operational)?;
     loop {
         let page = {
-            let mut statement = connection
-                .prepare(&format!(
-                    "SELECT {COLUMNS} FROM {prefix}_events
-                     WHERE tenant_id = ?1 AND (?2 IS NULL OR global_seq > ?2)
-                     ORDER BY global_seq LIMIT ?3"
-                ))
-                .map_err(operational)?;
-            let rows = statement
-                .query_map(params![tenant.as_str(), after, CHUNK], read_event)
-                .map_err(operational)?;
+            let rows = match after {
+                None => first.query_map(params![tenant.as_str(), CHUNK], read_event),
+                Some(after) => {
+                    continued.query_map(params![tenant.as_str(), after, CHUNK], read_event)
+                }
+            }
+            .map_err(operational)?;
             let mut page = Vec::new();
             for row in rows {
                 page.push(
@@ -549,6 +552,27 @@ fn read_events(
             after = Some(to_i64(event.global_seq)?);
             events.push(event);
         }
+    }
+}
+
+/// One page of a tenant's events in sequence order.
+///
+/// A continuation page has a mandatory sequence bound, so SQLite seeks the feed index on the
+/// tenant and the position together. An optional bound (`?2 IS NULL OR global_seq > ?2`) leaves
+/// the position as a filter and makes every page walk the tenant's earlier events again.
+pub(crate) fn events_page_sql(prefix: &str, continued: bool) -> String {
+    if continued {
+        format!(
+            "SELECT {COLUMNS} FROM {prefix}_events
+             WHERE tenant_id = ?1 AND global_seq > ?2
+             ORDER BY global_seq LIMIT ?3"
+        )
+    } else {
+        format!(
+            "SELECT {COLUMNS} FROM {prefix}_events
+             WHERE tenant_id = ?1
+             ORDER BY global_seq LIMIT ?2"
+        )
     }
 }
 
