@@ -33,6 +33,8 @@ under bare-version tags such as `0.1.0`.
 - Tree: a guarded group retried with its blobs is admitted again before its receipt answers it,
   as `AtomicEventStore::append_group_guarded_with_blobs` promises; a guard that refuses now
   refuses the retry.
+- Tree: an open requests file metadata once per history file instead of twice, and not at all
+  for a directory.
 
 ## 0.9.4 — 2026-11-11
 

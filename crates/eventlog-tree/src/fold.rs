@@ -101,8 +101,17 @@ pub(crate) fn stamps(root: &Path) -> Option<Stamps> {
             Err(_) => return None,
         };
         for entry in entries {
-            let path = entry.ok()?.path();
-            if path.is_dir() {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            // The entry's own type comes with the directory listing, so a directory costs no
+            // metadata request and a regular file only the one its stamp makes. A symbolic link is
+            // followed into a directory it names, as before, and otherwise stamped as the link.
+            let directory = match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => followed_is_dir(&path),
+                Ok(kind) => kind.is_dir(),
+                Err(_) => followed_is_dir(&path),
+            };
+            if directory {
                 stack.push(path);
             } else {
                 stamp_into(root, &path, &mut found)?;
@@ -112,10 +121,31 @@ pub(crate) fn stamps(root: &Path) -> Option<Stamps> {
     Some(found)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many metadata requests [`stamps`] made on this thread.
+    static METADATA_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Every metadata request [`stamps`] makes goes through here or [`own_metadata`].
+fn followed_is_dir(path: &Path) -> bool {
+    #[cfg(test)]
+    METADATA_REQUESTS.with(|count| count.set(count.get() + 1));
+    path.is_dir()
+}
+
+/// The metadata of `path` itself, a symbolic link as the link.
+#[cfg(unix)]
+fn own_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    METADATA_REQUESTS.with(|count| count.set(count.get() + 1));
+    fs::symlink_metadata(path)
+}
+
 #[cfg(unix)]
 fn stamp_into(root: &Path, path: &Path, found: &mut Stamps) -> Option<()> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match own_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(()),
         Err(_) => return None,
@@ -232,5 +262,72 @@ pub(crate) fn keep(root: &Path, key: &str, image: &[u8], mut state: Value) {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A warm open stamps every history file; review finding L70 counted two metadata requests
+    /// per file (one to classify the path, one for its stamp) and one per directory. The
+    /// directory listing already says what each entry is.
+    #[test]
+    fn stamps_request_metadata_once_per_file_and_never_for_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("store.json"), b"{}").unwrap();
+        let mut files = 1;
+        for (sub, count) in [
+            ("streams/item/one", 3),
+            ("streams/item/two", 2),
+            ("groups/ab", 4),
+        ] {
+            let path = root.join("tenants/tenant-a").join(sub);
+            fs::create_dir_all(&path).unwrap();
+            for index in 0..count {
+                fs::write(path.join(format!("{index}.json")), b"{}").unwrap();
+                files += 1;
+            }
+        }
+        METADATA_REQUESTS.with(|count| count.set(0));
+        let stamped = stamps(root).unwrap();
+        assert_eq!(stamped.len(), files);
+        assert_eq!(
+            METADATA_REQUESTS.with(std::cell::Cell::get),
+            files,
+            "one metadata request per file and none per directory"
+        );
+    }
+
+    /// The stamp rules for a symbolic link stay as they were: a link to a directory is followed
+    /// into it, any other link is stamped as the link itself, so retargeting it moves the stamp.
+    #[test]
+    fn a_link_to_a_directory_is_followed_and_any_other_link_is_stamped_as_the_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("store.json"), b"{}").unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("event.json"), b"{\"a\":1}").unwrap();
+        fs::write(outside.join("long-target-name.json"), b"{}").unwrap();
+        let tenant = root.join("tenants/tenant-a");
+        fs::create_dir_all(&tenant).unwrap();
+        std::os::unix::fs::symlink(&outside, tenant.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("event.json"), tenant.join("file-link")).unwrap();
+        let stamped = stamps(root).unwrap();
+        assert!(stamped.contains_key("tenants/tenant-a/linked/event.json"));
+        let link = stamped["tenants/tenant-a/file-link"];
+        fs::remove_file(tenant.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("long-target-name.json"),
+            tenant.join("file-link"),
+        )
+        .unwrap();
+        let moved = stamps(root).unwrap()["tenants/tenant-a/file-link"];
+        assert_ne!(
+            link[2], moved[2],
+            "the link's own length is its target's name"
+        );
     }
 }
