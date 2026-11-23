@@ -56,6 +56,9 @@ under bare-version tags such as `0.1.0`.
   `migrate` succeeded and `open` refused the table. `migrate` now creates the indexes missing by
   definition, whatever their stored names, and compares the table's whole shape before it
   commits, as `open` does.
+- PostgreSQL: a positive pool timeout under a whole millisecond is sent to the session rounded up
+  (500 µs becomes 1 ms). Before, it was truncated to 0, which PostgreSQL reads as no statement,
+  lock or idle-transaction limit.
 
 ## 0.9.4 — 2026-11-11
 

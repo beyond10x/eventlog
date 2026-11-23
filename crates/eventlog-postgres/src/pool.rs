@@ -40,6 +40,24 @@ async fn check_client_connection(client: &Client) -> Result<(), tokio_postgres::
     }
 }
 
+/// A server-side limit in whole milliseconds, rounded up: PostgreSQL reads 0 as no limit, so a
+/// positive duration under a millisecond must never become 0.
+fn server_millis(duration: Duration) -> u128 {
+    duration.as_micros().div_ceil(1000)
+}
+
+/// The settings every new physical session gets before a lease hands it out.
+fn session_configuration(schema: &str, options: &PoolOptions) -> String {
+    format!(
+        "SET search_path TO {schema}; SET default_transaction_isolation = 'read committed'; \
+         SET default_transaction_read_only = off; SET statement_timeout = {}; \
+         SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
+        server_millis(options.statement_timeout),
+        server_millis(options.lock_timeout),
+        server_millis(options.transaction_timeout)
+    )
+}
+
 /// Host assertion about the transport created by a caller-owned authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostgresTransportAssurance {
@@ -506,15 +524,7 @@ impl Pool {
                 self.state.lock().map_err(super::poisoned)?.churn.open();
                 lease.client = Some(connection);
                 let connection = lease.client.as_ref().expect("connected lease");
-                let configuration = format!(
-                    "SET search_path TO {}; SET default_transaction_isolation = 'read committed'; \
-                     SET default_transaction_read_only = off; SET statement_timeout = {}; \
-                     SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
-                    self.config.schema,
-                    self.options.statement_timeout.as_millis(),
-                    self.options.lock_timeout.as_millis(),
-                    self.options.transaction_timeout.as_millis()
-                );
+                let configuration = session_configuration(&self.config.schema, &self.options);
                 let configure = async {
                     connection.client.batch_execute(&configuration).await?;
                     check_client_connection(&connection.client).await
@@ -940,6 +950,32 @@ mod tests {
         pin::Pin,
         task::{Context, Poll, Waker},
     };
+
+    /// PostgreSQL reads a limit of 0 as none: an accepted 500 µs timeout must reach the session
+    /// as 1 ms, and a fraction of a millisecond rounds up rather than down.
+    #[test]
+    fn submillisecond_timeouts_keep_their_server_side_limits() {
+        let options = PoolOptions {
+            statement_timeout: Duration::from_micros(500),
+            lock_timeout: Duration::from_micros(1),
+            transaction_timeout: Duration::from_micros(2_500),
+            ..PoolOptions::default()
+        };
+        options.validate().expect("positive bounded timeouts");
+        assert_eq!(
+            session_configuration("hosted", &options),
+            "SET search_path TO hosted; SET default_transaction_isolation = 'read committed'; \
+             SET default_transaction_read_only = off; SET statement_timeout = 1; \
+             SET lock_timeout = 1; SET idle_in_transaction_session_timeout = 3"
+        );
+        let defaults = session_configuration("hosted", &PoolOptions::default());
+        assert!(
+            defaults.contains("statement_timeout = 5000;")
+                && defaults.contains("lock_timeout = 2000;")
+                && defaults.ends_with("idle_in_transaction_session_timeout = 10000"),
+            "{defaults}"
+        );
+    }
 
     struct TestAuthority {
         url: Option<String>,
