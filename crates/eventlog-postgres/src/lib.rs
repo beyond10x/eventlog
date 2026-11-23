@@ -37,6 +37,8 @@ mod inline_admin;
 mod pool;
 #[cfg(test)]
 mod receipt_snapshot;
+#[cfg(test)]
+mod registration_deadline;
 mod schema;
 #[cfg(test)]
 mod verify_content_once;

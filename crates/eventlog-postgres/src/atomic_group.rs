@@ -769,11 +769,13 @@ impl AtomicEventStore for PostgresEventStore {
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(async move {
-            let fingerprint = group.fingerprint()?;
-            self.freeze().await;
-            let commit_started = std::sync::atomic::AtomicBool::new(false);
+            // One budget from the public entry: the wait for registration to freeze (an inline
+            // rebuild holds it while it replays) is spent from it, as on the single-append path.
             let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
+            let fingerprint = group.fingerprint()?;
+            let commit_started = std::sync::atomic::AtomicBool::new(false);
             tokio::time::timeout_at(deadline, async {
+                self.freeze().await;
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;
@@ -824,13 +826,15 @@ impl AtomicBlobEventStore for PostgresEventStore {
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(async move {
+            // One budget from the public entry, registration wait included; see
+            // `append_group_guarded`.
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
             let fingerprint = request.fingerprint()?;
             let mut request = request.clone();
             request.blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
-            self.freeze().await;
             let commit_started = std::sync::atomic::AtomicBool::new(false);
-            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
             let outcome = tokio::time::timeout_at(deadline, async {
+                self.freeze().await;
                 let mut client = self.pool.acquire().await?;
                 client.quarantine();
                 let transaction = client.transaction().await.map_err(backend)?;

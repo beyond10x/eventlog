@@ -7,6 +7,10 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- PostgreSQL: a grouped append, with or without blobs, starts its transaction deadline at its
+  public entry. The wait for inline registration to freeze, which an inline rebuild can hold
+  while it replays, is now spent from the same budget instead of being followed by a fresh full
+  timeout, as on the single-append path.
 - PostgreSQL: `recorded_command` reads a command receipt and its events in one read-only
   REPEATABLE READ snapshot, so a tenant erasure that commits between the two reads no longer
   returns a receipt with no events or with events of recreated stream coordinates. A receipt
