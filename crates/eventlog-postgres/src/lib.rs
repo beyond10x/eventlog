@@ -223,30 +223,13 @@ impl PostgresEventStore {
         let pool = Pool::new(config, options)?;
         {
             let mut client = pool.acquire().await?;
-            let can_ddl:bool=client.query_one("SELECT COALESCE(has_schema_privilege(current_user,current_schema(),'CREATE'),true) OR EXISTS(SELECT FROM pg_roles WHERE rolname=current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) OR EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user)) OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND c.relkind IN ('r','p','S','v','m','f'))",&[]).await.map_err(backend)?.get(0);
-            if can_ddl {
-                return Err(EventLogError::Invalid(
-                    "hosted application role must not own schema DDL".into(),
-                ));
-            }
-            let role_limit: i32 = client
-                .query_one(
-                    "SELECT rolconnlimit FROM pg_roles WHERE rolname=current_user",
-                    &[],
-                )
-                .await
-                .map_err(backend)?
-                .get(0);
-            if role_limit <= 0
-                || usize::try_from(role_limit)
-                    .ok()
-                    .is_none_or(|limit| limit > replicas * pool.options.max_connections)
-            {
-                return Err(EventLogError::Invalid("hosted application role requires a finite connection limit within its admitted replica pool share".into()));
-            }
+            let share = replicas * pool.options.max_connections;
+            let role = pool::HostedRole::of(&client).await?;
+            role.admit(share)?;
             schema::validate(&mut client, &prefix).await?;
             schema::permissions(&client, &prefix).await?;
             client.settled();
+            pool.bind_hosted(role.principal, share);
         }
         Ok(Self::from_pool(pool, prefix, false))
     }

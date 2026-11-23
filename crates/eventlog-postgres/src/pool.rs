@@ -46,6 +46,72 @@ fn server_millis(duration: Duration) -> u128 {
     duration.as_micros().div_ceil(1000)
 }
 
+/// Who a hosted session is: the database, role and schema its statements run against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostedPrincipal {
+    database: String,
+    user: String,
+    schema: Option<String>,
+}
+
+/// One session's hosted identity and the role facts hosted admission judges.
+pub(crate) struct HostedRole {
+    pub(crate) principal: HostedPrincipal,
+    can_ddl: bool,
+    connection_limit: i32,
+}
+
+impl HostedRole {
+    /// Read them in one statement on `client`.
+    pub(crate) async fn of(client: &Client) -> Result<Self, EventLogError> {
+        let row = client
+            .query_one(
+                "SELECT current_database()::text, current_user::text, current_schema()::text, \
+                 COALESCE(has_schema_privilege(current_user,current_schema(),'CREATE'),true) \
+                 OR EXISTS(SELECT FROM pg_roles WHERE rolname=current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) \
+                 OR EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user)) \
+                 OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND c.relkind IN ('r','p','S','v','m','f')), \
+                 COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname=current_user), -1)",
+                &[],
+            )
+            .await
+            .map_err(super::backend)?;
+        Ok(Self {
+            principal: HostedPrincipal {
+                database: row.get(0),
+                user: row.get(1),
+                schema: row.get(2),
+            },
+            can_ddl: row.get(3),
+            connection_limit: row.get(4),
+        })
+    }
+
+    /// Refuse a role that can change the schema, or whose finite connection limit does not fit
+    /// within `share`, the admitted replicas' pool connections.
+    pub(crate) fn admit(&self, share: usize) -> Result<(), EventLogError> {
+        if self.can_ddl {
+            return Err(EventLogError::Invalid(
+                "hosted application role must not own schema DDL".into(),
+            ));
+        }
+        if self.connection_limit <= 0
+            || usize::try_from(self.connection_limit)
+                .ok()
+                .is_none_or(|limit| limit > share)
+        {
+            return Err(EventLogError::Invalid("hosted application role requires a finite connection limit within its admitted replica pool share".into()));
+        }
+        Ok(())
+    }
+}
+
+/// What hosted open admitted; every physical session the pool opens later must match it.
+struct HostedAdmission {
+    principal: HostedPrincipal,
+    share: usize,
+}
+
 /// The settings every new physical session gets before a lease hands it out.
 fn session_configuration(schema: &str, options: &PoolOptions) -> String {
     format!(
@@ -382,6 +448,7 @@ pub(crate) struct Pool {
     waiters: Arc<Semaphore>,
     state: Mutex<PoolState>,
     returned: Notify,
+    hosted: std::sync::OnceLock<HostedAdmission>,
     #[cfg(test)]
     recycle_pause: Mutex<Option<RecyclePause>>,
     #[cfg(test)]
@@ -443,6 +510,7 @@ impl Pool {
             options,
             state: Mutex::new(PoolState::default()),
             returned: Notify::new(),
+            hosted: std::sync::OnceLock::new(),
             #[cfg(test)]
             recycle_pause: Mutex::new(None),
             #[cfg(test)]
@@ -454,6 +522,12 @@ impl Pool {
             #[cfg(test)]
             fail_shutdown: AtomicBool::new(false),
         }))
+    }
+    /// Hold every physical session opened from now on to the principal hosted open admitted and
+    /// to the hosted role rules, before a lease serves it. A caller-owned authority that
+    /// reconnects as another role, database or schema is refused, not served.
+    pub(crate) fn bind_hosted(&self, principal: HostedPrincipal, share: usize) {
+        let _ = self.hosted.set(HostedAdmission { principal, share });
     }
     pub(crate) async fn acquire(self: &Arc<Self>) -> Result<Lease, EventLogError> {
         let mut waiting = None;
@@ -526,15 +600,31 @@ impl Pool {
                 let connection = lease.client.as_ref().expect("connected lease");
                 let configuration = session_configuration(&self.config.schema, &self.options);
                 let configure = async {
-                    connection.client.batch_execute(&configuration).await?;
-                    check_client_connection(&connection.client).await
+                    connection
+                        .client
+                        .batch_execute(&configuration)
+                        .await
+                        .map_err(super::backend)?;
+                    check_client_connection(&connection.client)
+                        .await
+                        .map_err(super::backend)?;
+                    if let Some(admitted) = self.hosted.get() {
+                        let role = HostedRole::of(&connection.client).await?;
+                        if role.principal != admitted.principal {
+                            return Err(EventLogError::Invalid(
+                                "pooled PostgreSQL session is not the admitted hosted principal"
+                                    .into(),
+                            ));
+                        }
+                        role.admit(admitted.share)?;
+                    }
+                    Ok(())
                 };
                 tokio::time::timeout(self.options.connect_timeout, configure)
                     .await
                     .map_err(|_| EventLogError::Deadline {
                         operation: "session configuration",
-                    })?
-                    .map_err(super::backend)?;
+                    })??;
                 break;
             }
         }

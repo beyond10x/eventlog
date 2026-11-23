@@ -1755,6 +1755,156 @@ mod url_shim {
     pub type Config = tokio_postgres::Config;
 }
 
+/// A caller-owned authority that asserts verified transport and connects, call by call, as the
+/// next principal in its list (the last one repeats).
+struct ReconnectingAuthority {
+    principals: Vec<tokio_postgres::Config>,
+    calls: AtomicUsize,
+}
+
+impl PostgresConnectionAuthority for ReconnectingAuthority {
+    fn assurance(&self) -> PostgresTransportAssurance {
+        PostgresTransportAssurance::Verified
+    }
+
+    fn connect(
+        &self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        let mut config = self.principals[call.min(self.principals.len() - 1)].clone();
+        config.connect_timeout(timeout);
+        Box::pin(async move {
+            let (client, driver) = config
+                .connect(NoTls)
+                .await
+                .map_err(|error| EventLogError::Backend(error.to_string()))?;
+            Ok(AuthorizedConnection::new(client, driver))
+        })
+    }
+}
+
+/// Hosted admission judges the first pooled session; every later physical session must be the
+/// same database, role and schema and pass the same role rules before it is served. A
+/// caller-owned authority that reconnects as the admitted role is served; one that reconnects as
+/// a schema-owning superuser is refused.
+#[tokio::test]
+async fn a_hosted_pool_refuses_a_reconnected_session_of_another_principal() {
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url).await;
+    sql.batch_execute(
+        "DROP SCHEMA IF EXISTS hosted_rebind CASCADE; CREATE SCHEMA hosted_rebind; \
+         DO $$ BEGIN IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname='eventlog_test_rebind') \
+         THEN CREATE ROLE eventlog_test_rebind LOGIN CONNECTION LIMIT 8; END IF; END $$; \
+         ALTER ROLE eventlog_test_rebind CONNECTION LIMIT 8;",
+    )
+    .await
+    .expect("isolated role and schema");
+    let owner: tokio_postgres::Config = url.parse().unwrap();
+    let mut application = owner.clone();
+    application.user("eventlog_test_rebind");
+    let migration = Arc::new(ReconnectingAuthority {
+        principals: vec![owner.clone()],
+        calls: AtomicUsize::new(0),
+    });
+    PostgresEventStore::migrate(
+        PostgresConfig::caller_owned("hosted_rebind", "kit", migration).unwrap(),
+        PoolOptions::default(),
+        &[],
+    )
+    .await
+    .expect("migration role applies the schema");
+    sql.batch_execute(
+        "GRANT USAGE ON SCHEMA hosted_rebind TO eventlog_test_rebind; \
+         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_rebind TO eventlog_test_rebind; \
+         REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_rebind.kit_schema_version, hosted_rebind.kit_projection_registry FROM eventlog_test_rebind; \
+         GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_rebind TO eventlog_test_rebind",
+    )
+    .await
+    .expect("DML-only grants");
+    let authority = Arc::new(ReconnectingAuthority {
+        principals: vec![application.clone(), application, owner],
+        calls: AtomicUsize::new(0),
+    });
+    let store = PostgresEventStore::open(
+        PostgresConfig::caller_owned("hosted_rebind", "kit", authority.clone()).unwrap(),
+        PoolOptions::default(),
+        16,
+        2,
+        8,
+    )
+    .await
+    .expect("the application role is admitted");
+    let tenant = TenantId::new("rebind").unwrap();
+    // End the pool's idle session server-side, so its next lease opens a new physical session.
+    let reconnect = || async {
+        sql.batch_execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='eventlog_test_rebind'",
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            let left: i64 = sql
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE usename='eventlog_test_rebind'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let append = |id: &'static str| {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = &store;
+        async move {
+            let mut outcome = Err(EventLogError::Closed);
+            // A lease that met the terminated session before its driver saw the close fails as a
+            // backend error and retires it; the next attempt opens the new session.
+            for _ in 0..5 {
+                outcome = store
+                    .append(
+                        &stream,
+                        Expected::NoStream,
+                        &[eventlog_conformance::event("item.received", 1)],
+                        &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    )
+                    .await
+                    .map(|_| ());
+                if !matches!(outcome, Err(EventLogError::Backend(_))) {
+                    break;
+                }
+            }
+            outcome
+        }
+    };
+    reconnect().await;
+    append("same")
+        .await
+        .expect("a reconnected session of the admitted role is served");
+    assert_eq!(authority.calls.load(Ordering::Acquire), 2);
+    reconnect().await;
+    assert_eq!(
+        append("other").await,
+        Err(EventLogError::Invalid(
+            "pooled PostgreSQL session is not the admitted hosted principal".into()
+        )),
+        "a session of another principal was served"
+    );
+    assert!(authority.calls.load(Ordering::Acquire) >= 3);
+    store.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid() {
     use eventlog_core::{AdmissionScope, EventLogError, Projector, Reservation};

@@ -14,6 +14,11 @@ under bare-version tags such as `0.1.0`.
   Existing deployments that granted DML on all tables must revoke it on these two tables:
   `REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON <prefix>_schema_version, <prefix>_projection_registry
   FROM <application role>`.
+- PostgreSQL: a hosted pool holds every physical session it opens after `open` to the database,
+  role and schema that admission saw, and to the hosted role rules (no DDL powers, a finite
+  connection limit within the replica share). A caller-owned authority that reconnects as another
+  principal is refused with `Invalid("pooled PostgreSQL session is not the admitted hosted
+  principal")` and the session is retired unserved. Before, only the first session was checked.
 
 ### Added
 
