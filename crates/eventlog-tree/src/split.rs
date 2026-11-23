@@ -22,8 +22,8 @@
 //! refuses an expansion whose length or SHA-256 is not the one the manifest recorded.
 
 use crate::layout::{
-    backend, blob_path, canonical, corrupt, segment, sha256_hex, tenant_dir, write_atomic,
-    write_once,
+    backend, blob_path, canonical, corrupt, read_file, segment, sha256_hex, tenant_dir,
+    write_atomic, write_once,
 };
 use eventlog_core::EventLogError;
 use serde_json::{Map, Value, json};
@@ -285,6 +285,54 @@ pub(crate) fn expand_file(
     digest: &str,
     path: &Path,
 ) -> Result<Vec<u8>, EventLogError> {
+    expand_file_with(root, tenant, digest, path, &mut Texts::default())
+}
+
+/// The most bytes of text one [`Texts`] keeps. A text past the bound is read again by every
+/// manifest that names it, as it was before there was a cache; the bound keeps one observation of
+/// a store with many large texts from holding all of them at once.
+const TEXT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The texts one observation of a tenant has read, by SHA-256 hex, so a text a hundred manifests
+/// name is opened once and not a hundred times. Each manifest still checks its own expansion's
+/// length and SHA-256, so a cached text is held to every manifest that names it.
+#[derive(Default)]
+pub(crate) struct Texts {
+    held: BTreeMap<String, Vec<u8>>,
+    bytes: usize,
+}
+
+impl Texts {
+    /// Append the text `hex` of `tenant` to `out`, from the cache or else from its file.
+    fn append(
+        &mut self,
+        root: &Path,
+        tenant: &str,
+        hex: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EventLogError> {
+        if let Some(text) = self.held.get(hex) {
+            out.extend_from_slice(text);
+            return Ok(());
+        }
+        let text = read_file(&text_path(root, tenant, hex))
+            .map_err(|_| corrupt("a split blob whose text is missing"))?;
+        out.extend_from_slice(&text);
+        if self.bytes + text.len() <= TEXT_CACHE_BYTES {
+            self.bytes += text.len();
+            self.held.insert(hex.to_owned(), text);
+        }
+        Ok(())
+    }
+}
+
+fn expand_file_with(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+    path: &Path,
+    texts: &mut Texts,
+) -> Result<Vec<u8>, EventLogError> {
     let bytes = fs::read(path).map_err(backend)?;
     let manifest: Value =
         serde_json::from_slice(&bytes).map_err(|_| corrupt("a split blob that is not JSON"))?;
@@ -303,7 +351,7 @@ pub(crate) fn expand_file(
         .and_then(Value::as_array)
         .ok_or_else(|| corrupt("a split blob without parts"))?;
     let mut out = Vec::new();
-    expand(root, tenant, parts, &mut out)?;
+    expand(root, tenant, parts, &mut out, texts)?;
     if map.get("length").and_then(Value::as_u64) != Some(out.len() as u64)
         || map.get("sha256").and_then(Value::as_str)
             != Some(format!("sha256:{}", sha256_hex(&out)).as_str())
@@ -318,6 +366,7 @@ fn expand(
     tenant: &str,
     parts: &[Value],
     out: &mut Vec<u8>,
+    texts: &mut Texts,
 ) -> Result<(), EventLogError> {
     for part in parts {
         match part {
@@ -326,12 +375,10 @@ fn expand(
                 if let Some(reference) = map.get("text").and_then(Value::as_str) {
                     let hex = text_hex(reference)
                         .ok_or_else(|| corrupt("a split blob naming a text badly"))?;
-                    let text = fs::read(text_path(root, tenant, hex))
-                        .map_err(|_| corrupt("a split blob whose text is missing"))?;
-                    out.extend_from_slice(&text);
+                    texts.append(root, tenant, hex, out)?;
                 } else if let Some(nested) = map.get("hex").and_then(Value::as_array) {
                     let mut inner = Vec::new();
-                    expand(root, tenant, nested, &mut inner)?;
+                    expand(root, tenant, nested, &mut inner, texts)?;
                     push_hex(out, &inner);
                 } else {
                     return Err(corrupt("a split blob with an unknown part"));
@@ -396,7 +443,17 @@ pub(crate) fn read_blob(
     tenant: &str,
     digest: &str,
 ) -> Result<Option<Vec<u8>>, EventLogError> {
-    let raw = match fs::read(blob_path(root, tenant, digest)) {
+    read_blob_with(root, tenant, digest, &mut Texts::default())
+}
+
+/// [`read_blob`], reading each text through `texts`.
+fn read_blob_with(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+    texts: &mut Texts,
+) -> Result<Option<Vec<u8>>, EventLogError> {
+    let raw = match read_file(&blob_path(root, tenant, digest)) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(backend(error)),
@@ -405,7 +462,7 @@ pub(crate) fn read_blob(
     if !manifest.exists() {
         return Ok(raw);
     }
-    let expanded = expand_file(root, tenant, digest, &manifest)?;
+    let expanded = expand_file_with(root, tenant, digest, &manifest, texts)?;
     match raw {
         Some(raw) if raw != expanded => Err(corrupt("a blob whose two forms disagree")),
         _ => Ok(Some(expanded)),
@@ -588,8 +645,9 @@ pub(crate) fn tenant_blobs(
             .map(|(digest, _)| digest),
     );
     let mut blobs = BTreeMap::new();
+    let mut texts = Texts::default();
     for digest in digests {
-        if let Some(bytes) = read_blob(root, tenant, &digest)? {
+        if let Some(bytes) = read_blob_with(root, tenant, &digest, &mut texts)? {
             blobs.insert(digest, bytes);
         }
     }
@@ -759,6 +817,37 @@ mod tests {
             cut.texts.len(),
             2,
             "expected the shared body once and the damaged line as its own text"
+        );
+    }
+
+    /// One scan of a tenant whose split blobs all name one text opens that text once; every
+    /// manifest still expands to its own bytes.
+    #[test]
+    fn a_scan_opens_a_text_many_manifests_name_once() {
+        const BLOBS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let body = "a paragraph many records share\\n".repeat(100);
+        let mut expected = BTreeMap::new();
+        for index in 0..BLOBS {
+            let digest = format!("sha256:blob-{index:02}");
+            let bytes = format!(r#"{{"body":"{body}","n":{index}}}"#).into_bytes();
+            write_blob(root, "tenant-a", &digest, &bytes, true).unwrap();
+            expected.insert(digest, bytes);
+        }
+        let texts = files_under(&tenant_dir(root, "tenant-a").join("texts")).unwrap();
+        assert_eq!(texts.len(), 1, "the shared body was not one text");
+        let text = &texts[0].1;
+        crate::layout::FILE_READS.with(|reads| reads.borrow_mut().clear());
+
+        let served = tenant_blobs(root, "tenant-a").unwrap();
+
+        assert_eq!(served, expected);
+        let opened = crate::layout::FILE_READS.with(|reads| reads.borrow().get(text).copied());
+        assert_eq!(
+            opened,
+            Some(1),
+            "one scan read the text {BLOBS} manifests name more than once"
         );
     }
 
