@@ -33,6 +33,8 @@ use serde_json::Value;
 use time::OffsetDateTime;
 mod atomic_group;
 mod capture;
+#[cfg(test)]
+mod capture_pages;
 mod inline_admin;
 mod pool;
 #[cfg(test)]

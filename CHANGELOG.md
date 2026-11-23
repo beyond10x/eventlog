@@ -40,6 +40,11 @@ under bare-version tags such as `0.1.0`.
 
 ### Changed
 
+- PostgreSQL: consistent tenant capture sizes each page of its event, blob and projection-row
+  reads from the remaining payload allowance and the largest item that read has admitted, from
+  one row up to 1,000. The first page of each read holds one row, so a first body over the
+  allowance is refused after one row arrived instead of after a full page (a 1,000-row page of
+  8 KB bodies was 8.2 MB on the wire).
 - PostgreSQL: `read_stream` and the stream reads of `read_many` still read one row past the page
   to decide `end_of_stream`, but no longer output, detoast or decode that row's event body; the
   next page reads it once.

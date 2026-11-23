@@ -32,6 +32,43 @@ use crate::{
 /// every blob through one unbounded query and only then testing the cap is the thing this avoids.
 const CHUNK: i64 = 1_000;
 
+/// Sizes the pages of one capture read from the remaining payload allowance.
+///
+/// A page holds as many rows as the allowance left could admit if each were as large as the
+/// largest item this read has admitted so far, at least one and at most [`CHUNK`]. The first
+/// page, with nothing seen yet, holds one row, so a first body larger than the whole allowance is
+/// refused after one row arrived rather than after a full page of them.
+struct Pages {
+    max_payload: u64,
+    largest: Option<u64>,
+}
+
+impl Pages {
+    const fn new(limits: &CaptureLimits) -> Self {
+        Self {
+            max_payload: limits.max_payload_bytes,
+            largest: None,
+        }
+    }
+
+    /// The `LIMIT` of the next page.
+    fn next(&self, budget: &CaptureBudget) -> i64 {
+        let Some(largest) = self.largest else {
+            return 1;
+        };
+        let remaining = self
+            .max_payload
+            .saturating_sub(budget.usage().payload_bytes);
+        i64::try_from(remaining / largest.max(1)).map_or(CHUNK, |rows| rows.clamp(1, CHUNK))
+    }
+
+    /// Note one item admitted; `before` is the payload admitted before it.
+    fn admitted(&mut self, before: u64, budget: &CaptureBudget) {
+        let size = budget.usage().payload_bytes.saturating_sub(before);
+        self.largest = Some(self.largest.map_or(size, |largest| largest.max(size)));
+    }
+}
+
 fn operational(error: tokio_postgres::Error) -> CaptureError {
     CaptureError::Store(backend(error))
 }
@@ -174,12 +211,20 @@ impl PostgresEventStore {
 
         let mut budget = CaptureBudget::new(limits);
         preflight(transaction, prefix, tenant, &admitted, &budget).await?;
-        let events = read_events(transaction, prefix, tenant, &mut budget).await?;
+        let events = read_events(transaction, prefix, tenant, &limits, &mut budget).await?;
         validate_captured_order(tenant, &events)?;
-        let blobs = read_blobs(transaction, prefix, tenant, &mut budget).await?;
+        let blobs = read_blobs(transaction, prefix, tenant, &limits, &mut budget).await?;
         let mut captured = Vec::with_capacity(admitted.len());
         for specification in admitted {
-            let rows = read_rows(transaction, prefix, tenant, specification, &mut budget).await?;
+            let rows = read_rows(
+                transaction,
+                prefix,
+                tenant,
+                specification,
+                &limits,
+                &mut budget,
+            )
+            .await?;
             captured.push(CapturedProjection {
                 specification,
                 rows,
@@ -284,10 +329,11 @@ async fn read_events(
     transaction: &Transaction<'_>,
     prefix: &str,
     tenant: &TenantId,
+    limits: &CaptureLimits,
     budget: &mut CaptureBudget,
 ) -> Result<Vec<RecordedEvent>, CaptureError> {
     let owner = tenant.as_str();
-    let chunk = CHUNK;
+    let mut pages = Pages::new(limits);
     let statement = format!(
         "SELECT {COLUMNS} FROM {prefix}_events
          WHERE tenant_id = $1 AND ($2::bigint IS NULL OR global_seq > $2) ORDER BY global_seq LIMIT $3"
@@ -295,16 +341,21 @@ async fn read_events(
     let mut events = Vec::new();
     let mut after: Option<i64> = None;
     loop {
+        let chunk = pages.next(budget);
         let page = transaction
             .query(&statement, &[&owner, &after, &chunk])
             .await
             .map_err(operational)?;
+        #[cfg(test)]
+        crate::capture_pages::record_page(prefix, page.len());
         if page.is_empty() {
             return Ok(events);
         }
         for row in &page {
             let event = read_event(row).map_err(|_| corrupt(CaptureMaterial::Event))?;
+            let before = budget.usage().payload_bytes;
             budget.admit_event(&event)?;
+            pages.admitted(before, budget);
             after = Some(to_i64(event.global_seq)?);
             events.push(event);
         }
@@ -315,10 +366,11 @@ async fn read_blobs(
     transaction: &Transaction<'_>,
     prefix: &str,
     tenant: &TenantId,
+    limits: &CaptureLimits,
     budget: &mut CaptureBudget,
 ) -> Result<Vec<CapturedBlob>, CaptureError> {
     let owner = tenant.as_str();
-    let chunk = CHUNK;
+    let mut pages = Pages::new(limits);
     let columns = "digest,bytes,byte_count,integrity_sha256,integrity_v1";
     let first = format!(
         "SELECT {columns} FROM {prefix}_blobs WHERE tenant_id = $1 ORDER BY digest LIMIT $2"
@@ -332,6 +384,7 @@ async fn read_blobs(
     loop {
         // The first page carries no key predicate: a binding is either in the set or it is not,
         // and one that sorts before every other must not disappear into a resume condition.
+        let chunk = pages.next(budget);
         let page = match &after {
             None => transaction.query(&first, &[&owner, &chunk]).await,
             Some(after) => transaction.query(&next, &[&owner, after, &chunk]).await,
@@ -352,7 +405,9 @@ async fn read_blobs(
             // The accepted SQL complete-content validator, not a checksum column read back raw.
             let bytes = validate_stored_blob(stored, count, hash, i64::from(edition))
                 .map_err(|_| corrupt(material))?;
+            let before = budget.usage().payload_bytes;
             budget.admit_blob(bytes.len() as u64)?;
+            pages.admitted(before, budget);
             after = Some(digest.clone());
             blobs.push(CapturedBlob { digest, bytes });
         }
@@ -364,10 +419,11 @@ async fn read_rows(
     prefix: &str,
     tenant: &TenantId,
     specification: ProjectionSpec,
+    limits: &CaptureLimits,
     budget: &mut CaptureBudget,
 ) -> Result<Vec<(String, Value)>, CaptureError> {
     let owner = tenant.as_str();
-    let chunk = CHUNK;
+    let mut pages = Pages::new(limits);
     let table = projection_table(prefix, specification.name);
     let first =
         format!("SELECT row_key, body FROM {table} WHERE tenant_id = $1 ORDER BY row_key LIMIT $2");
@@ -379,6 +435,7 @@ async fn read_rows(
     let mut after: Option<String> = None;
     loop {
         // An empty key is a key a writer here can produce, so the first page has no predicate.
+        let chunk = pages.next(budget);
         let page = match &after {
             None => transaction.query(&first, &[&owner, &chunk]).await,
             Some(after) => transaction.query(&next, &[&owner, after, &chunk]).await,
@@ -393,7 +450,9 @@ async fn read_rows(
             let material = CaptureMaterial::Projection;
             let key: String = row.try_get(0).map_err(|_| corrupt(material))?;
             let body: Value = row.try_get(1).map_err(|_| corrupt(material))?;
+            let before = budget.usage().payload_bytes;
             budget.admit_projection_row(&body)?;
+            pages.admitted(before, budget);
             after = Some(key.clone());
             rows.push((key, body));
         }
