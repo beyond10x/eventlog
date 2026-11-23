@@ -1025,12 +1025,20 @@ impl EventStore for PostgresEventStore {
             projection.validate()?;
             let table = projection_table(&self.prefix, projection.name);
             let mut client = self.pool.acquire().await?;
+            // Bytewise, like every other provider: the shared pager reads a prefix as one
+            // contiguous run of keys and a cursor as "after these bytes". Under the database
+            // collation (ICU `und`, glibc `en_US`) `Desk/2` sorts between `desk/1` and `desk/3`,
+            // and the pager stopped at it, silently dropping `desk/3`.
+            // No cursor is the first page, which starts at the empty key itself: `> ''` would
+            // skip a row keyed by the empty string. A supplied cursor, even an empty one, is
+            // exclusive.
+            let bound = if after_key.is_some() { ">" } else { ">=" };
             let rows = client
                 .query(
                     &format!(
                         "SELECT row_key, body FROM {table}
-                         WHERE tenant_id = $1 AND row_key > $2
-                         ORDER BY row_key LIMIT $3"
+                         WHERE tenant_id = $1 AND row_key COLLATE \"C\" {bound} $2
+                         ORDER BY row_key COLLATE \"C\" LIMIT $3"
                     ),
                     &[
                         &tenant.as_str(),
@@ -1518,6 +1526,29 @@ impl EventStore for PostgresEventStore {
             let table = projection_table(&self.prefix, projection.name);
             let limit = bounded_limit(limit);
             let mut client = self.pool.acquire().await?;
+            // `idx_N` is the N-th field of the registered declaration. A reader that swapped two
+            // field names would otherwise query the other field's column.
+            let prefix = &self.prefix;
+            let recorded = client
+                .query_opt(
+                    &format!(
+                        "SELECT indexed_fields FROM {prefix}_projection_registry
+                         WHERE projection_name = $1"
+                    ),
+                    &[&projection.name],
+                )
+                .await
+                .map_err(backend)?;
+            if let Some(recorded) = recorded.map(|row| row.get::<_, Value>(0))
+                && recorded != serde_json::json!(projection.indexed)
+            {
+                client.settled();
+                return Err(EventLogError::Invalid(format!(
+                    "projection {} is read with indexed fields {} but registered with {recorded}",
+                    projection.name,
+                    serde_json::json!(projection.indexed)
+                )));
+            }
             let rows = client
                 .query(
                     &format!(

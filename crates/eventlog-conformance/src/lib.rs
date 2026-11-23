@@ -1959,6 +1959,11 @@ pub async fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
         .register_inline(std::sync::Arc::new(Tally) as std::sync::Arc<dyn Projector>)
         .await
         .expect("registered");
+    // Registration freezes once serving begins, so the boundary projector registers here too.
+    store
+        .register_inline(std::sync::Arc::new(PageRows) as std::sync::Arc<dyn Projector>)
+        .await
+        .expect("registered");
     let body = json!({ "command": "create" });
     for index in 0..5 {
         let stream =
@@ -2040,6 +2045,289 @@ pub async fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
         bounded.rows.len(),
         5,
         "a prefix bounds the page to one contiguous run of keys, and the note is not in it"
+    );
+
+    run_paging_at_the_read_limit(store).await;
+    run_paging_bytewise_prefix(store).await;
+    run_paging_from_the_empty_key(store).await;
+
+    // A reader whose declaration names other indexed fields than the registration must not have
+    // its field position applied to the registered columns: `stream` in position 0 would query
+    // the `kind` column and answer with the five item rows.
+    let stale = eventlog_core::ProjectionSpec {
+        name: TALLY.name,
+        indexed: &["stream"],
+    };
+    let found = store
+        .projection_find(&stale, &tenant, "stream", "item", 10)
+        .await;
+    assert!(
+        matches!(found, Err(EventLogError::Invalid(_))),
+        "a stale declaration is refused before any row is read: {found:?}"
+    );
+}
+
+/// The first unfiltered listing starts at the empty key, and an empty cursor is still exclusive.
+///
+/// SQLite and PostgreSQL turned an absent `after_key` into `row_key > ''`, so a row keyed by the
+/// empty string, which writers may produce, was missing from list and page while a point read
+/// found it.
+async fn run_paging_from_the_empty_key(store: &std::sync::Arc<dyn EventStore>) {
+    let tenant = TenantId::new("tenant-page-empty").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "rows", "empty").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[event("rows.empty_key", 1)],
+            &meta("page-empty", &json!({ "command": "write" })),
+        )
+        .await
+        .expect("append");
+    let keys = |rows: &[(String, serde_json::Value)]| -> Vec<String> {
+        rows.iter().map(|(key, _)| key.clone()).collect()
+    };
+
+    let listed = store
+        .projection_list(&PAGE_ROWS, &tenant, None, 10)
+        .await
+        .expect("listable");
+    assert_eq!(
+        keys(&listed),
+        ["", "open"],
+        "an unbounded listing starts at the empty key"
+    );
+    let after_empty = store
+        .projection_list(&PAGE_ROWS, &tenant, Some(""), 10)
+        .await
+        .expect("listable");
+    assert_eq!(
+        keys(&after_empty),
+        ["open"],
+        "a supplied empty cursor is exclusive"
+    );
+
+    let page = store
+        .projection_page(&PAGE_ROWS, &tenant, None, None, 10)
+        .await
+        .expect("pageable");
+    assert_eq!(keys(&page.rows), ["", "open"]);
+    assert!(page.next_cursor.is_none());
+
+    let first = store
+        .projection_page(&PAGE_ROWS, &tenant, None, None, 1)
+        .await
+        .expect("pageable");
+    assert_eq!(keys(&first.rows), [""]);
+    assert_eq!(
+        first.next_cursor.as_deref(),
+        Some(""),
+        "the empty key is a cursor like any other"
+    );
+    let second = store
+        .projection_page(&PAGE_ROWS, &tenant, None, first.next_cursor.as_deref(), 1)
+        .await
+        .expect("pageable");
+    assert_eq!(keys(&second.rows), ["open"]);
+    assert!(second.next_cursor.is_none());
+}
+
+/// Keys whose bytewise order differs from a case-insensitive collation's order.
+const MIXED_CASE_KEYS: [&str; 3] = ["desk/1", "Desk/2", "desk/3"];
+
+/// A prefix and a cursor are bytes, whatever the backend's collation.
+///
+/// Bytewise, `Desk/2` sorts before both `desk/` keys, so `desk/` is one contiguous run. Under a
+/// case-insensitive database collation (PostgreSQL with ICU `und` or glibc `en_US`) it sorted
+/// between them, the pager stopped at the first key outside the prefix, and `desk/3` was lost.
+async fn run_paging_bytewise_prefix(store: &std::sync::Arc<dyn EventStore>) {
+    let tenant = TenantId::new("tenant-page-case").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "rows", "mixed").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[event("rows.mixed_case", 1)],
+            &meta("page-case", &json!({ "command": "write" })),
+        )
+        .await
+        .expect("append");
+
+    let all = store
+        .projection_page(&PAGE_ROWS, &tenant, Some("desk/"), None, 10)
+        .await
+        .expect("pageable");
+    let keys: Vec<&str> = all.rows.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["desk/1", "desk/3"],
+        "a prefix selects by bytes, in byte order, and no other-case key ends it early"
+    );
+    assert!(all.next_cursor.is_none());
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = store
+            .projection_page(&PAGE_ROWS, &tenant, Some("desk/"), cursor.as_deref(), 1)
+            .await
+            .expect("pageable");
+        seen.extend(page.rows.iter().map(|(key, _)| key.clone()));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        vec!["desk/1".to_owned(), "desk/3".to_owned()],
+        "a cursor continues after its bytes"
+    );
+
+    let everything = store
+        .projection_page(&PAGE_ROWS, &tenant, None, None, 10)
+        .await
+        .expect("pageable");
+    let keys: Vec<&str> = everything
+        .rows
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["Desk/2", "desk/1", "desk/3"],
+        "rows come in byte order"
+    );
+}
+
+/// The page size every provider clamps to, plus the one row that must not vanish behind it.
+const PAGE_BOUNDARY_ROWS: usize = eventlog_core::MAX_READ_LIMIT + 1;
+
+/// One wide read model, written by one event, for the full-page boundary.
+const PAGE_ROWS: eventlog_core::ProjectionSpec = eventlog_core::ProjectionSpec {
+    name: "page_rows",
+    indexed: &[],
+};
+
+/// Writes `PAGE_BOUNDARY_ROWS` rows from one event, so the boundary costs one commit.
+struct PageRows;
+
+impl eventlog_core::Projector for PageRows {
+    fn name(&self) -> &'static str {
+        "page_rows"
+    }
+
+    fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+        std::slice::from_ref(&PAGE_ROWS)
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a eventlog_core::RecordedEvent,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if event.name == "rows.empty_key" {
+                for key in ["", "open"] {
+                    store
+                        .upsert(&PAGE_ROWS, &event.tenant, key, &json!({ "key": key }))
+                        .await?;
+                }
+                return Ok(());
+            }
+            if event.name == "rows.mixed_case" {
+                for key in MIXED_CASE_KEYS {
+                    store
+                        .upsert(&PAGE_ROWS, &event.tenant, key, &json!({ "key": key }))
+                        .await?;
+                }
+                return Ok(());
+            }
+            if event.name != "rows.written" {
+                return Ok(());
+            }
+            for index in 0..PAGE_BOUNDARY_ROWS {
+                store
+                    .upsert(
+                        &PAGE_ROWS,
+                        &event.tenant,
+                        &format!("row/{index:05}"),
+                        &json!({ "index": index }),
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A full page at the public read limit still says that a row follows it.
+///
+/// The paginator asks for one row more than the page, and every provider clamps that request to
+/// `MAX_READ_LIMIT`. Without a boundary check, the 1,000-row page of 1,001 rows came back with no
+/// cursor and row 1,001 was unreachable by paging while a point read still found it.
+async fn run_paging_at_the_read_limit(store: &std::sync::Arc<dyn EventStore>) {
+    let limit = eventlog_core::MAX_READ_LIMIT;
+    let tenant = TenantId::new("tenant-page-limit").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "rows", "all").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[event("rows.written", 1)],
+            &meta("page-limit", &json!({ "command": "write" })),
+        )
+        .await
+        .expect("append");
+    let last_key = format!("row/{:05}", PAGE_BOUNDARY_ROWS - 1);
+
+    for prefix in [None, Some("row/")] {
+        let first = store
+            .projection_page(&PAGE_ROWS, &tenant, prefix, None, limit)
+            .await
+            .expect("pageable");
+        assert_eq!(first.rows.len(), limit, "the first page is full");
+        assert_eq!(
+            first.next_cursor.as_deref(),
+            Some(first.rows[limit - 1].0.as_str()),
+            "a full page at the read limit carries a cursor when row {PAGE_BOUNDARY_ROWS} follows it"
+        );
+        let second = store
+            .projection_page(
+                &PAGE_ROWS,
+                &tenant,
+                prefix,
+                first.next_cursor.as_deref(),
+                limit,
+            )
+            .await
+            .expect("pageable");
+        let keys: Vec<&str> = second.rows.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![last_key.as_str()],
+            "the cursor reaches the row behind the full page"
+        );
+        assert!(
+            second.next_cursor.is_none(),
+            "the last page carries no cursor"
+        );
+    }
+
+    let exact = store
+        .projection_page(
+            &PAGE_ROWS,
+            &tenant,
+            Some("row/"),
+            Some(&format!("row/{:05}", 0)),
+            limit,
+        )
+        .await
+        .expect("pageable");
+    assert_eq!(exact.rows.len(), limit);
+    assert!(
+        exact.next_cursor.is_none(),
+        "a full page that reached the last row carries no cursor"
     );
 }
 

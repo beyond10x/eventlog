@@ -18,6 +18,7 @@ mod inline_admin;
 mod inspection;
 #[cfg(feature = "kpi-counters")]
 pub mod kpi;
+mod table_owners;
 mod tracked_capture;
 mod verified;
 pub use inspection::SqliteHistoryInspector;
@@ -658,10 +659,14 @@ impl Inner {
                  indexed_fields TEXT NOT NULL
              );
              {}
+             {}
+             {}
              {}",
             atomic_group::ddl(prefix),
             origins_ddl(prefix),
-            atomic_group::batches_ddl(prefix)
+            atomic_group::batches_ddl(prefix),
+            capture::malformed_tenant_index(&format!("{prefix}_identity")),
+            capture::malformed_tenant_index(&format!("{prefix}_events")),
         );
         let mut connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
@@ -2429,10 +2434,13 @@ impl Inner {
         projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
+        // No cursor is the first page, which starts at the empty key itself: `> ''` would skip
+        // a row keyed by the empty string. A supplied cursor, even an empty one, is exclusive.
+        let bound = if after_key.is_some() { ">" } else { ">=" };
         let mut statement = guard
             .prepare(&format!(
                 "SELECT row_key, body FROM {table}
-                 WHERE tenant_id = ?1 AND row_key > ?2
+                 WHERE tenant_id = ?1 AND row_key {bound} ?2
                  ORDER BY row_key LIMIT ?3"
             ))
             .map_err(backend)?;
@@ -2674,19 +2682,21 @@ impl Inner {
         begin_immediate(&guard)?;
         let result = (|| {
             for spec in projector.projections() {
+                table_owners::claim_projection(&guard, prefix, spec.name)?;
                 let table = projection_table(prefix, spec.name);
                 let body = projection_table_body(spec.indexed.len());
+                guard
+                    .execute_batch(&format!("CREATE TABLE IF NOT EXISTS {table} ({body});"))
+                    .map_err(backend)?;
+                for position in 0..spec.indexed.len() {
+                    upgrade_projection_index(&guard, &table, position)?;
+                }
                 let indexes: String = joined(spec.indexed.len(), |position| {
                     let index = projection_index(&table, position);
-                    format!(
-                        "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
-                    )
+                    let columns = projection_index_columns(position).join(", ");
+                    format!("CREATE INDEX IF NOT EXISTS {index} ON {table} ({columns});")
                 });
-                guard
-                    .execute_batch(&format!(
-                        "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
-                    ))
-                    .map_err(backend)?;
+                guard.execute_batch(&indexes).map_err(backend)?;
                 durable_capture::cover_projection(&guard, prefix, &table)?;
             }
             for spec in projector.projections() {
@@ -2695,9 +2705,7 @@ impl Inner {
                 guard.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES(?1,?2) ON CONFLICT(projection_name) DO NOTHING"),params![spec.name,&indexed]).map_err(backend)?;
                 let recorded:String=guard.query_row(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"),params![spec.name],|row|row.get(0)).map_err(backend)?;
                 if recorded != indexed {
-                    return Err(EventLogError::Invalid(
-                        "projection registration shape changed".into(),
-                    ));
+                    return Err(changed_registration(prefix, spec.name, &recorded));
                 }
             }
             Ok(())
@@ -2867,13 +2875,27 @@ impl Inner {
                 "rebuild requires a catch-up projection".into(),
             ));
         }
+        // A host can hand in a projector assembled apart from registration. Its names are put into
+        // the maintenance SQL below, so every one is checked before the transaction starts.
+        let mut declared = BTreeSet::new();
+        for spec in projector.projections() {
+            spec.validate()?;
+            if !declared.insert(spec.name) {
+                return Err(EventLogError::Invalid(
+                    "duplicate projection in one rebuild".into(),
+                ));
+            }
+        }
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
         let callback_failed = Arc::new(AtomicBool::new(false));
         let result = (|| {
             for spec in projector.projections() {
-                let shadow = projection_table("eventlog_rebuild", spec.name);
+                refuse_unadmitted_rebuild(connection, &self.prefix, spec)?;
+            }
+            for spec in projector.projections() {
+                let shadow = projection_table(REBUILD_STAGING, spec.name);
                 let columns = joined(spec.indexed.len(), |position| {
                     format!(",idx_{position} TEXT")
                 });
@@ -2904,7 +2926,7 @@ impl Inner {
                     blob_prefix: &self.prefix,
                     verified: &self.verified,
                     tracked: &self.tracked,
-                    projection_prefix: "eventlog_rebuild",
+                    projection_prefix: REBUILD_STAGING,
                     inline: &self.inline_names,
                     tenant,
                     admission: None,
@@ -2920,8 +2942,8 @@ impl Inner {
                 }
             }
             for spec in projector.projections() {
-                let active = projection_table(&self.prefix, spec.name);
-                let shadow = projection_table("eventlog_rebuild", spec.name);
+                let active = durable_projection_table(&self.prefix, spec.name);
+                let shadow = projection_table(REBUILD_STAGING, spec.name);
                 connection
                     .execute(
                         &format!("DELETE FROM {active} WHERE tenant_id=?1"),
@@ -2989,6 +3011,7 @@ impl Inner {
         projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
+        refuse_stale_declaration(&guard, &self.prefix, projection)?;
         let mut statement = guard
             .prepare(&format!(
                 "SELECT body FROM {table}
@@ -3498,6 +3521,19 @@ fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
 }
 
+/// Where a rebuild stages its rows: the connection's `temp` schema, named with the schema.
+///
+/// `eventlog_rebuild` is also a valid owner prefix. Unqualified, an owner of that name has live
+/// tables whose names equal the staging tables, SQLite resolves the name to `temp` first, and the
+/// publication step would empty and refill the staging table while the live view stayed as it was.
+const REBUILD_STAGING: &str = "temp.eventlog_rebuild";
+
+/// The live projection table a rebuild publishes into, named with the `main` schema so it can never
+/// resolve to a staging table of the same name.
+fn durable_projection_table(prefix: &str, name: &str) -> String {
+    format!("main.{}", projection_table(prefix, name))
+}
+
 /// The one `CREATE TABLE` body every projection table in this kit is written with.
 ///
 /// Capture admits an actual stored table by comparing its whole declared body against this, so the
@@ -3515,6 +3551,170 @@ fn projection_table_body(indexed: usize) -> String {
 /// The one name a declared field's index is created and recognised under.
 fn projection_index(table: &str, position: usize) -> String {
     format!("{table}_idx_{position}")
+}
+
+/// The refusal of a registration whose declaration differs from the persisted one.
+///
+/// Releases up to 0.9.4 admitted a declaration that repeats an indexed field, which capture
+/// cannot read. Its persisted declaration can no longer be registered, and the corrected one
+/// differs from it, so the refusal names the projection's table and the way out: the table is
+/// derived from the log and is dropped and rebuilt, never edited in place.
+fn changed_registration(prefix: &str, name: &str, recorded: &str) -> EventLogError {
+    let repeats = serde_json::from_str::<Vec<String>>(recorded).is_ok_and(|fields| {
+        fields
+            .iter()
+            .enumerate()
+            .any(|(position, field)| fields[..position].contains(field))
+    });
+    if repeats {
+        return EventLogError::Invalid(format!(
+            "projection {name} is persisted with indexed fields {recorded}, which repeat a field \
+             capture cannot read; drop table {} and its {prefix}_projection_registry row, then \
+             register the corrected declaration and rebuild the projection",
+            projection_table(prefix, name)
+        ));
+    }
+    EventLogError::Invalid("projection registration shape changed".into())
+}
+
+/// Refuse a rebuild of a projection this owner has not admitted with exactly this declaration.
+///
+/// A rebuild replaces the live rows from a staging table shaped by the supplied declaration. One
+/// that no registration created, or whose fields differ from the registered ones, would publish
+/// rows into a table of another shape, so it is refused before any staging table exists.
+fn refuse_unadmitted_rebuild(
+    connection: &Connection,
+    prefix: &str,
+    projection: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"
+            ),
+            params![projection.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let declared = serde_json::to_string(projection.indexed)
+        .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+    match recorded {
+        None => Err(EventLogError::Invalid(format!(
+            "projection {} is not registered on this owner; create it before a rebuild",
+            projection.name
+        ))),
+        Some(recorded) if recorded != declared => Err(EventLogError::Invalid(format!(
+            "projection {} is rebuilt with indexed fields {declared} but registered with {recorded}",
+            projection.name
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Refuse a reader whose declared field order differs from the projection's registration.
+///
+/// `idx_N` is the N-th field of the registered declaration. A reader that swaps two field names
+/// passes syntax validation, and the position taken from its declaration would query the other
+/// field's column. A projection with no registry row (a file older than the registry that no
+/// registration has touched) has nothing to compare against and is read as declared.
+fn refuse_stale_declaration(
+    connection: &Connection,
+    prefix: &str,
+    projection: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"
+            ),
+            params![projection.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let declared = serde_json::to_string(projection.indexed)
+        .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+    match recorded {
+        Some(recorded) if recorded != declared => Err(EventLogError::Invalid(format!(
+            "projection {} is read with indexed fields {declared} but registered with {recorded}",
+            projection.name
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The columns of a declared field's index: the filter, then the order `projection_find` returns.
+///
+/// With `row_key` in the index, `WHERE tenant_id = ? AND idx_N = ? ORDER BY row_key LIMIT ?`
+/// walks the index in order and stops at the limit; without it SQLite visits every match.
+fn projection_index_columns(position: usize) -> [String; 3] {
+    [
+        String::from("tenant_id"),
+        format!("idx_{position}"),
+        String::from("row_key"),
+    ]
+}
+
+/// The columns a declared field's index had before `row_key` joined it. Capture still admits
+/// them, read-only, on a file no registration has upgraded yet.
+fn legacy_projection_index_columns(position: usize) -> [String; 2] {
+    [String::from("tenant_id"), format!("idx_{position}")]
+}
+
+/// Replace a declared field's index that still has those earlier columns.
+///
+/// An index holds no data of its own, so this changes no table, row or column: the index is
+/// dropped and created again under the same name, inside the registration transaction. Any other
+/// shape under that name is left for capture admission to refuse.
+fn upgrade_projection_index(
+    connection: &Connection,
+    table: &str,
+    position: usize,
+) -> Result<(), EventLogError> {
+    let index = projection_index(table, position);
+    // Only the plain index this kit created: not unique, not partial, made by CREATE INDEX.
+    let plain = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut plain = false;
+        for row in rows {
+            let (name, unique, origin, partial) = row.map_err(backend)?;
+            if name == index {
+                plain = !unique && origin == "c" && !partial;
+            }
+        }
+        plain
+    };
+    if !plain {
+        return Ok(());
+    }
+    let columns: Vec<String> = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_info({index})"))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)?
+    };
+    if columns == legacy_projection_index_columns(position) {
+        connection
+            .execute_batch(&format!("DROP INDEX {index};"))
+            .map_err(backend)?;
+    }
+    Ok(())
 }
 
 fn select_versions(

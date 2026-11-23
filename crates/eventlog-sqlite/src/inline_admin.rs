@@ -13,9 +13,9 @@ use rusqlite::params;
 use time::OffsetDateTime;
 
 use crate::{
-    COLUMNS, Inner, SqliteEventStore, SqliteProjections, backend, begin_immediate, capture, drive,
-    ensure_callback_integrity, finish_transaction, format_time, joined, poisoned, projection_table,
-    read_event, run_blocking, to_i64,
+    COLUMNS, Inner, REBUILD_STAGING, SqliteEventStore, SqliteProjections, backend, begin_immediate,
+    capture, drive, durable_projection_table, ensure_callback_integrity, finish_transaction,
+    format_time, joined, poisoned, projection_table, read_event, run_blocking, to_i64,
 };
 
 fn capture_error(error: CaptureError) -> EventLogError {
@@ -151,7 +151,7 @@ impl Inner {
             for specification in projector.projections() {
                 capture::admit_projection(&connection, &self.prefix, specification)
                     .map_err(capture_error)?;
-                let shadow = projection_table("eventlog_rebuild", specification.name);
+                let shadow = projection_table(REBUILD_STAGING, specification.name);
                 let columns = joined(specification.indexed.len(), |position| {
                     format!(",idx_{position} TEXT")
                 });
@@ -202,7 +202,7 @@ impl Inner {
                 blob_prefix: &self.prefix,
                 verified: &self.verified,
                 tracked: &self.tracked,
-                projection_prefix: "eventlog_rebuild",
+                projection_prefix: REBUILD_STAGING,
                 inline: &self.inline_names,
                 tenant,
                 admission: None,
@@ -221,8 +221,8 @@ impl Inner {
                 })?;
             }
             for specification in projector.projections() {
-                let active = projection_table(&self.prefix, specification.name);
-                let shadow = projection_table("eventlog_rebuild", specification.name);
+                let active = durable_projection_table(&self.prefix, specification.name);
+                let shadow = projection_table(REBUILD_STAGING, specification.name);
                 connection
                     .execute(
                         &format!("DELETE FROM {active} WHERE tenant_id=?1"),

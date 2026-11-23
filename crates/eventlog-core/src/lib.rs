@@ -1109,14 +1109,26 @@ pub trait EventStore: Send + Sync + 'static {
         Box::pin(async move {
             let limit = bounded_limit(limit);
             let prefix = prefix.unwrap_or("");
-            let after = cursor.map_or_else(|| prefix.to_owned(), str::to_owned);
+            // The first unfiltered page has no lower bound: an empty-string key is a valid row,
+            // and "after the empty string" would skip it. A prefix stays exclusive of itself.
+            let after = match cursor {
+                Some(cursor) => Some(cursor),
+                None if prefix.is_empty() => None,
+                None => Some(prefix),
+            };
             let fetched = self
-                .projection_list(projection, tenant, Some(&after), limit + 1)
+                .projection_list(projection, tenant, after, limit + 1)
                 .await?;
+            // A provider clamps `projection_list` to the public maximum, so a full page of
+            // MAX_READ_LIMIT rows arrives without its lookahead row. Count what came back to tell
+            // the end of the rows from a clamped read.
+            let fetched_count = fetched.len();
             let mut rows = Vec::with_capacity(limit);
             let mut more = false;
+            let mut left_prefix = false;
             for (key, body) in fetched {
                 if !key.starts_with(prefix) {
+                    left_prefix = true;
                     break;
                 }
                 if rows.len() == limit {
@@ -1124,6 +1136,16 @@ pub trait EventStore: Send + Sync + 'static {
                     break;
                 }
                 rows.push((key, body));
+            }
+            if !more && !left_prefix && rows.len() == limit && fetched_count <= limit {
+                // The lookahead was clamped away: ask the boundary directly whether one more row
+                // of the prefix follows the last one returned.
+                if let Some((last, _)) = rows.last() {
+                    let next = self
+                        .projection_list(projection, tenant, Some(last), 1)
+                        .await?;
+                    more = next.first().is_some_and(|(key, _)| key.starts_with(prefix));
+                }
             }
             let next_cursor = more
                 .then(|| rows.last().map(|(key, _)| key.clone()))

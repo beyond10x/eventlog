@@ -24,8 +24,30 @@ pub struct ProjectionSpec {
 
 impl ProjectionSpec {
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] for a name or field that cannot be a table or column.
+    /// Returns [`EventLogError::Invalid`] for a name or field that cannot be a table or column,
+    /// and for a field declared twice.
+    ///
+    /// A repeated field is refused here, where registration, migration and every read and write
+    /// check a declaration, because consistent capture refuses it: a shape registration admitted
+    /// and capture cannot read is a projection that can never be captured.
     pub fn validate(&self) -> Result<(), EventLogError> {
+        self.validate_identifiers()?;
+        for (position, field) in self.indexed.iter().enumerate() {
+            if self.indexed[..position].contains(field) {
+                return Err(EventLogError::Invalid(format!(
+                    "indexed field {field} is declared twice in projection {}",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The name, the field count and every field name, without the uniqueness of the fields.
+    ///
+    /// Capture checks uniqueness itself, after its duplicate-projection check, so that each
+    /// refusal keeps the reason the conformance contract names for it.
+    pub(crate) fn validate_identifiers(&self) -> Result<(), EventLogError> {
         validate_identifier("projection name", self.name)?;
         if self.indexed.len() > MAX_INDEXED_FIELDS {
             return Err(EventLogError::Invalid(format!(
@@ -379,5 +401,29 @@ mod tests {
                 limit: MAX_INDEXED_VALUE_BYTES,
             })
         );
+    }
+
+    #[test]
+    fn a_declaration_with_a_repeated_indexed_field_is_refused() {
+        let repeated = ProjectionSpec {
+            name: "by_kind",
+            indexed: &["kind", "owner", "kind"],
+        };
+        let Err(EventLogError::Invalid(reason)) = repeated.validate() else {
+            panic!("a declaration capture refuses was admitted");
+        };
+        assert_eq!(
+            reason,
+            "indexed field kind is declared twice in projection by_kind"
+        );
+        assert!(
+            repeated.validate_identifiers().is_ok(),
+            "the identifiers alone are valid; only their repetition is refused"
+        );
+        let distinct = ProjectionSpec {
+            name: "by_kind",
+            indexed: &["kind", "owner"],
+        };
+        assert!(distinct.validate().is_ok());
     }
 }

@@ -1022,7 +1022,7 @@ async fn the_paging_rule_holds_on_postgresql() {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
     };
-    drop_projection_tables(&store, &["paging_p_tally"]).await;
+    drop_projection_tables(&store, &["paging_p_tally", "paging_p_page_rows"]).await;
     let store: std::sync::Arc<dyn eventlog_core::EventStore> = std::sync::Arc::new(store);
     eventlog_conformance::run_paging(&store).await;
 }
