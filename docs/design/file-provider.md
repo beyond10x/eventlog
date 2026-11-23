@@ -36,6 +36,8 @@ On reopen, an intent plus an exact matching frame prefix proves an uncommitted t
 truncated. A complete frame that had not reached manifest publication is also uncommitted.
 An unexplained suffix, including concatenated branch histories, refuses. There is no merge driver.
 An error after manifest publication can report `UnknownCommit`; resolve the original identity.
+A cleanup that fails after publication (object or snapshot disposal) reports `Committed`: the
+outcome is known, and the next commit that changes bindings or a reopen disposes again.
 
 An open handle checks that every subsequent history extends the exact head it observed. A
 longer fork is not accepted merely because its sequence increased. Privacy starts a new epoch;

@@ -298,7 +298,7 @@ impl FileEventStore {
                         .push(serde_json::to_value(&tx.pending).map_err(backend)?);
                 }
                 tx.journal.privacy(tx.journal.transactions.clone())?;
-                tx.clear_snapshots()?;
+                tx.clear_snapshots().map_err(committed_with)?;
             } else if !tx.pending.is_empty() {
                 #[cfg(test)]
                 let group_pending = tx.pending.iter().any(|op| matches!(op, Op::Group { .. }));
@@ -326,15 +326,11 @@ impl FileEventStore {
             // and unbinds nothing — an event-only append, a cursor, a row — leaves the live set as
             // it was, so it neither lists nor synchronizes the object directory; objects a crash
             // left behind wait for the next commit that changes bindings or the complete opener.
+            // The commit is published by now, so a failed disposal is reported as that: the outcome
+            // is known, and the next commit that changes bindings or a reopen disposes again.
             let committed = tx.privacy || !tx.pending.is_empty();
             if committed && tx.changes_bindings() {
-                tx.clean_blobs().map_err(|error| {
-                    if tx.atomic_content && !tx.pending.is_empty() {
-                        EventLogError::UnknownCommit
-                    } else {
-                        error
-                    }
-                })?;
+                tx.clean_blobs().map_err(committed_with)?;
             }
             if !tx.staged_blobs.is_empty() {
                 journal::checkpoint("blob-cleaned");
@@ -1389,6 +1385,12 @@ mod batch_digest {
     }
 }
 
+/// A cleanup failure after publication: the commit happened and the caller is told so.
+fn committed_with(cleanup: EventLogError) -> EventLogError {
+    EventLogError::Committed {
+        cleanup: Box::new(cleanup),
+    }
+}
 /// One store root, resolved the same way for the ordinary opener and the read-only handle.
 fn root_path(path: &Path) -> Result<PathBuf, EventLogError> {
     if path.is_absolute() {

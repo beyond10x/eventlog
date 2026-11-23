@@ -5,6 +5,11 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- Core: `EventLogError::Committed { cleanup }`, returned when a commit is published and its
+  outcome known but the cleanup after it failed. The command is not to be retried as failed.
+
 ### Fixed
 
 - File: a deduplicated guarded retry of a blob-bearing group still runs its admission, but no
@@ -23,6 +28,10 @@ under bare-version tags such as `0.1.0`.
 - File: a delayed `save_snapshot_checked` of an older fold no longer replaces a newer cached
   snapshot of the same generation; it returns true and keeps the newer one, so the replay point
   never moves back. A cache of an earlier generation is still replaced at any revision.
+- File: a commit whose object or snapshot cleanup fails after publication returns
+  `EventLogError::Committed` instead of `UnknownCommit` (atomic content) or a plain backend error
+  (other writes, redaction, tenant erasure). The next commit that changes bindings, or a reopen,
+  retries the cleanup.
 
 ### Performance
 

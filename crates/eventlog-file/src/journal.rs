@@ -1936,7 +1936,15 @@ mod tests {
                     eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
                         .await;
                 if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
-                    assert_eq!(result, Err(EventLogError::UnknownCommit));
+                    // Published before the cleanup failed: the outcome is known (review L56).
+                    assert!(
+                        matches!(
+                            &result,
+                            Err(EventLogError::Committed { cleanup })
+                                if matches!(**cleanup, EventLogError::Backend(_))
+                        ),
+                        "a known commit with a failed cleanup reported {result:?}"
+                    );
                 } else {
                     result.unwrap();
                 }
