@@ -56,6 +56,19 @@ under bare-version tags such as `0.1.0`.
   table wait until it commits). After it, 0.10.0's `open` and `migrate` refuse the schema with
   "unknown PostgreSQL schema version/checksum", and this release's `open` refuses a schema that
   was not migrated. No new grants.
+- Every provider indexes a projection row's indexed value of any length again: 0.10.0 refused
+  one over 2,048 bytes with `EventLogError::IndexedValueTooLarge`, and nothing returns that now.
+  PostgreSQL indexes each declared field by a fixed-size digest of its value,
+  `(tenant_id, substr(decode(md5(idx_N), 'hex'), 1, 8))`, instead of the value, and every lookup
+  compares each candidate row with the value itself, so 8,000 bytes under a 512-byte tenant are
+  written and found where the value index aborted the append. Same schema edition and the same
+  operator steps as the entry above: `migrate` drops each registered projection table's
+  `(tenant_id, idx_N)` index and builds the digest index under the same name.
+
+### Deprecated
+
+- `eventlog_core::MAX_INDEXED_VALUE_BYTES`: no provider applies it. `indexed_values` keeps its
+  `Result` and returns no error.
 
 ### Fixed
 

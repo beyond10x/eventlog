@@ -1595,10 +1595,11 @@ impl EventStore for PostgresEventStore {
                 .query_typed(
                     &format!(
                         "SELECT body FROM {table}
-                         WHERE tenant_id = $1 AND idx_{position} = $2
+                         WHERE {}
                            AND NOT EXISTS (SELECT FROM {prefix}_projection_registry
                                            WHERE projection_name = $4 AND indexed_fields <> $5)
-                         ORDER BY row_key LIMIT $3"
+                         ORDER BY row_key LIMIT $3",
+                        schema::projection_find_filter(position)
                     ),
                     &[
                         (&tenant.as_str(), Type::TEXT),
@@ -1906,9 +1907,8 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .client
                 .query(
                     &format!(
-                        "SELECT body FROM {table}
-                         WHERE tenant_id = $1 AND idx_{position} = $2
-                         ORDER BY row_key LIMIT $3"
+                        "SELECT body FROM {table} WHERE {} ORDER BY row_key LIMIT $3",
+                        schema::projection_find_filter(position)
                     ),
                     &[&tenant.as_str(), &value, &to_i64(limit as u64)?],
                 )

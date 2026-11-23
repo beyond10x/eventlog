@@ -1026,7 +1026,8 @@ fn bounded_index_name(table: &str, role: &str) -> String {
 /// - `(tenant_id, row_key COLLATE "C")` walks a page in byte order (`projection_page_sql`). The
 ///   primary key orders keys under the database collation, which on a non-C database is not
 ///   the order the shared pager reads; without this index each page sorted the tenant's rows.
-/// - `(tenant_id, idx_N)` finds a row by a declared field's value.
+/// - `(tenant_id, indexed_digest(idx_N))` finds the candidates for a declared field's value
+///   (`projection_find_filter`).
 pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, String)> {
     let mut indexes = vec![(
         bounded_index_name(table, "key_c"),
@@ -1035,10 +1036,47 @@ pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, Str
     for position in 0..fields {
         indexes.push((
             projection_index(table, position),
-            format!("btree (tenant_id, idx_{position})"),
+            format!(
+                "btree (tenant_id, {})",
+                indexed_digest(&format!("idx_{position}"))
+            ),
         ));
     }
     indexes
+}
+
+/// The indexes of earlier editions that `migrate` drops: 0.10.0 and before indexed each field's
+/// value itself, `(tenant_id, idx_N)`, and a value too long for a B-tree entry aborted the append
+/// that wrote it.
+fn retired_projection_indexes(fields: usize) -> Vec<String> {
+    (0..fields)
+        .map(|position| format!("btree (tenant_id, idx_{position})"))
+        .collect()
+}
+
+/// A fixed-size digest of an indexed value, as SQL over `value`: the first 8 bytes of its MD5.
+///
+/// The index keys on this instead of the value, so every entry has one size whatever the
+/// value's length: PostgreSQL refuses a B-tree entry over about a third of a page, and a long
+/// indexed value aborted the append that wrote it (review L78). Two values can share the 8 bytes,
+/// so a lookup through it also compares the value itself (`projection_find_filter`). `md5(text)`
+/// is the one immutable digest of a text PostgreSQL has: an index expression must be immutable,
+/// and `sha256` takes `bytea`, which a text reaches only through stable conversions.
+pub(crate) fn indexed_digest(value: &str) -> String {
+    format!("substr(decode(md5({value}), 'hex'::text), 1, 8)")
+}
+
+/// The rows of tenant `$1` whose `position`-th declared field holds `$2`, as a `WHERE` clause.
+///
+/// The digest finds the candidates through the index; comparing the value itself keeps only the
+/// rows that hold it, since two values can share a digest.
+pub(crate) fn projection_find_filter(position: usize) -> String {
+    let column = format!("idx_{position}");
+    format!(
+        "tenant_id = $1 AND {} = {} AND {column} = $2",
+        indexed_digest(&column),
+        indexed_digest("$2::text")
+    )
 }
 
 /// The projection shape the ledger checksum covers: the index columns of a one-field table.
@@ -1083,38 +1121,51 @@ pub(crate) async fn create_projection(
     compare_projection(transaction, prefix, &table, spec.indexed.len()).await
 }
 
-/// Create every index of `projection_indexes` the stored table lacks.
+/// Drop every index of `retired_projection_indexes` the stored table has, then create every
+/// index of `projection_indexes` it lacks.
 ///
-/// An index is missing when no index of the table has its definition, whatever its name: an
-/// existing table may hold one created under an older, truncated name, and creating it again
-/// would leave two where the admitted shape has one. Each is built inside the migration
-/// transaction, which holds the table against writes until it commits.
+/// An index is matched by its definition, whatever its name: an existing table may hold one
+/// created under an older, truncated name, and creating it again would leave two where the
+/// admitted shape has one. The retired indexes go first, since a current one takes the same
+/// name. Each is built inside the migration transaction, which holds the table against writes
+/// until it commits.
 async fn install_projection_indexes(
     transaction: &Transaction<'_>,
     table: &str,
     fields: usize,
 ) -> Result<(), EventLogError> {
-    let installed: Vec<String> = transaction
+    let installed: Vec<(String, String)> = transaction
         .query(
-            "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid=to_regclass($1)",
+            "SELECT indexrelid::regclass::text, pg_get_indexdef(indexrelid)
+             FROM pg_index WHERE indrelid=to_regclass($1)",
             &[&table],
         )
         .await
         .map_err(backend)?
         .iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
+    let has = |columns: &str| {
+        let definition = format!(" USING {columns}");
+        installed
+            .iter()
+            .find(|(_, stored)| stored.ends_with(&definition))
+            .map(|(name, _)| name.clone())
+    };
+    let retired = retired_projection_indexes(fields)
+        .into_iter()
+        .filter_map(|columns| has(&columns))
+        .map(|index| format!("DROP INDEX {index};"));
     let missing = projection_indexes(table, fields)
         .into_iter()
-        .filter(|(_, columns)| {
-            let definition = format!(" USING {columns}");
-            !installed.iter().any(|stored| stored.ends_with(&definition))
-        })
-        .map(|(index, columns)| format!("CREATE INDEX {index} ON {table} USING {columns};"))
-        .collect::<Vec<_>>()
-        .concat();
-    if !missing.is_empty() {
-        transaction.batch_execute(&missing).await.map_err(backend)?;
+        .filter(|(_, columns)| has(columns).is_none())
+        .map(|(index, columns)| format!("CREATE INDEX {index} ON {table} USING {columns};"));
+    let statements = retired.chain(missing).collect::<Vec<_>>().concat();
+    if !statements.is_empty() {
+        transaction
+            .batch_execute(&statements)
+            .await
+            .map_err(backend)?;
     }
     Ok(())
 }
@@ -1765,9 +1816,10 @@ mod projection_index_tests {
             "migration adds the missing indexes: {repaired:?}"
         );
         assert!(
-            repaired
-                .iter()
-                .any(|index| index.ends_with(" USING btree (tenant_id, idx_1)")),
+            repaired.iter().any(|index| index.ends_with(&format!(
+                " USING btree (tenant_id, {})",
+                indexed_digest("idx_1")
+            ))),
             "{repaired:?}"
         );
         validate_projection(&mut sql, PREFIX, &LONG).await.unwrap();

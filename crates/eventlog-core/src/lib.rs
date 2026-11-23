@@ -38,9 +38,11 @@ pub use blob_integrity::{
     BlobMigrationReport, LegacyBlobMigration, blob_integrity_sha256, validate_legacy_blob_count,
     validate_stored_blob,
 };
+#[allow(deprecated)]
+pub use projection::MAX_INDEXED_VALUE_BYTES;
 pub use projection::{
-    CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, MAX_INDEXED_VALUE_BYTES, NoGuard,
-    ProjectionSpec, ProjectionStore, Projector, indexed_value, indexed_values, validate_identifier,
+    CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, NoGuard, ProjectionSpec,
+    ProjectionStore, Projector, indexed_value, indexed_values, validate_identifier,
 };
 
 mod atomic_blob;
@@ -949,8 +951,8 @@ pub enum EventLogError {
     /// The store declared, in its [`Capabilities`], that it does not do this.
     #[error("this event store does not support {capability}")]
     Unsupported { capability: &'static str },
-    /// A projection row carries a value for an indexed field longer than every provider can
-    /// index ([`MAX_INDEXED_VALUE_BYTES`]). Nothing was written.
+    /// 0.10.0 returned this for an indexed value over 2,048 bytes. No provider returns it since
+    /// every provider indexes a value of any length; it stays so that a match on it compiles.
     #[error("indexed field {field} holds {bytes} bytes; at most {limit} can be indexed")]
     IndexedValueTooLarge {
         field: &'static str,
