@@ -77,6 +77,9 @@ pub(crate) struct Cost {
     /// Projection rows an indexed `find` visited to answer: the entries its walk yielded, so a
     /// lookup that scanned the projection would charge every row it passed.
     pub projection_rows_visited: u64,
+    /// Snapshot generation records visited to decide which cached snapshots are still live. A
+    /// cleanup that scanned the generations once per snapshot would charge every record it passed.
+    pub generations_visited: u64,
 }
 
 impl std::ops::Sub for Cost {
@@ -94,6 +97,7 @@ impl std::ops::Sub for Cost {
             object_syncs: self.object_syncs - earlier.object_syncs,
             digest_comparisons: self.digest_comparisons - earlier.digest_comparisons,
             projection_rows_visited: self.projection_rows_visited - earlier.projection_rows_visited,
+            generations_visited: self.generations_visited - earlier.generations_visited,
         }
     }
 }

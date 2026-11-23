@@ -31,6 +31,9 @@ under bare-version tags such as `0.1.0`.
 - File: `projection_find` reads an in-memory index by tenant, projection, field, value and row
   key instead of every row of the projection, so a lookup of a value no row holds visits no row
   (it used to evaluate the field of every row: 512 for 512 rows). The journal format is unchanged.
+- File: deciding which cached snapshots are live builds one set of generations instead of scanning
+  every generation per snapshot, so opening a store with 64 live snapshots no longer makes 2,080
+  comparisons.
 
 ## 0.9.4 — 2026-11-11
 

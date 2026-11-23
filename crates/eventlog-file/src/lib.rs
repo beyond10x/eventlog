@@ -802,6 +802,21 @@ impl Transaction {
         let cache = self.root.join(".cache");
         if cache.exists() {
             directory(&cache)?;
+            // One membership set, built once: a snapshot's file name is a hash of its stream key,
+            // so its generation is all there is to look it up by, and a scan of every generation
+            // per snapshot made 2,080 comparisons for 64 live snapshots.
+            let mut visited = 0_u64;
+            let live_generations: std::collections::HashSet<&str> = self
+                .state
+                .generations
+                .values()
+                .inspect(|_| visited += 1)
+                .map(String::as_str)
+                .collect();
+            #[cfg(test)]
+            cost::charge(&self.root, |cost| cost.generations_visited += visited);
+            #[cfg(not(test))]
+            let _ = visited;
             for entry in fs::read_dir(&cache).map_err(backend)? {
                 let entry = entry.map_err(backend)?;
                 if !entry.file_type().map_err(backend)?.is_file() {
@@ -812,7 +827,7 @@ impl Transaction {
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<(String, Snapshot)>(&bytes).ok())
                         .is_some_and(|(generation, _)| {
-                            self.state.generations.values().any(|id| id == &generation)
+                            live_generations.contains(generation.as_str())
                         });
                     if !live {
                         fs::remove_file(entry.path()).map_err(backend)?;
@@ -3649,6 +3664,74 @@ mod steady_state_cost {
                     .unwrap()
                     .len(),
                 2
+            );
+        }
+    }
+
+    /// Opening a store visits each snapshot generation once to decide which cached snapshots are
+    /// live, however many snapshots there are: 64 live snapshots used to cost 2,080 generation
+    /// comparisons. A live snapshot survives the open and one with an unknown generation does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_visits_each_snapshot_generation_once() {
+        let owner = tenant("snapshots");
+        let count = 32;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append_group(&streams(&owner, "item", count))
+            .await
+            .unwrap();
+        let ids: Vec<StreamId> = (0..count)
+            .map(|i| StreamId::new(owner.clone(), "item", format!("s{i:04}")).unwrap())
+            .collect();
+        let minted = ids.clone();
+        store
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    for stream in &minted {
+                        tx.generation(stream)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let snapshot = Snapshot {
+            version: 1,
+            state_schema_version: 1,
+            state: json!({ "count": 1 }),
+            recorded_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        for stream in &ids {
+            let generation = store.snapshot_generation(stream).await.unwrap().unwrap();
+            assert!(
+                store
+                    .save_snapshot_checked(stream, &snapshot, &generation)
+                    .await
+                    .unwrap()
+            );
+        }
+        let stale = root.join(".cache").join("stale");
+        fs::write(
+            &stale,
+            serde_json::to_vec(&(new_event_id(), &snapshot)).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+
+        let before = crate::cost::of(root).generations_visited;
+        let reopened = FileEventStore::open(root).await.unwrap();
+        assert_eq!(
+            crate::cost::of(root).generations_visited - before,
+            count as u64,
+            "each generation is visited once, not once per snapshot"
+        );
+        assert!(!stale.exists(), "a snapshot of no generation survived");
+        for stream in &ids {
+            assert!(
+                reopened.load_snapshot(stream).await.unwrap().is_some(),
+                "a live snapshot was removed"
             );
         }
     }
