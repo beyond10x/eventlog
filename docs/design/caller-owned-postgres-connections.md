@@ -44,14 +44,25 @@ The existing pool remains the sole owner of bounds and lifecycle:
    stopped; and
 6. bounded shutdown closes admission and waits for every idle or checked-out driver retirement.
 
+Server-side cancellation goes through the authority too. The pool has no stream factory for a
+caller-owned transport, so when it retires an unsettled lease it calls the authority's `cancel`
+with the session's `CancelToken` and the connection timeout, on a thread of its own, and proceeds
+whatever the outcome. `cancel` has a default that reports `Unsupported`. With that default a
+retired query keeps running server-side, holding its locks, until it finishes or reaches its
+statement or lock timeout, unless the server ends it on the closed socket
+(`client_connection_check_interval`, PostgreSQL 14 and later on platforms that support it;
+PostgreSQL 13 has no such check). The lease's permit returns before that. A host that needs
+server work to end with its permit implements `cancel`.
+
 Dropping a not-yet-returned authority future owns and drops its partial connection state. Once an
 `AuthorizedConnection` is returned there is no await between taking it and installing its driver
 in the pool-owned `Connection`, so cancellation cannot strand an established driver outside pool
 accounting. Driver failure closes the paired client and prevents reuse.
 
-The factory is connection creation only. It cannot run SQL through the pool, alter accounting,
-mark a lease settled, select a schema/prefix, bypass hosted admission or observe another lease.
-There is no callback around transactions or domain operations.
+The factory creates connections and, when it implements `cancel`, sends cancel requests for
+sessions the pool retires. It cannot run SQL through the pool, alter accounting, mark a lease
+settled, select a schema/prefix, bypass hosted admission or observe another lease. There is no
+callback around transactions or domain operations.
 
 ## Compatibility and evidence
 

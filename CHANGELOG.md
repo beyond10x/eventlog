@@ -5,6 +5,15 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- PostgreSQL: `PostgresConnectionAuthority::cancel` sends the server-side cancel request for a
+  caller-owned session. The pool calls it when it retires an unsettled lease. The default
+  reports `Unsupported`, so existing authorities compile unchanged; with it, a retired query on a
+  server without disconnect polling (PostgreSQL 13, or a platform without
+  `client_connection_check_interval`) can keep running and holding locks after the pool returned
+  its permit, until it finishes or reaches its statement or lock timeout.
+
 ### Fixed
 
 - PostgreSQL: dropping an operation that holds an unsettled pool lease on a thread outside any

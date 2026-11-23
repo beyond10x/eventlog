@@ -93,6 +93,33 @@ pub trait PostgresConnectionAuthority: Send + Sync + 'static {
         &self,
         timeout: Duration,
     ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>>;
+
+    /// Sends PostgreSQL's cancel request for the session `token` names, over a transport this
+    /// authority opens, within `timeout`.
+    ///
+    /// The pool calls it when it retires an unsettled lease (a cancelled, timed-out or failed
+    /// operation), on a thread of its own with a current-thread Tokio runtime, and ignores the
+    /// outcome: the retirement proceeds either way.
+    ///
+    /// The default reports [`EventLogError::Unsupported`]. Without a cancel request a retired
+    /// query keeps running server-side, holding its locks, until it finishes or reaches its
+    /// statement or lock timeout, unless the server ends it on the closed socket
+    /// (`client_connection_check_interval`, PostgreSQL 14 and later where the platform supports
+    /// it). The pool returns the lease's permit before that, so a host that needs server work to
+    /// end with its permit implements this.
+    ///
+    /// # Errors
+    /// [`EventLogError::Unsupported`] by default, or the implementation's own failure.
+    fn cancel(
+        &self,
+        token: CancelToken,
+        timeout: Duration,
+    ) -> BoxFuture<'_, Result<(), EventLogError>> {
+        let _ = (token, timeout);
+        Box::pin(std::future::ready(Err(EventLogError::Unsupported {
+            capability: "server-side query cancellation",
+        })))
+    }
 }
 
 /// Limits are per process. A host must also admit the sum across its replicas.
@@ -570,11 +597,13 @@ impl Pool {
                         )
                     }
                 }
-                // A caller-owned transport has no stream factory the pool could open a cancel
-                // request with; its sessions rely on the server's client-connection check.
-                ConnectionSource::CallerOwned(authority) => {
-                    (authority.connect(self.options.connect_timeout).await?, None)
-                }
+                // The pool has no stream factory for a caller-owned transport: the authority
+                // sends the cancel request, or reports that it cannot and the session relies on
+                // the server's client-connection check and its own timeouts.
+                ConnectionSource::CallerOwned(authority) => (
+                    authority.connect(self.options.connect_timeout).await?,
+                    Some(CancelTransport::Authority(Arc::clone(authority))),
+                ),
             };
             let (client, connection) = authorized.into_parts();
             let cancel = transport.map(|transport| ServerCancel {
@@ -892,6 +921,7 @@ impl DriverSlot {
 enum CancelTransport {
     Plain,
     Tls(Arc<rustls::ClientConfig>),
+    Authority(Arc<dyn PostgresConnectionAuthority>),
 }
 
 /// The server-side cancel for one connection: closing the socket alone does not end a query
@@ -921,11 +951,16 @@ impl ServerCancel {
                     runtime.block_on(async {
                         let request = async {
                             match transport {
-                                CancelTransport::Plain => token.cancel_query(NoTls).await,
+                                CancelTransport::Plain => {
+                                    let _ = token.cancel_query(NoTls).await;
+                                }
                                 CancelTransport::Tls(tls) => {
-                                    token
+                                    let _ = token
                                         .cancel_query(MakeRustlsConnect::new((*tls).clone()))
-                                        .await
+                                        .await;
+                                }
+                                CancelTransport::Authority(authority) => {
+                                    let _ = authority.cancel(token, timeout).await;
                                 }
                             }
                         };
@@ -989,6 +1024,129 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// A caller-owned authority that also sends the cancel request, over plaintext to the
+    /// isolated test server, and counts the requests.
+    struct CancellingAuthority {
+        url: String,
+        cancels: AtomicUsize,
+    }
+
+    impl PostgresConnectionAuthority for CancellingAuthority {
+        fn assurance(&self) -> PostgresTransportAssurance {
+            PostgresTransportAssurance::Isolated
+        }
+
+        fn connect(
+            &self,
+            _timeout: Duration,
+        ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+            Box::pin(async move {
+                let (client, driver) = tokio_postgres::connect(&self.url, NoTls)
+                    .await
+                    .map_err(super::super::backend)?;
+                Ok(AuthorizedConnection::new(client, driver))
+            })
+        }
+
+        fn cancel(
+            &self,
+            token: CancelToken,
+            _timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), EventLogError>> {
+            self.cancels.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                token
+                    .cancel_query(NoTls)
+                    .await
+                    .map_err(super::super::backend)
+            })
+        }
+    }
+
+    /// A caller-owned lease dropped while its backend waits on a lock is cancelled server-side
+    /// through its authority. The socket check is switched off for this session so that only
+    /// the cancel request can end the wait, as on a server without disconnect polling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_owned_lease_blocked_in_a_query_is_cancelled_through_its_authority() {
+        const KEY: i64 = 0x0e7e_c105_e0b2;
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none());
+            eprintln!("skipped: caller-owned cancel needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let (holder, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(connection);
+        holder
+            .query_one("SELECT pg_advisory_lock($1)", &[&KEY])
+            .await
+            .unwrap();
+        let authority = Arc::new(CancellingAuthority {
+            url: url.clone(),
+            cancels: AtomicUsize::new(0),
+        });
+        let pool = Pool::new(
+            PostgresConfig::caller_owned("public", "caller_cancel", authority.clone()).unwrap(),
+            PoolOptions {
+                max_connections: 1,
+                statement_timeout: Duration::from_secs(60),
+                lock_timeout: Duration::from_secs(60),
+                ..PoolOptions::default()
+            },
+        )
+        .unwrap();
+        let lease = pool.acquire().await.unwrap();
+        lease
+            .batch_execute("SET client_connection_check_interval = 0")
+            .await
+            .unwrap();
+        let pid: i32 = lease
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            lease.query_one("SELECT pg_advisory_lock($1)", &[&KEY]),
+        )
+        .await;
+        assert!(blocked.is_err(), "the lease waits on the holder's lock");
+        drop(lease);
+        let dropped = std::time::Instant::now();
+        let present = || async {
+            holder
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
+                    &[&pid],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+        let mut seen = present().await;
+        while seen != 0 && dropped.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen = present().await;
+        }
+        let elapsed = dropped.elapsed();
+        holder
+            .query_one("SELECT pg_advisory_unlock($1)", &[&KEY])
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.cancels.load(Ordering::Acquire),
+            1,
+            "the pool did not ask the authority to cancel"
+        );
+        assert_eq!(
+            seen, 0,
+            "the blocked backend outlived its dropped lease by {elapsed:?}"
+        );
+        pool.shutdown().await.unwrap();
     }
 
     #[tokio::test]
