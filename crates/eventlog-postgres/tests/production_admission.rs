@@ -591,16 +591,18 @@ fn an_optimized_test_build_and_nextest_runs_alone_exactly_the_cases_that_lock_fo
         .nth(1)
         .and_then(|rest| rest.split("\n[").next())
         .expect("a default profile");
-    // `~/.cargo/config.toml` sets line-table debug info and a configuration file wins over the
-    // manifest, so the test build's profile lives in the repository's configuration file.
-    // Unoptimized, the CPU-bound cases (hashing above all) ran up to 15 times longer.
+    // A configuration file wins over the manifest, so the test build's profile lives in the
+    // repository's configuration file. Unoptimized, the CPU-bound cases (hashing above all) ran
+    // up to 15 times longer. Debug information is the host's: `~/.cargo/config.toml` sets
+    // `debug = false` for every build, so the compile cache keeps one copy of each crate, and a
+    // repository sets no other value (`~/beyond10x/AGENTS.md` § Tests stay fast).
     let build = include_str!("../../../.cargo/config.toml");
     let dev = build
         .split("[profile.dev]")
         .nth(1)
         .and_then(|rest| rest.split("\n[").next())
         .expect("a dev profile");
-    assert_eq!(setting(dev, "debug"), Some("false"), "{build}");
+    assert_eq!(setting(dev, "debug"), None, "{build}");
     assert_eq!(setting(dev, "opt-level"), Some("1"), "{build}");
     let dependencies = build
         .split("[profile.dev.package.\"*\"]")
