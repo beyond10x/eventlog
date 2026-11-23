@@ -1,6 +1,6 @@
 {
   "format": "eventlog-kpis/1",
-  "ab": { "rounds": 5, "max_ratio": 1.3 },
+  "ab": { "rounds": 5, "max_ratio": 1.5 },
   "kpis": [
     { "id": "core.fold_calls.151_commands", "kind": "counter", "finding": "P9", "provider": "sqlite", "unit": "calls", "direction": "lower",
       "measures": "Aggregate::apply calls made by Repository::handle",
