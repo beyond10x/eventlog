@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:pg-capture-releases-publication-gate-after-snapshot
 kind: story
-status: draft
+status: implemented
 title: A PostgreSQL capture releases the publication gate after its snapshot and checks the privacy epoch
 summary: Review P11 = B; writers of other tenants under one owner prefix wait for the whole capture read
 owner: eventlog
-revision: 1
+relations:
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T22:59:19Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T22:59:19Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T22:59:19Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

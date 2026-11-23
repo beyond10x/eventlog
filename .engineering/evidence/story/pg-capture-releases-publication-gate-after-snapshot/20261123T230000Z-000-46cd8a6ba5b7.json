@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T23:00:00Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-capture-releases-publication-gate-after-snapshot",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e2-pg: consistent_capture 10 passed (8 before); a_capture_past_its_snapshot_admits_other_writers_and_refuses_a_redaction_meanwhile red on base (append waited, gate held); mutations A-D all red"
+  }
+}
