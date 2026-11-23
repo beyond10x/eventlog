@@ -2,10 +2,15 @@
 format: aep.planning-md/3
 id: story:pg-projection-find-back-within-1-05
 kind: story
-status: draft
+status: active
 title: PostgreSQL projection_find returns within 1.05x of 0.10.0 with the digest index, FIPS-safe
 summary: The digest index costs 1.33x on projection_find (278.8 -> 371.0 us p50), from planning the md5 expression index
-revision: 1
+relations:
+- serves: vision:O2
+revision: 3
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T22:59:20Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-11-23T22:59:20Z", actor: "human:timo", revision: 3}
 ---
 ## Outcome
 

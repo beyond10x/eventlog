@@ -1,9 +1,17 @@
-//! One tenant's complete observation, behind the publication gate and inside one fresh snapshot.
+//! One tenant's complete observation, inside one snapshot fixed behind the publication gate.
 //!
 //! The order of the two is the whole design. Taking a repeatable-read snapshot first and *then*
 //! waiting for the gate fixes a view of the database before the wait, so an erasure that completes
 //! during that wait is invisible and the capture hands back a tenant that no longer exists. The
 //! lock comes first, at session level, and the snapshot is established after it is held.
+//!
+//! The gate is held for one statement only (review P11). The transaction's first statement fixes
+//! the snapshot, while the gate is held, and releases the gate; the read that follows lets every
+//! writer under the owner prefix commit, other tenants' included. What commits after the snapshot
+//! is outside it, which is what a snapshot is for, with one exception: an erasure or redaction of
+//! this tenant. So after the read one fresh statement reads the tenant's privacy state again (its
+//! stored identity, and whether an event of it is redacted), and a capture whose snapshot that
+//! state no longer matches is refused, as a capture that started after the change would be.
 //!
 //! The feed's watermark has no place here either. It exists to keep a resumable cursor from
 //! skipping a late commit, and it works by hiding rows an unrelated transaction's `xmin` still
@@ -18,7 +26,7 @@ use eventlog_core::{
     validate_stored_blob,
 };
 use serde_json::Value;
-use tokio_postgres::{IsolationLevel, Transaction};
+use tokio_postgres::{IsolationLevel, Transaction, types::Type};
 
 use crate::{
     ADVISORY_KEY, COLUMNS, PostgresEventStore, backend, pool::Lease, projection_table,
@@ -77,6 +85,55 @@ fn corrupt(material: CaptureMaterial) -> CaptureError {
     CaptureError::Corrupt { material }
 }
 
+fn unconfirmed_release() -> CaptureError {
+    CaptureError::Store(EventLogError::Backend(
+        "publication lock release was not confirmed".to_owned(),
+    ))
+}
+
+/// Refuse a capture whose tenant was erased or redacted after its snapshot was fixed.
+///
+/// One statement, after the capture's transaction ended, so it reads in a snapshot of its own
+/// taken now. Erasure deletes the stored identity and a new provision mints another; redaction
+/// marks an event and is never undone. The answer is the one a capture that started now would
+/// give: an identity this capture did not read is [`CaptureError::TenantIdentityMissing`], a
+/// redacted event is [`CaptureError::RedactedHistory`]. An erasure or redaction that commits
+/// after this statement is ordered after the capture.
+async fn unchanged_privacy(
+    client: &Lease,
+    prefix: &str,
+    tenant: &TenantId,
+    captured: &str,
+) -> Result<(), CaptureError> {
+    // Typed parameters: one round trip, no separate prepare.
+    let rows = client
+        .query_typed(
+            &format!(
+                "SELECT (SELECT stream_identity FROM {prefix}_identity WHERE tenant_id = $1),
+                        EXISTS(SELECT 1 FROM {prefix}_events
+                               WHERE tenant_id = $1 AND redacted_at IS NOT NULL)"
+            ),
+            &[(&tenant.as_str(), Type::TEXT)],
+        )
+        .await
+        .map_err(operational)?;
+    let [row] = rows.as_slice() else {
+        return Err(CaptureError::Store(EventLogError::Backend(
+            "the privacy check returned no row".to_owned(),
+        )));
+    };
+    let identity: Option<String> = row
+        .try_get(0)
+        .map_err(|_| corrupt(CaptureMaterial::Identity))?;
+    if identity.as_deref() != Some(captured) {
+        return Err(CaptureError::TenantIdentityMissing);
+    }
+    if row.get::<_, bool>(1) {
+        return Err(CaptureError::RedactedHistory);
+    }
+    Ok(())
+}
+
 impl ConsistentTenantCapture for PostgresEventStore {
     fn capture_tenant<'a>(
         &'a self,
@@ -122,26 +179,38 @@ impl PostgresEventStore {
             )
             .await
             .map_err(operational)?;
+        // `None` while the gate is held; the release statement inside the transaction sets it.
+        let mut released = None;
         let value = self
-            .capture_locked(&mut client, tenant, projections, limits)
-            .await;
-        let release = client
-            .query_one(
-                &format!("SELECT pg_advisory_unlock({ADVISORY_KEY})"),
-                &[&identity],
+            .capture_locked(
+                &mut client,
+                &identity,
+                &mut released,
+                tenant,
+                projections,
+                limits,
             )
             .await;
-        let released = match release {
-            Ok(row) => row.get::<_, bool>(0),
-            // A cleanup failure prevents returning a value, and never converts an earlier one.
-            Err(error) => return Err(value.err().unwrap_or_else(|| operational(error))),
+        let released = match released {
+            Some(released) => released,
+            // The capture ended before its snapshot statement released the gate.
+            None => match client
+                .query_one(
+                    &format!("SELECT pg_advisory_unlock({ADVISORY_KEY})"),
+                    &[&identity],
+                )
+                .await
+            {
+                Ok(row) => row.get::<_, bool>(0),
+                // A cleanup failure prevents returning a value, and never converts an earlier one.
+                Err(error) => return Err(value.err().unwrap_or_else(|| operational(error))),
+            },
         };
         let value = value?;
         if !released {
-            return Err(CaptureError::Store(EventLogError::Backend(
-                "publication lock release was not confirmed".to_owned(),
-            )));
+            return Err(unconfirmed_release());
         }
+        unchanged_privacy(&client, &self.prefix, tenant, &value.stream_identity).await?;
         // Only now: released, verified, and with a complete value in hand.
         client.settled();
         Ok(value)
@@ -150,6 +219,8 @@ impl PostgresEventStore {
     async fn capture_locked(
         &self,
         client: &mut Lease,
+        gate: &str,
+        released: &mut Option<bool>,
         tenant: &TenantId,
         projections: &[ProjectionSpec],
         limits: CaptureLimits,
@@ -164,9 +235,26 @@ impl PostgresEventStore {
             .start()
             .await
             .map_err(operational)?;
-        let value = self
-            .read_capture(&transaction, tenant, projections, limits)
-            .await;
+        let value = async {
+            // A repeatable-read transaction sees a snapshot taken at the start of its first
+            // statement, not at BEGIN. This statement is the first: the snapshot is fixed while
+            // the gate is still held, and the gate is released before any of the read below.
+            let unlocked: bool = transaction
+                .query_one(
+                    &format!("SELECT pg_advisory_unlock({ADVISORY_KEY})"),
+                    &[&gate],
+                )
+                .await
+                .map_err(operational)?
+                .get(0);
+            *released = Some(unlocked);
+            if !unlocked {
+                return Err(unconfirmed_release());
+            }
+            self.read_capture(&transaction, tenant, projections, limits)
+                .await
+        }
+        .await;
         match value {
             Ok(value) => {
                 transaction.commit().await.map_err(operational)?;

@@ -207,13 +207,22 @@ snapshot can predate an erasure that completes during that lock wait.
 
 All compliant event publishers take the publication lock before allocating sequence positions
 or other owner locks and retain it until commit/rollback. Once capture holds it exclusively,
-prior publishers have settled and later ones cannot allocate. Do not paginate or apply the feed
+prior publishers have settled and later ones cannot allocate. The first statement of the
+transaction fixes its snapshot (PostgreSQL fixes a repeatable-read snapshot at the start of the
+first statement) and releases the lock, so writers of every tenant under the owner prefix wait
+for that one statement, not for the whole read (review P11). Publishers that commit after it are
+outside the snapshot. An erasure or redaction of this tenant committed during the read is not:
+after the transaction ends, one fresh READ COMMITTED statement reads the tenant's stored identity
+and whether any of its events is redacted. A different or missing identity refuses the capture
+with `TenantIdentityMissing`, a redacted event with `RedactedHistory`, as a capture that started
+after that change would have. Do not paginate or apply the feed
 watermark to this complete snapshot: unrelated database `xmin` can otherwise hide committed
 tenant rows. This does not change the ordinary feed's watermark or contiguity rules. Identity
 and blob writes that do not take the gate are still observed atomically by the fresh MVCC snapshot.
 
-Commit or roll back the read-only transaction, explicitly unlock and verify successful release,
-then and only then mark the lease settled/reusable. If acquire/read/end/unlock fails, leave the
+Verify the release the first statement returns; a capture that fails before it unlocks after
+its rollback. Commit or roll back the read-only transaction, run the privacy check, then and only
+then mark the lease settled/reusable. If acquire/read/end/unlock fails, leave the
 lease quarantined; existing driver retirement releases locks before capacity is returned.
 Cancellation while awaiting the lock, holding it, or reading cannot recycle a locked session.
 The existing transaction deadline bounds lock acquisition plus the whole capture and cleanup;

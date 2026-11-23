@@ -28,6 +28,8 @@ const ATOMIC_GROUP_CHECKSUM: &str =
 const BLOB_INTEGRITY_CHECKSUM: &str =
     "3d101321a8cc49dbca39a7d2305fb82dafe0550789fc87612f95dd232359ad0d";
 const BATCH_CHECKSUM: &str = "f5989b20d7de8babbd77d3427015b92a70f5f6275982f740616476873d09a7fa";
+const MD5_DIGEST_CHECKSUM: &str =
+    "20d998c6771a5b4a4e03df9034ac4bab9479ae72ab908f2bae5ef045c7a6881c";
 
 fn legacy_base_ddl(prefix: &str) -> String {
     format!(
@@ -236,6 +238,13 @@ fn checksum() -> String {
 /// only by `(tenant_id, idx_N)`.
 fn batch_checksum() -> String {
     BATCH_CHECKSUM.into()
+}
+
+/// The edition `main` wrote from pull request 70 until the digest became FIPS-safe, never
+/// released: the current owner tables, the bytewise page index, and each field indexed by the
+/// first 8 bytes of `md5(idx_N)`, which a PostgreSQL server in FIPS mode refuses to compute.
+fn md5_digest_checksum() -> String {
+    MD5_DIGEST_CHECKSUM.into()
 }
 
 /// The edition with blob integrity columns and atomic groups, before the batch record.
@@ -718,7 +727,9 @@ pub(crate) async fn migrate_with_blob_migration(
     } else {
         Some(blob_shape(&transaction, prefix).await?)
     };
-    let mut batch_edition = false;
+    // The recorded checksum of an earlier edition that differs from the current one only in its
+    // projection tables' indexes, when the ledger holds one.
+    let mut index_edition: Option<String> = None;
     if prior_blob_shape == Some(PostgresBlobShape::Current) {
         if !ledger || !generations || !groups {
             return Err(EventLogError::Invalid(
@@ -730,10 +741,17 @@ pub(crate) async fn migrate_with_blob_migration(
         compare(&transaction, prefix, GROUP_ADDED).await?;
         if batches {
             compare(&transaction, prefix, BATCH_ADDED).await?;
-            // The 0.10.0 edition differs from the current one only in its projection tables'
-            // indexes, which `upgrade_registered_projections` moves below.
-            batch_edition =
-                version_among(&transaction, prefix, &[&checksum(), &batch_checksum()]).await? == 1;
+            // The 0.10.0 edition and `main`'s MD5 digest edition differ from the current one only
+            // in their projection tables' indexes, which `upgrade_registered_projections` moves
+            // below.
+            let editions = [checksum(), batch_checksum(), md5_digest_checksum()];
+            let recorded = version_among(
+                &transaction,
+                prefix,
+                &editions.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .await?;
+            index_edition = (recorded != 0).then(|| editions[recorded].clone());
         } else {
             version(&transaction, prefix, &blob_integrity_checksum()).await?;
         }
@@ -867,10 +885,11 @@ pub(crate) async fn migrate_with_blob_migration(
             .await
             .map_err(backend)?;
     } else if prior_blob_shape == Some(PostgresBlobShape::Legacy)
-        || (prior_blob_shape == Some(PostgresBlobShape::Current) && (!batches || batch_edition))
+        || (prior_blob_shape == Some(PostgresBlobShape::Current)
+            && (!batches || index_edition.is_some()))
     {
-        let prior_checksum = if batch_edition {
-            batch_checksum()
+        let prior_checksum = if let Some(recorded) = index_edition {
+            recorded
         } else if prior_blob_shape == Some(PostgresBlobShape::Current) {
             blob_integrity_checksum()
         } else {
@@ -1047,23 +1066,37 @@ pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, Str
 
 /// The indexes of earlier editions that `migrate` drops: 0.10.0 and before indexed each field's
 /// value itself, `(tenant_id, idx_N)`, and a value too long for a B-tree entry aborted the append
-/// that wrote it.
+/// that wrote it; `main` after pull request 70 indexed the first 8 bytes of `md5(idx_N)`, which a
+/// server in FIPS mode refuses to compute.
 fn retired_projection_indexes(fields: usize) -> Vec<String> {
     (0..fields)
-        .map(|position| format!("btree (tenant_id, idx_{position})"))
+        .flat_map(|position| {
+            [
+                format!("btree (tenant_id, idx_{position})"),
+                format!(
+                    "btree (tenant_id, substr(decode(md5(idx_{position}), 'hex'::text), 1, 8))"
+                ),
+            ]
+        })
         .collect()
 }
 
-/// A fixed-size digest of an indexed value, as SQL over `value`: the first 8 bytes of its MD5.
+/// A fixed-size digest of an indexed value, as SQL over `value`: its 64-bit
+/// `hashtextextended(value, 0)`, written the way `pg_get_indexdef` prints it.
 ///
 /// The index keys on this instead of the value, so every entry has one size whatever the
 /// value's length: PostgreSQL refuses a B-tree entry over about a third of a page, and a long
-/// indexed value aborted the append that wrote it (review L78). Two values can share the 8 bytes,
-/// so a lookup through it also compares the value itself (`projection_find_filter`). `md5(text)`
-/// is the one immutable digest of a text PostgreSQL has: an index expression must be immutable,
-/// and `sha256` takes `bytea`, which a text reaches only through stable conversions.
+/// indexed value aborted the append that wrote it (review L78). Two values can share the digest,
+/// so a lookup through it also compares the value itself (`projection_find_filter`).
+///
+/// `hashtextextended` is PostgreSQL's own text hash, the one hash partitioning stores: immutable,
+/// as an index expression must be, and kept stable across releases for that reason. Under a
+/// deterministic collation, which admission requires of every column, it hashes the value's
+/// bytes. It runs no OpenSSL digest, so a server in FIPS mode computes it; that server refuses
+/// `md5()`, which the previous digest called. Planning it also costs less than the MD5 expression
+/// it replaces (KPI `postgres.projection_find.latency`).
 pub(crate) fn indexed_digest(value: &str) -> String {
-    format!("substr(decode(md5({value}), 'hex'::text), 1, 8)")
+    format!("hashtextextended({value}, '0'::bigint)")
 }
 
 /// The rows of tenant `$1` whose `position`-th declared field holds `$2`, as a `WHERE` clause.
@@ -1315,9 +1348,9 @@ async fn downgrade_blob_fixture(client: &Client, prefix: &str) {
 mod blob_integrity_tests {
     use super::{
         ATOMIC_GROUP_CHECKSUM, BATCH_CHECKSUM, BLOB_INTEGRITY_CHECKSUM, LEGACY_CHECKSUM,
-        SNAPSHOT_CHECKSUM, additions, atomic_group_checksum, base_ddl, batch_checksum,
-        blob_integrity_checksum, checksum, group_additions, legacy_checksum, owner_ddl,
-        snapshot_additions, snapshot_checksum,
+        MD5_DIGEST_CHECKSUM, SNAPSHOT_CHECKSUM, additions, atomic_group_checksum, base_ddl,
+        batch_checksum, blob_integrity_checksum, checksum, group_additions, legacy_checksum,
+        md5_digest_checksum, owner_ddl, snapshot_additions, snapshot_checksum,
     };
     use sha2::{Digest, Sha256};
 
@@ -1345,6 +1378,19 @@ mod blob_integrity_tests {
         assert_eq!(batch_checksum(), BATCH_CHECKSUM);
         assert_eq!(format!("{:x}", Sha256::digest(owner_ddl())), BATCH_CHECKSUM);
         assert_ne!(checksum(), BATCH_CHECKSUM);
+        // `main`'s unreleased MD5 digest edition: the current owner DDL and the MD5 projection index.
+        assert_eq!(md5_digest_checksum(), MD5_DIGEST_CHECKSUM);
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(format!(
+                    "{}btree (tenant_id, row_key COLLATE \"C\");btree (tenant_id, substr(decode(md5(idx_0), 'hex'::text), 1, 8))",
+                    owner_ddl()
+                ))
+            ),
+            MD5_DIGEST_CHECKSUM
+        );
+        assert_ne!(checksum(), MD5_DIGEST_CHECKSUM);
     }
 }
 
