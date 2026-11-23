@@ -26,7 +26,7 @@ use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
     MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, Read,
     ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId,
-    VerifiedContent, blob_integrity_sha256, bounded_limit, indexed_value, new_event_id,
+    VerifiedContent, blob_integrity_sha256, bounded_limit, indexed_values, new_event_id,
     redaction_tombstone, validate_append, validate_field,
 };
 use serde_json::Value;
@@ -1626,11 +1626,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
             let updates: String = joined(projection.indexed.len(), |position| {
                 format!(", idx_{position} = EXCLUDED.idx_{position}")
             });
-            let indexed: Vec<Option<String>> = projection
-                .indexed
-                .iter()
-                .map(|field| indexed_value(body, field))
-                .collect();
+            let indexed = indexed_values(projection, body)?;
             let statement = format!(
                 "INSERT INTO {table} (tenant_id, row_key, body{columns})
                  VALUES ($1, $2, $3{placeholders})

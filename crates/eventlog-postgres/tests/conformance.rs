@@ -914,6 +914,94 @@ async fn the_inline_projection_exercise_passes_on_postgresql() {
     eventlog_conformance::run_inline_projections(&store).await;
 }
 
+/// PostgreSQL keeps a whole indexed value in a B-tree entry of about a third of a page. A row
+/// whose indexed value is far over the portable bound is refused by name before any SQL, rather
+/// than by the index aborting the append's transaction; a value at the bound under a tenant of
+/// the longest accepted length fits the entry and is found by its value.
+#[tokio::test]
+async fn an_oversized_indexed_value_is_refused_before_postgresql_aborts_the_append() {
+    struct WritesKind(TenantId, String);
+    impl eventlog_core::Guard for WritesKind {
+        fn check<'a>(
+            &'a self,
+            store: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                store
+                    .upsert(
+                        &eventlog_conformance::TALLY,
+                        &self.0,
+                        "oversized",
+                        &serde_json::json!({ "kind": self.1 }),
+                    )
+                    .await
+            })
+        }
+    }
+    let Some(store) = store("idx_bound").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    drop_projection_tables(&store, &["idx_bound_p_tally"]).await;
+    store
+        .register_inline(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("registered");
+    let tenant = TenantId::new(format!(
+        "idx-bound-{}",
+        "b".repeat(eventlog_core::MAX_FIELD_LEN - "idx-bound-".len())
+    ))
+    .unwrap();
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let noise: String = (0..8_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'!' + u8::try_from(state % 94).unwrap())
+        })
+        .collect();
+    let append = |id: &'static str, kind: String| {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = &store;
+        let guard = Arc::new(WritesKind(tenant.clone(), kind));
+        async move {
+            let outcome = store
+                .append_guarded(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    guard,
+                )
+                .await
+                .map(|_| ());
+            (outcome, store.stream_version(&stream).await.unwrap())
+        }
+    };
+    assert_eq!(
+        append("oversized", noise.clone()).await,
+        (
+            Err(EventLogError::IndexedValueTooLarge {
+                field: "kind",
+                bytes: 8_000,
+                limit: eventlog_core::MAX_INDEXED_VALUE_BYTES,
+            }),
+            None
+        )
+    );
+    let at_bound = noise[..eventlog_core::MAX_INDEXED_VALUE_BYTES].to_owned();
+    assert_eq!(
+        append("at-bound", at_bound.clone()).await,
+        (Ok(()), Some(1))
+    );
+    let found = store
+        .projection_find(&eventlog_conformance::TALLY, &tenant, "kind", &at_bound, 10)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "the row at the bound is found by its value");
+}
+
 async fn drop_projection_tables(store: &PostgresEventStore, tables: &[&str]) {
     let Some(url) = url() else { return };
     let client = client(&url).await;

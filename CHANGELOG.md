@@ -36,6 +36,11 @@ under bare-version tags such as `0.1.0`.
 - PostgreSQL: the same edition adds the index `<prefix>_scope_counters_bytes` on the byte order of
   the admission counter coordinates. Tenant erasure removes the tenant's counters with an index
   range scan instead of reading every counter while it holds the exclusive publication lock.
+- `eventlog_core::MAX_INDEXED_VALUE_BYTES` (2,048) and `indexed_values`: every provider refuses a
+  projection row whose indexed field value is longer, before writing, with the new
+  `EventLogError::IndexedValueTooLarge { field, bytes, limit }`. On PostgreSQL such a value could
+  exceed the B-tree entry limit and abort the append with a backend error; SQLite and the file
+  provider accepted it. A projector that indexes longer values must index a shorter key instead.
 
 ### Changed
 
