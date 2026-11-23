@@ -84,6 +84,11 @@ pub struct RestoredEvent {
     /// Where the event stood in the branchable history it is copied from, when it is copied rather
     /// than replayed into a store of its own. Recorded beside the event, never in its body.
     pub origin: Option<EventOrigin>,
+    /// The reason the event was redacted with, when the history it is replayed from had already
+    /// redacted it. The appended body must then be that reason's
+    /// [`eventlog_core::redaction_tombstone`]: the event is stored redacted, and every inline
+    /// projector is handed it redacted, never its tombstone as a live event.
+    pub redacted: Option<String>,
 }
 
 /// An event's place in a branchable history, kept when a linear store holds a copy of it: the
@@ -1756,17 +1761,29 @@ impl Inner {
         let mut written = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
             let version = head + 1 + offset as u64;
-            let (event_id, now, origin, position) =
+            let (event_id, now, origin, position, redacted) =
                 match self.restored.lock().map_err(poisoned)?.pop_front() {
                     Some((restored, position)) => (
                         restored.event_id,
                         restored.recorded_at,
                         restored.origin,
                         position.map(to_i64).transpose()?,
+                        restored.redacted,
                     ),
-                    None => (new_event_id(), minted, None, None),
+                    None => (new_event_id(), minted, None, None, None),
                 };
             let recorded_at = format_time(now)?;
+            // A replayed event its history had redacted is stored redacted from the start, so no
+            // inline projector below is handed its tombstone as a live event.
+            let redacted_at = match &redacted {
+                Some(reason) if event.data != redaction_tombstone(reason) => {
+                    return Err(EventLogError::Invalid(
+                        "a restored redacted event whose body is not its tombstone".into(),
+                    ));
+                }
+                Some(_) => Some(minted),
+                None => None,
+            };
             // A restored position is taken as given; otherwise `?17` is NULL and the store
             // assigns the next one.
             connection
@@ -1775,9 +1792,10 @@ impl Inner {
                         "INSERT INTO {prefix}_events (
                              tenant_id, stream_type, stream_id, version, event_id, event_name,
                              event_schema_version, occurred_at, recorded_at, subject, actor,
-                             request_id, trace_id, causation_id, causation_depth, data, global_seq)
+                             request_id, trace_id, causation_id, causation_depth, data, global_seq,
+                             redacted_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16, ?17)"
+                                 ?15, ?16, ?17, ?18)"
                     ),
                     params![
                         stream.tenant().as_str(),
@@ -1797,6 +1815,7 @@ impl Inner {
                         i64::from(meta.causation_depth),
                         event.data.to_string(),
                         position,
+                        redacted_at.map(format_time).transpose()?,
                     ],
                 )
                 .map_err(backend)?;
@@ -1844,7 +1863,7 @@ impl Inner {
                 trace_id: meta.trace_id.clone(),
                 causation_id: meta.causation_id.clone(),
                 causation_depth: meta.causation_depth,
-                redacted_at: None,
+                redacted_at,
                 data: event.data.clone(),
                 digest: None,
                 parents: Vec::new(),

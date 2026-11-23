@@ -41,6 +41,7 @@ fn restored(id: &str, version: u64) -> RestoredEvent {
             digest: format!("digest-{version}"),
             parents: Vec::new(),
         }),
+        redacted: None,
     }
 }
 
@@ -184,4 +185,111 @@ async fn restored_events_take_their_given_positions_and_appends_land_above_the_r
         13,
         "a reservation never lowers what was assigned"
     );
+}
+
+/// An inline projector that records, for each event, whether it was handed it redacted, and
+/// refuses a tombstone handed as a live event.
+struct Marks;
+
+const MARKS: ProjectionSpec = ProjectionSpec {
+    name: "marks",
+    indexed: &[],
+};
+
+impl Projector for Marks {
+    fn name(&self) -> &'static str {
+        "marks"
+    }
+
+    fn projections(&self) -> &'static [ProjectionSpec] {
+        &[MARKS]
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a RecordedEvent,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if !event.is_redacted() && event.data.get("redacted") == Some(&json!(true)) {
+                return Err(EventLogError::Invalid("a tombstone handed as live".into()));
+            }
+            store
+                .upsert(
+                    &MARKS,
+                    &event.tenant,
+                    &event.event_id,
+                    &json!({ "redacted": event.is_redacted() }),
+                )
+                .await
+        })
+    }
+}
+
+/// A replayed event its history had redacted is appended redacted: stored with its mark and
+/// handed to every inline projector with it. A body that is not that reason's tombstone is
+/// refused before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_redacted_event_is_stored_and_projected_redacted() {
+    let store = SqliteEventStore::in_memory("owner").await.unwrap();
+    store.register_inline(Arc::new(Marks)).await.unwrap();
+    let mut erased = restored("erased", 1);
+    erased.redacted = Some("erased".into());
+    store
+        .restore_events(vec![erased, restored("live", 2)])
+        .unwrap();
+    let tombstone = eventlog_core::NewEvent::new(
+        "item.received",
+        1,
+        eventlog_core::redaction_tombstone("erased"),
+    )
+    .unwrap();
+    store
+        .append(
+            &stream("x"),
+            Expected::NoStream,
+            &[tombstone, event("item.indexed", 2)],
+            &meta("key-1", &json!({})),
+        )
+        .await
+        .expect("a restored redacted event was handed to the projector as live");
+    let tenant = TenantId::new("tenant-a").unwrap();
+    assert_eq!(
+        store
+            .projection_get(&MARKS, &tenant, "erased")
+            .await
+            .unwrap(),
+        Some(json!({ "redacted": true }))
+    );
+    assert_eq!(
+        store.projection_get(&MARKS, &tenant, "live").await.unwrap(),
+        Some(json!({ "redacted": false }))
+    );
+    let read = store.read_stream(&stream("x"), 0, 10).await.unwrap().events;
+    assert!(read[0].is_redacted() && !read[1].is_redacted());
+
+    store
+        .restore_events(vec![restored_redacted("other")])
+        .unwrap();
+    let refused = store
+        .append(
+            &stream("y"),
+            Expected::NoStream,
+            &[event("item.received", 3)],
+            &meta("key-2", &json!({})),
+        )
+        .await
+        .expect_err("a live body restored as redacted was stored");
+    assert!(
+        matches!(&refused, EventLogError::Invalid(message) if message.contains("not its tombstone")),
+        "{refused:?}"
+    );
+    assert_eq!(store.stream_version(&stream("y")).await.unwrap(), None);
+}
+
+fn restored_redacted(id: &str) -> RestoredEvent {
+    RestoredEvent {
+        redacted: Some("erased".into()),
+        ..restored(id, 1)
+    }
 }

@@ -5,6 +5,17 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Breaking
+
+- SQLite: `RestoredEvent` has the new public field `redacted: Option<String>`; a struct literal
+  adds `redacted: None` to keep restoring live events.
+
+### Fixed
+
+- Tree: `copy` into a target with an inline projector hands a redacted event to the projector
+  as redacted (`RecordedEvent::redacted_at` set, the tombstone as body), and the target stores it
+  redacted.
+
 ## 0.10.0 — 2026-11-23
 
 ### Added

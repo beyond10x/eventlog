@@ -1066,6 +1066,7 @@ async fn replay(
                 event_id: record.event_id.clone(),
                 recorded_at: record.recorded_at,
                 origin,
+                redacted: record.redacted.clone(),
             })
         })
         .collect::<Result<Vec<_>, EventLogError>>()?;

@@ -30,6 +30,7 @@ fn restored(id: &str, version: u64) -> RestoredEvent {
             digest: format!("digest-{version}"),
             parents: Vec::new(),
         }),
+        redacted: None,
     }
 }
 

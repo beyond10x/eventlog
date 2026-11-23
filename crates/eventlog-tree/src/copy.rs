@@ -34,7 +34,9 @@ pub struct CopyReport {
 /// Copy every tenant of `from` into `to`, linearized: identities, blobs, every committed group in
 /// § 6.3 position order with its receipt, and every redaction. Each copied event's tree
 /// `{version, digest, parents}` is recorded in `to`'s origin map. A redaction whose reason is free
-/// text an earlier release accepted is copied with [`crate::LEGACY_REDACTION_REASON`].
+/// text an earlier release accepted is copied with [`crate::LEGACY_REDACTION_REASON`]. An event the
+/// tree had redacted is appended redacted, so an inline projector registered on `to` is handed it
+/// with its redaction mark, never its tombstone as a live event.
 ///
 /// The tree is held under its writer lock for the whole copy, so no write lands halfway. `to` must
 /// not be written by anyone else while the copy runs: it takes each event's original id and
