@@ -102,6 +102,16 @@ struct Transaction {
     /// Whether this transaction bound blob content. A binding write that returns an error drops
     /// everything the handle remembers, so content of a write that did not commit is not kept.
     binds: bool,
+    /// While a rollback-only scope is open ([`Transaction::begin_rollback`]), what each recorded
+    /// operation replaced, one entry per operation pushed to `pending` since the scope began.
+    undo: Option<Vec<Undo>>,
+}
+/// The state an operation recorded inside a rollback-only scope replaced.
+enum Undo {
+    Counter(String, Option<i64>),
+    Row(Op),
+    /// An operation no admission view can stage; a scope holding one cannot be rolled back.
+    Other,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -393,15 +403,21 @@ impl FileEventStore {
                     // "retries return the original result without repeating admission or
                     // projections" (`eventlog-core/src/atomic_group.rs`), which
                     // `eventlog-conformance/src/atomic_group.rs:153` asserts by counting calls.
+                    // It runs in a rollback-only scope: its decision stands, and what it staged —
+                    // a counter reservation above all — is taken back, because the answer is the
+                    // original receipt and charges nothing the original commit did not.
                     if !blobs.is_empty() {
-                        guard
+                        let mark = tx.begin_rollback();
+                        let admitted = guard
                             .check(&mut projection::View {
                                 admission: true,
                                 selected: None,
                                 tx,
                                 tenant: &group.tenant,
                             })
-                            .await?;
+                            .await;
+                        tx.rollback(mark)?;
+                        admitted?;
                     }
                     // Committed through `AtomicBlobEventStore`, whose fingerprint binds this
                     // group, these digests and the SHA-256 of these bytes: the same request.
@@ -551,8 +567,59 @@ impl Transaction {
     fn record(&mut self, op: Op) -> Result<(), EventLogError> {
         // Pushed before it is applied: an apply that fails part-way has still touched the state,
         // and a non-empty `pending` is what tells a refusal not to keep this view.
+        if let Some(undo) = &mut self.undo {
+            undo.push(match &op {
+                Op::Counter { coordinate, .. } => Undo::Counter(
+                    coordinate.clone(),
+                    self.state.counters.get(coordinate).copied(),
+                ),
+                Op::Row {
+                    tenant, name, key, ..
+                } => Undo::Row(Op::Row {
+                    tenant: tenant.clone(),
+                    name: name.clone(),
+                    key: key.clone(),
+                    body: self
+                        .state
+                        .rows
+                        .get(&(tenant.as_str().into(), name.clone(), key.clone()))
+                        .cloned(),
+                }),
+                _ => Undo::Other,
+            });
+        }
         self.pending.push(op.clone());
         self.state.apply(op)
+    }
+    /// Open a rollback-only scope: what is recorded until [`Transaction::rollback`] is staged and
+    /// visible to the code inside it, as in any transaction, and then taken back out of `pending`
+    /// and `state`, so the commit that follows carries none of it.
+    fn begin_rollback(&mut self) -> usize {
+        self.undo = Some(Vec::new());
+        self.pending.len()
+    }
+    /// Close the scope `begin_rollback` opened at `mark`, restoring what its operations replaced.
+    fn rollback(&mut self, mark: usize) -> Result<(), EventLogError> {
+        let undo = self.undo.take().unwrap_or_default();
+        if undo.len() != self.pending.len() - mark || undo.iter().any(|u| matches!(u, Undo::Other))
+        {
+            // Left staged: a non-empty `pending` makes the caller's refusal drop this view.
+            return Err(backend("a rollback-only scope staged an operation it cannot undo"));
+        }
+        for undo in undo.into_iter().rev() {
+            match undo {
+                Undo::Counter(coordinate, Some(value)) => {
+                    self.state.counters.insert(coordinate, value);
+                }
+                Undo::Counter(coordinate, None) => {
+                    self.state.counters.remove(&coordinate);
+                }
+                Undo::Row(op) => self.state.apply(op)?,
+                Undo::Other => unreachable!("refused above"),
+            }
+        }
+        self.pending.truncate(mark);
+        Ok(())
     }
     fn result(&self, range: &GroupRange, deduplicated: bool) -> AppendResult {
         AppendResult {
@@ -1152,6 +1219,7 @@ fn enter(
             staged_blobs: Vec::new(),
             atomic_content: false,
             binds: false,
+            undo: None,
         };
         // Only the objects the new frames bind are new to this handle; the rest it already hashed.
         for (tenant, digest) in &bound {
@@ -1205,6 +1273,7 @@ fn complete(
         staged_blobs: Vec::new(),
         atomic_content: false,
         binds: false,
+        undo: None,
     };
     tx.clear_snapshots()?;
     tx.clean_blobs()?;
@@ -1910,6 +1979,7 @@ impl EventStore for FileEventStore {
                 staged_blobs: Vec::new(),
                 atomic_content: false,
                 binds: false,
+                undo: None,
             };
             tx.register(projector.as_ref())?;
             let manifest = blocking(move || {

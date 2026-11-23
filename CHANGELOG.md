@@ -5,6 +5,13 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Fixed
+
+- File: a deduplicated guarded retry of a blob-bearing group still runs its admission, but no
+  longer commits what that admission staged. A counter reservation made by the retry used to be
+  journaled with zero new events, so each retry charged the quota again; it is now rolled back,
+  as SQLite rolls it back, and the original receipt is returned.
+
 ### Performance
 
 - File: `read_feed` and catch-up start at the requested position instead of walking the store
