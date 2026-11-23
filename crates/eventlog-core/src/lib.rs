@@ -981,7 +981,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// Drive this projector inside every append transaction from now on.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered.
+    /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered,
+    /// or when catch-up on this handle has already driven the projector.
     fn register_inline(
         &self,
         projector: Arc<dyn Projector>,
@@ -993,7 +994,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// Apply one batch of a catch-up projection under its own lock.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Backend`] when the store is unavailable.
+    /// Returns [`EventLogError::Backend`] when the store is unavailable, and
+    /// [`EventLogError::Invalid`] when the projector is driven inline.
     fn run_catch_up<'a>(
         &'a self,
         projector: Arc<dyn Projector>,

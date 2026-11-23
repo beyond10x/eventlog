@@ -7,6 +7,11 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- SQLite and PostgreSQL: a projector is driven inline or by catch-up, never both. A catch-up
+  runner created before the same projector was registered inline used to fold every event a
+  second time. `run_catch_up` now refuses an inline projector, as the file provider already did,
+  and inline registration or attachment refuses a projector catch-up has already driven on that
+  handle.
 - PostgreSQL: an inline projector is no longer folded by two appends at once. Appends to distinct
   streams, through one handle or several, each took only the shared publication gate and their own
   stream lock, so a projector that reads, computes and upserts a shared row could lose an update.

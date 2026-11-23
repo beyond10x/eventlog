@@ -70,6 +70,9 @@ pub struct PostgresEventStore {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    /// Projectors this handle has driven by catch-up. Locked after `inline`, so one projector is
+    /// driven inline or by catch-up, never both, whichever is registered first.
+    catch_up: Mutex<BTreeSet<String>>,
     /// Blob content this handle has verified or hashed at write time; see
     /// [`eventlog_core::VerifiedContent`].
     verified: VerifiedContent,
@@ -257,6 +260,7 @@ impl PostgresEventStore {
             admission_permit: eventlog_core::AdmissionPermit::default(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            catch_up: Mutex::new(BTreeSet::new()),
             verified: VerifiedContent::default(),
         }
     }
@@ -304,6 +308,31 @@ impl PostgresEventStore {
             outcome
         })
     }
+    /// Called with `inline` held, so no catch-up pass can claim the projector meanwhile.
+    fn refuse_catch_up_driven(&self, name: &str) -> Result<(), EventLogError> {
+        if self.catch_up.lock().map_err(poisoned)?.contains(name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven by catch-up"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that catch-up drives this projector, unless it is driven inline.
+    fn claim_catch_up(&self, name: &str) -> Result<(), EventLogError> {
+        let projectors = self.inline.lock().map_err(poisoned)?;
+        if projectors.iter().any(|projector| projector.name() == name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven inline"
+            )));
+        }
+        self.catch_up
+            .lock()
+            .map_err(poisoned)?
+            .insert(name.to_owned());
+        Ok(())
+    }
+
     fn bounded<'a, T: Send + 'a>(
         &'a self,
         future: impl std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
@@ -1261,6 +1290,8 @@ impl EventStore for PostgresEventStore {
                 }
             }
             self.create_projections(Arc::clone(&projector)).await?;
+            let mut projectors = self.inline.lock().map_err(poisoned)?;
+            self.refuse_catch_up_driven(projector.name())?;
             let mut names = self.inline_names.lock().map_err(poisoned)?;
             for spec in projector.projections() {
                 if !names.insert(spec.name.to_owned()) {
@@ -1271,7 +1302,7 @@ impl EventStore for PostgresEventStore {
                 }
             }
             drop(names);
-            self.inline.lock().map_err(poisoned)?.push(projector);
+            projectors.push(projector);
             Ok(())
         })
     }
@@ -1290,6 +1321,7 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<CatchUpProgress, EventLogError>> {
         self.bounded(async move {
             let batch = bounded_limit(batch);
+            self.claim_catch_up(projector.name())?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();

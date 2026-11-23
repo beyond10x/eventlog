@@ -128,6 +128,7 @@ impl Inner {
         {
             return Err(EventLogError::Invalid("duplicate inline projection".into()));
         }
+        self.refuse_catch_up_driven(projector.name())?;
 
         let connection = self.connection.lock().map_err(poisoned)?;
         begin_immediate(&connection)?;

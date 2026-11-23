@@ -126,6 +126,7 @@ impl InlineProjectionAdmin for PostgresEventStore {
             {
                 return Err(EventLogError::Invalid("duplicate inline projection".into()));
             }
+            self.refuse_catch_up_driven(projector.name())?;
             let mut installed = names.clone();
             installed.extend(
                 projector
