@@ -11,6 +11,8 @@ under bare-version tags such as `0.1.0`.
   `kpi/baseline.json` records them, and the `eventlog-kpi` runner checks the counters
   (`bash scripts/gate.sh --kpi`) and A/B-compares timings between two revisions. The providers'
   counters exist only behind the non-default `kpi-counters` feature; no public API changes.
+  CI runs them as two jobs: `KPI / KPI counters` (meant to become a required check) and
+  `KPI / KPI timing` (the A/B on pull requests, informational only).
 
 ## 0.9.4 — 2026-11-11
 

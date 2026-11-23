@@ -152,8 +152,11 @@ The runner is `crates/eventlog-kpi` (`publish = false`).
   quiet machine with a disposable PostgreSQL:
   `cargo run --release --locked -p eventlog-kpi --features counters -- record`. Never edit the
   baseline by hand and never re-record to absorb a regression.
-- CI: the `KPI gate` job of `.github/workflows/kpi.yml` runs the counters and, on a pull request,
-  the A/B against the base. A change of only `.engineering/` or Markdown skips it
+- CI: `.github/workflows/kpi.yml` has two jobs. `KPI / KPI counters` runs the counters with a
+  PostgreSQL service on every pull request and push to `main`; it is the one meant to become a
+  required check. `KPI / KPI timing` runs the A/B against the base on a pull request; it is
+  informational (`continue-on-error`) and never a required check. In both, a change of only
+  `.engineering/` or Markdown skips the measuring step and the job passes
   (`eventlog-kpi ci-scope`).
 
 ## Releases
