@@ -1278,33 +1278,36 @@ async fn count_round_trips(
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let server = tokio::net::TcpStream::connect(upstream).await?;
+    // Each message is forwarded as it arrives; without this, Nagle's algorithm holds every small
+    // write for the peer's delayed acknowledgement, about a second per append.
+    client.set_nodelay(true)?;
+    server.set_nodelay(true)?;
     let (mut from_client, mut to_client) = client.into_split();
     let (mut from_server, mut to_server) = server.into_split();
     tokio::spawn(async move { tokio::io::copy(&mut from_server, &mut to_client).await });
     // Untyped startup packets come first; an SSL or GSS encryption request precedes the real one.
     loop {
-        let mut length = [0_u8; 4];
-        from_client.read_exact(&mut length).await?;
-        let mut body = vec![0_u8; usize::try_from(u32::from_be_bytes(length)).unwrap() - 4];
-        from_client.read_exact(&mut body).await?;
-        to_server.write_all(&length).await?;
-        to_server.write_all(&body).await?;
-        let code = u32::from_be_bytes(body[..4].try_into().unwrap());
+        let mut packet = vec![0_u8; 4];
+        from_client.read_exact(&mut packet).await?;
+        let length = u32::from_be_bytes(packet[..4].try_into().unwrap());
+        packet.resize(usize::try_from(length).unwrap(), 0);
+        from_client.read_exact(&mut packet[4..]).await?;
+        to_server.write_all(&packet).await?;
+        let code = u32::from_be_bytes(packet[4..8].try_into().unwrap());
         if code != 80_877_103 && code != 80_877_104 {
             break;
         }
     }
     loop {
-        let mut header = [0_u8; 5];
-        from_client.read_exact(&mut header).await?;
-        let length = u32::from_be_bytes(header[1..].try_into().unwrap());
-        let mut body = vec![0_u8; usize::try_from(length).unwrap() - 4];
-        from_client.read_exact(&mut body).await?;
-        if header[0] == b'Q' || header[0] == b'S' {
+        let mut message = vec![0_u8; 5];
+        from_client.read_exact(&mut message).await?;
+        let length = u32::from_be_bytes(message[1..5].try_into().unwrap());
+        message.resize(usize::try_from(length).unwrap() + 1, 0);
+        from_client.read_exact(&mut message[5..]).await?;
+        if message[0] == b'Q' || message[0] == b'S' {
             round_trips.fetch_add(1, Ordering::AcqRel);
         }
-        to_server.write_all(&header).await?;
-        to_server.write_all(&body).await?;
+        to_server.write_all(&message).await?;
     }
 }
 
