@@ -7,6 +7,10 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- PostgreSQL: `recorded_command` reads a command receipt and its events in one read-only
+  REPEATABLE READ snapshot, so a tenant erasure that commits between the two reads no longer
+  returns a receipt with no events or with events of recreated stream coordinates. A receipt
+  whose interval lacks an event is refused as a backend error instead of returned short.
 - SQLite and PostgreSQL: a projector is driven inline or by catch-up, never both. A catch-up
   runner created before the same projector was registered inline used to fold every event a
   second time. `run_catch_up` now refuses an inline projector, as the file provider already did,

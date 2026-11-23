@@ -35,6 +35,8 @@ mod atomic_group;
 mod capture;
 mod inline_admin;
 mod pool;
+#[cfg(test)]
+mod receipt_snapshot;
 mod schema;
 #[cfg(test)]
 mod verify_content_once;
@@ -492,7 +494,16 @@ impl EventStore for PostgresEventStore {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
-            let transaction = client.transaction().await.map_err(backend)?;
+            // The receipt and its events are one observation. Under READ COMMITTED a tenant
+            // erasure committing between the two statements paired a receipt with no events, or
+            // with events of recreated stream coordinates.
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await
+                .map_err(backend)?;
             let recorded = transaction
                 .query_opt(
                     &format!(
@@ -526,10 +537,17 @@ impl EventStore for PostgresEventStore {
                     key: idempotency_key.to_owned(),
                 });
             }
+            #[cfg(test)]
+            receipt_snapshot::after_receipt(&self.prefix).await;
             let events =
                 select_versions(&transaction, &prefix, stream, first_version, last_version).await?;
             transaction.rollback().await.map_err(backend)?;
             client.settled();
+            if !is_complete_interval(&events, first_version, last_version) {
+                return Err(EventLogError::Backend(
+                    "recorded command interval is incomplete".into(),
+                ));
+            }
             Ok(Some(AppendResult {
                 first_version: to_u64(first_version)?,
                 last_version: to_u64(last_version)?,
@@ -1869,6 +1887,23 @@ fn joined(count: usize, render: impl Fn(usize) -> String) -> String {
 
 fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
+}
+
+/// Whether `events` are exactly the versions `first ..= last`, in order: a receipt's interval
+/// that a read returns short is refused rather than handed back as a complete answer.
+fn is_complete_interval(events: &[RecordedEvent], first: i64, last: i64) -> bool {
+    let (Ok(first), Ok(last)) = (u64::try_from(first), u64::try_from(last)) else {
+        return false;
+    };
+    // An empty interval is written as `last = first - 1`.
+    let Some(expected) = (last + 1).checked_sub(first) else {
+        return false;
+    };
+    events.len() as u64 == expected
+        && events
+            .iter()
+            .zip(first..)
+            .all(|(event, version)| event.version == version)
 }
 
 async fn select_versions<C: GenericClient>(
