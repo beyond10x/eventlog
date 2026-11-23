@@ -86,6 +86,10 @@ pub trait Aggregate: Sized + Send + Sync + Serialize + DeserializeOwned {
 
     /// Decide what a command means for this state, without touching anything.
     ///
+    /// Idempotency covers only a command that wrote events. A command that decided nothing
+    /// leaves no record under its idempotency key, so a retry with the same key is decided again
+    /// against the state current at the retry, and may then decide events and write them.
+    ///
     /// # Errors
     /// Returns the domain's own refusal. A command that changes nothing should return an empty
     /// list rather than an error, and the repository will not write.
@@ -102,6 +106,10 @@ pub struct Loaded<A> {
 }
 
 /// What handling a command did.
+///
+/// Only an outcome with events leaves a record under the command's idempotency key. A no-op
+/// outcome (no events, not `deduplicated`) records nothing, so the same command handled again is
+/// decided again against the state current then, as [`Aggregate::decide`] says.
 #[derive(Debug, Clone)]
 pub struct Outcome<A> {
     pub state: A,
@@ -109,6 +117,7 @@ pub struct Outcome<A> {
     /// Empty when the command decided nothing, in which case nothing was written.
     pub events: Vec<RecordedEvent>,
     /// True when this command had already been recorded and the stored result was returned.
+    /// Never true for a retry of a command that decided nothing: there was nothing to record.
     pub deduplicated: bool,
 }
 

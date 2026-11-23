@@ -62,6 +62,8 @@ enum Command {
     Add(i64),
     Clear,
     Nothing,
+    /// Clears a total that is not zero; a no-op on zero.
+    ClearIfAny,
 }
 
 impl Aggregate for Counter {
@@ -98,6 +100,13 @@ impl Aggregate for Counter {
             Command::Add(amount) => vec![Tally::Added(*amount)],
             Command::Clear => vec![Tally::Cleared],
             Command::Nothing => Vec::new(),
+            Command::ClearIfAny => {
+                if self.total == 0 {
+                    Vec::new()
+                } else {
+                    vec![Tally::Cleared]
+                }
+            }
         })
     }
 }
@@ -192,6 +201,60 @@ async fn a_command_that_decided_nothing_writes_nothing() {
         .expect("handled");
     assert_eq!(outcome.events, [] as [eventlog_core::RecordedEvent; 0]);
     assert_eq!(outcome.version, 1, "the stream did not move");
+}
+
+/// The contract `Aggregate::decide`, `Outcome` and `EventStore::recorded_command` document:
+/// idempotency covers only a command that wrote events. A no-op leaves no record, so the same
+/// command id handled after the state changed is decided again and writes.
+#[tokio::test]
+async fn a_retried_no_op_is_decided_again_against_the_current_state() {
+    let (store, tenant) = fixture().await;
+    let repository = Repository::<Counter>::new(store.clone());
+    let no_op = repository
+        .handle(&tenant, "c-1", &Command::ClearIfAny, &meta("clear"))
+        .await
+        .expect("handled");
+    assert!(
+        no_op.events.is_empty(),
+        "control: a zero total clears nothing"
+    );
+    assert!(
+        !no_op.deduplicated,
+        "a first command was answered as a retry"
+    );
+    let stream = repository.stream(&tenant, "c-1").unwrap();
+    let key = meta("clear");
+    assert!(
+        store
+            .recorded_command(&stream, &key.idempotency_key, &key.request_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "a command that decided nothing left a record"
+    );
+
+    repository
+        .handle(&tenant, "c-1", &Command::Add(3), &meta("add"))
+        .await
+        .expect("handled");
+    let retried = repository
+        .handle(&tenant, "c-1", &Command::ClearIfAny, &meta("clear"))
+        .await
+        .expect("handled again");
+    assert!(
+        !retried.deduplicated,
+        "the retried no-op was answered from a record instead of decided again"
+    );
+    assert_eq!(
+        retried
+            .events
+            .iter()
+            .map(|event| event.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tally.cleared"],
+        "the retry was not decided against the total it found"
+    );
+    assert_eq!((retried.version, retried.state.total), (2, 0));
 }
 
 #[tokio::test]

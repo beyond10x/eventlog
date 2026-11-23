@@ -848,6 +848,10 @@ pub trait EventStore: Send + Sync + 'static {
     /// retry — "that corpus already exists" — which is the opposite of what a retry means and is
     /// exactly what a caller who lost the first response would see.
     ///
+    /// Only an append records a command, so this answers only commands that wrote events. A
+    /// command that decided nothing appended nothing and answers `None`: its retry is decided
+    /// again against the stream as it is then (see [`Aggregate::decide`]).
+    ///
     /// # Errors
     /// Returns [`EventLogError::IdempotencyMismatch`] when the key was used for a different body.
     fn recorded_command<'a>(

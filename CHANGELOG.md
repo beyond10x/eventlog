@@ -46,6 +46,13 @@ under bare-version tags such as `0.1.0`.
   row-value range on the primary key instead of an expanded `OR` that rescanned the tenant's
   earlier digests on every row. Transaction, byte-count and integrity checks are unchanged.
 
+### Documentation
+
+- Repository: idempotency covers only a command that wrote events, now stated on
+  `Aggregate::decide`, `Outcome` and `EventStore::recorded_command`. A command that decided
+  nothing leaves no record under its key, so a retry with the same key is decided again against
+  the current state and may write. Behaviour is unchanged; a repository test pins it.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security
