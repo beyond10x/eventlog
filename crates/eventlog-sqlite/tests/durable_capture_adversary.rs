@@ -776,7 +776,7 @@ async fn a_checkpoint_taken_before_a_redaction_never_continues() {
         .redact(
             &StreamId::new(tenant(), "item", "seed").unwrap(),
             1,
-            "erasure request",
+            "subject-request",
         )
         .await
         .unwrap();

@@ -651,6 +651,9 @@ impl RecordedEvent {
 }
 
 /// The body a redacted event keeps, so that a reader can still say what is missing and why.
+///
+/// `reason` is an owner-defined code that [`validate_redaction_reason`] accepts; every provider
+/// checks it before it writes a tombstone.
 #[must_use]
 pub fn redaction_tombstone(reason: &str) -> Value {
     json!({ "redacted": true, "reason": reason })
@@ -845,6 +848,10 @@ pub trait EventStore: Send + Sync + 'static {
     /// retry — "that corpus already exists" — which is the opposite of what a retry means and is
     /// exactly what a caller who lost the first response would see.
     ///
+    /// Only an append records a command, so this answers only commands that wrote events. A
+    /// command that decided nothing appended nothing and answers `None`: its retry is decided
+    /// again against the stream as it is then (see [`Aggregate::decide`]).
+    ///
     /// # Errors
     /// Returns [`EventLogError::IdempotencyMismatch`] when the key was used for a different body.
     fn recorded_command<'a>(
@@ -887,8 +894,13 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Erase one event's body, keeping its id, version and place.
     ///
+    /// `reason` is an owner-defined code such as `subject-request` and is kept in the tombstone;
+    /// any explanation stays outside the log.
+    ///
     /// # Errors
-    /// Returns [`EventLogError::NotFound`] when the stream has no such version.
+    /// Returns [`EventLogError::Invalid`], before anything is written, when `reason` is not a code
+    /// [`validate_redaction_reason`] accepts, and [`EventLogError::NotFound`] when the stream has
+    /// no such version.
     fn redact<'a>(
         &'a self,
         stream: &'a StreamId,
@@ -920,6 +932,9 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Cache a fold only if its observed history still exists unchanged by redaction/erasure.
     /// Returns `false` when the observation is stale; no snapshot is written in that case.
+    /// Within one generation the cached revision never moves back: a save older than the cache
+    /// leaves the newer one in place and returns `true`. A cache from an earlier generation is
+    /// always replaced.
     ///
     /// # Errors
     /// Returns a store error, or [`EventLogError::Invalid`] for unsupported implementations.
@@ -936,6 +951,10 @@ pub trait EventStore: Send + Sync + 'static {
         })
     }
 
+    /// The stream's cached fold, only while its persisted provenance still matches the stream's
+    /// history; a cache from before a redaction or erasure is never returned.
+    /// [`Repository::load`] reads it without capturing a generation, so a read writes nothing.
+    ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
     fn load_snapshot<'a>(
@@ -1222,13 +1241,41 @@ pub fn validate_field(what: &str, value: &str) -> Result<(), EventLogError> {
 /// display name rather than an id.
 pub fn validate_identity(what: &str, value: &str) -> Result<(), EventLogError> {
     validate_field(what, value)?;
-    if value.contains('@') || value.contains(' ') {
+    if !is_opaque(value) {
         return Err(EventLogError::Invalid(format!(
             "{what} must be an opaque id: an address or display name in an append-only log \
              outlives every request to erase it"
         )));
     }
     Ok(())
+}
+
+/// A redaction reason is an opaque code the owner defines, such as `subject-request`, never an
+/// explanation.
+///
+/// The tombstone keeps the reason after the body is gone, so whatever a reason says is read
+/// back by everyone who reads the redacted event. An explanation is where a name or an address
+/// arrives, so the reason takes the grammar of an identity: printable, no space, no `@`. What a
+/// code means is the owner's to define and to keep outside the log; this kit names none.
+///
+/// # Errors
+/// Returns [`EventLogError::Invalid`] when the reason is not usable, or carries a space or an `@`
+/// and so reads as free text rather than a code.
+pub fn validate_redaction_reason(reason: &str) -> Result<(), EventLogError> {
+    validate_field("redaction reason", reason)?;
+    if !is_opaque(reason) {
+        return Err(EventLogError::Invalid(
+            "redaction reason must be an owner-defined code such as `subject-request`, not free \
+             text: the tombstone keeps it after the body is erased"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// No space and no `@`: what separates an id or a code from a name, an address or a sentence.
+fn is_opaque(value: &str) -> bool {
+    !value.contains('@') && !value.contains(' ')
 }
 
 /// Check an append request before any backend touches a connection.
@@ -1291,6 +1338,31 @@ mod tests {
             "heads that concatenate alike were not told apart"
         );
         assert_eq!(one.to_hex().len(), 64);
+    }
+
+    #[test]
+    fn a_redaction_reason_is_a_code_never_free_text() {
+        for code in [
+            "subject-request",
+            "legal_hold",
+            "gdpr.art17",
+            "retention:30d",
+        ] {
+            validate_redaction_reason(code).expect("an owner-defined code is a reason");
+        }
+        for free_text in ["the person asked", "jane@example.org", "Jane Doe"] {
+            let Err(EventLogError::Invalid(message)) = validate_redaction_reason(free_text) else {
+                panic!("{free_text:?} was accepted as a redaction reason");
+            };
+            assert!(
+                message.contains("owner-defined code"),
+                "{free_text:?} was refused for another reason: {message}"
+            );
+        }
+        let Err(EventLogError::Invalid(message)) = validate_redaction_reason("") else {
+            panic!("an empty redaction reason was accepted");
+        };
+        assert_eq!(message, "redaction reason is required");
     }
 
     /// Every stored idempotency hash is this function's output, so its bytes are a stored format.

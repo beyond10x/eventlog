@@ -180,6 +180,7 @@ pub async fn run(store: &dyn EventStore) {
     bytes_live_outside_the_log_and_can_be_erased_alone(store, &tenant).await;
     run_blob_binding_race(store, store).await;
     a_stream_identity_is_stable(store, &tenant, &other).await;
+    a_free_text_redaction_reason_is_refused_before_writing(store, &stream).await;
     redaction_keeps_the_place_and_drops_the_snapshot(store, &stream).await;
     forgetting_a_tenant_leaves_nothing(store, &other, &twin).await;
 }
@@ -960,6 +961,142 @@ pub async fn run_snapshot_generations(store: std::sync::Arc<dyn EventStore>) {
     );
 }
 
+/// Exercise the cached revision: within one generation it never moves back, and a cache from an
+/// earlier generation is replaced by a save at any revision.
+///
+/// # Panics
+/// Panics when a delayed older save moves the replay point back, or when a save in a new
+/// generation cannot replace the previous generation's cache.
+pub async fn run_snapshot_revision_is_monotonic(store: &dyn EventStore) {
+    let tenant = TenantId::new("snapshot-monotonic").unwrap();
+    let stream = StreamId::new(tenant, "item", "one").unwrap();
+    let events: Vec<NewEvent> = (1..=4).map(|value| event("item.counted", value)).collect();
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &events,
+            &meta("monotonic", &json!({})),
+        )
+        .await
+        .unwrap();
+    let at = |version: u64| Snapshot {
+        version,
+        state_schema_version: 1,
+        state: json!({ "version": version }),
+        recorded_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    let observed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(3), &observed)
+            .await
+            .unwrap()
+    );
+    // A save of an older fold of the same history finishes late.
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(1), &observed)
+            .await
+            .unwrap(),
+        "an older fold of current history is not a stale observation"
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        3,
+        "the replay point does not move back within a generation"
+    );
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(4), &observed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        4
+    );
+
+    // A redaction after the cached revision starts a new generation and leaves that cache in
+    // place but unproven; the first save of the new generation replaces it whatever its revision.
+    store
+        .append(
+            &stream,
+            Expected::Exact(4),
+            &[event("item.counted", 5)],
+            &meta("monotonic-5", &json!({})),
+        )
+        .await
+        .unwrap();
+    store.redact(&stream, 5, "erased").await.unwrap();
+    assert_eq!(
+        store
+            .load_snapshot(&stream)
+            .await
+            .unwrap()
+            .map(|s| s.version),
+        None,
+        "the revision 4 cache is not proven in the new generation"
+    );
+    let renewed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    assert_ne!(renewed, observed);
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(1), &renewed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        1,
+        "a new generation replaces the previous generation's cache"
+    );
+}
+
+/// A redaction reason is an owner-defined code. The tombstone keeps it after the body is gone,
+/// so free text, where a name or an address arrives, is refused before anything is written: the
+/// body, the snapshot and the snapshot generation stay as they were.
+async fn a_free_text_redaction_reason_is_refused_before_writing(
+    store: &dyn EventStore,
+    stream: &StreamId,
+) {
+    let events = store.read_stream(stream, 0, 100).await.expect("readable");
+    let snapshot = store.load_snapshot(stream).await.expect("readable");
+    let generation = store.snapshot_generation(stream).await.expect("readable");
+    assert!(
+        snapshot.is_some() && generation.is_some(),
+        "control: the stream holds a snapshot a redaction would drop"
+    );
+    let target = events.events[1].version;
+    for free_text in ["the person asked", "jane@example.org", "Jane Doe"] {
+        let refused = store.redact(stream, target, free_text).await;
+        let Err(EventLogError::Invalid(message)) = refused else {
+            panic!(
+                "a redaction with the free-text reason {free_text:?} was not refused: {refused:?}"
+            );
+        };
+        assert!(
+            message.contains("redaction reason"),
+            "{free_text:?} was refused for another reason: {message}"
+        );
+    }
+    assert_eq!(
+        store.read_stream(stream, 0, 100).await.expect("readable"),
+        events,
+        "a refused redaction changed the stream"
+    );
+    assert_eq!(
+        store.load_snapshot(stream).await.expect("readable"),
+        snapshot,
+        "a refused redaction dropped the snapshot"
+    );
+    assert_eq!(
+        store.snapshot_generation(stream).await.expect("readable"),
+        generation,
+        "a refused redaction moved the snapshot generation"
+    );
+}
+
 async fn redaction_keeps_the_place_and_drops_the_snapshot(
     store: &dyn EventStore,
     stream: &StreamId,
@@ -969,14 +1106,14 @@ async fn redaction_keeps_the_place_and_drops_the_snapshot(
     assert!(!target.is_redacted());
 
     let redacted = store
-        .redact(stream, target.version, "the person asked")
+        .redact(stream, target.version, "subject-request")
         .await
         .expect("redactable");
     assert_eq!(redacted.event_id, target.event_id, "the fact keeps its id");
     assert_eq!(redacted.version, target.version, "and its place");
     assert!(redacted.is_redacted());
     assert_eq!(redacted.data["redacted"], json!(true));
-    assert_eq!(redacted.data["reason"], json!("the person asked"));
+    assert_eq!(redacted.data["reason"], json!("subject-request"));
 
     assert!(
         store
@@ -995,7 +1132,7 @@ async fn redaction_keeps_the_place_and_drops_the_snapshot(
     );
 
     let error = store
-        .redact(stream, 9_999, "no such version")
+        .redact(stream, 9_999, "subject-request")
         .await
         .expect_err("there is nothing there to redact");
     assert_eq!(error, EventLogError::NotFound);

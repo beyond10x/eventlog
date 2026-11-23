@@ -168,10 +168,7 @@ async fn fixture(store: &PostgresEventStore) -> Vec<Read> {
         )
         .await
         .unwrap();
-    store
-        .redact(&redacted, 2, "erased on request")
-        .await
-        .unwrap();
+    store.redact(&redacted, 2, "subject-request").await.unwrap();
     store
         .append(
             &twin,

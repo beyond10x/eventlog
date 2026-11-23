@@ -12,7 +12,7 @@
 //! redaction replaces `data` and would take the origin with it.
 
 use crate::history::{self, Loaded};
-use crate::{TreeEventStore, refresh, replay};
+use crate::{TreeEventStore, refresh, replay, replayable_reason};
 use eventlog_core::{EventLogError, EventStore, MAX_READ_LIMIT, StreamId, TenantId};
 use eventlog_sqlite::SqliteEventStore;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,7 +33,8 @@ pub struct CopyReport {
 
 /// Copy every tenant of `from` into `to`, linearized: identities, blobs, every committed group in
 /// § 6.3 position order with its receipt, and every redaction. Each copied event's tree
-/// `{version, digest, parents}` is recorded in `to`'s origin map.
+/// `{version, digest, parents}` is recorded in `to`'s origin map. A redaction whose reason is free
+/// text an earlier release accepted is copied with [`crate::LEGACY_REDACTION_REASON`].
 ///
 /// The tree is held under its writer lock for the whole copy, so no write lands halfway. `to` must
 /// not be written by anyone else while the copy runs: it takes each event's original id and
@@ -85,7 +86,8 @@ pub async fn copy(
         // After every group, as the tree's own replay does: a redaction is not a group, and the
         // body it replaces had to be appended first.
         for (stream, version, reason) in redactions {
-            to.redact(&stream, version, &reason).await?;
+            to.redact(&stream, version, replayable_reason(&reason))
+                .await?;
             report.redactions += 1;
         }
     }

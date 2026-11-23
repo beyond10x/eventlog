@@ -19,6 +19,22 @@ under bare-version tags such as `0.1.0`.
   each takes, `positions` reads every event's position and the highest one ever assigned
   (`EventPositions`), and `reserve_positions_through` keeps later appends above a position.
 
+### Changed
+
+- Every provider's `redact` takes the reason as an owner-defined code, such as
+  `subject-request`, and refuses free text with `EventLogError::Invalid` before it writes
+  anything. The tombstone keeps the reason after the body is gone, so a name or an address in an
+  explanation was read back by everyone who read the redacted event. A code takes the grammar of
+  an identity (`validate_identity`): printable ASCII, no space, no `@`; the new
+  `validate_redaction_reason` checks it, and the kit defines no codes. Stricter input on a public
+  API: a minor release. A tree store an earlier release redacted with free text still opens and
+  copies: the replay and `eventlog_tree::copy` redact with the fixed code
+  `eventlog_tree::LEGACY_REDACTION_REASON` (`legacy-reason`), and the event file keeps its bytes.
+  Consumers whose test fixtures pass free-text reasons and fail on this release: conductor tests
+  (`erased on request`), entity-runtime `crates/entity-eventlog/tests/providers.rs`, ekr-store
+  tests, service-sdk `service-eventlog` and the `service-host` persistence fixtures. Shared
+  exercise case `a_free_text_redaction_reason_is_refused_before_writing`.
+
 ### Fixed
 
 - Tree: a redaction, tenant erasure or blob deletion through one handle is no longer served by
@@ -50,6 +66,35 @@ under bare-version tags such as `0.1.0`.
   redaction, an erasure or an inline attachment) keeps every served event's global position and
   places history new to it above the highest position it assigned, so a saved feed cursor no
   longer skips events. A rebuild no longer loads a kept state, which another replay ordered.
+- Repository: a command the store answers as already recorded is answered from the stream it was
+  recorded on. A tenant-wide claim retried under a freshly minted id used to fold the original
+  stream's events into the retry id's aggregate and could cache that state under the retry id;
+  the outcome now carries the recorded stream's state, nothing is cached for the retry id, and a
+  claim recorded on a stream of another aggregate type is refused with `IdempotencyMismatch`.
+  The same holds on one stream: a duplicate answered after other writers moved the stream past
+  the revision this call loaded no longer skips their events.
+- Repository: `load` is read-only. It no longer captures a snapshot generation, which wrote a
+  durable generation row for every absent stream read on SQLite and PostgreSQL. It still starts
+  from a cache only when the provider's provenance check accepts it; `handle` captures a
+  generation only when its policy can write a snapshot, and `snapshot_now` always does.
+- Repository: automatic snapshots count the events since the cache a command started from, and
+  write at the committed revision. A command of several events used to step over the exact
+  multiple and skip the snapshot, so a stream of two-event commands could be folded from zero on
+  every command. The generation check is unchanged.
+- SQLite and PostgreSQL: within one snapshot generation the cached revision never moves back. A
+  delayed checked save of an older fold used to replace a newer cache and move the replay point
+  back; it now leaves the newer cache and returns `true`. A cache from an earlier generation is
+  still replaced at any revision. Shared exercise `run_snapshot_revision_is_monotonic`.
+- SQLite: the populated legacy blob migration walks its `(tenant_id, digest)` cursor with one
+  row-value range on the primary key instead of an expanded `OR` that rescanned the tenant's
+  earlier digests on every row. Transaction, byte-count and integrity checks are unchanged.
+
+### Documentation
+
+- Repository: idempotency covers only a command that wrote events, now stated on
+  `Aggregate::decide`, `Outcome` and `EventStore::recorded_command`. A command that decided
+  nothing leaves no record under its key, so a retry with the same key is decided again against
+  the current state and may write. Behaviour is unchanged; a repository test pins it.
 
 ## 0.9.4 — 2026-11-11
 

@@ -1257,7 +1257,7 @@ async fn redaction_and_tenant_erasure_leave_no_journal_entry() {
             .redact(
                 &StreamId::new(tenant(), "item", "seed").unwrap(),
                 1,
-                "erasure request",
+                "subject-request",
             )
             .await
             .unwrap();
@@ -1565,7 +1565,7 @@ async fn a_redacted_tenants_group_keeps_the_chain_for_every_other_tenant() {
             .redact(
                 &StreamId::new(tenant(), "item", "seed").unwrap(),
                 1,
-                "erasure request",
+                "subject-request",
             )
             .await
             .unwrap();

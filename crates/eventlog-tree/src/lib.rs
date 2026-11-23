@@ -94,6 +94,24 @@ fn key_of(stream: &StreamId) -> StreamKey {
     )
 }
 
+/// The reason a replay or a [`copy`] redacts with when the file holds one this release refuses.
+///
+/// Releases up to 0.9.4 accepted free text as a redaction reason, and an event file keeps the
+/// reason it was redacted with. A replay redacts again through
+/// [`EventStore::redact`], which now takes only an owner-defined code, so such a reason is
+/// replaced by this code rather than refusing to open or copy the store. The event file keeps
+/// its bytes; what the store serves, and what a copy holds, is this code.
+pub const LEGACY_REDACTION_REASON: &str = "legacy-reason";
+
+/// `reason` when [`EventStore::redact`] accepts it, otherwise [`LEGACY_REDACTION_REASON`].
+fn replayable_reason(reason: &str) -> &str {
+    if eventlog_core::validate_redaction_reason(reason).is_ok() {
+        reason
+    } else {
+        LEGACY_REDACTION_REASON
+    }
+}
+
 /// What the store knows beyond what the engine holds.
 struct State {
     engine: Arc<SqliteEventStore>,
@@ -938,7 +956,9 @@ async fn replay_all(
         }
     }
     for (stream, version, reason) in redactions {
-        engine.redact(&stream, version, &reason).await?;
+        engine
+            .redact(&stream, version, replayable_reason(&reason))
+            .await?;
     }
     if served.is_some() {
         // An append after the rebuild lands above every position the handle ever assigned, also
@@ -1197,6 +1217,7 @@ impl EventStore for TreeEventStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
         Box::pin(async move {
+            eventlog_core::validate_redaction_reason(reason)?;
             let mut state = self.state.lock().await;
             if state.poisoned {
                 return Err(EventLogError::Closed);

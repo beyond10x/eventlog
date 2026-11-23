@@ -709,11 +709,7 @@ impl Inner {
                     let row = if let Some((tenant, digest)) = &after {
                         transaction
                             .query_row(
-                                &format!(
-                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
-                             WHERE tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)
-                             ORDER BY tenant_id,digest LIMIT 1"
-                        ),
+                                &legacy_blob_cursor_sql(&table),
                                 params![tenant, digest],
                                 read,
                             )
@@ -2111,7 +2107,7 @@ impl Inner {
         version: u64,
         reason: &str,
     ) -> Result<RecordedEvent, EventLogError> {
-        validate_field("redaction reason", reason)?;
+        eventlog_core::validate_redaction_reason(reason)?;
         let prefix = self.prefix.clone();
         let mut guard = self.connection.lock().map_err(poisoned)?;
         let transaction = guard
@@ -2207,11 +2203,18 @@ impl Inner {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
         let before = tracked_capture::Stamp::read(&transaction).ok();
-        let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation.as_uuid().to_string()]).map_err(backend)?;
-        if accepted == 0 {
+        let generation = generation.as_uuid().to_string();
+        // Whether the cached snapshot was proven in this generation, read before this save
+        // proves its own; the immediate transaction keeps the two in one write.
+        let Some(prior) = transaction.query_row(&format!("SELECT cached_generation FROM {prefix}_snapshot_generations WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation],|row| row.get::<_, Option<String>>(0)).optional().map_err(backend)? else {
             transaction.rollback().map_err(backend)?;
             return Ok(false);
-        }
+        };
+        let replace_any = prior.as_deref() != Some(generation.as_str());
+        transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation]).map_err(backend)?;
+        // Within one generation the cached revision only moves forward: a delayed save of an
+        // older fold must not move the replay point back. A cache from an earlier generation is
+        // not proven and is always replaced.
         transaction
             .execute(
                 &format!(
@@ -2223,7 +2226,8 @@ impl Inner {
                          version = excluded.version,
                          state_schema_version = excluded.state_schema_version,
                          state = excluded.state,
-                         recorded_at = excluded.recorded_at"
+                         recorded_at = excluded.recorded_at
+                     WHERE ?8 OR {prefix}_snapshots.version <= excluded.version"
                 ),
                 params![
                     stream.tenant().as_str(),
@@ -2233,6 +2237,7 @@ impl Inner {
                     i64::from(snapshot.state_schema_version),
                     snapshot.state.to_string(),
                     format_time(snapshot.recorded_at)?,
+                    replace_any,
                 ],
             )
             .map_err(backend)?;
@@ -3806,11 +3811,73 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
 }
 
+/// The next legacy blob after a `(tenant_id, digest)` cursor, one row per query.
+///
+/// The row-value comparison is a single range on the primary key. The expanded
+/// `tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)` form rescanned the current tenant's
+/// earlier digests on every step, quadratic in a tenant's blob count.
+fn legacy_blob_cursor_sql(table: &str) -> String {
+    format!(
+        "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+         WHERE (tenant_id, digest) > (?1, ?2)
+         ORDER BY tenant_id,digest LIMIT 1"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, recognized_sqlite_blob_shape,
+        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, legacy_blob_cursor_sql,
+        recognized_sqlite_blob_shape,
     };
+
+    #[test]
+    fn the_legacy_blob_cursor_walks_every_key_in_order_in_linear_steps() {
+        let connection = rusqlite::Connection::open_in_memory().expect("a database");
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_blobs (tenant_id TEXT NOT NULL, digest TEXT NOT NULL,
+                     bytes BLOB NOT NULL, byte_count INTEGER NOT NULL, recorded_at TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, digest));",
+            )
+            .expect("a legacy table");
+        let mut expected = Vec::new();
+        for tenant in ["a", "b"] {
+            for i in 0..512 {
+                let digest = format!("item-{i:06}");
+                connection
+                    .execute(
+                        "INSERT INTO legacy_blobs VALUES (?1, ?2, x'616263', 3, '1970-01-01T00:00:00Z')",
+                        rusqlite::params![tenant, digest],
+                    )
+                    .expect("a row");
+                expected.push((tenant.to_owned(), digest));
+            }
+        }
+        let mut statement = connection
+            .prepare(&legacy_blob_cursor_sql("legacy_blobs"))
+            .expect("a statement");
+        let mut walked = vec![expected[0].clone()];
+        loop {
+            let (tenant, digest) = walked.last().expect("a cursor").clone();
+            let next: Option<(String, String)> = rusqlite::OptionalExtension::optional(
+                statement.query_row(rusqlite::params![tenant, digest], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                }),
+            )
+            .expect("a step");
+            let Some(next) = next else { break };
+            walked.push(next);
+        }
+        assert_eq!(
+            walked, expected,
+            "every key once, in key order, across tenants"
+        );
+        let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+        // A range seek per row is a few dozen VM steps; the expanded OR predicate rescans the
+        // tenant's earlier keys and takes millions here.
+        assert!(steps < 200_000, "{steps} VM steps for 1,024 rows");
+    }
 
     #[test]
     fn a_file_database_hashes_a_blob_again_and_an_in_memory_one_checks_its_metadata() {

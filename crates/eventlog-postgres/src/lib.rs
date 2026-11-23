@@ -729,7 +729,7 @@ impl EventStore for PostgresEventStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
         self.bounded(async move {
-            validate_field("redaction reason", reason)?;
+            eventlog_core::validate_redaction_reason(reason)?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -831,12 +831,18 @@ impl EventStore for PostgresEventStore {
             client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
             publication_gate(&transaction, prefix, false).await?;
-            let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)?;
-            if accepted == 0 {
+            // The row lock orders concurrent saves of one stream; the prior proof says whether
+            // the cached snapshot belongs to this generation.
+            let Some(prior) = transaction.query_opt(&format!("SELECT cached_generation FROM {prefix}_snapshot_generations WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4 FOR UPDATE"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)? else {
                 transaction.rollback().await.map_err(backend)?;
                 client.settled();
                 return Ok(false);
-            }
+            };
+            let replace_any = prior.get::<_, Option<uuid::Uuid>>(0).as_ref() != Some(generation.as_uuid());
+            transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)?;
+            // Within one generation the cached revision only moves forward: a delayed save of an
+            // older fold must not move the replay point back. A cache from an earlier generation
+            // is not proven and is always replaced.
             transaction
                 .execute(
                     &format!(
@@ -848,7 +854,8 @@ impl EventStore for PostgresEventStore {
                              version = EXCLUDED.version,
                              state_schema_version = EXCLUDED.state_schema_version,
                              state = EXCLUDED.state,
-                             recorded_at = EXCLUDED.recorded_at"
+                             recorded_at = EXCLUDED.recorded_at
+                         WHERE $8 OR {prefix}_snapshots.version <= EXCLUDED.version"
                     ),
                     &[
                         &stream.tenant().as_str(),
@@ -858,6 +865,7 @@ impl EventStore for PostgresEventStore {
                         &to_i32(snapshot.state_schema_version)?,
                         &snapshot.state,
                         &snapshot.recorded_at,
+                        &replace_any,
                     ],
                 )
                 .await

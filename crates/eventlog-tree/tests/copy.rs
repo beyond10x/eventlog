@@ -12,7 +12,7 @@ use eventlog_core::{
     RecordedEvent, StreamAppend, StreamId, TenantId, redaction_tombstone,
 };
 use eventlog_sqlite::{OriginMap, SqliteEventStore};
-use eventlog_tree::{CopyReport, TreeEventStore, TreeLayout, copy};
+use eventlog_tree::{CopyReport, LEGACY_REDACTION_REASON, TreeEventStore, TreeLayout, copy};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -596,7 +596,77 @@ async fn a_copy_refuses_a_target_with_queued_restored_identities_and_writes_noth
     assert_eq!(target.restored_pending().unwrap(), 1);
 }
 
+/// Releases up to 0.9.4 took free text as a redaction reason, and the event file keeps it. Both
+/// paths that redact again from the files, reopening the store and copying it, replace such a
+/// reason by [`LEGACY_REDACTION_REASON`] instead of refusing an old store.
+async fn a_store_redacted_with_free_text_by_an_earlier_release_reopens_and_copies(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let x = stream("tenant-a", "x");
+    {
+        let tree = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
+        tree.append(
+            &x,
+            Expected::NoStream,
+            &[event("item.received", 1), event("item.indexed", 2)],
+            &meta("key-1", &json!({ "command": "one" })),
+        )
+        .await
+        .unwrap();
+        tree.redact(&x, 1, "erased").await.unwrap();
+    }
+    // What an earlier release wrote: the same file with a free-text reason. The digest covers
+    // neither the body nor the reason, so only the text changes.
+    let mut rewritten = 0;
+    for path in walk(directory.path()) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.contains(r#""redacted":{"reason":"erased"}"#) {
+            fs::write(
+                &path,
+                text.replace(r#""reason":"erased""#, r#""reason":"the person asked""#),
+            )
+            .unwrap();
+            rewritten += 1;
+        }
+    }
+    assert_eq!(rewritten, 1, "control: one event file holds the redaction");
+    fs::remove_dir_all(directory.path().join(".cache")).ok();
+
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .expect("a store an earlier release redacted with free text opens");
+    assert!(
+        tree.replayed().await,
+        "control: the open replayed the files"
+    );
+    let served = &tree.read_stream(&x, 0, 10).await.unwrap().events[0];
+    assert_eq!(
+        served.data,
+        redaction_tombstone(LEGACY_REDACTION_REASON),
+        "the reopened store does not serve the legacy code"
+    );
+
+    let target = SqliteEventStore::in_memory("copy").await.unwrap();
+    let report = copy(&tree, &target)
+        .await
+        .expect("a store an earlier release redacted with free text copies");
+    assert_eq!(report.redactions, 1, "the redaction was not copied");
+    let copied = &target.read_stream(&x, 0, 10).await.unwrap().events[0];
+    assert!(copied.is_redacted(), "the copy holds the erased body");
+    assert_eq!(
+        copied.data,
+        redaction_tombstone(LEGACY_REDACTION_REASON),
+        "the copy does not hold the legacy code"
+    );
+}
+
 each_layout!(
+    a_store_redacted_with_free_text_by_an_earlier_release_reopens_and_copies,
     a_tree_copied_into_sqlite_holds_every_event_blob_and_receipt_modulo_the_origin_map,
     a_forked_then_merged_tree_linearizes_in_position_order_the_same_way_on_every_checkout,
     a_copy_refuses_a_target_that_already_holds_history_and_writes_nothing,
