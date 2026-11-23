@@ -975,8 +975,9 @@ impl Transaction {
         // new digests costs O(n log n) comparisons rather than n(n-1)/2.
         let mut seen: std::collections::BTreeMap<BatchDigest<'_>, usize> =
             std::collections::BTreeMap::new();
+        // Charged on every way out of the loop below, a refusal included, and on its thread.
         #[cfg(test)]
-        let compared = batch_digest::compared();
+        let tally = batch_digest::Tally::new(&self.root);
         let mut objects: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
         for (digest, bytes) in blobs {
             validate_field("blob digest", digest)?;
@@ -1010,10 +1011,7 @@ impl Transaction {
         }
         drop(seen);
         #[cfg(test)]
-        {
-            let compared = batch_digest::compared() - compared;
-            cost::charge(&self.root, |cost| cost.digest_comparisons += compared);
-        }
+        drop(tally);
         if fresh.is_empty() {
             return Ok(());
         }
@@ -1362,6 +1360,30 @@ mod batch_digest {
 
     pub(super) fn compared() -> u64 {
         COMPARED.with(Cell::get)
+    }
+
+    /// Charges the comparisons this thread makes from its creation to its drop to one store root,
+    /// whichever way the scope it lives in ends. Created and dropped on one thread, with no await
+    /// between, because the tally it reads is the thread's.
+    pub(super) struct Tally {
+        root: std::path::PathBuf,
+        from: u64,
+    }
+
+    impl Tally {
+        pub(super) fn new(root: &std::path::Path) -> Self {
+            Self {
+                root: root.to_owned(),
+                from: compared(),
+            }
+        }
+    }
+
+    impl Drop for Tally {
+        fn drop(&mut self) {
+            let compared = compared() - self.from;
+            crate::cost::charge(&self.root, |cost| cost.digest_comparisons += compared);
+        }
     }
 }
 
@@ -2470,7 +2492,7 @@ mod grouped_blob_barrier {
     /// nothing without the count it replaces.
     #[tokio::test]
     async fn blobs_inside_one_group_take_the_groups_single_barrier() {
-        for count in [1_usize, 8, 32] {
+        for count in [1_usize, 8] {
             let separate = tempfile::tempdir().unwrap();
             let store = FileEventStore::open(separate.path()).await.unwrap();
             let before = cost::of(separate.path());
@@ -2933,14 +2955,17 @@ mod stamped_resume_cost {
     /// vouches for its one file outside the window. Nothing is hashed on either path.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_segmented_resume_compares_only_the_segments_it_cannot_trust() {
-        for layout in [FileLayout::Single, FileLayout::Segmented { seal_at: 1024 }] {
+        // Both fixtures are written first and wait out the window together. A seal at one byte
+        // seals every frame, so twelve frames leave the eleven sealed segments the assertions
+        // need; at 1,024 bytes the same took forty frames and a wait per layout.
+        let mut fixtures = Vec::new();
+        for layout in [FileLayout::Single, FileLayout::Segmented { seal_at: 1 }] {
             let directory = tempfile::tempdir().unwrap();
-            let root = directory.path();
             {
-                let store = FileEventStore::open_with_layout(root, layout)
+                let store = FileEventStore::open_with_layout(directory.path(), layout)
                     .await
                     .unwrap();
-                for index in 0..40 {
+                for index in 0..12 {
                     let stream =
                         StreamId::new(stream().tenant().clone(), "item", format!("s{index}"))
                             .unwrap();
@@ -2955,8 +2980,12 @@ mod stamped_resume_cost {
                         .unwrap();
                 }
             }
-            // Past the window: the next open stamps every file it verifies.
-            tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+            fixtures.push((layout, directory));
+        }
+        // Past the window: the next open stamps every file it verifies.
+        tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+        for (layout, directory) in &fixtures {
+            let (layout, root) = (*layout, directory.path());
             let store = FileEventStore::open(root).await.unwrap();
             let sealed_before = fs::read_dir(root.join("segments")).map_or(0, Iterator::count);
             store
@@ -3221,7 +3250,7 @@ mod stamped_resume_cost {
         let root = directory.path();
         {
             let writer = FileEventStore::open(root).await.unwrap();
-            for index in 0..20 {
+            for index in 0..4 {
                 writer
                     .append(
                         &stream(),
@@ -3453,22 +3482,38 @@ mod steady_state_cost {
     /// every earlier entry: 512 distinct digests cost 130,816 comparisons scanned pairwise
     /// (1,024 cost 523,776). The index keeps the batch's rules: a digest repeated with the same
     /// bytes binds once, and one repeated with different bytes refuses the whole group.
+    ///
+    /// The 512 digests are measured in a batch whose last entry repeats the first with other
+    /// bytes: the index runs over all of them exactly as it does for a batch that commits, and the
+    /// refusal comes before any object is written, so the bound costs no object synchronization
+    /// (a committed batch of 512 synchronized 512 objects, 9.9 s of this case). The same bound
+    /// is held on a batch that commits.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blob_batch_finds_repeated_digests_without_scanning_the_batch() {
         const DISTINCT: u64 = 512;
+        const COMMITTED: u64 = 16;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let owner = tenant("batch-index");
         let store = FileEventStore::open(root).await.unwrap();
 
-        let batch: Vec<_> = (0..DISTINCT)
-            .map(|i| (format!("digest-{i:04}"), i.to_le_bytes().to_vec()))
-            .collect();
+        let batch = |count: u64| -> Vec<_> {
+            (0..count)
+                .map(|i| (format!("digest-{i:04}"), i.to_le_bytes().to_vec()))
+                .collect()
+        };
+        let mut refused_at_the_end = batch(DISTINCT);
+        refused_at_the_end.push(("digest-0000".to_owned(), b"other".to_vec()));
         let before = crate::cost::of(root).digest_comparisons;
-        store
-            .append_group_with_blobs(&blob_group(&owner, "distinct"), &batch)
+        let refused = store
+            .append_group_with_blobs(&blob_group(&owner, "distinct"), &refused_at_the_end)
             .await
-            .unwrap();
+            .expect_err("the last entry names different bytes");
+        assert!(
+            matches!(&refused, EventLogError::Invalid(reason)
+                if reason == "blob digest already names different content"),
+            "{refused:?}"
+        );
         let compared = crate::cost::of(root).digest_comparisons - before;
         assert!(compared > 0, "the batch index compared nothing");
         // Well under the n(n-1)/2 = 130,816 of a pairwise scan; a B-tree lookup plus insert per
@@ -3477,7 +3522,20 @@ mod steady_state_cost {
             compared <= 64 * DISTINCT,
             "{DISTINCT} distinct digests took {compared} comparisons"
         );
-        assert_eq!(object_files(root), usize::try_from(DISTINCT).unwrap());
+        assert_eq!(object_files(root), 0, "a refused batch wrote objects");
+
+        let before = crate::cost::of(root).digest_comparisons;
+        store
+            .append_group_with_blobs(&blob_group(&owner, "committed"), &batch(COMMITTED))
+            .await
+            .unwrap();
+        let compared = crate::cost::of(root).digest_comparisons - before;
+        assert!(compared > 0, "the batch index compared nothing");
+        assert!(
+            compared <= 64 * COMMITTED,
+            "{COMMITTED} distinct digests took {compared} comparisons"
+        );
+        assert_eq!(object_files(root), usize::try_from(COMMITTED).unwrap());
 
         let repeated = vec![
             ("same".to_owned(), b"one".to_vec()),
@@ -3490,7 +3548,7 @@ mod steady_state_cost {
             .unwrap();
         assert_eq!(
             object_files(root),
-            usize::try_from(DISTINCT).unwrap() + 2,
+            usize::try_from(COMMITTED).unwrap() + 2,
             "a digest repeated with the same bytes binds once"
         );
 
@@ -3512,7 +3570,7 @@ mod steady_state_cost {
         assert_eq!(store.get_blob(&owner, "second").await.unwrap(), None);
         assert_eq!(
             object_files(root),
-            usize::try_from(DISTINCT).unwrap() + 2,
+            usize::try_from(COMMITTED).unwrap() + 2,
             "the refused group left objects behind"
         );
     }

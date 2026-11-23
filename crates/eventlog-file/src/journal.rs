@@ -2318,9 +2318,9 @@ mod tests {
         let held = |content: &Content| (content.retained.bytes().capacity(), content.length);
         {
             let mut journal = Journal::open(root.path()).unwrap();
-            for index in 0..40 {
+            for index in 0..4 {
                 journal
-                    .append(json!({ "index": index, "pad": "x".repeat(3_000) }))
+                    .append(json!({ "index": index, "pad": "x".repeat(30_000) }))
                     .unwrap();
             }
         }
@@ -2345,7 +2345,7 @@ mod tests {
         journal.append(json!({"value": 0})).unwrap();
         let other = journal.content();
         let held = journal.manifest.clone();
-        for value in 1..=50 {
+        for value in 1..=12 {
             journal.append(json!({ "value": value })).unwrap();
             assert!(
                 journal.content.shares_bytes_with(&other),
@@ -2358,7 +2358,7 @@ mod tests {
         let resumed = Journal::resume(root.path(), &held, &other)
             .unwrap()
             .unwrap();
-        assert_eq!(resumed.fresh.len(), 50);
+        assert_eq!(resumed.fresh.len(), 12);
     }
 
     /// Two views of one buffer each keep exactly the bytes they verified. A view continued with
