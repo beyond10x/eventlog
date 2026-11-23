@@ -20,6 +20,7 @@ use eventlog_core::EventLogError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What a [`migrate`] call does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +42,8 @@ pub struct MigrationReport {
     pub blobs: usize,
     /// Blobs already held split before this call.
     pub already_split: usize,
-    /// Raw blobs this call splits (or would).
+    /// Raw blobs this call splits (or would), counting a raw copy left beside a split form of the
+    /// same blob, which it removes.
     pub blobs_split: usize,
     /// Text files this call adds (or would): texts no blob held yet, each once.
     pub texts_added: usize,
@@ -87,36 +89,54 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
     let largest_before = largest(&sizes);
 
     let mut already_split = 0;
-    let mut plan = Vec::new();
+    let mut plan: Vec<Planned> = Vec::new();
     for tenant in before.tenants.keys() {
         let splits: BTreeSet<String> = split::split_files(root, tenant)?
             .into_iter()
             .map(|(digest, _)| digest)
             .collect();
         already_split += splits.len();
-        let blobs: BTreeMap<&str, &[u8]> = before.tenants[tenant]
+        let blobs: BTreeMap<&str, &Arc<[u8]>> = before.tenants[tenant]
             .blobs
             .iter()
-            .map(|(digest, bytes)| (digest.as_str(), &**bytes))
+            .map(|(digest, bytes)| (digest.as_str(), bytes))
             .collect();
         for (digest, _) in split::raw_files(root, tenant)? {
-            if splits.contains(&digest) {
+            // The load read every blob, and refused one whose two forms disagree, so these are
+            // the bytes the store serves under `digest`.
+            let bytes = Arc::clone(
+                blobs
+                    .get(digest.as_str())
+                    .ok_or_else(|| crate::layout::corrupt("a blob the replay did not read"))?,
+            );
+            // A raw file beside a split form that serves the same bytes — an interrupted
+            // conversion, or a merge of a branch that had not migrated — is finished: the raw
+            // copy goes. Planning it as already split would leave it there for good.
+            let step = if splits.contains(&digest) {
+                Step::DropRaw
+            } else if let Some(cut) = split::split(&digest, &bytes) {
+                Step::Split(cut)
+            } else {
                 continue;
-            }
-            let bytes = blobs
-                .get(digest.as_str())
-                .ok_or_else(|| crate::layout::corrupt("a blob the replay did not read"))?;
-            if let Some(cut) = split::split(&digest, bytes) {
-                plan.push((tenant.clone(), digest, cut));
-            }
+            };
+            plan.push(Planned {
+                tenant: tenant.clone(),
+                digest,
+                bytes,
+                step,
+            });
         }
     }
 
     // What the history files would be: each converted blob's raw file replaced by its manifest,
-    // and each text no blob held yet added once.
+    // and each text no blob held yet added once; a raw copy beside its split form just removed.
     let mut texts_added = 0;
-    for (tenant, digest, cut) in &plan {
+    for planned in &plan {
+        let (tenant, digest) = (&planned.tenant, &planned.digest);
         sizes.remove(&relative(root, &blob_path(root, tenant, digest)));
+        let Step::Split(cut) = &planned.step else {
+            continue;
+        };
         sizes.insert(
             relative(root, &split::split_path(root, tenant, digest)),
             cut.manifest.len() as u64,
@@ -160,14 +180,14 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
     if format == StoreFormat::V1 {
         split::set_format(root, FORMAT)?;
     }
-    for (tenant, digest, cut) in &plan {
-        let bytes = before.tenants[tenant]
-            .blobs
-            .iter()
-            .find(|(held, _)| held == digest)
-            .map(|(_, bytes)| &**bytes)
-            .ok_or_else(|| crate::layout::corrupt("a blob the replay did not read"))?;
-        split::convert(root, tenant, digest, bytes, cut)?;
+    for planned in &plan {
+        let (tenant, digest, bytes) = (&planned.tenant, &planned.digest, &planned.bytes);
+        match &planned.step {
+            Step::Split(cut) => {
+                split::convert(root, tenant, digest, bytes, cut)?;
+            }
+            Step::DropRaw => split::drop_raw(root, tenant, digest, bytes)?,
+        }
     }
 
     let after = history::load(root)?;
@@ -182,6 +202,22 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
     report.largest_after = largest(&measured);
     report.verified_blobs = Some(served_after.blobs.len());
     Ok(report)
+}
+
+/// One raw blob file the migration replaces, with the bytes the load read for it, so applying the
+/// plan looks nothing up again.
+struct Planned {
+    tenant: String,
+    digest: String,
+    bytes: Arc<[u8]>,
+    step: Step,
+}
+
+enum Step {
+    /// Write the split form, read it back, then remove the raw file.
+    Split(split::Split),
+    /// The split form is already there: read it back, then remove the raw file.
+    DropRaw,
 }
 
 /// Everything a store serves, reduced to what a comparison needs: each blob's bytes by digest,

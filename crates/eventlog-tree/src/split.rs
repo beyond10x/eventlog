@@ -677,16 +677,29 @@ pub(crate) fn convert(
         }
         write_once(&path, text)?;
     }
-    let manifest = split_path(root, tenant, digest);
-    write_once(&manifest, &cut.manifest)?;
-    if expand_file(root, tenant, digest, &manifest)? != bytes {
+    write_once(&split_path(root, tenant, digest), &cut.manifest)?;
+    drop_raw(root, tenant, digest, bytes)?;
+    Ok(written)
+}
+
+/// Remove the raw file of blob `digest` once its split form reads back as `bytes`, and make the
+/// removal durable. Finishes a conversion, and cleans up a raw copy an interrupted conversion or
+/// a merge left beside a split form that already serves the same bytes.
+pub(crate) fn drop_raw(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), EventLogError> {
+    if expand_file(root, tenant, digest, &split_path(root, tenant, digest))? != bytes {
         return Err(corrupt("a split blob that does not read back"));
     }
-    remove_if_present(&blob_path(root, tenant, digest))?;
-    if let Some(directory) = blob_path(root, tenant, digest).parent() {
+    let raw = blob_path(root, tenant, digest);
+    remove_if_present(&raw)?;
+    if let Some(directory) = raw.parent() {
         crate::layout::sync_dir(directory)?;
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Rewrite `store.json` with `format`, keeping its identity.

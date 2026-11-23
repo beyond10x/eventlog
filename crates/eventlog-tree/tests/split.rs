@@ -272,6 +272,37 @@ async fn a_raw_blob_merged_into_a_v2_store_reads_and_is_split_by_the_next_migrat
     assert_eq!(served(root, "sha256:late").await, Some(bytes));
 }
 
+/// An interrupted conversion, or a merge of a branch that had not migrated, can leave a blob in
+/// both forms holding the same bytes. The migration finishes it: the raw copy goes, and a second
+/// run has nothing left to do.
+async fn a_raw_copy_beside_its_equal_split_form_is_removed_by_the_next_migration(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let bytes = document("one", &body("one"));
+    write(root, layout, &[("sha256:one", bytes.clone())]).await;
+    assert_eq!(files_under(root, "split-blobs").len(), 1);
+    let shard = root.join("tenants/tenant-a/blobs/sh");
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join("sha256%3Aone"), &bytes).unwrap();
+    assert_eq!(served(root, "sha256:one").await, Some(bytes.clone()));
+
+    let planned = migrate(root, MigrationMode::DryRun).unwrap();
+    assert!(
+        planned.pending() && planned.blobs_split == 1 && planned.texts_added == 0,
+        "the raw copy beside an equal split form was not planned: {planned:?}"
+    );
+    let applied = migrate(root, MigrationMode::Apply).unwrap();
+    assert_eq!(applied.blobs_split, 1, "{applied:?}");
+    assert_eq!(applied.bytes_after, planned.bytes_after, "{applied:?}");
+    assert_eq!(files_under(root, "blobs"), [] as [PathBuf; 0]);
+    assert_eq!(files_under(root, "split-blobs").len(), 1);
+    assert_eq!(served(root, "sha256:one").await, Some(bytes));
+    assert_eq!(verify(root, None), Vec::new());
+    assert!(!migrate(root, MigrationMode::DryRun).unwrap().pending());
+}
+
 async fn a_blob_whose_two_forms_disagree_is_refused(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -563,6 +594,7 @@ each_layout!(
     a_v1_store_reads_and_writes_raw_blobs_as_before,
     a_dry_run_writes_nothing_and_an_apply_serves_every_blob_byte_for_byte,
     a_raw_blob_merged_into_a_v2_store_reads_and_is_split_by_the_next_migration,
+    a_raw_copy_beside_its_equal_split_form_is_removed_by_the_next_migration,
     a_blob_whose_two_forms_disagree_is_refused,
     a_changed_text_is_refused_on_open_and_by_verify,
     a_v1_store_holding_split_files_and_an_unknown_format_are_refused_by_name,

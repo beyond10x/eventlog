@@ -93,13 +93,15 @@ capture.
 
 `eventlog_tree::migrate(root, MigrationMode::{DryRun, Apply})`, explicit and never on open:
 
-1. Take the writer lock; read and verify the whole store; plan every raw blob that would split.
+1. Take the writer lock; read and verify the whole store; plan every raw blob that would split,
+   and every raw copy an interrupted run or a merge left beside a split form of the same bytes.
 2. A dry run reports blobs, blobs to split, texts to add, history bytes and the largest history
    file before and after, and writes nothing.
 3. An apply switches `store.json` first (a v2 store whose blobs are all raw is valid), then per
    blob writes its texts, then its manifest, reads the manifest back and compares the bytes, and
-   only then removes the raw file. A crash anywhere leaves a store that opens and serves the same
-   bytes, and running the migration again finishes it.
+   only then removes the raw file and syncs its directory; a raw copy beside its split form is
+   removed the same way once the split form reads back. A crash anywhere leaves a store that opens
+   and serves the same bytes, and running the migration again finishes it.
 4. It reloads the store and compares what it serves — every blob's bytes by digest, every group and
    event digest, identities, torn files — with what it served before, and reports the count.
 
