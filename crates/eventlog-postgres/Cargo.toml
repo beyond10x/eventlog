@@ -28,7 +28,7 @@ pool-churn = []
 clap.workspace = true
 tempfile.workspace = true
 eventlog-conformance.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tokio-postgres.workspace = true
 serde_json.workspace = true
 

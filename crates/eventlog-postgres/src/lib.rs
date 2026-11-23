@@ -17,7 +17,7 @@
 //! `xid8`, `pg_current_xact_id()` and `pg_snapshot_xmin()` require PostgreSQL 13 or later.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -1602,19 +1602,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .batch_execute("SAVEPOINT eventlog_reservation")
                 .await
                 .map_err(backend)?;
-            let result=async {
-                for (coordinate,_) in &ordered {lock_identity(self.client,self.lock_prefix,"admission",&[coordinate]).await?;}
-                let table=format!("{}_scope_counters",self.lock_prefix);
-                let mut next=Vec::with_capacity(ordered.len());
-                // Validate every scope before any writes, including absent zero counters.
-                for (coordinate,reservation) in &ordered {
-                    let held=self.client.query_opt(&format!("SELECT held FROM {table} WHERE coordinate=$1 FOR UPDATE"), &[coordinate]).await.map_err(backend)?.map_or(0,|row|row.get::<_,i64>(0));
-                    let updated=held.checked_add(reservation.delta).filter(|value|*value>=0 && *value<=reservation.ceiling).ok_or_else(||EventLogError::Invalid("admission ceiling or release bound refused".into()))?;
-                    next.push(updated);
-                }
-                for ((coordinate,_),held) in ordered.iter().zip(&next) {self.client.execute(&format!("INSERT INTO {table}(coordinate,held) VALUES($1,$2) ON CONFLICT(coordinate) DO UPDATE SET held=EXCLUDED.held"), &[coordinate,held]).await.map_err(backend)?;}
-                Ok(next)
-            }.await;
+            let result = reserve_ordered(self.client, self.lock_prefix, &ordered).await;
             if result.is_err() {
                 self.client
                     .batch_execute("ROLLBACK TO SAVEPOINT eventlog_reservation")
@@ -2281,6 +2269,81 @@ async fn lock_identity(
         .await
         .map_err(backend)?;
     Ok(())
+}
+
+/// One reservation's locks, reads and writes: one statement per phase, whatever the scope count.
+///
+/// The advisory locks are taken in one statement over the coordinates in their sorted order, so
+/// two reservations still lock overlapping scopes in the same order. Every ceiling is checked
+/// before anything is written, and a scope whose value does not change is not written at all: a
+/// zero delta reads the counter under the same locks without creating a row or writing WAL, and
+/// an absent counter is zero.
+async fn reserve_ordered(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    ordered: &[(String, &eventlog_core::Reservation)],
+) -> Result<Vec<i64>, EventLogError> {
+    let identities = ordered
+        .iter()
+        .map(|(coordinate, _)| lock_coordinates(prefix, "admission", &[coordinate]))
+        .collect::<Result<Vec<_>, _>>()?;
+    // A function in FROM yields the array's elements in order, and nothing above it re-sorts.
+    let key = ADVISORY_KEY.replace("$1", "scope.identity");
+    transaction
+        .query_one(
+            &format!(
+                "SELECT count(pg_advisory_xact_lock({key})) FROM unnest($1::text[]) AS scope(identity)"
+            ),
+            &[&identities],
+        )
+        .await
+        .map_err(backend)?;
+    let table = format!("{prefix}_scope_counters");
+    let coordinates: Vec<&str> = ordered
+        .iter()
+        .map(|(coordinate, _)| coordinate.as_str())
+        .collect();
+    let held: BTreeMap<String, i64> = transaction
+        .query(
+            &format!(
+                "SELECT coordinate, held FROM {table} WHERE coordinate = ANY($1::text[]) FOR UPDATE"
+            ),
+            &[&coordinates],
+        )
+        .await
+        .map_err(backend)?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let mut next = Vec::with_capacity(ordered.len());
+    let mut changed: (Vec<&str>, Vec<i64>) = (Vec::new(), Vec::new());
+    for (coordinate, reservation) in ordered {
+        let current = held.get(coordinate).copied().unwrap_or(0);
+        let updated = current
+            .checked_add(reservation.delta)
+            .filter(|value| *value >= 0 && *value <= reservation.ceiling)
+            .ok_or_else(|| {
+                EventLogError::Invalid("admission ceiling or release bound refused".into())
+            })?;
+        if updated != current {
+            changed.0.push(coordinate);
+            changed.1.push(updated);
+        }
+        next.push(updated);
+    }
+    if !changed.0.is_empty() {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {table}(coordinate,held) SELECT * FROM unnest($1::text[],$2::bigint[]) \
+                     ON CONFLICT(coordinate) DO UPDATE SET held=EXCLUDED.held"
+                ),
+                &[&changed.0, &changed.1],
+            )
+            .await
+            .map_err(backend)?;
+    }
+    Ok(next)
 }
 
 // Evaluate both the row watermark and the first withheld position in one statement snapshot.

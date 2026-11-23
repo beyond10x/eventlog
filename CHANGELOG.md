@@ -41,6 +41,10 @@ under bare-version tags such as `0.1.0`.
 - PostgreSQL: `AtomicBlobEventStore` hashes each blob once (the fingerprint's SHA-256 is the
   integrity column), binds from the caller's bytes without copying the request, and reads a
   stored blob back only when its digest was already bound.
+- PostgreSQL: a guard's scope reservation takes one statement per phase (advisory locks in sorted
+  order, the counter read, the counter write) instead of three per scope: 64 scopes cost the same
+  round trips as one. A scope whose value does not change is not written, so a zero-delta check
+  creates no counter row and writes no WAL; the locks and ceiling checks are unchanged.
 
 ### Fixed
 

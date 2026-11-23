@@ -1105,6 +1105,180 @@ async fn scope_reservations_are_atomic_and_confined() {
     eventlog_conformance::run_scope_atomicity(&store, &store.admission_permit()).await;
 }
 
+/// `count` reservations of `delta` against `ceiling` on distinct tenant scopes named `key-N`.
+fn quota_guard(
+    store: &PostgresEventStore,
+    tenant: &TenantId,
+    count: usize,
+    delta: i64,
+    ceiling: i64,
+) -> Arc<dyn eventlog_core::Guard> {
+    use eventlog_core::{AdmissionScope, Reservation};
+    Arc::new(eventlog_conformance::ReserveScopes {
+        permit: store.admission_permit(),
+        reservations: (0..count)
+            .map(|n| Reservation {
+                scope: AdmissionScope::Tenant {
+                    tenant: tenant.clone(),
+                    key: format!("key-{n}"),
+                },
+                delta,
+                ceiling,
+            })
+            .collect(),
+    })
+}
+
+/// A zero-delta reservation is a policy read: it takes the locks and checks the ceilings, and
+/// writes nothing — no row for an absent scope, no new row version for an existing one.
+#[tokio::test]
+async fn a_zero_delta_quota_check_writes_no_counter_rows() {
+    let Some(store) = store("quota_read").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url().expect("fixture URL")).await;
+    let tenant = TenantId::new("quota-read").unwrap();
+    let append = |id: &'static str, guard| {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = &store;
+        async move {
+            store
+                .append_guarded(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    guard,
+                )
+                .await
+                .expect("admitted append")
+        }
+    };
+    append("absent", quota_guard(&store, &tenant, 64, 0, 1)).await;
+    let rows: i64 = sql
+        .query_one("SELECT count(*) FROM quota_read_scope_counters", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0, "a zero-delta check created counter rows");
+    append("held", quota_guard(&store, &tenant, 1, 1, 1)).await;
+    let version = || async {
+        sql.query_one(
+            "SELECT xmin::text, held FROM quota_read_scope_counters",
+            &[],
+        )
+        .await
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .unwrap()
+    };
+    let before = version().await;
+    append("recheck", quota_guard(&store, &tenant, 1, 0, 1)).await;
+    assert_eq!(
+        version().await,
+        before,
+        "a zero-delta check rewrote an unchanged counter"
+    );
+}
+
+/// Forward one PostgreSQL connection and count the client's request boundaries: a simple
+/// `Query` or an extended-protocol `Sync` is one round trip.
+async fn count_round_trips(
+    client: tokio::net::TcpStream,
+    upstream: std::net::SocketAddr,
+    round_trips: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = tokio::net::TcpStream::connect(upstream).await?;
+    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_server, mut to_server) = server.into_split();
+    tokio::spawn(async move { tokio::io::copy(&mut from_server, &mut to_client).await });
+    // Untyped startup packets come first; an SSL or GSS encryption request precedes the real one.
+    loop {
+        let mut length = [0_u8; 4];
+        from_client.read_exact(&mut length).await?;
+        let mut body = vec![0_u8; usize::try_from(u32::from_be_bytes(length)).unwrap() - 4];
+        from_client.read_exact(&mut body).await?;
+        to_server.write_all(&length).await?;
+        to_server.write_all(&body).await?;
+        let code = u32::from_be_bytes(body[..4].try_into().unwrap());
+        if code != 80_877_103 && code != 80_877_104 {
+            break;
+        }
+    }
+    loop {
+        let mut header = [0_u8; 5];
+        from_client.read_exact(&mut header).await?;
+        let length = u32::from_be_bytes(header[1..].try_into().unwrap());
+        let mut body = vec![0_u8; usize::try_from(length).unwrap() - 4];
+        from_client.read_exact(&mut body).await?;
+        if header[0] == b'Q' || header[0] == b'S' {
+            round_trips.fetch_add(1, Ordering::AcqRel);
+        }
+        to_server.write_all(&header).await?;
+        to_server.write_all(&body).await?;
+    }
+}
+
+/// A reservation costs one statement per phase — lock, read, write — whatever its scope count,
+/// not three per scope: 64 scopes and one scope take the same number of round trips.
+#[tokio::test]
+async fn a_64_scope_reservation_takes_as_many_round_trips_as_one_scope() {
+    let Some(direct) = store("quota_trips").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    direct.shutdown().await.unwrap();
+    let url = url().expect("fixture URL");
+    let config: tokio_postgres::Config = url.parse().unwrap();
+    let tokio_postgres::config::Host::Tcp(host) = &config.get_hosts()[0] else {
+        panic!("the round-trip count needs a TCP fixture");
+    };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    let upstream = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .unwrap()
+        .next()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let round_trips = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&round_trips);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(count_round_trips(client, upstream, Arc::clone(&counter)));
+        }
+    });
+    let proxied = url.replacen(&format!("{host}:{port}"), &proxy.to_string(), 1);
+    assert_ne!(proxied, url, "the fixture URL names its host and port");
+    let store = PostgresEventStore::connect(&proxied, "quota_trips")
+        .await
+        .expect("a store behind the counting proxy");
+    let tenant = TenantId::new("quota-trips").unwrap();
+    let mut costs = Vec::new();
+    for (id, scopes) in [("warm", 1), ("one", 1), ("many", 64)] {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let before = round_trips.load(Ordering::Acquire);
+        store
+            .append_guarded(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta(id, &serde_json::json!({})),
+                quota_guard(&store, &tenant, scopes, 1, 3),
+            )
+            .await
+            .expect("admitted append");
+        costs.push(round_trips.load(Ordering::Acquire) - before);
+    }
+    assert_eq!(
+        costs[2], costs[1],
+        "round trips of an append reserving 64 scopes against one reserving 1 (warm-up {})",
+        costs[0]
+    );
+    store.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn absent_deployment_scope_races_across_tenants_and_clients() {
     use eventlog_core::{AdmissionScope, Reservation};
@@ -1975,24 +2149,28 @@ async fn caught_reservation_cancellation_cannot_commit_an_unchecked_append() {
         tenant: tenant.clone(),
         key: "quota".into(),
     };
-    let stream = StreamId::new(tenant.clone(), "item", "seed").expect("stream");
-    store
-        .append_guarded(
-            &stream,
-            Expected::NoStream,
-            &[eventlog_conformance::event("item.received", 0)],
-            &eventlog_conformance::meta("seed", &serde_json::json!({})),
-            Arc::new(eventlog_conformance::ReserveScopes {
-                permit: store.admission_permit(),
-                reservations: vec![Reservation {
-                    scope: scope.clone(),
-                    delta: 0,
-                    ceiling: 1,
-                }],
-            }),
-        )
-        .await
-        .expect("zero counter");
+    // A zero counter row for the competing transaction to lock: hold one slot and release it (a
+    // zero-delta check writes no row).
+    for (id, delta) in [("seed", 1), ("seed-release", -1)] {
+        let stream = StreamId::new(tenant.clone(), "item", id).expect("stream");
+        store
+            .append_guarded(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 0)],
+                &eventlog_conformance::meta(id, &serde_json::json!({})),
+                Arc::new(eventlog_conformance::ReserveScopes {
+                    permit: store.admission_permit(),
+                    reservations: vec![Reservation {
+                        scope: scope.clone(),
+                        delta,
+                        ceiling: 1,
+                    }],
+                }),
+            )
+            .await
+            .expect("zero counter");
+    }
     let ready = Arc::new(tokio::sync::Notify::new());
     let caught = Arc::new(tokio::sync::Notify::new());
     let (ready_child, caught_child) = (ready.clone(), caught.clone());
