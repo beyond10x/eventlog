@@ -1641,14 +1641,14 @@ async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid()
         resume: resume_second.clone(),
         position: position.clone(),
     });
-    first
-        .register_inline(projector.clone())
-        .await
-        .expect("first setup");
+    // Only the newer writer's handle drives the inline projector. An attached projector's lock is
+    // taken before the guard and held to commit, so an older writer paused in its guard on a
+    // handle that drove it would keep the newer writer out of the projector, and the XID/position
+    // reversal this regression stages could not happen.
     second
         .register_inline(projector)
         .await
-        .expect("second setup");
+        .expect("newer writer setup");
     let (writer, first_tenant) = (first.clone(), tenant.clone());
     let guard = Arc::new(OlderGuard {
         permit: first.admission_permit(),
