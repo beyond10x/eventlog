@@ -91,10 +91,18 @@ bash scripts/gate.sh
 ```
 
 The compatibility shell entry point delegates argument parsing and selection to the Rust `gate`
-example. In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
+example. In order: `cargo nextest run --workspace --locked`, `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, and the same clippy for
 `eventlog-kpi --features counters`, which compiles the providers' KPI counters.
 Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate).
+
+The test step needs `cargo-nextest` 0.9.143 or later. `.config/nextest.toml` ends any test that
+runs 60 s, and the gate then prints the run's ten slowest tests from nextest's JUnit report
+(`target/nextest/default/junit.xml`). Nextest runs every test in a process of its own, so a
+`static` lock in a test binary orders nothing: the PostgreSQL `conformance` and `runtime_context`
+binaries, which serialize through one, run each test with every other test stopped (the
+watermark couples feed latency across the instance; see above). A binary added with such a lock
+is added to that filter.
 
 The required shared Gates check covers common security/privacy rules. Install coordinated local
 hooks with `b10x-gates --repository beyond10x/eventlog install`; they inspect the index, messages
