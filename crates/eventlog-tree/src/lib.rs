@@ -647,12 +647,25 @@ async fn replay_all(
     catch_up: Vec<Arc<dyn Projector>>,
 ) -> Result<State, EventLogError> {
     let loaded = history::load(root)?;
+    // An inline projector is handed each event as the replay appends it, and a redacted event is
+    // appended with its tombstone body and marked redacted only after every group is in: the
+    // projector would take a redacted event for a live one. With any redaction in the history,
+    // the inline projectors are therefore driven afterwards, from the restored events.
+    let redacted = loaded
+        .tenants
+        .values()
+        .flat_map(|tenant| &tenant.groups)
+        .flat_map(|committed| committed.events.iter().flatten())
+        .any(|record| record.redacted.is_some());
+    let deferred = redacted && !inline.is_empty();
     let engine = Arc::new(SqliteEventStore::in_memory("tree").await?);
     for projector in &catch_up {
         engine.create_projections(Arc::clone(projector)).await?;
     }
-    for projector in &inline {
-        engine.register_inline(Arc::clone(projector)).await?;
+    if !deferred {
+        for projector in &inline {
+            engine.register_inline(Arc::clone(projector)).await?;
+        }
     }
     let mut heads: BTreeMap<StreamKey, BTreeSet<String>> = BTreeMap::new();
     let mut records = BTreeMap::new();
@@ -693,6 +706,11 @@ async fn replay_all(
     for (stream, version, reason) in redactions {
         engine.redact(&stream, version, &reason).await?;
     }
+    let engine = if deferred {
+        drive_inline_from_restored(&engine, &loaded, &inline, &catch_up).await?
+    } else {
+        engine
+    };
     // A parent is always replayed before its child, so removing parents as their children arrive
     // leaves exactly the events no other event follows.
     Ok(State {
@@ -710,6 +728,35 @@ async fn replay_all(
         poisoned: false,
         replayed: true,
     })
+}
+
+/// An engine holding everything `replayed` holds, with `inline` registered and each of their
+/// projections folded from the restored events, redaction marks included, tenant by tenant.
+///
+/// Registration closes once an engine has appended, so the replayed engine is carried over through
+/// its image, as a kept state is ([`from_kept`]).
+async fn drive_inline_from_restored(
+    replayed: &SqliteEventStore,
+    loaded: &history::Loaded,
+    inline: &[Arc<dyn Projector>],
+    catch_up: &[Arc<dyn Projector>],
+) -> Result<Arc<SqliteEventStore>, EventLogError> {
+    let engine = Arc::new(SqliteEventStore::from_image("tree", replayed.image().await?).await?);
+    for projector in catch_up {
+        engine.create_projections(Arc::clone(projector)).await?;
+    }
+    for projector in inline {
+        engine.register_inline(Arc::clone(projector)).await?;
+    }
+    for tenant in loaded.tenants.keys() {
+        let tenant = TenantId::new(tenant.clone())?;
+        for projector in inline {
+            engine
+                .rebuild_inline_projection(projector.name(), &tenant)
+                .await?;
+        }
+    }
+    Ok(engine)
 }
 
 /// Append one committed group to the engine as its writer did, keeping its identities and
