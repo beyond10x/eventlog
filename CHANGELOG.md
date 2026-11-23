@@ -40,6 +40,10 @@ under bare-version tags such as `0.1.0`.
   for a directory.
 - Tree: `attach_inline_existing` refuses a projection that `create_projections` did not admit on
   the handle, or admitted with another shape, instead of creating it and reporting success.
+- Tree: an open handle that rebuilds its engine (after another handle's commit, a merge, a
+  redaction, an erasure or an inline attachment) keeps every served event's global position and
+  places history new to it above the highest position it assigned, so a saved feed cursor no
+  longer skips events. A rebuild no longer loads a kept state, which another replay ordered.
 
 ## 0.9.4 — 2026-11-11
 

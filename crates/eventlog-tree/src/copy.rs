@@ -73,7 +73,7 @@ pub async fn copy(
         }
         let mut redactions = Vec::new();
         for committed in &history.groups {
-            let written = replay(to, &tenant, committed, Some(&versions)).await?;
+            let written = replay(to, &tenant, committed, Some(&versions), None).await?;
             report.groups += 1;
             for (record, version) in committed.events.iter().flatten().zip(written) {
                 report.events += 1;

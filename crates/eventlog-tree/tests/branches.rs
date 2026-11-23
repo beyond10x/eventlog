@@ -13,6 +13,7 @@ use eventlog_core::{
 };
 use eventlog_tree::{TreeEventStore, TreeLayout};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -897,7 +898,278 @@ fn two_handles_contending_for_the_writer_lock_on_one_thread_both_commit() {
     }
 }
 
+/// What makes an open handle rebuild its engine from the files.
+#[derive(Clone, Copy, Debug)]
+enum Rebuild {
+    AnotherHandleAppends,
+    /// Another handle appends, and a third open replays the files in tenant order and keeps its
+    /// state for exactly these files, which the rebuild must not load.
+    AnotherReplayKeptItsState,
+    MergeAddsHistory,
+    AnotherHandleRedacts,
+    AnotherHandleErases,
+}
+
+fn on(tenant: &str, id: &str) -> StreamId {
+    StreamId::new(TenantId::new(tenant).unwrap(), "item", id).unwrap()
+}
+
+async fn append_one(
+    store: &TreeEventStore,
+    tenant: &str,
+    id: &str,
+) -> eventlog_core::RecordedEvent {
+    store
+        .append(
+            &on(tenant, id),
+            Expected::Any,
+            &[event("item.received", 1)],
+            &meta(&format!("{tenant}-{id}"), &json!({})),
+        )
+        .await
+        .unwrap()
+        .events
+        .remove(0)
+}
+
+/// Every event of `tenant` after `cursor`, through every page, and the cursor a reader saves.
+async fn feed_after(
+    store: &TreeEventStore,
+    tenant: &str,
+    mut cursor: u64,
+) -> (Vec<eventlog_core::RecordedEvent>, u64) {
+    let tenant = TenantId::new(tenant).unwrap();
+    let mut events = Vec::new();
+    loop {
+        let page = store.read_feed(&tenant, cursor, 2).await.unwrap();
+        events.extend(page.events);
+        cursor = page.next_position;
+        if !page.has_more {
+            return (events, cursor);
+        }
+    }
+}
+
+/// Positions are valid while the store is open, so a reader's saved feed cursor must not pass an
+/// event it has not seen when the handle rebuilds its engine. Tenant `tenant-z` writes first and
+/// `tenant-a` second, so a replay in tenant order would move `tenant-a`'s events, and the one new
+/// to the handle, below the cursor `tenant-a`'s reader saved.
+async fn a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
+    layout: TreeLayout,
+    rebuild: Rebuild,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let branch = tempfile::tempdir().unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    for (tenant, id) in [
+        ("tenant-z", "one"),
+        ("tenant-z", "two"),
+        ("tenant-a", "one"),
+        ("tenant-a", "two"),
+    ] {
+        append_one(&store, tenant, id).await;
+    }
+    let (seen, cursor) = feed_after(&store, "tenant-a", 0).await;
+    let (z_seen, _) = feed_after(&store, "tenant-z", 0).await;
+    let served: Vec<(String, u64)> = z_seen
+        .iter()
+        .chain(&seen)
+        .map(|event| (event.event_id.clone(), event.global_seq))
+        .collect();
+    let high_water = served.iter().map(|(_, at)| *at).max().unwrap();
+
+    let unseen = if matches!(rebuild, Rebuild::MergeAddsHistory) {
+        copy_tree(directory.path(), branch.path());
+        let other = TreeEventStore::open_in(branch.path(), layout)
+            .await
+            .unwrap();
+        let unseen = append_one(&other, "tenant-a", "three").await;
+        for path in walk(&branch.path().join("tenants")) {
+            let target = directory
+                .path()
+                .join(path.strip_prefix(branch.path()).unwrap());
+            if !target.exists() {
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::copy(&path, &target).unwrap();
+            }
+        }
+        unseen
+    } else {
+        let other = TreeEventStore::open_in(directory.path(), layout)
+            .await
+            .unwrap();
+        let unseen = append_one(&other, "tenant-a", "three").await;
+        match rebuild {
+            Rebuild::AnotherHandleRedacts => {
+                other
+                    .redact(&on("tenant-z", "one"), 1, "erased")
+                    .await
+                    .unwrap();
+            }
+            Rebuild::AnotherHandleErases => {
+                other
+                    .forget_tenant(&TenantId::new("tenant-z").unwrap())
+                    .await
+                    .unwrap();
+            }
+            Rebuild::AnotherReplayKeptItsState => {
+                // A state is kept only once every file is older than the stamp window.
+                tokio::time::sleep(Duration::from_millis(2_100)).await;
+                let replaying = TreeEventStore::open_in(directory.path(), layout)
+                    .await
+                    .unwrap();
+                assert!(replaying.replayed().await);
+                drop(replaying);
+                let warm = TreeEventStore::open_in(directory.path(), layout)
+                    .await
+                    .unwrap();
+                assert!(
+                    !warm.replayed().await,
+                    "control: the third open kept its state for these files"
+                );
+            }
+            _ => {}
+        }
+        unseen
+    };
+    // A write rebuilds after another writer's commit; a read rebuilds after a removal.
+    let own = match rebuild {
+        Rebuild::AnotherHandleAppends
+        | Rebuild::AnotherReplayKeptItsState
+        | Rebuild::MergeAddsHistory => Some(append_one(&store, "tenant-z", "three").await),
+        Rebuild::AnotherHandleRedacts | Rebuild::AnotherHandleErases => None,
+    };
+
+    let (after, _) = feed_after(&store, "tenant-a", cursor).await;
+    let ids: Vec<&str> = after.iter().map(|event| event.event_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [unseen.event_id.as_str()],
+        "{rebuild:?}: the reader at cursor {cursor} after {:?} was served {after:?}",
+        seen.iter()
+            .map(|event| event.global_seq)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        after[0].global_seq > high_water,
+        "{rebuild:?}: history new to the handle placed at {} below its high water {high_water}",
+        after[0].global_seq
+    );
+    let (a_now, _) = feed_after(&store, "tenant-a", 0).await;
+    let (z_now, _) = feed_after(&store, "tenant-z", 0).await;
+    let now: BTreeMap<String, u64> = a_now
+        .iter()
+        .chain(&z_now)
+        .map(|event| (event.event_id.clone(), event.global_seq))
+        .collect();
+    for (event_id, at) in &served {
+        match (rebuild, now.get(event_id)) {
+            (Rebuild::AnotherHandleErases, None) => {}
+            (_, Some(now)) => assert_eq!(now, at, "{rebuild:?}: a served event moved"),
+            (_, None) => panic!("{rebuild:?}: a served event is gone"),
+        }
+    }
+    if let Some(own) = own {
+        assert!(
+            own.global_seq > high_water,
+            "{rebuild:?}: the write that rebuilt landed at {} below {high_water}",
+            own.global_seq
+        );
+    }
+    let next = append_one(&store, "tenant-a", "four").await;
+    assert!(
+        next.global_seq > after[0].global_seq,
+        "{rebuild:?}: an append after the rebuild landed at {} below {}",
+        next.global_seq,
+        after[0].global_seq
+    );
+}
+
+/// An erasure leaves a gap where the erased events stood. When the erased tenant held the highest
+/// position, an event written to that tenant afterwards still lands above every position the
+/// handle assigned, so the cursor its reader saved before the erasure passes nothing.
+async fn an_erased_tenants_saved_cursor_passes_no_event_written_after_the_erasure(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    append_one(&store, "tenant-a", "one").await;
+    append_one(&store, "tenant-z", "one").await;
+    append_one(&store, "tenant-z", "two").await;
+    let (_, cursor) = feed_after(&store, "tenant-z", 0).await;
+    let other = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    other
+        .forget_tenant(&TenantId::new("tenant-z").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(feed_after(&store, "tenant-z", 0).await.0, Vec::new());
+    let written = append_one(&store, "tenant-z", "three").await;
+    let (after, _) = feed_after(&store, "tenant-z", cursor).await;
+    assert_eq!(
+        after
+            .iter()
+            .map(|event| &event.event_id)
+            .collect::<Vec<_>>(),
+        [&written.event_id],
+        "an event written after the erasure took position {} at or below the saved cursor \
+         {cursor}",
+        written.global_seq
+    );
+}
+
+async fn a_saved_feed_cursor_skips_nothing_after_another_handle_appends(layout: TreeLayout) {
+    a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
+        layout,
+        Rebuild::AnotherHandleAppends,
+    )
+    .await;
+}
+
+async fn a_saved_feed_cursor_skips_nothing_when_another_replay_kept_its_state(layout: TreeLayout) {
+    a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
+        layout,
+        Rebuild::AnotherReplayKeptItsState,
+    )
+    .await;
+}
+
+async fn a_saved_feed_cursor_skips_nothing_after_a_merge(layout: TreeLayout) {
+    a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
+        layout,
+        Rebuild::MergeAddsHistory,
+    )
+    .await;
+}
+
+async fn a_saved_feed_cursor_skips_nothing_after_a_redaction(layout: TreeLayout) {
+    a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
+        layout,
+        Rebuild::AnotherHandleRedacts,
+    )
+    .await;
+}
+
+async fn a_saved_feed_cursor_skips_nothing_after_a_tenant_erasure(layout: TreeLayout) {
+    a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
+        layout,
+        Rebuild::AnotherHandleErases,
+    )
+    .await;
+}
+
 each_layout!(
+    a_saved_feed_cursor_skips_nothing_after_another_handle_appends,
+    a_saved_feed_cursor_skips_nothing_when_another_replay_kept_its_state,
+    a_saved_feed_cursor_skips_nothing_after_a_merge,
+    a_saved_feed_cursor_skips_nothing_after_a_redaction,
+    a_saved_feed_cursor_skips_nothing_after_a_tenant_erasure,
+    an_erased_tenants_saved_cursor_passes_no_event_written_after_the_erasure,
     history_reopens_with_the_same_ids_versions_instants_and_receipts,
     a_group_and_its_blobs_reopen_whole,
     an_event_without_its_group_file_is_never_served_and_repair_removes_it,

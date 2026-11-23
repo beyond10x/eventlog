@@ -42,7 +42,10 @@
 //!
 //! What this store does not promise, in [`Capabilities::BRANCHABLE`]: positions are valid only
 //! while the store is open, claims are refused, and snapshots, catch-up cursors and admission
-//! counters live only in memory.
+//! counters live only in memory. While a handle is open its positions hold: when it rebuilds its
+//! engine, because another handle or a merge added history or content was removed, every event it
+//! served keeps its position, an erased one leaves a gap, and history new to it is placed above
+//! every position it assigned, so a saved feed cursor never passes an event it has not seen.
 
 mod copy;
 mod fold;
@@ -66,7 +69,7 @@ use eventlog_core::{
     ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamAppend, StreamId, StreamSlice,
     TenantCapture, TenantId, redaction_tombstone,
 };
-use eventlog_sqlite::{EventOrigin, RestoredEvent, SqliteEventStore};
+use eventlog_sqlite::{EventOrigin, EventPositions, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
     FORMAT, FORMAT_V3, backend, canonical, corrupt, event_path, group_path, identity_path,
@@ -315,7 +318,7 @@ impl TreeEventStore {
     ) -> Result<Self, EventLogError> {
         let root = root.as_ref().to_owned();
         prepare(&root, layout)?;
-        let state = build(&root, inline, Vec::new(), Locked::NotHeld).await?;
+        let state = build(&root, inline, Vec::new(), Locked::NotHeld, None).await?;
         Ok(Self {
             root,
             state: Mutex::new(state),
@@ -655,6 +658,7 @@ async fn refresh(root: &Path, state: &mut State) -> Result<(), EventLogError> {
         state.inline.clone(),
         state.catch_up.clone(),
         Locked::Held,
+        Some(state.engine.positions().await?),
     )
     .await?;
     *state = rebuilt;
@@ -675,11 +679,18 @@ enum Locked {
 /// A state is kept only under the writer lock, and only while the privacy token it was built under
 /// is still the published one: a removal of content deletes every kept state under that lock, so
 /// a replay that read the files before the removal can never put its image back afterwards.
+///
+/// `served` holds where every event stood in the engine an open handle is replacing. Positions are
+/// valid for as long as the handle is open, and a reader may have saved any of them, so a rebuild
+/// replays from the files with each of those events at its old position, and places every event
+/// new to the handle above the highest position it ever assigned. A kept state was folded by
+/// another replay, in that replay's order, so a rebuild never loads one.
 async fn build(
     root: &Path,
     inline: Vec<Arc<dyn Projector>>,
     catch_up: Vec<Arc<dyn Projector>>,
     locked: Locked,
+    served: Option<EventPositions>,
 ) -> Result<State, EventLogError> {
     let privacy = fold::privacy_token(root)?;
     let started = fold::now_ns();
@@ -700,14 +711,15 @@ async fn build(
         (Some(stamps), Some(inline), Some(catch_up)) => Some(fold::key(stamps, &inline, &catch_up)),
         _ => None,
     };
-    if let Some(key) = &key
+    if served.is_none()
+        && let Some(key) = &key
         && let Some((image, kept)) = fold::load(root, key)
         && let Ok(mut state) = from_kept(root, image, &kept, &inline, &catch_up).await
     {
         state.privacy = privacy;
         return Ok(state);
     }
-    let mut state = replay_all(root, inline, catch_up).await?;
+    let mut state = replay_all(root, inline, catch_up, served.as_ref()).await?;
     state.privacy = privacy;
     if let (Some(before), Some(key)) = (before, key)
         && fold::settled(&before, started)
@@ -833,11 +845,13 @@ async fn from_kept(
     })
 }
 
-/// Replay the files under `root` into a fresh engine.
+/// Replay the files under `root` into a fresh engine, keeping the positions in `served` (see
+/// [`build`]).
 async fn replay_all(
     root: &Path,
     inline: Vec<Arc<dyn Projector>>,
     catch_up: Vec<Arc<dyn Projector>>,
+    served: Option<&EventPositions>,
 ) -> Result<State, EventLogError> {
     let loaded = history::load(root)?;
     let engine = Arc::new(SqliteEventStore::in_memory("tree").await?);
@@ -852,6 +866,7 @@ async fn replay_all(
     let mut digests = BTreeMap::new();
     let mut identities = BTreeSet::new();
     let mut redactions = Vec::new();
+    let mut order = Vec::new();
     for (tenant_name, tenant_history) in &loaded.tenants {
         let tenant = TenantId::new(tenant_name.clone())?;
         if let Some(identity) = &tenant_history.identity {
@@ -862,29 +877,71 @@ async fn replay_all(
             engine.put_blob(&tenant, digest, bytes).await?;
         }
         for committed in &tenant_history.groups {
-            let versions = replay(&engine, &tenant, committed, None).await?;
-            for (record, version) in committed.events.iter().flatten().zip(versions) {
-                let key = (
-                    record.tenant.clone(),
-                    record.stream_type.clone(),
-                    record.stream_id.clone(),
-                );
-                let entry = heads.entry(key).or_default();
-                for parent in &record.parents {
-                    entry.remove(parent);
-                }
-                let digest = record.digest()?;
-                entry.insert(digest.clone());
-                if let Some(reason) = &record.redacted {
-                    redactions.push((record.stream()?, version, reason.clone()));
-                }
-                digests.insert(record.event_id.clone(), digest);
-                records.insert(record.event_id.clone(), record.clone());
+            order.push((tenant.clone(), committed));
+        }
+    }
+    // Tenant by tenant, each in causal order, unless the handle has served positions. Then every
+    // group it served goes first, in the order it held them, which was causal when they were
+    // appended, and each event keeps its position; the groups new to it follow in causal order,
+    // above the highest position it assigned. A stream's versions then still rise with positions.
+    let mut next = served.map_or(0, |served| served.high_water);
+    if let Some(served) = served {
+        let first = |committed: &Committed| {
+            committed
+                .events
+                .iter()
+                .flatten()
+                .filter_map(|record| served.by_event.get(&record.event_id).copied())
+                .min()
+        };
+        // Stable, so the new groups keep their causal order behind the served ones.
+        order.sort_by_key(|(_, committed)| first(committed).map_or((1, 0), |at| (0, at)));
+    }
+    for (tenant, committed) in order {
+        let positions = served.map(|served| {
+            committed
+                .events
+                .iter()
+                .flatten()
+                .map(|record| {
+                    served
+                        .by_event
+                        .get(&record.event_id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            next += 1;
+                            next
+                        })
+                })
+                .collect()
+        });
+        let versions = replay(&engine, &tenant, committed, None, positions).await?;
+        for (record, version) in committed.events.iter().flatten().zip(versions) {
+            let key = (
+                record.tenant.clone(),
+                record.stream_type.clone(),
+                record.stream_id.clone(),
+            );
+            let entry = heads.entry(key).or_default();
+            for parent in &record.parents {
+                entry.remove(parent);
             }
+            let digest = record.digest()?;
+            entry.insert(digest.clone());
+            if let Some(reason) = &record.redacted {
+                redactions.push((record.stream()?, version, reason.clone()));
+            }
+            digests.insert(record.event_id.clone(), digest);
+            records.insert(record.event_id.clone(), record.clone());
         }
     }
     for (stream, version, reason) in redactions {
         engine.redact(&stream, version, &reason).await?;
+    }
+    if served.is_some() {
+        // An append after the rebuild lands above every position the handle ever assigned, also
+        // one an event since erased held.
+        engine.reserve_positions_through(next).await?;
     }
     // A parent is always replayed before its child, so removing parents as their children arrive
     // leaves exactly the events no other event follows.
@@ -912,11 +969,14 @@ async fn replay_all(
 ///
 /// `origins` holds the tree's version of each event, by event id, when the engine is a copy's
 /// target rather than the tree's own; each event then records where it stood in the tree.
+/// `positions` holds the global position each event takes, in the group's order, when a rebuild
+/// keeps the positions a handle served.
 async fn replay(
     engine: &SqliteEventStore,
     tenant: &TenantId,
     committed: &Committed,
     origins: Option<&BTreeMap<String, u64>>,
+    positions: Option<Vec<u64>>,
 ) -> Result<Vec<u64>, EventLogError> {
     let restored = committed
         .events
@@ -940,7 +1000,10 @@ async fn replay(
             })
         })
         .collect::<Result<Vec<_>, EventLogError>>()?;
-    engine.restore_events(restored)?;
+    match positions {
+        None => engine.restore_events(restored)?,
+        Some(positions) => engine.restore_events_at(restored, positions)?,
+    }
     let mut appends = Vec::with_capacity(committed.events.len());
     for (member, records) in committed.record.members.iter().zip(&committed.events) {
         appends.push(StreamAppend {
@@ -1321,8 +1384,15 @@ impl EventStore for TreeEventStore {
                 Err(EventLogError::Invalid(_)) if !state.records.is_empty() => {
                     let mut inline = state.inline.clone();
                     inline.push(projector);
-                    *state =
-                        build(&self.root, inline, state.catch_up.clone(), Locked::NotHeld).await?;
+                    let served = state.engine.positions().await?;
+                    *state = build(
+                        &self.root,
+                        inline,
+                        state.catch_up.clone(),
+                        Locked::NotHeld,
+                        Some(served),
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1665,7 +1735,15 @@ impl InlineProjectionAdmin for TreeEventStore {
             // means: every row it would have written is written.
             let mut inline = state.inline.clone();
             inline.push(projector);
-            *state = build(&self.root, inline, state.catch_up.clone(), Locked::NotHeld).await?;
+            let served = state.engine.positions().await?;
+            *state = build(
+                &self.root,
+                inline,
+                state.catch_up.clone(),
+                Locked::NotHeld,
+                Some(served),
+            )
+            .await?;
             Ok(())
         })
     }
