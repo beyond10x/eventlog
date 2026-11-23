@@ -20,10 +20,14 @@ fn production_runner_preserves_cargo_package_runtime_environment() {
         Ok(env!("CARGO_MANIFEST_DIR")),
         "the direct runner inherited another package's CARGO_MANIFEST_DIR"
     );
-    assert_eq!(
-        std::env::var("CARGO_MANIFEST_PATH").as_deref(),
-        Ok(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")),
-        "the direct runner inherited another package's CARGO_MANIFEST_PATH"
+    // Cargo and the production proof's runner set CARGO_MANIFEST_PATH; nextest, which runs the
+    // gate's test step and marks every test process with `NEXTEST=1`, does not set it at all.
+    let manifest_path = std::env::var("CARGO_MANIFEST_PATH");
+    let under_nextest = std::env::var("NEXTEST").as_deref() == Ok("1");
+    assert!(
+        manifest_path.as_deref() == Ok(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            || (under_nextest && manifest_path == Err(std::env::VarError::NotPresent)),
+        "the direct runner inherited another package's CARGO_MANIFEST_PATH: {manifest_path:?}"
     );
     assert_eq!(
         std::env::var("CARGO_PKG_NAME").as_deref(),
