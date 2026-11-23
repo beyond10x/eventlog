@@ -1099,6 +1099,21 @@ impl Transaction {
     /// Whether committing this transaction can change which object files are live: it binds or
     /// unbinds a blob, wrote or staged an object, carries atomic content, or rewrites history for
     /// privacy. Only such a commit sweeps the object directory.
+    /// Whether an inline projector attached to this handle owns `projector` or one of its tables:
+    /// by name, or because one of its tables carries the same name. A catch-up path that wrote such
+    /// a table would leave rows of two configurations, the one it ran and the attached one every
+    /// later append runs.
+    fn driven_inline(&self, projector: &dyn Projector) -> bool {
+        self.inline.iter().any(|attached| {
+            attached.name() == projector.name()
+                || attached.projections().iter().any(|owned| {
+                    projector
+                        .projections()
+                        .iter()
+                        .any(|spec| spec.name == owned.name)
+                })
+        })
+    }
     fn changes_bindings(&self) -> bool {
         self.privacy
             || self.atomic_content
@@ -1137,7 +1152,7 @@ impl Transaction {
         tenant: &TenantId,
         batch: usize,
     ) -> Result<CatchUpProgress, EventLogError> {
-        if self.inline.iter().any(|p| p.name() == projector.name()) {
+        if self.driven_inline(projector) {
             return Err(EventLogError::Invalid("projection is driven inline".into()));
         }
         let cursor = self
@@ -2085,6 +2100,13 @@ impl EventStore for FileEventStore {
         let tenant = tenant.clone();
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
+                // Refused before a row is cleared, as SQLite and PostgreSQL refuse it: an inline
+                // table is rebuilt by `rebuild_inline_projection`, with the attached projector.
+                if tx.driven_inline(projector.as_ref()) {
+                    return Err(EventLogError::Invalid(
+                        "rebuild requires a catch-up projection".into(),
+                    ));
+                }
                 tx.register(projector.as_ref())?;
                 for spec in projector.projections() {
                     tx.record(Op::DirtyView {
@@ -4010,5 +4032,101 @@ mod steady_state_cost {
         for spec in &OWN_TABLES {
             assert_eq!(registered.get(spec.name), Some(&Vec::new()), "{}", spec.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod catch_up_ownership {
+    use super::*;
+    use eventlog_conformance::{TALLY, Tally, event, meta};
+    use eventlog_core::InlineProjectionAdmin;
+    use serde_json::json;
+
+    /// Another projector over the inline projector's table, writing what the attached one never
+    /// would.
+    struct Rival;
+
+    impl Projector for Rival {
+        fn name(&self) -> &'static str {
+            "rival"
+        }
+        fn projections(&self) -> &'static [ProjectionSpec] {
+            std::slice::from_ref(&TALLY)
+        }
+        fn apply<'a>(
+            &'a self,
+            event: &'a RecordedEvent,
+            store: &'a mut dyn ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                let key = format!("{}/{}", event.stream_type, event.stream_id);
+                store
+                    .upsert(
+                        &TALLY,
+                        &event.tenant,
+                        &key,
+                        &json!({ "kind": "rival", "count": 100 }),
+                    )
+                    .await
+            })
+        }
+    }
+
+    /// The catch-up rebuild refuses a table an attached inline projector owns, under its own name
+    /// or another's, before a row is cleared: it used to clear the inline rows and fold them with
+    /// the supplied projector, while later appends ran the attached one. The catch-up poll refuses
+    /// the table as well, and the inline rebuild still rebuilds it with the attached projector.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_rebuild_refuses_a_table_an_inline_projector_owns() {
+        let owner = TenantId::new("inline-owned").unwrap();
+        let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(directory.path()).await.unwrap();
+        store.register_inline(Arc::new(Tally)).await.unwrap();
+        store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[event("item.created", 1)],
+                &meta("one", &json!({})),
+            )
+            .await
+            .unwrap();
+        let inline_rows = || async {
+            store
+                .projection_list(&TALLY, &owner, None, 10)
+                .await
+                .unwrap()
+        };
+        let before = inline_rows().await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1["count"], 1);
+
+        for projector in [Arc::new(Rival) as Arc<dyn Projector>, Arc::new(Tally)] {
+            let name = projector.name();
+            let refused = store
+                .rebuild_projection(projector.clone(), &owner)
+                .await
+                .expect_err("an inline table is not rebuilt through catch-up");
+            assert!(
+                matches!(&refused, EventLogError::Invalid(reason) if reason == "rebuild requires a catch-up projection"),
+                "{name}: {refused:?}"
+            );
+            assert_eq!(inline_rows().await, before, "{name}: the inline rows moved");
+            let refused = store
+                .run_catch_up(projector, &owner, 10)
+                .await
+                .expect_err("an inline table is not polled through catch-up");
+            assert!(
+                matches!(&refused, EventLogError::Invalid(reason) if reason == "projection is driven inline"),
+                "{name}: {refused:?}"
+            );
+        }
+        let rebuilt = store
+            .rebuild_inline_projection("tally", &owner)
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.applied, 1);
+        assert_eq!(inline_rows().await, before);
     }
 }
