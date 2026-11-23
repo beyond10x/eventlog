@@ -414,24 +414,32 @@ fn is_redaction(old: &[u8], new: &[u8]) -> bool {
     let (Some(old), Some(new)) = (old.as_object(), new.as_object()) else {
         return false;
     };
-    if old.contains_key("redacted") || !new.contains_key("redacted") {
+    // The new file must be a well-formed redaction. The old one is either live, or itself a
+    // well-formed redaction whose reason a second redaction replaced; an old redaction that kept
+    // more than its tombstone is not a base this change can be judged against.
+    if tombstone_reason(new).is_none()
+        || (old.contains_key("redacted") && tombstone_reason(old).is_none())
+    {
         return false;
     }
-    let Some(reason) = new
-        .get("redacted")
-        .and_then(|redaction| redaction.get("reason"))
-        .and_then(serde_json::Value::as_str)
-    else {
-        return false;
-    };
-    let envelope_equal = old
-        .iter()
-        .filter(|(key, _)| key.as_str() != "data")
-        .all(|(key, value)| new.get(key) == Some(value));
-    let only_expected_keys = new
-        .keys()
-        .all(|key| old.contains_key(key) || key == "redacted");
-    envelope_equal
-        && only_expected_keys
-        && new.get("data") == Some(&eventlog_core::redaction_tombstone(reason))
+    // Every other field is immutable: the same keys, the same values.
+    let mutable = |key: &String| key == "data" || key == "redacted";
+    old.iter()
+        .filter(|(key, _)| !mutable(key))
+        .all(|(key, value)| new.get(key) == Some(value))
+        && new
+            .keys()
+            .filter(|key| !mutable(key))
+            .all(|key| old.contains_key(key))
+}
+
+/// The reason of an event file's redaction, when it holds one in its one form: a `redacted`
+/// object with only a `reason`, and a body that is exactly that reason's tombstone.
+fn tombstone_reason(event: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    let redaction = event.get("redacted")?.as_object()?;
+    if redaction.len() != 1 {
+        return None;
+    }
+    let reason = redaction.get("reason")?.as_str()?;
+    (event.get("data") == Some(&eventlog_core::redaction_tombstone(reason))).then_some(reason)
 }

@@ -138,6 +138,112 @@ async fn a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_n
     assert!(rules(&verify(rewritten.path(), Some(base.path()))).contains(&"V2"));
 }
 
+/// The shared conformance case redacts an already-redacted version again with another reason.
+/// The tree that results is a valid successor of the tree after the first redaction: only the
+/// reason and its tombstone changed.
+async fn a_second_redaction_with_another_reason_is_not_v2(layout: TreeLayout) {
+    let base = tempfile::tempdir().unwrap();
+    written(base.path(), layout).await;
+    TreeEventStore::open_in(base.path(), layout)
+        .await
+        .unwrap()
+        .redact(&stream("x"), 1, "erased")
+        .await
+        .unwrap();
+
+    let tree = tempfile::tempdir().unwrap();
+    copy(base.path(), tree.path());
+    TreeEventStore::open_in(tree.path(), layout)
+        .await
+        .unwrap()
+        .redact(&stream("x"), 1, "erased again, for another reason")
+        .await
+        .unwrap();
+    assert_eq!(
+        verify(tree.path(), Some(base.path())),
+        Vec::new(),
+        "a change of a redaction's reason was reported as a change"
+    );
+
+    // Anything beyond the reason and its tombstone is still a change.
+    let file = event_files(tree.path())
+        .into_iter()
+        .find(|(_, value)| value.get("redacted").is_some())
+        .expect("a redacted event file")
+        .0;
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    value["data"] = json!({ "redacted": true, "reason": "erased" });
+    fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(
+        rules(&verify(tree.path(), Some(base.path()))).contains(&"V2"),
+        "a tombstone that does not match its reason passed as a redaction"
+    );
+}
+
+/// Every event file under `root`, with its parsed content.
+fn event_files(root: &Path) -> Vec<(PathBuf, serde_json::Value)> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.join("tenants")];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.components().any(|part| part.as_os_str() == "streams") {
+                let value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                found.push((path, value));
+            }
+        }
+    }
+    found
+}
+
+/// A redacted record whose body was put back — an incomplete sanitization, or a restore from a
+/// copy taken before the redaction — keeps content the digest does not cover. Verification
+/// without a base, and an open, must refuse it.
+async fn a_redacted_record_that_keeps_its_body_is_refused(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    written(root, layout).await;
+    let live = event_files(root);
+    TreeEventStore::open_in(root, layout)
+        .await
+        .unwrap()
+        .redact(&stream("x"), 1, "erased")
+        .await
+        .unwrap();
+    assert_eq!(verify(root, None), Vec::new());
+
+    let (file, mut value) = event_files(root)
+        .into_iter()
+        .find(|(_, value)| value.get("redacted").is_some())
+        .expect("a redacted event file");
+    let original = live
+        .iter()
+        .find(|(path, _)| *path == file)
+        .map(|(_, value)| value["data"].clone())
+        .expect("the event's file before the redaction");
+    value["data"] = original;
+    fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let findings = verify(root, None);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule == "V4" && finding.detail.contains("not its tombstone")),
+        "a redacted record holding its body passed: {findings:?}"
+    );
+    let _ = fs::remove_dir_all(root.join(".cache"));
+    let refused = TreeEventStore::open(root)
+        .await
+        .err()
+        .expect("a store with a redacted record holding its body opened");
+    assert!(
+        refused.to_string().contains("not its tombstone"),
+        "{refused}"
+    );
+}
+
 /// The findings of rule `incomplete` whose detail contains `reason`.
 fn incomplete_because(findings: &[eventlog_tree::Finding], reason: &str) -> bool {
     findings
@@ -219,4 +325,6 @@ each_layout!(
     an_edited_event_is_v4,
     a_reformatted_file_is_v5,
     a_deleted_or_rewritten_file_against_the_base_is_v2_but_a_redaction_is_not,
+    a_second_redaction_with_another_reason_is_not_v2,
+    a_redacted_record_that_keeps_its_body_is_refused,
 );

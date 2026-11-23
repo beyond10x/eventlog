@@ -4,7 +4,9 @@ use crate::layout::{
     EVENT_FORMAT, GROUP_FORMAT, backend, canonical, corrupt, group_path, json_files, sha256_hex,
     subdirectories,
 };
-use eventlog_core::{CommandMeta, EventLogError, Expected, NewEvent, StreamId, TenantId};
+use eventlog_core::{
+    CommandMeta, EventLogError, Expected, NewEvent, StreamId, TenantId, redaction_tombstone,
+};
 use serde_json::{Map, Value, json};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -346,6 +348,13 @@ impl EventRecord {
             data: field(map, "data")?.clone(),
             redacted,
         };
+        // A redacted record keeps exactly the tombstone of its reason: any other body would be
+        // content the redaction was meant to remove, and the digest does not cover it.
+        if let Some(reason) = &record.redacted
+            && record.data != redaction_tombstone(reason)
+        {
+            return Err(corrupt("a redacted event whose body is not its tombstone"));
+        }
         let stated = text(field(map, "digest")?, "event digest")?.to_owned();
         Ok((record, stated))
     }
