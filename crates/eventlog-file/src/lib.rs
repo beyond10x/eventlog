@@ -2160,18 +2160,30 @@ impl EventStore for FileEventStore {
                     tenant: &tenant,
                 }
                 .validate(&spec, &tenant)?;
-                Ok(tx
+                // A seek to the first key past the cursor, so a page costs the rows it returns
+                // and not every row before it: paging 512 rows by 32 used to evaluate 4,864.
+                let (owner, name) = (tenant.as_str().to_owned(), spec.name.to_owned());
+                let from = match after {
+                    Some(after) => std::ops::Bound::Excluded((owner.clone(), name.clone(), after)),
+                    None => {
+                        std::ops::Bound::Included((owner.clone(), name.clone(), String::new()))
+                    }
+                };
+                let mut visited = 0_u64;
+                let page = tx
                     .state
                     .rows
-                    .iter()
-                    .filter(|((t, n, k), _)| {
-                        t == tenant.as_str()
-                            && n == spec.name
-                            && after.as_ref().is_none_or(|a| k > a)
-                    })
+                    .range((from, std::ops::Bound::Unbounded))
+                    .inspect(|_| visited += 1)
+                    .take_while(|((t, n, _), _)| t == &owner && n == &name)
                     .take(bounded_limit(limit))
                     .map(|((_, _, key), body)| (key.clone(), body.clone()))
-                    .collect())
+                    .collect();
+                #[cfg(test)]
+                cost::charge(&tx.root, |cost| cost.projection_rows_visited += visited);
+                #[cfg(not(test))]
+                let _ = visited;
+                Ok(page)
             })
         }))
     }
@@ -3822,6 +3834,71 @@ mod steady_state_cost {
         assert!(
             matches!(&diverged, EventLogError::Backend(reason) if reason.contains("diverged")),
             "{diverged:?}"
+        );
+    }
+
+    /// A projection page seeks to the first key past its cursor: it visits the rows it returns
+    /// and at most one more, wherever the page starts. Paging 512 rows by 32 used to evaluate
+    /// 4,864 rows. Pages still cover every row of this tenant's projection once, in key order,
+    /// including the empty key, and no row of another tenant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_projection_page_visits_the_rows_it_returns_not_the_rows_before_it() {
+        let owner = tenant("pages");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.create_projections(Arc::new(Tally)).await.unwrap();
+        let (rows, page) = (128_usize, 16_usize);
+        let mut keys: Vec<String> = (0..rows - 1).map(|i| format!("k{i:04}")).collect();
+        keys.insert(0, String::new());
+        let written = keys.clone();
+        let (mine, before, after) = (owner.clone(), tenant("pagea"), tenant("pagez"));
+        store
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    for (tenant, keys) in [(&before, &written), (&mine, &written), (&after, &written)]
+                    {
+                        for key in keys {
+                            tx.record(Op::Row {
+                                tenant: tenant.clone(),
+                                name: "tally".into(),
+                                key: key.clone(),
+                                body: Some(json!({ "kind": "item", "count": 1 })),
+                            })?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let start = crate::cost::of(root).projection_rows_visited;
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut calls = 0;
+        loop {
+            let before = crate::cost::of(root).projection_rows_visited;
+            let found = store
+                .projection_list(&eventlog_conformance::TALLY, &owner, cursor.as_deref(), page)
+                .await
+                .unwrap();
+            calls += 1;
+            let spent = crate::cost::of(root).projection_rows_visited - before;
+            assert!(
+                spent <= found.len() as u64 + 1,
+                "page {calls} visited {spent} rows to return {}",
+                found.len()
+            );
+            let Some((last, _)) = found.last() else { break };
+            cursor = Some(last.clone());
+            listed.extend(found.into_iter().map(|(key, _)| key));
+        }
+        assert_eq!(listed, keys);
+        assert_eq!(calls, rows / page + 1);
+        assert!(
+            crate::cost::of(root).projection_rows_visited - start <= (rows + calls) as u64,
+            "the pages together visited more rows than they returned and one per call"
         );
     }
 }

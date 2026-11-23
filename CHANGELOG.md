@@ -39,6 +39,9 @@ under bare-version tags such as `0.1.0`.
 - File: deciding which cached snapshots are live builds one set of generations instead of scanning
   every generation per snapshot, so opening a store with 64 live snapshots no longer makes 2,080
   comparisons.
+- File: `projection_list` seeks to the first key past its cursor instead of walking the rows from
+  the first key, so a page visits the rows it returns and at most one more (paging 512 rows by 32
+  used to evaluate 4,864).
 
 ## 0.9.4 — 2026-11-11
 

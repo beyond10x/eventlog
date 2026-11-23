@@ -74,8 +74,9 @@ pub(crate) struct Cost {
     /// binds. Charged by the comparisons themselves (`crate::BatchDigest`'s `Ord`), so a lookup
     /// that scans the batch charges every entry it passes.
     pub digest_comparisons: u64,
-    /// Projection rows an indexed `find` visited to answer: the entries its walk yielded, so a
-    /// lookup that scanned the projection would charge every row it passed.
+    /// Projection rows an indexed `find` or a `projection_list` page visited to answer: the
+    /// entries its walk yielded, so a lookup or a page that scanned the projection, or started at
+    /// its first key, would charge every row it passed.
     pub projection_rows_visited: u64,
     /// Snapshot generation records visited to decide which cached snapshots are still live. A
     /// cleanup that scanned the generations once per snapshot would charge every record it passed.
