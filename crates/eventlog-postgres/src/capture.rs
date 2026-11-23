@@ -234,17 +234,7 @@ async fn preflight(
     // server measures the bytes inside this same snapshot: no blob crosses the wire here, and an
     // oversized one is never allocated on this side to find out how long it is.
     let totals = transaction
-        .query_one(
-            &format!(
-                "SELECT (SELECT COUNT(*) FROM {prefix}_events WHERE tenant_id = $1),
-                        (SELECT COUNT(*) FROM {prefix}_blobs WHERE tenant_id = $1),
-                        (SELECT COALESCE(SUM(octet_length(bytes)),0)::bigint FROM {prefix}_blobs
-                         WHERE tenant_id = $1),
-                        (SELECT COUNT(*) FROM {prefix}_blobs WHERE tenant_id = $1
-                         AND byte_count IS DISTINCT FROM octet_length(bytes)::bigint)"
-            ),
-            &[&tenant.as_str()],
-        )
+        .query_one(&preflight_totals_sql(prefix), &[&tenant.as_str()])
         .await
         .map_err(operational)?;
     budget.proven(CaptureResource::Events, to_u64(totals.get(0))?)?;
@@ -274,6 +264,20 @@ async fn preflight(
             .ok_or_else(|| corrupt(CaptureMaterial::Projection))?;
     }
     budget.proven(CaptureResource::ProjectionRows, rows)
+}
+
+/// The four preflight totals: events, blobs, blob bytes, and blobs whose stored length lies.
+///
+/// The three blob totals come from one aggregate, so the tenant's bindings are scanned once; the
+/// event count stays its own subquery over the events table.
+fn preflight_totals_sql(prefix: &str) -> String {
+    format!(
+        "SELECT (SELECT COUNT(*) FROM {prefix}_events WHERE tenant_id = $1),
+                COUNT(*),
+                COALESCE(SUM(octet_length(bytes)),0)::bigint,
+                COUNT(*) FILTER (WHERE byte_count IS DISTINCT FROM octet_length(bytes)::bigint)
+         FROM {prefix}_blobs WHERE tenant_id = $1"
+    )
 }
 
 async fn read_events(
@@ -571,4 +575,70 @@ pub(crate) async fn admit_projection(
         return Err(mismatch());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preflight_totals_sql;
+    use serde_json::Value;
+
+    fn scans_of<'a>(plan: &'a Value, table: &str, found: &mut Vec<&'a Value>) {
+        if plan["Relation Name"].as_str() == Some(table) {
+            found.push(plan);
+        }
+        for child in plan["Plans"].as_array().into_iter().flatten() {
+            scans_of(child, table, found);
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_scans_blob_bindings_once_and_keeps_every_total() {
+        let Ok(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL") else {
+            eprintln!("skipped: preflight plan proof requires EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // Session-local tables of the same column shape: nothing to clean up, nothing shared.
+        sql.batch_execute(
+            "CREATE TEMP TABLE preflight_plan_events (tenant_id text NOT NULL);
+             CREATE TEMP TABLE preflight_plan_blobs
+                 (tenant_id text NOT NULL, bytes bytea NOT NULL, byte_count bigint NOT NULL);
+             INSERT INTO preflight_plan_events SELECT 'sample' FROM generate_series(1,3);
+             INSERT INTO preflight_plan_events VALUES ('other');
+             INSERT INTO preflight_plan_blobs VALUES
+                 ('sample','\\x0102',2), ('sample','\\x03',1), ('sample','\\x0405',7),
+                 ('other','\\x06',1);",
+        )
+        .await
+        .unwrap();
+        let statement = preflight_totals_sql("preflight_plan");
+        let totals = sql.query_one(&statement, &[&"sample"]).await.unwrap();
+        assert_eq!(
+            (
+                totals.get::<_, i64>(0),
+                totals.get::<_, i64>(1),
+                totals.get::<_, i64>(2),
+                totals.get::<_, i64>(3)
+            ),
+            (3, 3, 5, 1),
+            "events, blobs, measured bytes and lying lengths of this tenant only"
+        );
+        let plan: Value = sql
+            .query_one(&format!("EXPLAIN (FORMAT JSON) {statement}"), &[&"sample"])
+            .await
+            .unwrap()
+            .get(0);
+        let mut blob_scans = Vec::new();
+        scans_of(&plan[0]["Plan"], "preflight_plan_blobs", &mut blob_scans);
+        assert_eq!(
+            blob_scans.len(),
+            1,
+            "the blob totals must come from one scan of the bindings: {plan}"
+        );
+    }
 }
