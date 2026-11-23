@@ -303,6 +303,48 @@ async fn a_raw_copy_beside_its_equal_split_form_is_removed_by_the_next_migration
     assert!(!migrate(root, MigrationMode::DryRun).unwrap().pending());
 }
 
+/// A key `put_blob` refuses names no blob. Deleting by one — here one whose first two bytes end
+/// inside a character, which the shard of its file name was once sliced from — is refused with
+/// the same reason before the engine or a file changes, and the store stays usable.
+async fn a_blob_key_put_refuses_is_refused_by_a_deletion_before_anything_changes(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let key = "aé-blob";
+    assert!(!key.is_char_boundary(2), "the key must split a character");
+    let bytes = document("one", &body("one"));
+    write(root, layout, &[("sha256:one", bytes.clone())]).await;
+    let store = TreeEventStore::open(root).await.unwrap();
+    let refused_put = store
+        .put_blob(&tenant(), key, b"raw bytes")
+        .await
+        .expect_err("put_blob admitted a key it cannot store verbatim");
+
+    let refused = store
+        .delete_blob(&tenant(), key)
+        .await
+        .expect_err("a deletion by a key put_blob refuses went through");
+
+    assert_eq!(refused.to_string(), refused_put.to_string());
+    store
+        .append(
+            &StreamId::new(tenant(), "item", "y").unwrap(),
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("two", &json!({})),
+        )
+        .await
+        .expect("the store stayed usable after the refusal");
+    assert_eq!(
+        store.get_blob(&tenant(), "sha256:one").await.unwrap(),
+        Some(bytes.clone())
+    );
+    drop(store);
+    assert_eq!(served(root, "sha256:one").await, Some(bytes));
+    assert_eq!(verify(root, None), Vec::new());
+}
+
 async fn a_blob_whose_two_forms_disagree_is_refused(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -595,6 +637,7 @@ each_layout!(
     a_dry_run_writes_nothing_and_an_apply_serves_every_blob_byte_for_byte,
     a_raw_blob_merged_into_a_v2_store_reads_and_is_split_by_the_next_migration,
     a_raw_copy_beside_its_equal_split_form_is_removed_by_the_next_migration,
+    a_blob_key_put_refuses_is_refused_by_a_deletion_before_anything_changes,
     a_blob_whose_two_forms_disagree_is_refused,
     a_changed_text_is_refused_on_open_and_by_verify,
     a_v1_store_holding_split_files_and_an_unknown_format_are_refused_by_name,

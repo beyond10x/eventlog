@@ -1267,6 +1267,9 @@ impl EventStore for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
+            // A key `put_blob` refuses names no blob, and its file name would be derived from
+            // bytes no writer ever spelled: refuse it before anything is resolved or removed.
+            eventlog_core::validate_field("digest", digest)?;
             let _lock = self.writer_lock()?;
             // A split blob takes with it every text no other blob of the tenant names, so a
             // deleted blob's content is gone from the tree and not only its manifest. Every
