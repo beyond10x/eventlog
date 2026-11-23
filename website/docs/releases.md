@@ -8,18 +8,20 @@ changes.
 
 ## 0.10.0 — November 23, 2026
 
-This release fixes the findings of the 0.9.4 review and adds a KPI gate. It has breaking changes:
+This release fixes the findings of the 0.9.4 review, adds a KPI gate and has breaking changes:
 
-- A redaction reason must be an owner-defined code. Free text is refused with `Invalid`; the Tree
-  store maps reasons stored as free text to `legacy-reason` when it reopens or copies a history.
-- An indexed projection value over 2,048 bytes is refused with
-  `EventLogError::IndexedValueTooLarge` by every provider.
+- A redaction reason must be an owner-defined code, and free text is refused with `Invalid`. The
+  Tree store maps reasons stored as free text to `legacy-reason` when it reopens or copies a
+  history.
+- Every provider refuses an indexed projection value over 2,048 bytes with
+  `EventLogError::IndexedValueTooLarge`.
 - The File store reports `EventLogError::Committed { cleanup }` when a commit is published but its
   cleanup fails.
-- PostgreSQL adds the table `<prefix>_settlement_floor`. After a `pg_restore`, run `migrate`
+- PostgreSQL adds the table `<prefix>_settlement_floor`: after a `pg_restore`, run `migrate`
   before you open the history.
 - The PostgreSQL application role keeps only `SELECT` on the migration metadata.
-- New `canonical_request_hash` (`c1:` prefix); `request_hash` is unchanged for existing keys.
+- `canonical_request_hash` is new, with the `c1:` prefix, and `request_hash` is unchanged for
+  existing keys.
 - `PostgresConnectionAuthority::cancel` is new and reports `Unsupported` by default.
 - PostgreSQL serializes inline projectors per prefix, name and tenant.
 - Opening a hosted PostgreSQL history takes 152 round trips instead of 1,085.
@@ -28,7 +30,7 @@ Read the [0.10.0 release notes](https://github.com/beyond10x/eventlog/releases/t
 
 ## 0.9.4 — November 11, 2026
 
-- SQLite: the bundled SQLite moves to 3.54.1 through `rusqlite` 0.41.0. This fixes
+- SQLite: the bundled SQLite moves to 3.54.1 through `rusqlite` 0.41.0. The upgrade fixes
   RUSTSEC-2026-0459, where SQLite before 3.54.0 could return uninitialized memory when it opened
   a database with a `-wal` file of a different page size.
 - The SQLite provider's API and on-disk format are unchanged.
@@ -48,21 +50,20 @@ Read the [0.9.3 release notes](https://github.com/beyond10x/eventlog/releases/ta
 
 ## 0.9.2 — October 31, 2026
 
-- No library crate changed. The persistence proof now runs with ess 0.75.0 and the generated
-  capture types are regenerated with it.
+- No library crate changed. The persistence proof runs with ess 0.75.0, and the generated capture
+  types are regenerated with it.
 - The documentation site moves to docs-system 0.12.0.
 
 Read the [0.9.2 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.2).
 
 ## 0.9.1 — October 16, 2026
 
-- PostgreSQL: a connection whose lease is dropped after a deadline or a cancelled call now closes
-  on the dropping thread, on any runtime, and the pool sends the server a cancel for a backend
-  blocked in a query, so an abandoned transaction no longer holds its locks until the server's
-  own timeout.
+- PostgreSQL: a connection whose lease is dropped after a deadline or a cancelled call closes on
+  the dropping thread, on any runtime. The pool sends the server a cancel for a backend blocked in
+  a query, so an abandoned transaction no longer holds its locks until the server's own timeout.
 - PostgreSQL: a guarded append or append group whose deadline fires before COMMIT was written
-  returns `EventLogError::Deadline`, which is safe to retry; `UnknownCommit` now means COMMIT was
-  sent. No variant changed, but a caller that matches only `UnknownCommit` sees `Deadline` for
+  returns `EventLogError::Deadline`, which is safe to retry, and `UnknownCommit` now means COMMIT
+  was sent. No variant changed, but a caller that matches only `UnknownCommit` sees `Deadline` for
   these timeouts.
 
 Read the [0.9.1 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.1).
@@ -71,19 +72,22 @@ Read the [0.9.1 release notes](https://github.com/beyond10x/eventlog/releases/ta
 
 - Two opt-in on-disk layouts, chosen only when a store is created. The defaults are unchanged:
   `TreeEventStore::open` still creates `eventlog-tree/2` and `FileEventStore::open` still creates
-  `eventlog-file/1`, an existing store keeps its layout, nothing is migrated, and this release
-  reads every layout. Earlier releases refuse the new ones, so opt in only once every reader of
-  the store has 0.9.0.
+  `eventlog-file/1`. An existing store keeps its layout and is not migrated, and this release
+  reads every layout. Earlier releases refuse the new layouts, so opt in only after every reader
+  of the store has 0.9.0.
 - Tree store: `TreeLayout::Hashed` (`eventlog-tree/3`) changes the on-disk stream paths to
   `streams/<kk>/<h>`, so every event path fits a Windows Git checkout without long paths for a
   tenant of up to 36 escaped bytes. Tools that read stream directories by path must read them
-  through the API instead.
+  through the API.
 - File provider: `FileLayout::Segmented` (`eventlog-file/2`) seals the history into segments, so a
   resumed handle compares only the segments it cannot trust: about 7 times fewer bytes after its
   own write in the measured case.
-- Fixes: a capture after a write resumes from the writer's view; a resumed handle no longer drops
-  snapshots for another handle's frames; a dropped writer lock is released even with a forked
-  child; two handles creating one tree store both open; `rustls` 0.23.46.
+- Fixes:
+  - A capture after a write resumes from the writer's view.
+  - A resumed handle no longer drops snapshots for another handle's frames.
+  - A dropped writer lock is released even with a forked child.
+  - Two handles creating one tree store both open.
+  - `rustls` 0.23.46.
 - The SQLite capture checkpoint is encoded with types generated from the ESS specification.
 
 Read the [0.9.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.9.0).
@@ -91,8 +95,8 @@ Read the [0.9.0 release notes](https://github.com/beyond10x/eventlog/releases/ta
 ## 0.8.4 — October 13, 2026
 
 - Tree store: opening a store while another handle commits a group no longer reports a corrupt
-  store. The open reads only the groups it listed before reading events; a group committed after
-  the list is treated as torn, and a listed group whose event is missing is still refused.
+  store. The open reads only the groups it listed before reading events, treats a group committed
+  after the list as torn, and still refuses a listed group whose event is missing.
 
 Read the [0.8.4 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.8.4).
 
@@ -130,12 +134,12 @@ Read the [0.8.1 release notes](https://github.com/beyond10x/eventlog/releases/ta
 
 - SQLite offers durable capture continuity: a capture checkpoint a later process can continue
   from, after `SqliteEventStore::enable_durable_continuity`. A checkpoint continues as unchanged
-  or as an append delta only through an unbroken journal chain; anything else yields a complete
+  or as an append delta only through an unbroken journal chain, and otherwise yields a complete
   capture. Other providers keep complete capture.
 - Enabling continuity is one-way for older readers: 0.7.0 and earlier refuse such a store until
   `disable_durable_continuity` removes it.
 - SQLite capture deltas carry the stored text a complete capture reads, and trigger checks match
-  table names without regard to case.
+  table names case-insensitively.
 
 Read the [0.8.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.8.0).
 
@@ -150,11 +154,11 @@ Read the [0.7.0 release notes](https://github.com/beyond10x/eventlog/releases/ta
 
 ## 0.6.0 — September 27, 2026
 
-- Tree stores keep long text once. The new layout `eventlog-tree/2` may keep a JSON blob as a
-  manifest whose long string literals are stored once per tenant; readers serve exactly the
-  blob's bytes. New stores use `eventlog-tree/2`.
-- `eventlog_tree::migrate` moves an `eventlog-tree/1` store to `eventlog-tree/2`, verifying before
-  and after. It never runs on open, and earlier readers refuse migrated stores.
+- Tree store: the new layout `eventlog-tree/2` may keep a JSON blob as a manifest whose long
+  string literals are stored once per tenant, and readers serve exactly the blob's bytes. New
+  stores use `eventlog-tree/2`.
+- `eventlog_tree::migrate` moves an `eventlog-tree/1` store to `eventlog-tree/2` and verifies the
+  store before and after. It does not run on open, and earlier readers refuse migrated stores.
 
 Read the [0.6.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.6.0).
 
@@ -164,7 +168,7 @@ Read the [0.6.0 release notes](https://github.com/beyond10x/eventlog/releases/ta
   commit in one transaction. PostgreSQL still refuses the method.
 - File and SQLite accept a guarded blob-bearing retry of a group committed through
   `AtomicBlobEventStore::append_group_with_blobs`.
-- `eventlog_tree::copy` linearizes a tree store into a SQLite store, keeping event ids, instants,
+- `eventlog_tree::copy` linearizes a tree store into a SQLite store and keeps event ids, instants,
   receipts, identities, blobs and redactions.
 - A SQLite database file hashes each distinct blob content at most once per handle.
 - A rolled-back SQLite append returns the restored identities it took, and PostgreSQL
@@ -175,13 +179,13 @@ Read the [0.5.0 release notes](https://github.com/beyond10x/eventlog/releases/ta
 ## 0.4.0 — September 24, 2026
 
 - `eventlog-tree`, a file event store whose history merges under version control, joins the
-  workspace, with fork vocabulary (`Expected::Merge`, event digests and parents, capabilities)
-  that linear providers refuse as `Unsupported`.
-- `EventStore::read_many` answers a batch of reads; File answers it in one transaction.
+  workspace. Linear providers refuse its fork vocabulary as `Unsupported`: `Expected::Merge`,
+  event digests and parents, and capabilities.
+- `EventStore::read_many` answers a batch of reads, in one transaction on File.
 - File stops re-hashing an unchanged committed journal, and a refused read keeps the handle's
   verified view.
 - SQLite validates an existing blob's stored length, integrity hash and edition before a fresh
-  atomic group reuses it. This closes the 0.3.0 limitation.
+  atomic group reuses it, which closes the 0.3.0 limitation.
 - `Expected`, `Capabilities` and `EventLogError` are `#[non_exhaustive]`: an exhaustive downstream
   `match` needs one wildcard arm.
 
@@ -190,17 +194,17 @@ Read the [0.4.0 release notes](https://github.com/beyond10x/eventlog/releases/ta
 ## 0.3.0 — September 22, 2026
 
 - File joins SQLite and PostgreSQL as a durable provider.
-- Native atomic blob/event publication is available across all three providers. File additionally
+- Native atomic blob/event publication is available across all three providers, and File also
   supports grouped blob binding under one durability barrier.
 - Existing-only open, strict File/SQLite inspection, complete tenant capture and inline projection
   administration make provisioning and observation boundaries explicit.
 - File reuses verified history while checking the committed prefix for damage. Deferred capture
   verifies content when read.
-- SQL blob reads verify integrity; differing bytes under an existing binding refuse.
+- SQL blob reads verify integrity and refuse differing bytes under an existing binding.
 - Limitation: a fresh SQLite atomic group reusing an existing blob binding compares its bytes but
   does not validate all stored integrity metadata. 0.4.0 adds the check.
 
-Read the [authoritative 0.3.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.3.0)
-for exact changes and the File method-name collision. The
-[full changelog](https://github.com/beyond10x/eventlog/blob/0.3.0/CHANGELOG.md)
-retains earlier releases as history.
+Read the [0.3.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.3.0) for the
+File method-name collision. The
+[full changelog](https://github.com/beyond10x/eventlog/blob/0.3.0/CHANGELOG.md) records earlier
+releases.
