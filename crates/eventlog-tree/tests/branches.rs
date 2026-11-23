@@ -179,6 +179,88 @@ async fn a_group_and_its_blobs_reopen_whole(layout: TreeLayout) {
     );
 }
 
+/// Review L71: a cold replay rebuilt a group's receipt fingerprint from the bodies and blobs still
+/// present, so after a redaction or a blob deletion the exact retry of a committed group answered
+/// `IdempotencyMismatch`. The group file keeps the fingerprint (`eventlog-tree/group/2`), and the
+/// retry gets the group's receipt with its original result ranges.
+async fn a_group_retried_after_its_content_was_removed_gets_its_receipt_after_a_cold_reopen(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let tenant = TenantId::new("tenant-a").unwrap();
+    let group = |key: &str, ids: [&str; 2]| AppendGroup {
+        tenant: tenant.clone(),
+        appends: ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| StreamAppend {
+                stream: stream(id),
+                expected: Expected::NoStream,
+                events: vec![event("item.received", i64::try_from(index).unwrap() + 1)],
+            })
+            .collect(),
+        meta: meta(key, &json!({ "group": key })),
+    };
+    let with_blob = group("with-blob", ["left", "right"]);
+    let plain = group("plain", ["up", "down"]);
+    let blobs = vec![("blob-1".to_owned(), b"bytes".to_vec())];
+    let guard = || std::sync::Arc::new(eventlog_core::NoGuard);
+    let (first, second) = {
+        let store = TreeEventStore::open_in(root, layout).await.unwrap();
+        let first = store
+            .append_group_guarded_with_blobs(&with_blob, guard(), &blobs)
+            .await
+            .unwrap();
+        let second = store.append_group_guarded(&plain, guard()).await.unwrap();
+        store.redact(&stream("left"), 1, "erased").await.unwrap();
+        store.delete_blob(&tenant, "blob-1").await.unwrap();
+        store.redact(&stream("down"), 1, "erased").await.unwrap();
+        (first, second)
+    };
+    let _ = fs::remove_dir_all(root.join(".cache"));
+
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
+    assert!(store.replayed().await, "control: the reopen replayed");
+    let ranges = |result: &eventlog_core::AppendGroupResult| {
+        result
+            .appends
+            .iter()
+            .map(|append| {
+                (
+                    append.first_version,
+                    append.last_version,
+                    append.events[0].event_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let retried = store
+        .append_group_guarded_with_blobs(&with_blob, guard(), &blobs)
+        .await
+        .expect("the exact retry of a group whose content was removed was refused");
+    assert!(retried.deduplicated, "the retry wrote again");
+    assert_eq!(ranges(&retried), ranges(&first));
+    let retried = store
+        .append_group_guarded(&plain, guard())
+        .await
+        .expect("the exact retry of a group whose event was redacted was refused");
+    assert!(retried.deduplicated, "the retry wrote again");
+    assert_eq!(ranges(&retried), ranges(&second));
+
+    // The fingerprint still tells another request under the same key from the one recorded.
+    let mut changed = plain.clone();
+    changed.appends[0].events = vec![event("item.received", 9)];
+    let refused = store
+        .append_group_guarded(&changed, guard())
+        .await
+        .expect_err("another request under a recorded key was answered");
+    assert!(
+        matches!(&refused, EventLogError::IdempotencyMismatch { key } if key == "plain"),
+        "{refused:?}"
+    );
+}
+
 async fn an_event_without_its_group_file_is_never_served_and_repair_removes_it(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     {
@@ -1307,6 +1389,7 @@ async fn a_cold_replay_hands_an_inline_projector_a_redacted_event_as_redacted(la
 
 each_layout!(
     a_saved_feed_cursor_skips_nothing_after_another_handle_appends,
+    a_group_retried_after_its_content_was_removed_gets_its_receipt_after_a_cold_reopen,
     a_saved_feed_cursor_skips_nothing_when_another_replay_kept_its_state,
     a_saved_feed_cursor_skips_nothing_after_a_merge,
     a_saved_feed_cursor_skips_nothing_after_a_redaction,

@@ -299,6 +299,81 @@ impl SqliteEventStore {
         Ok(self.inner.restored.lock().map_err(poisoned)?.len())
     }
 
+    /// The request fingerprint the receipt of `tenant`'s atomic group under `idempotency_key`
+    /// records, `None` when no group committed under that key. A retry of the group is answered
+    /// from its receipt only when it carries this fingerprint.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the receipt cannot be read.
+    pub async fn group_fingerprint(
+        &self,
+        tenant: &TenantId,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let key = idempotency_key.to_owned();
+        run_blocking(move || {
+            let prefix = &inner.prefix;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT request_hash FROM {prefix}_append_groups
+                         WHERE tenant_id = ?1 AND idempotency_key = ?2"
+                    ),
+                    params![tenant.as_str(), key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)
+        })
+        .await
+    }
+
+    /// Record `fingerprint` as the request fingerprint of the receipt of `tenant`'s atomic group
+    /// under `idempotency_key`, which a replay of the group has just committed.
+    ///
+    /// For a provider that replays its history into this store: a replayed group's request is
+    /// rebuilt from what its history still holds, and after a redaction or a blob's deletion that
+    /// is no longer the request its writer made, so its fingerprint differs and an exact retry of
+    /// the original request would be refused. The provider kept the original fingerprint and puts
+    /// it back here. Never call this on a store other writers use.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::NotFound`] when no group committed under that key, and
+    /// [`EventLogError::Backend`] when the receipt cannot be written.
+    pub async fn restore_group_fingerprint(
+        &self,
+        tenant: &TenantId,
+        idempotency_key: &str,
+        fingerprint: &str,
+    ) -> Result<(), EventLogError> {
+        eventlog_core::validate_field("request fingerprint", fingerprint)?;
+        let inner = Arc::clone(&self.inner);
+        let tenant = tenant.clone();
+        let key = idempotency_key.to_owned();
+        let fingerprint = fingerprint.to_owned();
+        run_blocking(move || {
+            let prefix = &inner.prefix;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let changed = connection
+                .execute(
+                    &format!(
+                        "UPDATE {prefix}_append_groups SET request_hash = ?3
+                         WHERE tenant_id = ?1 AND idempotency_key = ?2"
+                    ),
+                    params![tenant.as_str(), key, fingerprint],
+                )
+                .map_err(backend)?;
+            if changed == 0 {
+                return Err(EventLogError::NotFound);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Every origin a copy recorded for `tenant`'s events.
     ///
     /// # Errors

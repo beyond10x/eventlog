@@ -4,7 +4,10 @@
 //! opened, such as on the checked-out tree of a pull request and its merge base.
 
 use crate::history;
-use crate::layout::{StoreFormat, canonical, json_files, read_file, subdirectories};
+use crate::layout::{
+    GROUP_FORMAT, GROUP_FORMAT_V2, GROUPS_KEY, StoreFormat, canonical, json_files, read_file,
+    subdirectories,
+};
 use crate::split;
 use std::collections::BTreeSet;
 use std::fs;
@@ -349,7 +352,7 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
         if path == Path::new("store.json") && is_format_upgrade(&old, &new) {
             continue;
         }
-        if !is_redaction(&old, &new) {
+        if !is_redaction(&old, &new) && !is_fingerprint_backfill(&old, &new) {
             findings.push(Finding {
                 rule: "V2",
                 path,
@@ -357,6 +360,27 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
             });
         }
     }
+}
+
+/// Whether `new` is the group file `old` given the request fingerprint by the migration: an
+/// `eventlog-tree/group/1` file that became `eventlog-tree/group/2` and changed in nothing else.
+fn is_fingerprint_backfill(old: &[u8], new: &[u8]) -> bool {
+    let (Ok(serde_json::Value::Object(mut old)), Ok(serde_json::Value::Object(mut new))) = (
+        serde_json::from_slice::<serde_json::Value>(old),
+        serde_json::from_slice::<serde_json::Value>(new),
+    ) else {
+        return false;
+    };
+    let tag = |map: &mut serde_json::Map<String, serde_json::Value>| {
+        map.remove("format")
+            .and_then(|format| format.as_str().map(str::to_owned))
+    };
+    tag(&mut old).as_deref() == Some(GROUP_FORMAT)
+        && tag(&mut new).as_deref() == Some(GROUP_FORMAT_V2)
+        && new
+            .remove("fingerprint")
+            .is_some_and(|value| value.is_string())
+        && old == new
 }
 
 /// For a base file that holds a blob — a raw file or a split blob — its tenant and digest. `None`
@@ -419,7 +443,8 @@ fn store_identity(root: &Path) -> Result<String, String> {
         .ok_or_else(|| "store.json declares no identity".to_owned())
 }
 
-/// `store.json` changed only from `eventlog-tree/1` to `eventlog-tree/2`, keeping its identity.
+/// `store.json` changed only as a migration changes it, keeping its identity: from
+/// `eventlog-tree/1` to `eventlog-tree/2`, declaring `eventlog-tree/group/2`, or both.
 fn is_format_upgrade(old: &[u8], new: &[u8]) -> bool {
     let (Ok(serde_json::Value::Object(mut old)), Ok(serde_json::Value::Object(mut new))) = (
         serde_json::from_slice::<serde_json::Value>(old),
@@ -427,16 +452,19 @@ fn is_format_upgrade(old: &[u8], new: &[u8]) -> bool {
     ) else {
         return false;
     };
-    old.remove("format")
-        .as_ref()
-        .and_then(serde_json::Value::as_str)
-        == Some(StoreFormat::V1.tag())
-        && new
-            .remove("format")
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            == Some(StoreFormat::V2.tag())
-        && old == new
+    let mut take = |key: &str| {
+        let text =
+            |value: Option<serde_json::Value>| value.and_then(|v| v.as_str().map(str::to_owned));
+        (text(old.remove(key)), text(new.remove(key)))
+    };
+    let (old_format, new_format) = take("format");
+    let (old_groups, new_groups) = take(GROUPS_KEY);
+    let format_kept_or_upgraded = old_format == new_format
+        || (old_format.as_deref() == Some(StoreFormat::V1.tag())
+            && new_format.as_deref() == Some(StoreFormat::V2.tag()));
+    let groups_kept_or_fenced = old_groups == new_groups
+        || (old_groups.is_none() && new_groups.as_deref() == Some(GROUP_FORMAT_V2));
+    format_kept_or_upgraded && groups_kept_or_fenced && old == new
 }
 
 fn is_redaction(old: &[u8], new: &[u8]) -> bool {

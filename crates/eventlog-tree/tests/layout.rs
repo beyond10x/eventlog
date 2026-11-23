@@ -404,3 +404,242 @@ async fn a_tenant_of_the_longest_accepted_length_is_stored_and_reopens() {
         assert_eq!(erased.stream_version(&on(&long, "x")).await.unwrap(), None);
     }
 }
+
+/// What `tests/fixtures/tree-0.10.0` (nested) and `tree-0.10.0-hashed` hold, as Eventlog 0.10.0
+/// wrote them: tenant `tenant-a` with its identity; stream `item/x`, an append of two events whose
+/// second is redacted; the group `g-intact` (`item/y`, `item/z`) with raw blob `blob-1` and the
+/// JSON blob `doc-1`, held split; the group `g-erased` (`item/w`, two events) with blob `blob-2`,
+/// its first event redacted and its blob deleted since; and the blob-free group `g-plain`
+/// (`item/v`).
+fn fixture_0_10_0(layout: TreeLayout) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(match layout {
+        TreeLayout::Nested => "tests/fixtures/tree-0.10.0",
+        _ => "tests/fixtures/tree-0.10.0-hashed",
+    })
+}
+
+fn copy_of(fixture: &Path) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    for (relative, bytes) in files(fixture) {
+        let target = directory.path().join(relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, bytes).unwrap();
+    }
+    directory
+}
+
+/// The JSON blob `doc-1` of the 0.10.0 fixtures.
+fn document_0_10_0() -> Vec<u8> {
+    let body = format!(
+        "# doc\n\n{}",
+        "A sentence of the story's outcome.\n".repeat(100)
+    );
+    serde_json::to_vec(&json!(["a.record/1", {"body": body, "id": "doc-1"}])).unwrap()
+}
+
+/// The blobs a fixture group carried, by digest.
+type Blobs = Vec<(String, Vec<u8>)>;
+
+/// The request the fixture committed under `key`, with the blobs it carried.
+fn fixture_group(key: &str) -> (AppendGroup, Blobs) {
+    let (members, blobs): (Vec<(&str, Vec<i64>)>, Blobs) = match key {
+        "g-intact" => (
+            vec![("y", vec![3]), ("z", vec![4])],
+            vec![
+                ("blob-1".to_owned(), b"raw blob bytes".to_vec()),
+                ("doc-1".to_owned(), document_0_10_0()),
+            ],
+        ),
+        "g-erased" => (
+            vec![("w", vec![5, 6])],
+            vec![("blob-2".to_owned(), b"second blob".to_vec())],
+        ),
+        _ => (vec![("v", vec![7])], Vec::new()),
+    };
+    let group = AppendGroup {
+        tenant: tenant(),
+        appends: members
+            .into_iter()
+            .map(|(id, values)| StreamAppend {
+                stream: stream(id),
+                expected: Expected::NoStream,
+                events: values
+                    .into_iter()
+                    .map(|value| event("item.received", value))
+                    .collect(),
+            })
+            .collect(),
+        meta: meta(key, &json!({ "group": key })),
+    };
+    (group, blobs)
+}
+
+async fn retry_fixture_group(
+    store: &TreeEventStore,
+    key: &str,
+) -> Result<eventlog_core::AppendGroupResult, EventLogError> {
+    let (group, blobs) = fixture_group(key);
+    if blobs.is_empty() {
+        store.append_group_guarded(&group, Arc::new(NoGuard)).await
+    } else {
+        store
+            .append_group_guarded_with_blobs(&group, Arc::new(NoGuard), &blobs)
+            .await
+    }
+}
+
+async fn assert_serves_the_0_10_0_fixture(store: &TreeEventStore) {
+    let x = store.read_stream(&stream("x"), 0, 10).await.unwrap().events;
+    assert_eq!(
+        x.iter()
+            .map(|event| (event.version, event.is_redacted()))
+            .collect::<Vec<_>>(),
+        vec![(1, false), (2, true)],
+        "the redaction 0.10.0 wrote was lost"
+    );
+    assert_eq!(x[1].parents, vec![x[0].digest.clone().unwrap()]);
+    for (id, version) in [("y", 1), ("z", 1), ("w", 2), ("v", 1)] {
+        assert_eq!(
+            store.stream_version(&stream(id)).await.unwrap(),
+            Some(version),
+            "item/{id}"
+        );
+    }
+    let w = store.read_stream(&stream("w"), 0, 10).await.unwrap().events;
+    assert!(w[0].is_redacted() && !w[1].is_redacted());
+    assert_eq!(
+        store.get_blob(&tenant(), "blob-1").await.unwrap(),
+        Some(b"raw blob bytes".to_vec())
+    );
+    assert_eq!(
+        store.get_blob(&tenant(), "doc-1").await.unwrap(),
+        Some(document_0_10_0())
+    );
+    assert_eq!(store.get_blob(&tenant(), "blob-2").await.unwrap(), None);
+}
+
+/// The format tag of every group file under `root`, by the group's idempotency key.
+fn group_formats(root: &Path) -> std::collections::BTreeMap<String, String> {
+    files(root)
+        .into_iter()
+        .filter(|(path, _)| path.components().any(|part| part.as_os_str() == "groups"))
+        .map(|(_, bytes)| {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (
+                value["idempotency_key"].as_str().unwrap().to_owned(),
+                value["format"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Every history a 0.10.0 Tree wrote reads unchanged in both layouts, and a write to it keeps
+/// writing `eventlog-tree/group/1` until the store is migrated: the group format is fenced, so a
+/// 0.10.0 binary keeps reading a store no migration moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_written_by_0_10_0_reads_unchanged_and_keeps_writing_group_1() {
+    for layout in [TreeLayout::Nested, TreeLayout::Hashed] {
+        let fixture = fixture_0_10_0(layout);
+        let directory = copy_of(&fixture);
+        let root = directory.path();
+        let before = files(root);
+
+        let store = TreeEventStore::open(root).await.unwrap();
+        assert_eq!(store.layout().unwrap(), layout);
+        assert_serves_the_0_10_0_fixture(&store).await;
+        drop(store);
+        assert_eq!(files(root), before, "opening rewrote a file");
+        assert_eq!(verify(root, None), Vec::new());
+
+        let store = TreeEventStore::open(root).await.unwrap();
+        let retried = retry_fixture_group(&store, "g-intact").await.unwrap();
+        assert!(retried.deduplicated);
+        let (mut group, _) = fixture_group("g-plain");
+        group.meta = meta("g-new", &json!({ "group": "g-new" }));
+        group.appends[0].stream = stream("u");
+        store
+            .append_group_guarded(&group, Arc::new(NoGuard))
+            .await
+            .unwrap();
+        drop(store);
+        let formats = group_formats(root);
+        assert_eq!(formats.len(), 5, "{formats:?}");
+        assert!(
+            formats
+                .values()
+                .all(|format| format == "eventlog-tree/group/1"),
+            "a store no migration fenced was written a group format 0.10.0 cannot read: \
+             {formats:?}"
+        );
+        assert_eq!(verify(root, Some(&fixture)), Vec::new());
+    }
+}
+
+/// `migrate` fences a 0.10.0 store into `eventlog-tree/group/2` and backfills the fingerprint of
+/// every group whose content is still intact. A group whose content was removed before the
+/// migration keeps `eventlog-tree/group/1`, and its exact retry after a cold reopen still answers
+/// `IdempotencyMismatch` (the limit the CHANGELOG names); every intact group's retry after a later
+/// removal gets its receipt.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrating_a_0_10_0_store_keeps_the_fingerprint_of_every_intact_group() {
+    for layout in [TreeLayout::Nested, TreeLayout::Hashed] {
+        let fixture = fixture_0_10_0(layout);
+        let directory = copy_of(&fixture);
+        let root = directory.path();
+
+        let planned = migrate(root, MigrationMode::DryRun).unwrap();
+        assert!(planned.pending(), "{planned:?}");
+        migrate(root, MigrationMode::Apply).unwrap();
+        let formats = group_formats(root);
+        assert_eq!(
+            formats.get("g-intact").map(String::as_str),
+            Some("eventlog-tree/group/2")
+        );
+        assert_eq!(
+            formats.get("g-plain").map(String::as_str),
+            Some("eventlog-tree/group/2")
+        );
+        assert_eq!(
+            formats.get("g-erased").map(String::as_str),
+            Some("eventlog-tree/group/1"),
+            "a group whose content was removed got a fingerprint rebuilt from what is left"
+        );
+        assert_eq!(
+            formats.get("one").map(String::as_str),
+            Some("eventlog-tree/group/1"),
+            "a stream append's receipt is its caller's request hash, kept already"
+        );
+        assert!(!migrate(root, MigrationMode::DryRun).unwrap().pending());
+        assert_eq!(verify(root, Some(&fixture)), Vec::new());
+
+        let store = TreeEventStore::open(root).await.unwrap();
+        assert_serves_the_0_10_0_fixture(&store).await;
+        let first = retry_fixture_group(&store, "g-intact").await.unwrap();
+        store.redact(&stream("y"), 1, "erased").await.unwrap();
+        store.delete_blob(&tenant(), "blob-1").await.unwrap();
+        drop(store);
+        let _ = fs::remove_dir_all(root.join(".cache"));
+
+        let store = TreeEventStore::open(root).await.unwrap();
+        assert!(store.replayed().await, "control: the reopen replayed");
+        let retried = retry_fixture_group(&store, "g-intact")
+            .await
+            .expect("the retry of a migrated group whose content was removed was refused");
+        assert!(retried.deduplicated);
+        let ranges = |result: &eventlog_core::AppendGroupResult| {
+            result
+                .appends
+                .iter()
+                .map(|append| (append.first_version, append.last_version))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(&retried), ranges(&first));
+        let limit = retry_fixture_group(&store, "g-erased")
+            .await
+            .expect_err("control: a group erased before the migration has no fingerprint left");
+        assert!(
+            matches!(&limit, EventLogError::IdempotencyMismatch { key } if key == "g-erased"),
+            "{limit:?}"
+        );
+    }
+}

@@ -12,6 +12,28 @@ under bare-version tags such as `0.1.0`.
 - Tree: eventlog 0.10.0 and earlier refuse a store holding a tenant directory named
   `%%<digest>`, which this release writes for a tenant whose escaped name is longer than 255
   bytes. Upgrade every binary that reads such a store before one writes it.
+- Tree: `MigrationReport` has the new public fields `group_fingerprints_before`,
+  `groups_fingerprinted` and `groups_without_fingerprint`.
+- Tree: eventlog 0.10.0 and earlier refuse a group file in the format `eventlog-tree/group/2`,
+  which this release writes in every new store and in a store `migrate` fenced. Upgrade every
+  binary that reads a store before one writes it.
+
+### Added
+
+- Tree: the group file format `eventlog-tree/group/2` keeps the fingerprint of the request an
+  atomic group answered. A retry of the group after one of its events was redacted or one of its
+  blobs deleted gets its original receipt after a cold reopen, where it got
+  `IdempotencyMismatch` before. A new store declares the format in `store.json`
+  (`"groups": "eventlog-tree/group/2"`); a store 0.10.0 or earlier wrote keeps writing
+  `eventlog-tree/group/1` and reads unchanged.
+- Tree: `migrate(root, MigrationMode::Apply)` fences a store into `eventlog-tree/group/2` and
+  writes the fingerprint into every group whose events and blobs are all still intact.
+  Operators: run it once on each existing tree store, only after every binary that reads the
+  store runs this release. The limit: a group that was redacted, or whose blob was deleted,
+  before the migration cannot get its fingerprint back, and a retry of it after a reopen still
+  answers `IdempotencyMismatch` (`MigrationReport::groups_without_fingerprint` counts them).
+- SQLite: `SqliteEventStore::group_fingerprint` and `restore_group_fingerprint` read and restore
+  the fingerprint of an atomic group's receipt.
 
 ### Fixed
 

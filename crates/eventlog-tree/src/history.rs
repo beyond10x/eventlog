@@ -1,11 +1,12 @@
 //! The two immutable records, reading them back, and the order history is replayed in.
 
 use crate::layout::{
-    EVENT_FORMAT, GROUP_FORMAT, backend, canonical, corrupt, group_path, json_files, sha256_hex,
-    subdirectories,
+    EVENT_FORMAT, GROUP_FORMAT, GROUP_FORMAT_V2, backend, canonical, corrupt, group_path,
+    json_files, sha256_hex, subdirectories,
 };
 use eventlog_core::{
-    CommandMeta, EventLogError, Expected, NewEvent, StreamId, TenantId, redaction_tombstone,
+    AppendGroup, CommandMeta, EventLogError, Expected, NewEvent, StreamAppend, StreamId, TenantId,
+    redaction_tombstone,
 };
 use serde_json::{Map, Value, json};
 use std::cmp::Reverse;
@@ -113,6 +114,12 @@ pub(crate) struct GroupRecord {
     /// Blob digests the group committed with its events, sorted.
     pub blobs: Vec<String>,
     pub recorded_at: OffsetDateTime,
+    /// The request fingerprint the group's receipt recorded when it committed, which an exact
+    /// retry must carry. Kept by an atomic group's file in `eventlog-tree/group/2` only: a replay
+    /// rebuilds the request from the bodies and blobs still present, which after a redaction or a
+    /// blob's deletion is no longer the request the writer made. An append's receipt is its
+    /// caller's `request_hash`, which every group file keeps.
+    pub fingerprint: Option<String>,
 }
 
 impl GroupRecord {
@@ -146,9 +153,11 @@ pub(crate) fn receipt_digest(
 }
 
 impl GroupRecord {
+    /// The group file's content: `eventlog-tree/group/2` when it keeps a fingerprint, otherwise
+    /// `eventlog-tree/group/1`, byte for byte as every earlier release wrote it.
     pub fn to_value(&self) -> Result<Value, EventLogError> {
         let meta = &self.meta;
-        Ok(json!({
+        let mut value = json!({
             "format": GROUP_FORMAT,
             "tenant": self.tenant,
             "kind": self.kind.as_str(),
@@ -169,7 +178,12 @@ impl GroupRecord {
             }))).collect::<Result<Vec<_>, EventLogError>>()?,
             "blobs": self.blobs,
             "recorded_at": format_time(self.recorded_at)?,
-        }))
+        });
+        if let (Some(fingerprint), Some(map)) = (&self.fingerprint, value.as_object_mut()) {
+            map.insert("format".into(), json!(GROUP_FORMAT_V2));
+            map.insert("fingerprint".into(), json!(fingerprint));
+        }
+        Ok(value)
     }
 
     pub fn from_value(value: &Value) -> Result<Self, EventLogError> {
@@ -192,16 +206,25 @@ impl GroupRecord {
                 "members",
                 "blobs",
                 "recorded_at",
+                "fingerprint",
             ],
             "a group file",
         )?;
-        if text(field(map, "format")?, "group format")? != GROUP_FORMAT {
-            return Err(corrupt("group format"));
-        }
         let kind = match text(field(map, "kind")?, "group kind")? {
             "append" => Kind::Append,
             "group" => Kind::Group,
             _ => return Err(corrupt("group kind")),
+        };
+        // Group/1 keeps no fingerprint; group/2 keeps one, and only an atomic group's.
+        let fingerprint = match (
+            text(field(map, "format")?, "group format")?,
+            map.get("fingerprint"),
+        ) {
+            (GROUP_FORMAT, None) => None,
+            (GROUP_FORMAT_V2, Some(fingerprint)) if kind == Kind::Group => {
+                Some(text(fingerprint, "group fingerprint")?.to_owned())
+            }
+            _ => return Err(corrupt("group format")),
         };
         let causation_id = match field(map, "causation_id")? {
             Value::Null => None,
@@ -250,7 +273,67 @@ impl GroupRecord {
             members,
             blobs: strings(field(map, "blobs")?, "group blobs")?,
             recorded_at: parse_time(field(map, "recorded_at")?, "group recorded at")?,
+            fingerprint,
         })
+    }
+
+    /// The request this group's writer committed, as far as the files still hold it: with a
+    /// redacted event's tombstone for its body, and without a blob deleted since.
+    ///
+    /// # Errors
+    /// Refuses a member whose stream or event the core does not accept.
+    pub fn request(&self, events: &[Vec<EventRecord>]) -> Result<AppendGroup, EventLogError> {
+        let tenant = TenantId::new(self.tenant.clone())?;
+        let mut appends = Vec::with_capacity(self.members.len());
+        for (member, records) in self.members.iter().zip(events) {
+            appends.push(StreamAppend {
+                stream: StreamId::new(
+                    tenant.clone(),
+                    member.stream_type.clone(),
+                    member.stream_id.clone(),
+                )?,
+                expected: member.expected,
+                events: records
+                    .iter()
+                    .map(EventRecord::new_event)
+                    .collect::<Result<Vec<NewEvent>, _>>()?,
+            });
+        }
+        Ok(AppendGroup {
+            tenant,
+            appends,
+            meta: self.meta.clone(),
+        })
+    }
+}
+
+impl Committed {
+    /// The fingerprint the engine records for this group when it is replayed: what its writer's
+    /// receipt recorded, as long as no event of it was redacted and none of its blobs deleted.
+    /// `None` once content was removed: what the files still hold is another request.
+    ///
+    /// # Errors
+    /// As [`GroupRecord::request`], and refuses what the core's fingerprint refuses.
+    pub fn intact_fingerprint(&self) -> Result<Option<String>, EventLogError> {
+        let redacted = self
+            .events
+            .iter()
+            .flatten()
+            .any(|record| record.redacted.is_some());
+        if redacted || self.blobs.len() != self.record.blobs.len() {
+            return Ok(None);
+        }
+        let request = self.record.request(&self.events)?;
+        if self.blobs.is_empty() {
+            return request.fingerprint().map(Some);
+        }
+        let blobs = self
+            .blobs
+            .iter()
+            .map(|(digest, bytes)| (digest.as_str(), &bytes[..]));
+        Ok(Some(
+            eventlog_core::BlobAppendGroup::fingerprint_parts(&request, blobs)?.0,
+        ))
     }
 }
 

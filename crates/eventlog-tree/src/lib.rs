@@ -82,8 +82,8 @@ use eventlog_core::{
 use eventlog_sqlite::{EventOrigin, EventPositions, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
-    FORMAT, FORMAT_V3, backend, canonical, corrupt, event_path, group_path, identity_path,
-    sha256_hex, tenant_dir, write_atomic, write_once,
+    FORMAT, FORMAT_V3, GROUP_FORMAT_V2, GROUPS_KEY, backend, canonical, corrupt, event_path,
+    group_path, identity_path, sha256_hex, tenant_dir, write_atomic, write_once,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -385,6 +385,7 @@ impl TreeEventStore {
         }
         let _lock = self.writer_lock().await?;
         refresh(&self.root, &mut state).await?;
+        let (format, fingerprinted) = layout::store_manifest(&self.root)?;
 
         // A command already recorded is answered from its receipt, whatever the heads are now: a
         // merge that committed has left one head where it found several, and a retry of it must
@@ -518,6 +519,7 @@ impl TreeEventStore {
                 digests
             },
             recorded_at,
+            fingerprint: None,
         };
         let key = group.key_digest();
         let mut written = Vec::new();
@@ -558,9 +560,27 @@ impl TreeEventStore {
             running.insert(key_of(stream), parents);
         }
 
+        // A store that declares `eventlog-tree/group/2` keeps the fingerprint the engine's receipt
+        // recorded in an atomic group's file, so a replay after a removal restores the receipt.
+        if fingerprinted && kind == Kind::Group {
+            match state
+                .engine
+                .group_fingerprint(tenant, &meta.idempotency_key)
+                .await
+            {
+                Ok(Some(fingerprint)) => group.fingerprint = Some(fingerprint),
+                Ok(None) => {
+                    state.poisoned = true;
+                    return Err(corrupt("a committed group the engine holds no receipt for"));
+                }
+                Err(error) => {
+                    state.poisoned = true;
+                    return Err(error);
+                }
+            }
+        }
         let persisted = (|| {
             layout::name_tenant_dir(&self.root, tenant.as_str())?;
-            let format = layout::store_format(&self.root)?;
             let splits = format.splits();
             for (digest, bytes) in blobs {
                 split::write_blob(&self.root, tenant.as_str(), digest, bytes, splits)?;
@@ -654,12 +674,19 @@ fn prepare(root: &Path, layout: TreeLayout) -> Result<(), EventLogError> {
             layout::store_format(root)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let empty = !root.join("tenants").exists();
             let format = match layout {
-                TreeLayout::Hashed if !root.join("tenants").exists() => FORMAT_V3,
+                TreeLayout::Hashed if empty => FORMAT_V3,
                 _ => FORMAT,
             };
             let identity = eventlog_core::new_event_id();
-            let value = json!({ "format": format, "identity": identity });
+            let mut value = json!({ "format": format, "identity": identity });
+            // A store with no history yet has had no writer of an earlier release, so it keeps
+            // its groups' fingerprints from the start; one that holds history is fenced into that
+            // by `migrate` only.
+            if empty && let Some(map) = value.as_object_mut() {
+                map.insert(GROUPS_KEY.into(), json!(GROUP_FORMAT_V2));
+            }
             // No lock is held yet, so two handles may create one store at once. The first
             // `store.json` published is the store's; a later one never replaces it, since the
             // first handle may already have appended under its layout. The others honour it.
@@ -1121,6 +1148,13 @@ async fn replay(
                     .append_group_with_blobs(&blob_group(group, &committed.blobs))
                     .await?
             };
+            // The request rebuilt above lacks whatever was redacted or deleted since it
+            // committed; the receipt answers the request its writer made.
+            if let Some(fingerprint) = &committed.record.fingerprint {
+                engine
+                    .restore_group_fingerprint(tenant, &meta.idempotency_key, fingerprint)
+                    .await?;
+            }
             result.appends
         }
     };

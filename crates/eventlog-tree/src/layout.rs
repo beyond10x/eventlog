@@ -90,22 +90,49 @@ impl StoreFormat {
 /// Refuses a `store.json` that is not a tree store's, including one of a format this reader does
 /// not know, by name.
 pub(crate) fn store_format(root: &Path) -> Result<StoreFormat, EventLogError> {
+    Ok(store_manifest(root)?.0)
+}
+
+/// The format `store.json` under `root` declares, and whether it declares group files that keep
+/// their request fingerprint ([`GROUP_FORMAT_V2`]).
+///
+/// # Errors
+/// As [`store_format`], and refuses a `store.json` declaring a group format this reader does not
+/// know.
+pub(crate) fn store_manifest(root: &Path) -> Result<(StoreFormat, bool), EventLogError> {
     let bytes = fs::read(root.join("store.json")).map_err(backend)?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| corrupt("store.json"))?;
     if value.get("identity").and_then(Value::as_str).is_none() {
         return Err(corrupt("store.json is not an eventlog-tree store"));
     }
-    match value.get("format").and_then(Value::as_str) {
-        Some(FORMAT_V1) => Ok(StoreFormat::V1),
-        Some(FORMAT) => Ok(StoreFormat::V2),
-        Some(FORMAT_V3) => Ok(StoreFormat::V3),
-        _ => Err(corrupt("store.json is not an eventlog-tree store")),
-    }
+    let format = match value.get("format").and_then(Value::as_str) {
+        Some(FORMAT_V1) => StoreFormat::V1,
+        Some(FORMAT) => StoreFormat::V2,
+        Some(FORMAT_V3) => StoreFormat::V3,
+        _ => return Err(corrupt("store.json is not an eventlog-tree store")),
+    };
+    let fingerprints = match value.get(GROUPS_KEY) {
+        None => false,
+        Some(groups) if groups.as_str() == Some(GROUP_FORMAT_V2) => true,
+        Some(_) => {
+            return Err(corrupt(
+                "store.json declares a group format this reader does not know",
+            ));
+        }
+    };
+    Ok((format, fingerprints))
 }
 /// The format tag of an event file.
 pub(crate) const EVENT_FORMAT: &str = "eventlog-tree/event/1";
-/// The format tag of a group file.
+/// The format tag of a group file that does not keep its request fingerprint.
 pub(crate) const GROUP_FORMAT: &str = "eventlog-tree/group/1";
+/// The format tag of a group file that keeps the request fingerprint its receipt recorded, so a
+/// replay restores the receipt after content of the group was removed. Written only in a store
+/// whose `store.json` declares it under [`GROUPS_KEY`]: a new one, or one [`crate::migrate`] moved.
+/// Eventlog 0.10.0 and earlier refuse such a group file as corrupt.
+pub(crate) const GROUP_FORMAT_V2: &str = "eventlog-tree/group/2";
+/// The key of `store.json` declaring [`GROUP_FORMAT_V2`].
+pub(crate) const GROUPS_KEY: &str = "groups";
 
 pub(crate) fn backend(error: impl std::fmt::Display) -> EventLogError {
     EventLogError::Backend(error.to_string())
