@@ -19,17 +19,23 @@ jobs:
           path: repository
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: beyond10x/aep
-          ref: 0.64.0
-          path: aep
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - name: Build the pinned aep
-        run: cargo build --manifest-path aep/Cargo.toml --locked --release -p aep-cli --bin aep
+      - name: The CI path list holds both sides
+        working-directory: repository
+        run: sh scripts/ci-paths-test.sh
+      # The released binary of the pinned tag: a planning-only pull request compiles nothing.
+      - name: Install the pinned aep release
+        working-directory: ${{ runner.temp }}
+        env:
+          AEP_VERSION: "0.64.0"
+          AEP_SHA256: 074d3c301d6184f8ce37006478957c60e62607ca6853ac41765ff5f7ebfdb03b
+        run: |
+          set -euo pipefail
+          asset="aep-$AEP_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          release="https://github.com/beyond10x/aep/releases/download/$AEP_VERSION"
+          curl --fail --silent --show-error --location --output "$asset" "$release/$asset"
+          echo "$AEP_SHA256  $asset" | sha256sum --check --strict
+          tar -xzf "$asset"
+          echo "$RUNNER_TEMP/aep-$AEP_VERSION-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
       - name: Validate the planning store
         working-directory: repository
-        run: |
-          aep="$GITHUB_WORKSPACE/aep/target/release/aep"
-          "$aep" plan artifact validate
+        run: aep plan artifact validate

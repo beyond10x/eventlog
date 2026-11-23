@@ -16,8 +16,27 @@ permissions:
   contents: read
 
 jobs:
+  # A pull request of planning or prose only (scripts/ci-paths.sh) skips the build; a change under
+  # website/ or to code runs it. A skipped job reports success to its check.
+  classify:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.paths.outputs.docs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Planning, prose, site or code
+        id: paths
+        run: sh scripts/ci-paths.sh pull-request
+
   build:
     name: Build Docusaurus
+    needs: classify
+    if: ${{ !cancelled() && needs.classify.outputs.docs != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

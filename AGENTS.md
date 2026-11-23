@@ -114,6 +114,16 @@ runner output and counts. The Persistence proof CI job runs this mode against Po
 with verified TLS. Comparative capacity and restart receipts remain separate evidence; neither
 a local nor CI conformance run approves a deployment budget.
 
+**A pull request of planning or prose only runs no build, test, KPI or proof.**
+`scripts/ci-paths.sh` is the one path list: `.engineering/` is planning, `website/` is the site,
+Markdown no code reads is prose, everything else is code. The first job of the Persistence
+proof, KPI and Documentation validation workflows classifies the pull request's merge commit, and
+the work jobs are skipped when it holds no code (the site build runs for a `website/` change); a
+skipped job reports success to its required check. Never add `paths-ignore` to a workflow that
+carries a required check: the check then stays pending. `scripts/ci-paths-test.sh`, run by the
+`planning validate` job, holds both sides of the list and fails when code names a Markdown file
+the list calls prose; add such a file to the code lines of the list.
+
 **A green local gate does not guarantee a green CI.** The steps mirror each other; the toolchain
 does not — CI installs whatever `stable` is that day, and a newer clippy can fail a commit that
 passed locally. Run `rustup update` before pushing, and read the gate's own exit status, never a
