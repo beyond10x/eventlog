@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T12:00:00Z",
+  "actor": "human:timo",
+  "artifact": "story:file-capture-drop-adversary-flaky-under-load",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-tests: eventlog-file lib case 20 runs load 94-146, pass=20 fail=0; red before fix 4 of 20 at load 140"
+  }
+}

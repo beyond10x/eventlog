@@ -37,10 +37,14 @@ fn limits() -> CaptureLimits {
 /// capture. The transaction path has no such point: it adopts inside `enter`'s blocking work and
 /// drops a view it cannot share synchronously.
 ///
-/// The case polls the capture by hand and drops it at the first `Pending` after `retain_once` has
+/// The case polls the capture by hand and drops it at the first `Pending` after the capture has
 /// cloned the writer's view for its blocking task: the one moment the writer's buffer has a holder
-/// that is neither a view nor this case. Eight megabytes of history make that task's comparison
-/// long enough that the poll which spawned it cannot also see it finish.
+/// that is neither a view nor this case. The case holds the writers' interprocess lock
+/// (`writer.lock`) across that poll, as another handle's transaction would, so the blocking task
+/// waits for it and the capture cannot finish in the poll that spawned it. Without the lock the
+/// case asked the machine to be idle: under load the task compared its eight megabytes before
+/// the poll that spawned it looked, and the capture finished with nothing to drop
+/// (story:file-capture-drop-adversary-flaky-under-load).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_dropped_while_it_retains_once_leaves_one_buffer() {
     let directory = tempfile::tempdir().unwrap();
@@ -93,6 +97,14 @@ async fn a_capture_dropped_while_it_retains_once_leaves_one_buffer() {
     // The writer's view and this case's clone.
     let holders = Arc::strong_count(&writer.retained);
 
+    // Another writer's hold on the interprocess lock: the capture's blocking work waits on it.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("writer.lock"))
+        .expect("the writers' lock");
+    held.lock()
+        .expect("the writers' lock is free before the capture");
     let mut capture = Box::pin(store.capture_tenant(&tenant, &[], limits()));
     let mut context = Context::from_waker(Waker::noop());
     let mut dropped = false;
@@ -110,6 +122,7 @@ async fn a_capture_dropped_while_it_retains_once_leaves_one_buffer() {
             Poll::Pending => tokio::task::yield_now().await,
         }
     }
+    held.unlock().expect("released the writers' lock");
     assert!(
         dropped,
         "the capture finished in the poll that began retaining once: nothing to drop at"
@@ -132,5 +145,11 @@ async fn a_capture_dropped_while_it_retains_once_leaves_one_buffer() {
             verified.length,
             captured.length
         );
+    }
+    drop(runtime);
+    // The dropped capture's blocking work still runs, past the released lock, and lets go of its
+    // clone of the writer's bytes when it ends: the directory outlives it.
+    while Arc::strong_count(&writer.retained) > holders {
+        tokio::task::yield_now().await;
     }
 }

@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T11:30:00Z",
+  "actor": "human:timo",
+  "artifact": "story:ci-planning-only-pull-requests-skip-the-work",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "eventlog PR #67 checks green on 09e4690b, merged aeac1bd7; entity-runtime PR #100 merged with Gate/MSRV/KPI skipped"
+  }
+}

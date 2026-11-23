@@ -117,11 +117,33 @@ impl Guard for BusyPastDeadline {
     }
 }
 
-async fn seeded_store(url: &str, prefix: &str, options: PoolOptions) -> PostgresEventStore {
+/// A store on `url` with the case's `options`, over a schema that holds the tally table the guard
+/// reads, after one settled append of its own.
+///
+/// The schema is the setup's, not the case's: a store of default options on `direct` (the fixture
+/// itself, never a relay that counts connections) migrates it and registers the tally projection,
+/// and is shut down before the case's store opens. Registration migrates and admits the schema
+/// (tens of catalog round trips and a DDL commit) under `transaction_timeout`, and a case that
+/// shortens that deadline for the append it times out had its seed refused with `Deadline` on a
+/// loaded host (story:pg-retired-cancel-review-seed-deadline-under-load). The case's store
+/// registers nothing: the guard only reads the tally table, and no case asserts a projected row.
+async fn seeded_store(
+    direct: &str,
+    url: &str,
+    prefix: &str,
+    options: PoolOptions,
+) -> PostgresEventStore {
+    let setup = PostgresEventStore::connect_local(direct, prefix, PoolOptions::default())
+        .await
+        .expect("an isolated setup store");
+    setup
+        .register_inline(Arc::new(Tally))
+        .await
+        .expect("the tally table");
+    setup.shutdown().await.expect("the setup store closes");
     let store = PostgresEventStore::connect_local(url, prefix, options)
         .await
         .expect("an isolated store");
-    store.register_inline(Arc::new(Tally)).await.unwrap();
     store.seal().await;
     let tenant = TenantId::new("review").unwrap();
     store
@@ -132,7 +154,7 @@ async fn seeded_store(url: &str, prefix: &str, options: PoolOptions) -> Postgres
             &eventlog_conformance::meta("seed", &serde_json::json!({})),
         )
         .await
-        .expect("the seeded tally row");
+        .expect("the seed append");
     store
 }
 
@@ -224,7 +246,7 @@ fn only_an_unsettled_retirement_sends_a_cancel_and_only_one() {
         // Settled traffic, then shutdown: one session, no cancel connection.
         let (port, accepted) = counting_proxy(through(&url, 0, "x").1).await;
         let (relayed, _) = through(&url, port, "rcr_settled");
-        let store = seeded_store(&relayed, PREFIX, PoolOptions::default()).await;
+        let store = seeded_store(&url, &relayed, PREFIX, PoolOptions::default()).await;
         store.shutdown().await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
@@ -237,6 +259,7 @@ fn only_an_unsettled_retirement_sends_a_cancel_and_only_one() {
         let (port, accepted) = counting_proxy(through(&url, 0, "x").1).await;
         let (relayed, _) = through(&url, port, "rcr_unsettled");
         let store = seeded_store(
+            &url,
             &relayed,
             PREFIX,
             PoolOptions {
@@ -285,6 +308,7 @@ fn a_retirement_dropped_with_its_callers_runtime_does_not_strand_occupancy() {
     let first = current_thread();
     let store = first.block_on(async {
         let store = seeded_store(
+            &url,
             &with_application(&url, "rcr_runtime_drop"),
             PREFIX,
             PoolOptions {
@@ -625,7 +649,7 @@ async fn an_idempotency_mismatch_keeps_its_pooled_connection() {
     };
     let observer = connect(&url).await;
     fresh(&observer, PREFIX).await;
-    let store = seeded_store(&url, PREFIX, PoolOptions::default()).await;
+    let store = seeded_store(&url, &url, PREFIX, PoolOptions::default()).await;
     let stream = StreamId::new(TenantId::new("review").unwrap(), "item", "held").unwrap();
     let before = store.pool_churn();
     for _ in 0..3 {

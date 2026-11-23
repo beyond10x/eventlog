@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T12:00:00Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-test-step-fits-the-budget",
+  "kind": "story",
+  "revision": 2,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-tests: nextest -p eventlog-postgres 198 executed, slowest 24.1 s, conformance binary 50.2 s (load 80) and 79.1 s (load 150); 60 s kill proven with a 70 s stand-in"
+  }
+}
