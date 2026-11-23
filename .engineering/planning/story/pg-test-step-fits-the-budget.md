@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:pg-test-step-fits-the-budget
 kind: story
-status: draft
+status: implemented
 title: 'The eventlog-postgres test step fits the budget: conformance binary under 120 s, deadline test green under load'
 summary: conformance binary 110-134 s under load; batch-read deadline test fails under load on main
 owner: eventlog
-revision: 2
+relations:
+- serves: vision:O2
+revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T13:04:52Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T13:04:52Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T13:04:52Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

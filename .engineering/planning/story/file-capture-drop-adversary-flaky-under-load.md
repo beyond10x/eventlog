@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:file-capture-drop-adversary-flaky-under-load
 kind: story
-status: draft
+status: implemented
 title: eventlog-file adversary2 a_capture_dropped_while_it_retains_once_leaves_one_buffer fails under load
 summary: adversary2_compare_once.rs:113 nothing to drop; failed 2 of 4 parallel runs and alone at integration
 owner: eventlog
-revision: 2
+relations:
+- serves: vision:O2
+revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T13:04:31Z", actor: "human:timo", revision: 3}
+- {from: "proposed", to: "active", at: "2026-11-23T13:04:32Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-11-23T13:04:51Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 
