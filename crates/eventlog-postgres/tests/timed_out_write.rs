@@ -310,3 +310,94 @@ async fn guarded_append_deadline_after_commit_is_unknown_commit() {
     setup.drop_tables().await.expect("dropped");
     setup.shutdown().await.expect("closed");
 }
+
+/// How long `COMMIT` takes once [`slow_commit`] is installed: past [`SHORT`], so the deadline
+/// fires while `COMMIT` is running, and well inside the statement timeout, so `COMMIT` succeeds.
+const COMMIT_RUNS: Duration = Duration::from_secs(3);
+
+/// Make every `COMMIT` that changed or deleted one of this owner's events take [`COMMIT_RUNS`]:
+/// a deferred constraint trigger runs at `COMMIT`, after the transaction's last statement.
+///
+/// Installed after both stores are open, because schema admission refuses an owner table with a
+/// trigger.
+async fn slow_commit(prefix: &str) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let seconds = COMMIT_RUNS.as_secs();
+    client
+        .batch_execute(&format!(
+            "CREATE FUNCTION {prefix}_slow_commit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN PERFORM pg_sleep({seconds}); RETURN NULL; END $$; \
+             CREATE CONSTRAINT TRIGGER {prefix}_slow_commit AFTER UPDATE OR DELETE \
+             ON {prefix}_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             EXECUTE FUNCTION {prefix}_slow_commit();"
+        ))
+        .await
+        .unwrap();
+    client
+}
+
+async fn append_one(store: &PostgresEventStore, stream: &StreamId) {
+    store
+        .append(
+            stream,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("privacy-write", &serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+}
+
+async fn finish_slow(
+    setup: PostgresEventStore,
+    timed: PostgresEventStore,
+    admin: &tokio_postgres::Client,
+    prefix: &str,
+) {
+    finish(setup, timed).await;
+    admin
+        .batch_execute(&format!("DROP FUNCTION {prefix}_slow_commit()"))
+        .await
+        .unwrap();
+}
+
+/// A redaction whose deadline fires while its `COMMIT` runs cannot say whether the tombstone was
+/// written: `UnknownCommit`, not `Deadline`. (The dropped lease cancels the COMMIT still
+/// running, so here it does not land; the caller cannot know that.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redaction_deadline_during_commit_is_unknown_commit() {
+    let prefix = prefix("redact");
+    let (setup, timed) = stores(&prefix).await;
+    let stream = StreamId::new(TenantId::new("timed-out").unwrap(), "item", "one").unwrap();
+    append_one(&setup, &stream).await;
+    let admin = slow_commit(&prefix).await;
+    let outcome = timed.redact(&stream, 1, "privacy-request").await;
+    assert_eq!(
+        outcome.map(|_| ()),
+        Err(EventLogError::UnknownCommit),
+        "a deadline during COMMIT is an unknown commit"
+    );
+    finish_slow(setup, timed, &admin, &prefix).await;
+}
+
+/// A tenant erasure whose deadline fires while its `COMMIT` runs cannot say whether the tenant is
+/// gone: `UnknownCommit`, not `Deadline`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erasure_deadline_during_commit_is_unknown_commit() {
+    let prefix = prefix("erase");
+    let (setup, timed) = stores(&prefix).await;
+    let tenant = TenantId::new("timed-out").unwrap();
+    let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+    append_one(&setup, &stream).await;
+    let admin = slow_commit(&prefix).await;
+    let outcome = timed.forget_tenant(&tenant).await;
+    assert_eq!(
+        outcome,
+        Err(EventLogError::UnknownCommit),
+        "a deadline during COMMIT is an unknown commit"
+    );
+    finish_slow(setup, timed, &admin, &prefix).await;
+}

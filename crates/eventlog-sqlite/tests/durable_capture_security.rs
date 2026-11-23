@@ -305,7 +305,7 @@ async fn a_group_after_redaction_copies_no_redacted_material_into_the_journal() 
             .redact(
                 &StreamId::new(tenant(), "item", "secret").unwrap(),
                 1,
-                "erasure request",
+                "subject-request",
             )
             .await
             .unwrap();
@@ -382,7 +382,7 @@ async fn a_failed_redaction_or_erasure_leaves_journal_and_data_consistent() {
             .redact(
                 &StreamId::new(tenant(), "item", "one").unwrap(),
                 1,
-                "erasure request",
+                "subject-request",
             )
             .await;
         assert!(
@@ -408,7 +408,7 @@ async fn a_failed_redaction_or_erasure_leaves_journal_and_data_consistent() {
         .redact(
             &StreamId::new(tenant(), "item", "one").unwrap(),
             1,
-            "erasure request",
+            "subject-request",
         )
         .await
         .unwrap();
@@ -557,7 +557,7 @@ async fn no_ordinary_path_creates_a_continuity_object_for_an_owner_that_never_en
             )
             .await
             .unwrap();
-        store.redact(&stream, 1, "erasure request").await.unwrap();
+        store.redact(&stream, 1, "subject-request").await.unwrap();
     }
     file.open()
         .await

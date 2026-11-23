@@ -118,3 +118,77 @@ async fn a_non_text_event_tenant_coordinate_is_corruption_not_absence() {
         "a malformed row with this tenant's exact bytes must not disappear from complete history"
     );
 }
+
+/// The full-scan and VM steps of the malformed-coordinate probe a capture runs on one table.
+fn malformed_probe_steps(sql: &Connection, table: &str, tenant: &TenantId) -> (bool, i32, i32) {
+    let mut statement = sql
+        .prepare(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table}
+             WHERE typeof(tenant_id)<>'text' AND CAST(tenant_id AS BLOB)=?1)"
+        ))
+        .expect("probe query");
+    let found: bool = statement
+        .query_row(params![tenant.as_str().as_bytes()], |row| row.get(0))
+        .expect("probe");
+    (
+        found,
+        statement.get_status(rusqlite::StatementStatus::FullscanStep),
+        statement.get_status(rusqlite::StatementStatus::VmStep),
+    )
+}
+
+/// One tenant's capture checked every tenant's identity row for a malformed coordinate: with
+/// 8,192 healthy bindings the probe took 8,191 full-scan steps. A partial index holding only
+/// malformed coordinates answers it with none, and still finds a malformed row.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_malformed_coordinate_probe_does_not_scan_other_tenants_identities() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("store.db");
+    let path = path.to_str().expect("UTF-8 path");
+    let store = SqliteEventStore::open(path, PREFIX)
+        .await
+        .expect("opened store");
+    let tenant = TenantId::new("capture-review-two-probe").expect("valid tenant");
+    store
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    let sql = Connection::open(path).expect("fixture connection");
+    let tx = sql.unchecked_transaction().expect("fixture transaction");
+    for index in 0..8_191 {
+        tx.execute(
+            &format!("INSERT INTO {PREFIX}_identity(tenant_id,stream_identity) VALUES (?1,?2)"),
+            params![format!("other-{index:05}"), format!("identity-{index:05}")],
+        )
+        .expect("healthy binding");
+    }
+    tx.commit().expect("fixture");
+
+    let table = format!("{PREFIX}_identity");
+    let (found, fullscan, steps) = malformed_probe_steps(&sql, &table, &tenant);
+    eprintln!("identity probe over 8,192 bindings: fullscan_steps={fullscan} vm_steps={steps}");
+    assert!(!found);
+    assert_eq!(fullscan, 0, "the probe reads only malformed coordinates");
+    store
+        .capture_tenant(&tenant, &[], limits())
+        .await
+        .expect("a healthy tenant captures");
+
+    let events = format!("{PREFIX}_events");
+    let (_, fullscan, _) = malformed_probe_steps(&sql, &events, &tenant);
+    assert_eq!(fullscan, 0, "the events probe is indexed the same way");
+
+    sql.execute(
+        &format!("UPDATE {table} SET tenant_id=CAST(tenant_id AS BLOB) WHERE tenant_id=?1"),
+        params![tenant.as_str()],
+    )
+    .expect("a malformed coordinate");
+    assert!(malformed_probe_steps(&sql, &table, &tenant).0);
+    assert_eq!(
+        store.capture_tenant(&tenant, &[], limits()).await,
+        Err(CaptureError::Corrupt {
+            material: CaptureMaterial::Identity,
+        }),
+        "the index keeps finding a malformed identity row"
+    );
+}

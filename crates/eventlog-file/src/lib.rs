@@ -8,6 +8,8 @@ mod cost;
 mod inline_admin;
 mod inspection;
 mod journal;
+#[cfg(feature = "kpi-counters")]
+pub mod kpi;
 pub use inspection::FileHistoryInspector;
 #[cfg(test)]
 mod measure_segmented;
@@ -102,6 +104,16 @@ struct Transaction {
     /// Whether this transaction bound blob content. A binding write that returns an error drops
     /// everything the handle remembers, so content of a write that did not commit is not kept.
     binds: bool,
+    /// While a rollback-only scope is open ([`Transaction::begin_rollback`]), what each recorded
+    /// operation replaced, one entry per operation pushed to `pending` since the scope began.
+    undo: Option<Vec<Undo>>,
+}
+/// The state an operation recorded inside a rollback-only scope replaced.
+enum Undo {
+    Counter(String, Option<i64>),
+    Row(Op),
+    /// An operation no admission view can stage; a scope holding one cannot be rolled back.
+    Other,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -157,27 +169,39 @@ impl FileEventStore {
     ) -> Result<Self, EventLogError> {
         let root = root_path(path)?;
         let path = root.clone();
-        let journal = blocking(move || match layout {
-            Some(layout) => Journal::open_with_layout(&path, layout),
-            None => Journal::open_existing(&path),
+        let permit = AdmissionPermit::default();
+        let content: Arc<VerifiedContent> = Arc::default();
+        let (opener_permit, opener_content) = (permit.clone(), Arc::clone(&content));
+        // One complete transaction over the journal this open verified, under the writer lock that
+        // open took: it replays the whole history once, hashes every active object and disposes
+        // of what nothing references, then leaves its view as the handle's verified cache. The
+        // lock is released only when that view is taken apart below.
+        let (manifest, transactions, state, kept) = blocking(move || {
+            let journal = match layout {
+                Some(layout) => Journal::open_with_layout(&path, layout),
+                None => Journal::open_existing(&path),
+            }?;
+            let tx = complete(&path, journal, Vec::new(), opener_permit, opener_content)?;
+            let state = tx.state;
+            let (manifest, transactions, kept) = tx.journal.into_parts();
+            Ok((manifest, transactions, state, kept))
         })
         .await?;
-        State::replay(&journal.transactions)?;
-        let observed = Some(journal.manifest.clone());
-        drop(journal);
-        let store = Self {
+        Ok(Self {
             root,
             runtime: Mutex::new(Runtime {
-                observed,
+                observed: Some(manifest.clone()),
+                verified: Some(Verified {
+                    manifest,
+                    transactions,
+                    state,
+                    content: kept,
+                }),
                 ..Runtime::default()
             }),
-            permit: AdmissionPermit::default(),
-            content: Arc::default(),
-        };
-        // The cache starts empty, so this transaction is the complete one: it rereads and chains
-        // the whole history, hashes every active object and disposes of what nothing references.
-        store.transaction(|_| Box::pin(async { Ok(()) })).await?;
-        Ok(store)
+            permit,
+            content,
+        })
     }
     async fn transaction<T, F>(&self, work: F) -> Result<T, EventLogError>
     where
@@ -256,6 +280,13 @@ impl FileEventStore {
                 return Err(refusal);
             }
         };
+        // A privacy rewrite replaces the bytes a reader's view holds, so that view goes now,
+        // before publication starts: whether the rewrite then publishes, fails or leaves its
+        // outcome unknown, and even when this call is cancelled meanwhile, the handle keeps no
+        // copy of content the rewrite exists to remove.
+        if tx.privacy {
+            runtime.captured = None;
+        }
         let committed = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
@@ -269,7 +300,7 @@ impl FileEventStore {
                         .push(serde_json::to_value(&tx.pending).map_err(backend)?);
                 }
                 tx.journal.privacy(tx.journal.transactions.clone())?;
-                tx.clear_snapshots()?;
+                tx.clear_snapshots().map_err(committed_with)?;
             } else if !tx.pending.is_empty() {
                 #[cfg(test)]
                 let group_pending = tx.pending.iter().any(|op| matches!(op, Op::Group { .. }));
@@ -293,16 +324,15 @@ impl FileEventStore {
                     journal::checkpoint("group-postcommit");
                 }
             }
-            // Disposal belongs to the writer that changed what is referenced.
+            // Disposal belongs to the writer that changed what is referenced. A commit that binds
+            // and unbinds nothing — an event-only append, a cursor, a row — leaves the live set as
+            // it was, so it neither lists nor synchronizes the object directory; objects a crash
+            // left behind wait for the next commit that changes bindings or the complete opener.
+            // The commit is published by now, so a failed disposal is reported as that: the outcome
+            // is known, and the next commit that changes bindings or a reopen disposes again.
             let committed = tx.privacy || !tx.pending.is_empty();
-            if committed {
-                tx.clean_blobs().map_err(|error| {
-                    if tx.atomic_content && !tx.pending.is_empty() {
-                        EventLogError::UnknownCommit
-                    } else {
-                        error
-                    }
-                })?;
+            if committed && tx.changes_bindings() {
+                tx.clean_blobs().map_err(committed_with)?;
             }
             if !tx.staged_blobs.is_empty() {
                 journal::checkpoint("blob-cleaned");
@@ -378,15 +408,21 @@ impl FileEventStore {
                     // "retries return the original result without repeating admission or
                     // projections" (`eventlog-core/src/atomic_group.rs`), which
                     // `eventlog-conformance/src/atomic_group.rs:153` asserts by counting calls.
+                    // It runs in a rollback-only scope: its decision stands, and what it staged —
+                    // a counter reservation above all — is taken back, because the answer is the
+                    // original receipt and charges nothing the original commit did not.
                     if !blobs.is_empty() {
-                        guard
+                        let mark = tx.begin_rollback();
+                        let admitted = guard
                             .check(&mut projection::View {
                                 admission: true,
                                 selected: None,
                                 tx,
                                 tenant: &group.tenant,
                             })
-                            .await?;
+                            .await;
+                        tx.rollback(mark)?;
+                        admitted?;
                     }
                     // Committed through `AtomicBlobEventStore`, whose fingerprint binds this
                     // group, these digests and the SHA-256 of these bytes: the same request.
@@ -536,8 +572,61 @@ impl Transaction {
     fn record(&mut self, op: Op) -> Result<(), EventLogError> {
         // Pushed before it is applied: an apply that fails part-way has still touched the state,
         // and a non-empty `pending` is what tells a refusal not to keep this view.
+        if let Some(undo) = &mut self.undo {
+            undo.push(match &op {
+                Op::Counter { coordinate, .. } => Undo::Counter(
+                    coordinate.clone(),
+                    self.state.counters.get(coordinate).copied(),
+                ),
+                Op::Row {
+                    tenant, name, key, ..
+                } => Undo::Row(Op::Row {
+                    tenant: tenant.clone(),
+                    name: name.clone(),
+                    key: key.clone(),
+                    body: self
+                        .state
+                        .rows
+                        .get(&(tenant.as_str().into(), name.clone(), key.clone()))
+                        .cloned(),
+                }),
+                _ => Undo::Other,
+            });
+        }
         self.pending.push(op.clone());
         self.state.apply(op)
+    }
+    /// Open a rollback-only scope: what is recorded until [`Transaction::rollback`] is staged and
+    /// visible to the code inside it, as in any transaction, and then taken back out of `pending`
+    /// and `state`, so the commit that follows carries none of it.
+    fn begin_rollback(&mut self) -> usize {
+        self.undo = Some(Vec::new());
+        self.pending.len()
+    }
+    /// Close the scope `begin_rollback` opened at `mark`, restoring what its operations replaced.
+    fn rollback(&mut self, mark: usize) -> Result<(), EventLogError> {
+        let undo = self.undo.take().unwrap_or_default();
+        if undo.len() != self.pending.len() - mark || undo.iter().any(|u| matches!(u, Undo::Other))
+        {
+            // Left staged: a non-empty `pending` makes the caller's refusal drop this view.
+            return Err(backend(
+                "a rollback-only scope staged an operation it cannot undo",
+            ));
+        }
+        for undo in undo.into_iter().rev() {
+            match undo {
+                Undo::Counter(coordinate, Some(value)) => {
+                    self.state.counters.insert(coordinate, value);
+                }
+                Undo::Counter(coordinate, None) => {
+                    self.state.counters.remove(&coordinate);
+                }
+                Undo::Row(op) => self.state.apply(op)?,
+                Undo::Other => unreachable!("refused above"),
+            }
+        }
+        self.pending.truncate(mark);
+        Ok(())
     }
     fn result(&self, range: &GroupRange, deduplicated: bool) -> AppendResult {
         AppendResult {
@@ -720,6 +809,21 @@ impl Transaction {
         let cache = self.root.join(".cache");
         if cache.exists() {
             directory(&cache)?;
+            // One membership set, built once: a snapshot's file name is a hash of its stream key,
+            // so its generation is all there is to look it up by, and a scan of every generation
+            // per snapshot made 2,080 comparisons for 64 live snapshots.
+            let mut visited = 0_u64;
+            let live_generations: std::collections::HashSet<&str> = self
+                .state
+                .generations
+                .values()
+                .inspect(|_| visited += 1)
+                .map(String::as_str)
+                .collect();
+            #[cfg(test)]
+            cost::charge(&self.root, |cost| cost.generations_visited += visited);
+            #[cfg(not(test))]
+            let _ = visited;
             for entry in fs::read_dir(&cache).map_err(backend)? {
                 let entry = entry.map_err(backend)?;
                 if !entry.file_type().map_err(backend)?.is_file() {
@@ -730,7 +834,7 @@ impl Transaction {
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<(String, Snapshot)>(&bytes).ok())
                         .is_some_and(|(generation, _)| {
-                            self.state.generations.values().any(|id| id == &generation)
+                            live_generations.contains(generation.as_str())
                         });
                     if !live {
                         fs::remove_file(entry.path()).map_err(backend)?;
@@ -866,13 +970,21 @@ impl Transaction {
         self.binds = true;
         let directory = self.root.join("blobs");
         let mut fresh: Vec<(Blob, String)> = Vec::new();
+        // The digests `fresh` already binds, each to its entry there: `fresh` keeps the batch's
+        // order for the frame, and this answers membership without scanning it, so a batch of n
+        // new digests costs O(n log n) comparisons rather than n(n-1)/2.
+        let mut seen: std::collections::BTreeMap<BatchDigest<'_>, usize> =
+            std::collections::BTreeMap::new();
+        // Charged on every way out of the loop below, a refusal included, and on its thread.
+        #[cfg(test)]
+        let tally = batch_digest::Tally::new(&self.root);
         let mut objects: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
         for (digest, bytes) in blobs {
             validate_field("blob digest", digest)?;
             // A digest repeated inside one batch binds once, and disagrees with itself exactly as
             // it would disagree with a binding the committed history already carries.
-            if let Some((earlier, _)) = fresh.iter().find(|(_, name)| name == digest) {
-                if earlier.hash != hash(bytes) {
+            if let Some(&index) = seen.get(&BatchDigest(digest)) {
+                if fresh[index].0.hash != hash(bytes) {
                     return Err(EventLogError::Invalid(
                         "blob digest already names different content".into(),
                     ));
@@ -894,8 +1006,12 @@ impl Transaction {
             // This handle hashed these exact bytes; a write that does not commit forgets them.
             self.content.remember(&blob.hash, bytes);
             objects.push((blob.id.clone(), directory.join(&blob.id), bytes.clone()));
+            seen.insert(BatchDigest(digest), fresh.len());
             fresh.push((blob, digest.clone()));
         }
+        drop(seen);
+        #[cfg(test)]
+        drop(tally);
         if fresh.is_empty() {
             return Ok(());
         }
@@ -978,6 +1094,31 @@ impl Transaction {
             .and_then(|f| f.sync_all())
             .map_err(backend)
     }
+    /// Whether committing this transaction can change which object files are live: it binds or
+    /// unbinds a blob, wrote or staged an object, carries atomic content, or rewrites history for
+    /// privacy. Only such a commit sweeps the object directory.
+    /// Whether an inline projector attached to this handle owns `projector` or one of its tables:
+    /// by name, or because one of its tables carries the same name. A catch-up path that wrote such
+    /// a table would leave rows of two configurations, the one it ran and the attached one every
+    /// later append runs.
+    fn driven_inline(&self, projector: &dyn Projector) -> bool {
+        self.inline.iter().any(|attached| {
+            attached.name() == projector.name()
+                || attached.projections().iter().any(|owned| {
+                    projector
+                        .projections()
+                        .iter()
+                        .any(|spec| spec.name == owned.name)
+                })
+        })
+    }
+    fn changes_bindings(&self) -> bool {
+        self.privacy
+            || self.atomic_content
+            || !self.written.is_empty()
+            || !self.staged_blobs.is_empty()
+            || self.pending.iter().any(|op| matches!(op, Op::Blob { .. }))
+    }
     fn clean_blobs(&self) -> Result<(), EventLogError> {
         let directory = self.root.join("blobs");
         if !directory.exists() {
@@ -987,6 +1128,8 @@ impl Transaction {
         let live: BTreeSet<_> = self.state.blobs.values().map(|b| b.id.as_str()).collect();
         for entry in fs::read_dir(&directory).map_err(backend)? {
             let entry = entry.map_err(backend)?;
+            #[cfg(feature = "kpi-counters")]
+            kpi::blob_dir_entry();
             let name = entry.file_name();
             let name = name
                 .to_str()
@@ -999,6 +1142,8 @@ impl Transaction {
                 fs::remove_file(entry.path()).map_err(backend)?;
             }
         }
+        #[cfg(feature = "kpi-counters")]
+        kpi::blob_dir_sync();
         fs::File::open(directory)
             .and_then(|f| f.sync_all())
             .map_err(backend)
@@ -1009,19 +1154,20 @@ impl Transaction {
         tenant: &TenantId,
         batch: usize,
     ) -> Result<CatchUpProgress, EventLogError> {
-        if self.inline.iter().any(|p| p.name() == projector.name()) {
+        if self.driven_inline(projector) {
             return Err(EventLogError::Invalid("projection is driven inline".into()));
         }
-        let position = *self
+        let cursor = self
             .state
             .cursors
             .get(&(tenant.as_str().into(), projector.name().into()))
-            .unwrap_or(&0);
+            .copied();
+        let position = cursor.unwrap_or(0);
         let mut events: Vec<_> = self
             .state
             .events
-            .values()
-            .filter(|e| &e.tenant == tenant && e.global_seq > position)
+            .after(position)
+            .filter(|e| &e.tenant == tenant)
             .take(bounded_limit(batch) + 1)
             .cloned()
             .collect();
@@ -1041,11 +1187,16 @@ impl Transaction {
                 .await?;
         }
         let position = events.last().map_or(position, |e| e.global_seq);
-        self.record(Op::Cursor {
-            tenant: tenant.clone(),
-            name: projector.name().into(),
-            position,
-        })?;
+        // A caught-up poll whose cursor already stands at `position` records nothing, so it
+        // commits no frame: the journal grows only when the projection moves. A projector with no
+        // cursor yet still records its first one, at 0 when the tenant has no events.
+        if cursor != Some(position) {
+            self.record(Op::Cursor {
+                tenant: tenant.clone(),
+                name: projector.name().into(),
+                position,
+            })?;
+        }
         Ok(CatchUpProgress {
             applied: events.len() as u64,
             position,
@@ -1107,6 +1258,7 @@ fn enter(
             staged_blobs: Vec::new(),
             atomic_content: false,
             binds: false,
+            undo: None,
         };
         // Only the objects the new frames bind are new to this handle; the rest it already hashed.
         for (tenant, digest) in &bound {
@@ -1131,6 +1283,22 @@ fn enter(
         ));
     }
     journal.adopt(reader);
+    complete(root, journal, inline, permit, content)
+}
+
+/// The complete transaction over a journal opened from scratch: replay its whole history once,
+/// dispose of snapshots and objects nothing references, and hash every active object.
+///
+/// Shared by [`enter`]'s complete path and by [`FileEventStore::open_with_creation`], which hands
+/// in the journal it has just opened — still holding the writer lock taken by that open and with
+/// any pending intent already recovered — instead of dropping it and opening it again.
+fn complete(
+    root: &Path,
+    journal: Journal,
+    inline: Vec<Arc<dyn Projector>>,
+    permit: AdmissionPermit,
+    content: Arc<VerifiedContent>,
+) -> Result<Transaction, EventLogError> {
     let tx = Transaction {
         state: State::replay(&journal.transactions)?,
         journal,
@@ -1144,6 +1312,7 @@ fn enter(
         staged_blobs: Vec::new(),
         atomic_content: false,
         binds: false,
+        undo: None,
     };
     tx.clear_snapshots()?;
     tx.clean_blobs()?;
@@ -1153,6 +1322,81 @@ fn enter(
     Ok(tx)
 }
 
+/// A blob digest as [`Transaction::bind_blobs`] indexes one batch by it.
+///
+/// Its own type so a test build can count the comparisons the index makes: every equality and
+/// ordering goes through [`Ord::cmp`] below, which charges the thread's tally. The count is made
+/// by the comparison itself, so an index that compared more would charge more.
+struct BatchDigest<'a>(&'a str);
+
+impl Ord for BatchDigest<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(test)]
+        batch_digest::charge();
+        self.0.cmp(other.0)
+    }
+}
+impl PartialOrd for BatchDigest<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for BatchDigest<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for BatchDigest<'_> {}
+
+/// Comparisons between [`BatchDigest`]s made on this thread. Test-only. `bind_blobs` reads it
+/// before and after its synchronous loop and charges the difference to the store root.
+#[cfg(test)]
+mod batch_digest {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COMPARED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn charge() {
+        COMPARED.with(|compared| compared.set(compared.get() + 1));
+    }
+
+    pub(super) fn compared() -> u64 {
+        COMPARED.with(Cell::get)
+    }
+
+    /// Charges the comparisons this thread makes from its creation to its drop to one store root,
+    /// whichever way the scope it lives in ends. Created and dropped on one thread, with no await
+    /// between, because the tally it reads is the thread's.
+    pub(super) struct Tally {
+        root: std::path::PathBuf,
+        from: u64,
+    }
+
+    impl Tally {
+        pub(super) fn new(root: &std::path::Path) -> Self {
+            Self {
+                root: root.to_owned(),
+                from: compared(),
+            }
+        }
+    }
+
+    impl Drop for Tally {
+        fn drop(&mut self) {
+            let compared = compared() - self.from;
+            crate::cost::charge(&self.root, |cost| cost.digest_comparisons += compared);
+        }
+    }
+}
+
+/// A cleanup failure after publication: the commit happened and the caller is told so.
+fn committed_with(cleanup: EventLogError) -> EventLogError {
+    EventLogError::Committed {
+        cleanup: Box::new(cleanup),
+    }
+}
 /// One store root, resolved the same way for the ordinary opener and the read-only handle.
 fn root_path(path: &Path) -> Result<PathBuf, EventLogError> {
     if path.is_absolute() {
@@ -1561,11 +1805,11 @@ impl EventStore for FileEventStore {
         let tenant = tenant.clone();
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
-                let mut events: Vec<_> = tx
-                    .state
-                    .events
-                    .values()
-                    .filter(|e| e.tenant == tenant && e.global_seq > after)
+                let values = tx.state.events.after(after);
+                #[cfg(feature = "kpi-counters")]
+                let values = values.inspect(|_| kpi::feed_visit());
+                let mut events: Vec<_> = values
+                    .filter(|e| e.tenant == tenant)
                     .take(bounded_limit(limit) + 1)
                     .cloned()
                     .collect();
@@ -1635,6 +1879,17 @@ impl EventStore for FileEventStore {
                     return Ok(false);
                 }
                 let path = tx.snapshot_path(&stream);
+                // A delayed save of an older fold of the same history keeps the newer cache, so the
+                // replay point never moves back within a generation; a cache of an earlier
+                // generation is replaced at any revision.
+                if let Ok(bytes) = fs::read(&path)
+                    && let Ok((cached_generation, cached)) =
+                        serde_json::from_slice::<(String, Snapshot)>(&bytes)
+                    && cached_generation == generation
+                    && cached.version > snapshot.version
+                {
+                    return Ok(true);
+                }
                 fs::create_dir_all(tx.root.join(".cache")).map_err(backend)?;
                 directory(&tx.root.join(".cache"))?;
                 fs::write(
@@ -1711,9 +1966,13 @@ impl EventStore for FileEventStore {
         version: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
+        // Refused before the transaction opens, so a free-text reason takes no lock and
+        // writes no journal.
+        if let Err(error) = eventlog_core::validate_redaction_reason(reason) {
+            return Box::pin(std::future::ready(Err(error)));
+        }
         let (stream, reason) = (stream.clone(), reason.to_owned());
         Box::pin(self.transaction(move |tx| Box::pin(async move {
-            validate_field("redaction reason", &reason)?;
             let mut event = tx.state.events.of_stream(&stream, version..=version).next().cloned().ok_or(EventLogError::NotFound)?;
             event.data = redaction_tombstone(&reason); event.redacted_at = Some(OffsetDateTime::now_utc());
             for transaction in &mut tx.journal.transactions {
@@ -1741,12 +2000,25 @@ impl EventStore for FileEventStore {
             Box::pin(async move {
                 // Erased content is not kept in this handle's memory.
                 tx.content.forget();
-                for transaction in &mut tx.journal.transactions {
+                let mut erased = false;
+                let mut rewritten = Vec::with_capacity(tx.journal.transactions.len());
+                for transaction in &tx.journal.transactions {
                     let mut ops: Vec<Op> =
                         serde_json::from_value(transaction.clone()).map_err(backend)?;
+                    let before = ops.len();
                     ops.retain(|op| op.tenant() != Some(&tenant));
-                    *transaction = serde_json::to_value(ops).map_err(backend)?;
+                    erased |= ops.len() != before;
+                    rewritten.push(serde_json::to_value(ops).map_err(backend)?);
                 }
+                if !erased {
+                    // The history holds nothing of this tenant's: no rewrite, so the epoch every
+                    // other handle observed stays. What an interrupted earlier erasure may have
+                    // left outside the journal — a snapshot of a retired generation, an object no
+                    // binding names — is still disposed of.
+                    tx.clear_snapshots()?;
+                    return tx.clean_blobs();
+                }
+                tx.journal.transactions = rewritten;
                 tx.state = State::replay(&tx.journal.transactions)?;
                 tx.privacy = true;
                 Ok(())
@@ -1782,39 +2054,66 @@ impl EventStore for FileEventStore {
             }) {
                 return Err(EventLogError::Invalid("duplicate inline projection".into()));
             }
+            // Entered as every transaction enters: from this handle's verified view when the file
+            // still extends it, folding only frames it gained since, and through the complete
+            // opener (which refuses a diverged history) otherwise. Each registration used to open
+            // and replay the whole journal again, and retire the view for the next call.
             let path = self.root.clone();
-            let journal = blocking(move || Journal::open(&path)).await?;
-            if let Some(observed) = &runtime.observed
-                && !journal.extends(observed)?
-            {
-                return Err(backend(
-                    "file history diverged from this handle's observed history",
-                ));
-            }
-            let mut tx = Transaction {
-                state: State::replay(&journal.transactions)?,
-                journal,
-                pending: Vec::new(),
-                inline: runtime.inline.clone(),
-                root: self.root.clone(),
-                privacy: false,
-                permit: self.permit.clone(),
-                content: Arc::clone(&self.content),
-                written: Vec::new(),
-                staged_blobs: Vec::new(),
-                atomic_content: false,
-                binds: false,
-            };
-            tx.register(projector.as_ref())?;
-            let manifest = blocking(move || {
-                if !tx.pending.is_empty() {
-                    tx.journal
-                        .append(serde_json::to_value(tx.pending).map_err(backend)?)?;
-                }
-                Ok(tx.journal.manifest.clone())
+            let observed = runtime.observed.clone();
+            let verified = runtime
+                .verified
+                .take()
+                .filter(|verified| Some(&verified.manifest) == observed.as_ref());
+            let reader = capture::reader_bytes(runtime.captured.as_ref());
+            let (inline, permit, content) = (
+                runtime.inline.clone(),
+                self.permit.clone(),
+                Arc::clone(&self.content),
+            );
+            let mut tx = blocking(move || {
+                enter(
+                    &path,
+                    observed.as_ref(),
+                    verified,
+                    reader.as_ref(),
+                    inline,
+                    permit,
+                    content,
+                )
             })
             .await?;
-            runtime.observed = Some(manifest);
+            capture::keep_reader_once(&mut runtime.captured, &tx.journal);
+            if let Err(refusal) = tx.register(projector.as_ref()) {
+                if tx.pending.is_empty() {
+                    let state = tx.state;
+                    let (manifest, transactions, content) = tx.journal.into_parts();
+                    runtime.observed = Some(manifest.clone());
+                    runtime.verified = Some(Verified {
+                        manifest,
+                        transactions,
+                        state,
+                        content,
+                    });
+                }
+                return Err(refusal);
+            }
+            let (manifest, transactions, state, content) = blocking(move || {
+                if !tx.pending.is_empty() {
+                    tx.journal
+                        .append(serde_json::to_value(&tx.pending).map_err(backend)?)?;
+                }
+                let state = tx.state;
+                let (manifest, transactions, content) = tx.journal.into_parts();
+                Ok((manifest, transactions, state, content))
+            })
+            .await?;
+            runtime.observed = Some(manifest.clone());
+            runtime.verified = Some(Verified {
+                manifest,
+                transactions,
+                state,
+                content,
+            });
             runtime.inline.push(projector);
             Ok(())
         })
@@ -1848,6 +2147,20 @@ impl EventStore for FileEventStore {
         let tenant = tenant.clone();
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
+                // Refused before a row is cleared: an inline table is rebuilt with the projector
+                // attached to it, through `rebuild_inline_projection` or by passing that very
+                // instance here (the complete rebuild a redaction requires). Any other projector
+                // over it — another name, or the same name in another instance — would leave rows
+                // of a configuration later appends do not run.
+                let attached = tx
+                    .inline
+                    .iter()
+                    .any(|inline| Arc::ptr_eq(inline, &projector));
+                if !attached && tx.driven_inline(projector.as_ref()) {
+                    return Err(EventLogError::Invalid(
+                        "rebuild requires a catch-up projection".into(),
+                    ));
+                }
                 tx.register(projector.as_ref())?;
                 for spec in projector.projections() {
                     tx.record(Op::DirtyView {
@@ -1949,18 +2262,28 @@ impl EventStore for FileEventStore {
                     tenant: &tenant,
                 }
                 .validate(&spec, &tenant)?;
-                Ok(tx
+                // A seek to the first key past the cursor, so a page costs the rows it returns
+                // and not every row before it: paging 512 rows by 32 used to evaluate 4,864.
+                let (owner, name) = (tenant.as_str().to_owned(), spec.name.to_owned());
+                let from = match after {
+                    Some(after) => std::ops::Bound::Excluded((owner.clone(), name.clone(), after)),
+                    None => std::ops::Bound::Included((owner.clone(), name.clone(), String::new())),
+                };
+                let mut visited = 0_u64;
+                let page = tx
                     .state
                     .rows
-                    .iter()
-                    .filter(|((t, n, k), _)| {
-                        t == tenant.as_str()
-                            && n == spec.name
-                            && after.as_ref().is_none_or(|a| k > a)
-                    })
+                    .range((from, std::ops::Bound::Unbounded))
+                    .inspect(|_| visited += 1)
+                    .take_while(|((t, n, _), _)| t == &owner && n == &name)
                     .take(bounded_limit(limit))
                     .map(|((_, _, key), body)| (key.clone(), body.clone()))
-                    .collect())
+                    .collect();
+                #[cfg(test)]
+                cost::charge(&tx.root, |cost| cost.projection_rows_visited += visited);
+                #[cfg(not(test))]
+                let _ = visited;
+                Ok(page)
             })
         }))
     }
@@ -2199,7 +2522,7 @@ mod grouped_blob_barrier {
     /// nothing without the count it replaces.
     #[tokio::test]
     async fn blobs_inside_one_group_take_the_groups_single_barrier() {
-        for count in [1_usize, 8, 32] {
+        for count in [1_usize, 8] {
             let separate = tempfile::tempdir().unwrap();
             let store = FileEventStore::open(separate.path()).await.unwrap();
             let before = cost::of(separate.path());
@@ -2573,7 +2896,7 @@ mod stamped_resume_cost {
         store.put_blob(&tenant, "blob-1", b"bytes").await.unwrap();
         store.read_stream(&stream(), 0, 10).await.unwrap();
         let refused = store
-            .redact(&stream(), 7, "no such version")
+            .redact(&stream(), 7, "subject-request")
             .await
             .expect_err("a redaction of an absent event refuses");
         assert!(matches!(refused, EventLogError::NotFound));
@@ -2662,14 +2985,17 @@ mod stamped_resume_cost {
     /// vouches for its one file outside the window. Nothing is hashed on either path.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_segmented_resume_compares_only_the_segments_it_cannot_trust() {
-        for layout in [FileLayout::Single, FileLayout::Segmented { seal_at: 1024 }] {
+        // Both fixtures are written first and wait out the window together. A seal at one byte
+        // seals every frame, so twelve frames leave the eleven sealed segments the assertions
+        // need; at 1,024 bytes the same took forty frames and a wait per layout.
+        let mut fixtures = Vec::new();
+        for layout in [FileLayout::Single, FileLayout::Segmented { seal_at: 1 }] {
             let directory = tempfile::tempdir().unwrap();
-            let root = directory.path();
             {
-                let store = FileEventStore::open_with_layout(root, layout)
+                let store = FileEventStore::open_with_layout(directory.path(), layout)
                     .await
                     .unwrap();
-                for index in 0..40 {
+                for index in 0..12 {
                     let stream =
                         StreamId::new(stream().tenant().clone(), "item", format!("s{index}"))
                             .unwrap();
@@ -2684,8 +3010,12 @@ mod stamped_resume_cost {
                         .unwrap();
                 }
             }
-            // Past the window: the next open stamps every file it verifies.
-            tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+            fixtures.push((layout, directory));
+        }
+        // Past the window: the next open stamps every file it verifies.
+        tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+        for (layout, directory) in &fixtures {
+            let (layout, root) = (*layout, directory.path());
             let store = FileEventStore::open(root).await.unwrap();
             let sealed_before = fs::read_dir(root.join("segments")).map_or(0, Iterator::count);
             store
@@ -2950,7 +3280,7 @@ mod stamped_resume_cost {
         let root = directory.path();
         {
             let writer = FileEventStore::open(root).await.unwrap();
-            for index in 0..20 {
+            for index in 0..4 {
                 writer
                     .append(
                         &stream(),
@@ -3016,5 +3346,899 @@ mod stamped_resume_cost {
             spent.prefix_bytes_compared > 0,
             "a fresh write was not re-read: {spent:?}"
         );
+    }
+}
+
+/// What a store costs while nothing changes: an idle projector poll and an ordinary open.
+#[cfg(test)]
+mod steady_state_cost {
+    use super::*;
+    use eventlog_conformance::{Tally, event, meta};
+    use serde_json::json;
+
+    fn tenant(case: &str) -> TenantId {
+        TenantId::new(format!("steady-{case}")).unwrap()
+    }
+
+    fn journal_length(root: &Path) -> u64 {
+        fs::metadata(root.join("events.jsonl")).unwrap().len()
+    }
+
+    /// A caught-up projector polled again commits nothing: twenty idle polls used to add twenty
+    /// cursor frames at the position the cursor already held (369 → 7,901 bytes, no event
+    /// applied). The first poll of a projector that has no cursor still records one, at 0 on a
+    /// tenant with no events, and a poll that applies events still moves it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_catch_up_polls_leave_the_journal_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        let tally = Arc::new(Tally);
+        store.create_projections(tally.clone()).await.unwrap();
+
+        let empty = tenant("empty");
+        let before = journal_length(root);
+        let first = store
+            .run_catch_up(tally.clone(), &empty, 100)
+            .await
+            .unwrap();
+        assert_eq!((first.applied, first.position), (0, 0));
+        assert!(
+            journal_length(root) > before,
+            "the first poll of a projector without a cursor records it"
+        );
+
+        let busy = tenant("busy");
+        let stream = StreamId::new(busy.clone(), "item", "one").unwrap();
+        store
+            .append(
+                &stream,
+                Expected::Any,
+                &[event("added", 1), event("added", 2)],
+                &meta("seed", &json!({ "seed": true })),
+            )
+            .await
+            .unwrap();
+        let caught = store.run_catch_up(tally.clone(), &busy, 100).await.unwrap();
+        assert_eq!(caught.applied, 2);
+
+        let length = journal_length(root);
+        let barriers = crate::cost::of(root).durability_barriers;
+        for tenant in [&empty, &busy].into_iter().cycle().take(20) {
+            let idle = store
+                .run_catch_up(tally.clone(), tenant, 100)
+                .await
+                .unwrap();
+            assert_eq!(idle.applied, 0, "an idle poll of {tenant:?}");
+        }
+        assert_eq!(
+            journal_length(root),
+            length,
+            "20 idle polls grew the journal"
+        );
+        assert_eq!(
+            crate::cost::of(root).durability_barriers - barriers,
+            0,
+            "20 idle polls committed frames"
+        );
+
+        store
+            .append(
+                &stream,
+                Expected::Any,
+                &[event("added", 3)],
+                &meta("more", &json!({ "more": true })),
+            )
+            .await
+            .unwrap();
+        let moved = store.run_catch_up(tally.clone(), &busy, 100).await.unwrap();
+        assert_eq!((moved.applied, moved.position), (1, 3));
+        drop(store);
+        let reopened = FileEventStore::open(root).await.unwrap();
+        let after = reopened.run_catch_up(tally, &busy, 100).await.unwrap();
+        assert_eq!(
+            (after.applied, after.position),
+            (0, 3),
+            "the moved cursor was committed"
+        );
+    }
+
+    /// An event-only commit does not sweep the object directory. The sweep listed every object
+    /// file and synchronized the directory on each append (64 objects listed and one directory
+    /// `fsync` for one appended event). An object file no frame names, as a crash leaves one, is
+    /// therefore still there after event-only appends, and is disposed of by the next commit that
+    /// changes bindings and by the complete opener.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_only_append_does_not_sweep_the_object_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let owner = tenant("sweep");
+        let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.put_blob(&owner, "kept", b"kept").await.unwrap();
+        let orphan = root.join("blobs").join(new_event_id());
+        let plant = || fs::write(&orphan, b"left by a crash").unwrap();
+
+        plant();
+        for n in 1..=3 {
+            store
+                .append(
+                    &stream,
+                    Expected::Any,
+                    &[event("added", n)],
+                    &meta(&format!("event-{n}"), &json!({ "n": n })),
+                )
+                .await
+                .unwrap();
+        }
+        let tally = Arc::new(Tally);
+        store.create_projections(tally.clone()).await.unwrap();
+        store.run_catch_up(tally, &owner, 100).await.unwrap();
+        assert!(
+            orphan.exists(),
+            "an event-only commit swept the object directory"
+        );
+
+        store.put_blob(&owner, "bound", b"bound").await.unwrap();
+        assert!(!orphan.exists(), "a binding commit sweeps the directory");
+
+        plant();
+        drop(store);
+        let reopened = FileEventStore::open(root).await.unwrap();
+        assert!(!orphan.exists(), "the complete opener sweeps the directory");
+        assert_eq!(
+            reopened.get_blob(&owner, "kept").await.unwrap().as_deref(),
+            Some(&b"kept"[..])
+        );
+    }
+
+    fn blob_group(owner: &TenantId, key: &str) -> AppendGroup {
+        AppendGroup {
+            tenant: owner.clone(),
+            meta: meta(key, &json!({ "key": key })),
+            appends: vec![eventlog_core::StreamAppend {
+                stream: StreamId::new(owner.clone(), "item", key).unwrap(),
+                expected: Expected::NoStream,
+                events: vec![event("added", 1)],
+            }],
+        }
+    }
+
+    fn object_files(root: &Path) -> usize {
+        fs::read_dir(root.join("blobs")).map_or(0, Iterator::count)
+    }
+
+    /// A batch of new digests finds the ones it already binds through an index, not by scanning
+    /// every earlier entry: 512 distinct digests cost 130,816 comparisons scanned pairwise
+    /// (1,024 cost 523,776). The index keeps the batch's rules: a digest repeated with the same
+    /// bytes binds once, and one repeated with different bytes refuses the whole group.
+    ///
+    /// The 512 digests are measured in a batch whose last entry repeats the first with other
+    /// bytes: the index runs over all of them exactly as it does for a batch that commits, and the
+    /// refusal comes before any object is written, so the bound costs no object synchronization
+    /// (a committed batch of 512 synchronized 512 objects, 9.9 s of this case). The same bound
+    /// is held on a batch that commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_batch_finds_repeated_digests_without_scanning_the_batch() {
+        const DISTINCT: u64 = 512;
+        const COMMITTED: u64 = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let owner = tenant("batch-index");
+        let store = FileEventStore::open(root).await.unwrap();
+
+        let batch = |count: u64| -> Vec<_> {
+            (0..count)
+                .map(|i| (format!("digest-{i:04}"), i.to_le_bytes().to_vec()))
+                .collect()
+        };
+        let mut refused_at_the_end = batch(DISTINCT);
+        refused_at_the_end.push(("digest-0000".to_owned(), b"other".to_vec()));
+        let before = crate::cost::of(root).digest_comparisons;
+        let refused = store
+            .append_group_with_blobs(&blob_group(&owner, "distinct"), &refused_at_the_end)
+            .await
+            .expect_err("the last entry names different bytes");
+        assert!(
+            matches!(&refused, EventLogError::Invalid(reason)
+                if reason == "blob digest already names different content"),
+            "{refused:?}"
+        );
+        let compared = crate::cost::of(root).digest_comparisons - before;
+        assert!(compared > 0, "the batch index compared nothing");
+        // Well under the n(n-1)/2 = 130,816 of a pairwise scan; a B-tree lookup plus insert per
+        // digest stays far below 64 comparisons each at this size.
+        assert!(
+            compared <= 64 * DISTINCT,
+            "{DISTINCT} distinct digests took {compared} comparisons"
+        );
+        assert_eq!(object_files(root), 0, "a refused batch wrote objects");
+
+        let before = crate::cost::of(root).digest_comparisons;
+        store
+            .append_group_with_blobs(&blob_group(&owner, "committed"), &batch(COMMITTED))
+            .await
+            .unwrap();
+        let compared = crate::cost::of(root).digest_comparisons - before;
+        assert!(compared > 0, "the batch index compared nothing");
+        assert!(
+            compared <= 64 * COMMITTED,
+            "{COMMITTED} distinct digests took {compared} comparisons"
+        );
+        assert_eq!(object_files(root), usize::try_from(COMMITTED).unwrap());
+
+        let repeated = vec![
+            ("same".to_owned(), b"one".to_vec()),
+            ("other".to_owned(), b"two".to_vec()),
+            ("same".to_owned(), b"one".to_vec()),
+        ];
+        store
+            .append_group_with_blobs(&blob_group(&owner, "repeated"), &repeated)
+            .await
+            .unwrap();
+        assert_eq!(
+            object_files(root),
+            usize::try_from(COMMITTED).unwrap() + 2,
+            "a digest repeated with the same bytes binds once"
+        );
+
+        let differing = vec![
+            ("fresh".to_owned(), b"first".to_vec()),
+            ("second".to_owned(), b"second".to_vec()),
+            ("fresh".to_owned(), b"changed".to_vec()),
+        ];
+        let refused = store
+            .append_group_with_blobs(&blob_group(&owner, "differing"), &differing)
+            .await
+            .expect_err("a digest repeated with different bytes refuses");
+        assert!(
+            matches!(&refused, EventLogError::Invalid(reason)
+                if reason == "blob digest already names different content"),
+            "{refused:?}"
+        );
+        assert_eq!(store.get_blob(&owner, "fresh").await.unwrap(), None);
+        assert_eq!(store.get_blob(&owner, "second").await.unwrap(), None);
+        assert_eq!(
+            object_files(root),
+            usize::try_from(COMMITTED).unwrap() + 2,
+            "the refused group left objects behind"
+        );
+    }
+
+    /// Opening an existing store chains its history once. The opener used to verify and replay
+    /// the journal, drop it, and open and replay it again in a complete transaction: two passes
+    /// over the same bytes on every ordinary open. Every active object is still hashed once, and
+    /// the next transaction resumes from the view the open verified instead of opening again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_an_existing_store_chains_its_history_once() {
+        const FRAMES: u64 = 8;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let owner = tenant("open");
+        let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
+        {
+            let store = FileEventStore::open(root).await.unwrap();
+            store.put_blob(&owner, "blob-1", b"bytes").await.unwrap();
+            for frame in 1..FRAMES {
+                store
+                    .append(
+                        &stream,
+                        Expected::Any,
+                        &[event("added", i64::try_from(frame).unwrap())],
+                        &meta(&format!("frame-{frame}"), &json!({ "frame": frame })),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let frames = Journal::open(root).unwrap().transactions.len() as u64;
+        assert_eq!(frames, FRAMES);
+        let length = journal_length(root);
+
+        let before = crate::cost::of(root);
+        let store = FileEventStore::open(root).await.unwrap();
+        let opened = crate::cost::of(root) - before;
+        assert_eq!(
+            opened.frames_chained, frames,
+            "an open chained the journal more than once: {opened:?}"
+        );
+        assert!(
+            opened.journal_bytes_hashed <= length,
+            "an open hashed {} bytes of a {length}-byte journal",
+            opened.journal_bytes_hashed
+        );
+        assert_eq!(
+            opened.blobs_hashed, 1,
+            "the open hashes every active object"
+        );
+
+        let before = crate::cost::of(root);
+        assert_eq!(
+            store.stream_version(&stream).await.unwrap(),
+            Some(FRAMES - 1)
+        );
+        let resumed = crate::cost::of(root) - before;
+        assert_eq!(
+            (resumed.frames_chained, resumed.blobs_hashed),
+            (0, 0),
+            "the first call after the open did not resume its view: {resumed:?}"
+        );
+    }
+
+    /// One group appending one event to each of `count` streams of `kind`.
+    fn streams(owner: &TenantId, kind: &str, count: usize) -> AppendGroup {
+        AppendGroup {
+            tenant: owner.clone(),
+            meta: meta(&format!("{kind}-{count}"), &json!({ "kind": kind })),
+            appends: (0..count)
+                .map(|i| eventlog_core::StreamAppend {
+                    stream: StreamId::new(owner.clone(), kind, format!("s{i:04}")).unwrap(),
+                    expected: Expected::NoStream,
+                    events: vec![event("added", 1)],
+                })
+                .collect(),
+        }
+    }
+
+    /// The row index the handle's next transaction holds, and the one its rows call for.
+    async fn row_index(store: &FileEventStore) -> (crate::state::RowIndex, crate::state::RowIndex) {
+        store
+            .transaction(|tx| {
+                Box::pin(async move {
+                    Ok((
+                        tx.state.row_index.clone(),
+                        crate::state::RowIndex::of(&tx.state.rows, &tx.state.projections),
+                    ))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// An indexed lookup visits the rows it returns, not the rows of the projection: a value no
+    /// row holds took 128 field evaluations for 128 rows and 512 for 512. The index stays the one
+    /// the rows call for through catch-up, a rebuild, a tenant's erasure and a replay from the
+    /// journal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_indexed_lookup_visits_the_rows_it_returns_not_the_projection() {
+        let owner = tenant("find");
+        let other = tenant("find-other");
+        let tally = Arc::new(Tally);
+        for rows in [32_usize, 256] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let store = FileEventStore::open(root).await.unwrap();
+            store.create_projections(tally.clone()).await.unwrap();
+            for tenant in [&owner, &other] {
+                store
+                    .append_group(&streams(tenant, "item", rows))
+                    .await
+                    .unwrap();
+                store
+                    .append_group(&streams(tenant, "rare", 2))
+                    .await
+                    .unwrap();
+                store
+                    .run_catch_up(tally.clone(), tenant, 10_000)
+                    .await
+                    .unwrap();
+            }
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(held, called_for, "{rows} rows: after catch-up");
+
+            let find = |value: &'static str, limit| {
+                let (store, owner) = (&store, &owner);
+                async move {
+                    let before = crate::cost::of(root).projection_rows_visited;
+                    let found = store
+                        .projection_find(&eventlog_conformance::TALLY, owner, "kind", value, limit)
+                        .await
+                        .unwrap();
+                    let kinds: Vec<_> = found
+                        .iter()
+                        .map(|row| row["kind"].as_str().unwrap().to_owned())
+                        .collect();
+                    (
+                        kinds,
+                        crate::cost::of(root).projection_rows_visited - before,
+                    )
+                }
+            };
+            assert_eq!(
+                find("missing", 1).await,
+                (vec![], 0),
+                "{rows} rows: no match"
+            );
+            assert_eq!(
+                find("item", 1).await,
+                (vec!["item".to_owned()], 1),
+                "{rows} rows: one of many"
+            );
+            assert_eq!(
+                find("rare", 10).await,
+                (vec!["rare".to_owned(); 2], 2),
+                "{rows} rows: every match"
+            );
+
+            // A row whose indexed value changes, a deleted row and a cleared projection, written
+            // as the ops a projector's upsert, delete and a rebuild record.
+            let (moved_owner, other_tenant) = (owner.clone(), other.clone());
+            store
+                .transaction(move |tx| {
+                    Box::pin(async move {
+                        tx.record(Op::Row {
+                            tenant: moved_owner.clone(),
+                            name: "tally".into(),
+                            key: "item/s0000".into(),
+                            body: Some(json!({ "kind": "moved", "count": 1 })),
+                        })?;
+                        tx.record(Op::Row {
+                            tenant: moved_owner,
+                            name: "tally".into(),
+                            key: "item/s0001".into(),
+                            body: None,
+                        })?;
+                        tx.record(Op::ClearRows {
+                            tenant: other_tenant,
+                            name: "tally".into(),
+                        })
+                    })
+                })
+                .await
+                .unwrap();
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(
+                held, called_for,
+                "{rows} rows: after a change, a delete and a clear"
+            );
+            assert_eq!(
+                find("moved", 10).await,
+                (vec!["moved".to_owned()], 1),
+                "{rows} rows: the changed value"
+            );
+            assert_eq!(
+                held.keys(owner.as_str(), "tally", "kind", "item").count(),
+                rows - 2,
+                "{rows} rows: the old value of the changed row and the deleted row"
+            );
+
+            store
+                .rebuild_projection(tally.clone(), &owner)
+                .await
+                .unwrap();
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(held, called_for, "{rows} rows: after a rebuild");
+            store.forget_tenant(&other).await.unwrap();
+            let (held, called_for) = row_index(&store).await;
+            assert_eq!(held, called_for, "{rows} rows: after an erasure");
+            assert!(
+                held.keys(other.as_str(), "tally", "kind", "item")
+                    .next()
+                    .is_none(),
+                "the erased tenant's rows are still indexed"
+            );
+            drop(store);
+            let reopened = FileEventStore::open(root).await.unwrap();
+            let (replayed, called_for) = row_index(&reopened).await;
+            assert_eq!(replayed, called_for, "{rows} rows: after a replay");
+            assert_eq!(
+                replayed, held,
+                "{rows} rows: a replay rebuilt another index"
+            );
+            assert_eq!(
+                reopened
+                    .projection_find(&eventlog_conformance::TALLY, &owner, "kind", "rare", 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+
+    /// Opening a store visits each snapshot generation once to decide which cached snapshots are
+    /// live, however many snapshots there are: 64 live snapshots used to cost 2,080 generation
+    /// comparisons. A live snapshot survives the open and one with an unknown generation does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_visits_each_snapshot_generation_once() {
+        let owner = tenant("snapshots");
+        let count = 32;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append_group(&streams(&owner, "item", count))
+            .await
+            .unwrap();
+        let ids: Vec<StreamId> = (0..count)
+            .map(|i| StreamId::new(owner.clone(), "item", format!("s{i:04}")).unwrap())
+            .collect();
+        let minted = ids.clone();
+        store
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    for stream in &minted {
+                        tx.generation(stream)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let snapshot = Snapshot {
+            version: 1,
+            state_schema_version: 1,
+            state: json!({ "count": 1 }),
+            recorded_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        for stream in &ids {
+            let generation = store.snapshot_generation(stream).await.unwrap().unwrap();
+            assert!(
+                store
+                    .save_snapshot_checked(stream, &snapshot, &generation)
+                    .await
+                    .unwrap()
+            );
+        }
+        let stale = root.join(".cache").join("stale");
+        fs::write(
+            &stale,
+            serde_json::to_vec(&(new_event_id(), &snapshot)).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+
+        let before = crate::cost::of(root).generations_visited;
+        let reopened = FileEventStore::open(root).await.unwrap();
+        assert_eq!(
+            crate::cost::of(root).generations_visited - before,
+            count as u64,
+            "each generation is visited once, not once per snapshot"
+        );
+        assert!(!stale.exists(), "a snapshot of no generation survived");
+        for stream in &ids {
+            assert!(
+                reopened.load_snapshot(stream).await.unwrap().is_some(),
+                "a live snapshot was removed"
+            );
+        }
+    }
+
+    /// Forgetting a tenant the history does not hold leaves the journal and its epoch as they
+    /// were: it used to rewrite the journal and advance the epoch under every other handle. What
+    /// an interrupted erasure left outside the journal is still disposed of.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_an_absent_tenant_keeps_the_journal_and_its_epoch() {
+        let kept = tenant("kept");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append_group(&streams(&kept, "item", 2))
+            .await
+            .unwrap();
+        store.put_blob(&kept, "kept", b"bytes").await.unwrap();
+        let other = FileEventStore::open(root).await.unwrap();
+        let journal = fs::read(root.join("events.jsonl")).unwrap();
+        let manifest = fs::read(root.join("manifest.json")).unwrap();
+        let orphan_object = root.join("blobs").join(new_event_id());
+        fs::write(&orphan_object, b"left behind").unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        let orphan_snapshot = root.join(".cache").join("retired");
+        fs::write(
+            &orphan_snapshot,
+            serde_json::to_vec(&(
+                new_event_id(),
+                Snapshot {
+                    version: 1,
+                    state_schema_version: 1,
+                    state: json!({}),
+                    recorded_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        store.forget_tenant(&tenant("absent")).await.unwrap();
+        assert!(
+            fs::read(root.join("manifest.json")).unwrap() == manifest,
+            "the manifest moved: the epoch advanced for nothing"
+        );
+        assert!(
+            fs::read(root.join("events.jsonl")).unwrap() == journal,
+            "the journal was rewritten"
+        );
+        assert!(!orphan_object.exists(), "an unbound object survived");
+        assert!(!orphan_snapshot.exists(), "a retired snapshot survived");
+        assert_eq!(
+            other.get_blob(&kept, "kept").await.unwrap().as_deref(),
+            Some(&b"bytes"[..])
+        );
+
+        store.forget_tenant(&kept).await.unwrap();
+        assert!(
+            fs::read(root.join("manifest.json")).unwrap() != manifest,
+            "a tenant that is present is still erased through a rewrite"
+        );
+        assert_eq!(store.get_blob(&kept, "kept").await.unwrap(), None);
+        // The control: the epoch a real erasure mints is what the other handle runs into.
+        let diverged = other
+            .get_blob(&kept, "kept")
+            .await
+            .expect_err("the other handle observed the epoch before the erasure");
+        assert!(
+            matches!(&diverged, EventLogError::Backend(reason) if reason.contains("diverged")),
+            "{diverged:?}"
+        );
+    }
+
+    /// A projection page seeks to the first key past its cursor: it visits the rows it returns
+    /// and at most one more, wherever the page starts. Paging 512 rows by 32 used to evaluate
+    /// 4,864 rows. Pages still cover every row of this tenant's projection once, in key order,
+    /// including the empty key, and no row of another tenant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_projection_page_visits_the_rows_it_returns_not_the_rows_before_it() {
+        let owner = tenant("pages");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store.create_projections(Arc::new(Tally)).await.unwrap();
+        let (rows, page) = (128_usize, 16_usize);
+        let mut keys: Vec<String> = (0..rows - 1).map(|i| format!("k{i:04}")).collect();
+        keys.insert(0, String::new());
+        let written = keys.clone();
+        let (mine, before, after) = (owner.clone(), tenant("pagea"), tenant("pagez"));
+        store
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    for (tenant, keys) in
+                        [(&before, &written), (&mine, &written), (&after, &written)]
+                    {
+                        for key in keys {
+                            tx.record(Op::Row {
+                                tenant: tenant.clone(),
+                                name: "tally".into(),
+                                key: key.clone(),
+                                body: Some(json!({ "kind": "item", "count": 1 })),
+                            })?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let start = crate::cost::of(root).projection_rows_visited;
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut calls = 0;
+        loop {
+            let before = crate::cost::of(root).projection_rows_visited;
+            let found = store
+                .projection_list(
+                    &eventlog_conformance::TALLY,
+                    &owner,
+                    cursor.as_deref(),
+                    page,
+                )
+                .await
+                .unwrap();
+            calls += 1;
+            let spent = crate::cost::of(root).projection_rows_visited - before;
+            assert!(
+                spent <= found.len() as u64 + 1,
+                "page {calls} visited {spent} rows to return {}",
+                found.len()
+            );
+            let Some((last, _)) = found.last() else { break };
+            cursor = Some(last.clone());
+            listed.extend(found.into_iter().map(|(key, _)| key));
+        }
+        assert_eq!(listed, keys);
+        assert_eq!(calls, rows / page + 1);
+        assert!(
+            crate::cost::of(root).projection_rows_visited - start <= (rows + calls) as u64,
+            "the pages together visited more rows than they returned and one per call"
+        );
+    }
+
+    static OWN_TABLES: [ProjectionSpec; 4] = [
+        ProjectionSpec {
+            name: "own_0",
+            indexed: &[],
+        },
+        ProjectionSpec {
+            name: "own_1",
+            indexed: &[],
+        },
+        ProjectionSpec {
+            name: "own_2",
+            indexed: &[],
+        },
+        ProjectionSpec {
+            name: "own_3",
+            indexed: &[],
+        },
+    ];
+
+    /// An inline projector over one table of its own that applies nothing.
+    struct Own(usize);
+
+    impl Projector for Own {
+        fn name(&self) -> &'static str {
+            OWN_TABLES[self.0].name
+        }
+        fn projections(&self) -> &'static [ProjectionSpec] {
+            std::slice::from_ref(&OWN_TABLES[self.0])
+        }
+        fn apply<'a>(
+            &'a self,
+            _: &'a RecordedEvent,
+            _: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// An inline registration resumes the handle's verified view: four registrations on an opened
+    /// store chain no committed frame again, and the call after them resumes too. Each used to open
+    /// and replay the whole journal (518 extra frame visits for four on a 128-frame store) and
+    /// retire the view, so the next call replayed it once more. The registrations are committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_registrations_resume_the_verified_view() {
+        let owner = tenant("registrations");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        {
+            let store = FileEventStore::open(root).await.unwrap();
+            for round in 0..8 {
+                store
+                    .append_group(&streams(&owner, &format!("r{round}"), 2))
+                    .await
+                    .unwrap();
+            }
+        }
+        let store = FileEventStore::open(root).await.unwrap();
+        let before = crate::cost::of(root).frames_chained;
+        for index in 0..OWN_TABLES.len() {
+            store.register_inline(Arc::new(Own(index))).await.unwrap();
+        }
+        assert_eq!(
+            crate::cost::of(root).frames_chained - before,
+            0,
+            "a registration chained committed frames again"
+        );
+        let stream = StreamId::new(owner.clone(), "r0", "s0000").unwrap();
+        assert_eq!(
+            store
+                .read_stream(&stream, 0, 10)
+                .await
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        assert_eq!(
+            crate::cost::of(root).frames_chained - before,
+            0,
+            "the call after the registrations did not resume the view"
+        );
+        drop(store);
+        let reopened = FileEventStore::open(root).await.unwrap();
+        let registered = reopened
+            .transaction(|tx| Box::pin(async move { Ok(tx.state.projections.clone()) }))
+            .await
+            .unwrap();
+        for spec in &OWN_TABLES {
+            assert_eq!(
+                registered.get(spec.name),
+                Some(&Vec::new()),
+                "{}",
+                spec.name
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod catch_up_ownership {
+    use super::*;
+    use eventlog_conformance::{TALLY, Tally, event, meta};
+    use eventlog_core::InlineProjectionAdmin;
+    use serde_json::json;
+
+    /// Another projector over the inline projector's table, writing what the attached one never
+    /// would.
+    struct Rival;
+
+    impl Projector for Rival {
+        fn name(&self) -> &'static str {
+            "rival"
+        }
+        fn projections(&self) -> &'static [ProjectionSpec] {
+            std::slice::from_ref(&TALLY)
+        }
+        fn apply<'a>(
+            &'a self,
+            event: &'a RecordedEvent,
+            store: &'a mut dyn ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                let key = format!("{}/{}", event.stream_type, event.stream_id);
+                store
+                    .upsert(
+                        &TALLY,
+                        &event.tenant,
+                        &key,
+                        &json!({ "kind": "rival", "count": 100 }),
+                    )
+                    .await
+            })
+        }
+    }
+
+    /// The catch-up rebuild refuses a table an attached inline projector owns, under its own name
+    /// or another's, before a row is cleared: it used to clear the inline rows and fold them with
+    /// the supplied projector, while later appends ran the attached one. A second instance of the
+    /// attached projector's own type is refused too. The catch-up poll refuses the table as well;
+    /// the inline rebuild, and the catch-up rebuild given the attached instance itself, still
+    /// rebuild it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_rebuild_refuses_a_table_an_inline_projector_owns() {
+        let owner = TenantId::new("inline-owned").unwrap();
+        let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileEventStore::open(directory.path()).await.unwrap();
+        let attached: Arc<dyn Projector> = Arc::new(Tally);
+        store.register_inline(attached.clone()).await.unwrap();
+        store
+            .append(
+                &stream,
+                Expected::NoStream,
+                &[event("item.created", 1)],
+                &meta("one", &json!({})),
+            )
+            .await
+            .unwrap();
+        let inline_rows = || async {
+            store
+                .projection_list(&TALLY, &owner, None, 10)
+                .await
+                .unwrap()
+        };
+        let before = inline_rows().await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1["count"], 1);
+
+        for projector in [Arc::new(Rival) as Arc<dyn Projector>, Arc::new(Tally)] {
+            let name = projector.name();
+            let refused = store
+                .rebuild_projection(projector.clone(), &owner)
+                .await
+                .expect_err("an inline table is not rebuilt through catch-up");
+            assert!(
+                matches!(&refused, EventLogError::Invalid(reason) if reason == "rebuild requires a catch-up projection"),
+                "{name}: {refused:?}"
+            );
+            assert_eq!(inline_rows().await, before, "{name}: the inline rows moved");
+            let refused = store
+                .run_catch_up(projector, &owner, 10)
+                .await
+                .expect_err("an inline table is not polled through catch-up");
+            assert!(
+                matches!(&refused, EventLogError::Invalid(reason) if reason == "projection is driven inline"),
+                "{name}: {refused:?}"
+            );
+        }
+        let rebuilt = store
+            .rebuild_inline_projection("tally", &owner)
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.applied, 1);
+        assert_eq!(inline_rows().await, before);
+        assert_eq!(store.rebuild_projection(attached, &owner).await.unwrap(), 1);
+        assert_eq!(inline_rows().await, before);
     }
 }

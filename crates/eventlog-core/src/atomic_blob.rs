@@ -38,20 +38,38 @@ impl BlobAppendGroup {
     pub fn fingerprint_and_hashes(
         &self,
     ) -> Result<(String, BTreeMap<String, String>), EventLogError> {
-        let group_fingerprint = self.group.fingerprint()?;
-        if self.blobs.is_empty() {
-            return Err(EventLogError::Invalid(
-                "an atomic blob group must contain blobs".into(),
-            ));
-        }
+        Self::fingerprint_parts(
+            &self.group,
+            self.blobs
+                .iter()
+                .map(|blob| (blob.digest.as_str(), blob.bytes.as_slice())),
+        )
+    }
+
+    /// [`Self::fingerprint_and_hashes`] of the request made of `group` and `blobs`, without
+    /// building it: a provider that holds a group and its blobs apart would otherwise copy every
+    /// byte into a [`BlobAppendGroup`] only to fingerprint it.
+    ///
+    /// # Errors
+    /// As [`Self::fingerprint`].
+    pub fn fingerprint_parts<'a>(
+        group: &AppendGroup,
+        blobs: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) -> Result<(String, BTreeMap<String, String>), EventLogError> {
+        let group_fingerprint = group.fingerprint()?;
         let mut ordered = BTreeMap::new();
-        for blob in &self.blobs {
-            crate::validate_field("blob digest", &blob.digest)?;
-            if ordered.insert(&blob.digest, &blob.bytes).is_some() {
+        for (digest, bytes) in blobs {
+            crate::validate_field("blob digest", digest)?;
+            if ordered.insert(digest, bytes).is_some() {
                 return Err(EventLogError::Invalid(
                     "duplicate blob digest in atomic group".into(),
                 ));
             }
+        }
+        if ordered.is_empty() {
+            return Err(EventLogError::Invalid(
+                "an atomic blob group must contain blobs".into(),
+            ));
         }
         let mut hashes = BTreeMap::new();
         let blobs = ordered
@@ -60,7 +78,7 @@ impl BlobAppendGroup {
                 let byte_count = u64::try_from(bytes.len())
                     .map_err(|_| EventLogError::Invalid("blob length exceeds u64".into()))?;
                 let content_sha256 = format!("{:x}", Sha256::digest(bytes));
-                hashes.insert(digest.clone(), content_sha256.clone());
+                hashes.insert(digest.to_owned(), content_sha256.clone());
                 Ok(json!({"digest":digest,"byte_count":byte_count,"content_sha256":content_sha256}))
             })
             .collect::<Result<Vec<_>, EventLogError>>()?;

@@ -16,7 +16,7 @@ mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod blob_integrity;
 mod verified_content;
-pub use verified_content::{VERIFIED_CONTENT_BUDGET, VerifiedContent};
+pub use verified_content::{ContentGeneration, VERIFIED_CONTENT_BUDGET, VerifiedContent};
 mod capture;
 mod inline_admin;
 pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
@@ -24,12 +24,12 @@ mod projection;
 
 pub use capture::{
     BoundBlobs, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
-    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection,
-    CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture, DeferredBlob,
-    DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal, TenantCapture,
-    TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs, order_rows,
-    validate_capture_request, validate_captured_branchable_order, validate_captured_digest,
-    validate_captured_event, validate_captured_order,
+    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedOrder,
+    CapturedProjection, CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture,
+    DeferredBlob, DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal,
+    TenantCapture, TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs,
+    order_rows, validate_capture_request, validate_captured_branchable_order,
+    validate_captured_digest, validate_captured_event, validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 
@@ -39,8 +39,8 @@ pub use blob_integrity::{
     validate_stored_blob,
 };
 pub use projection::{
-    CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, NoGuard, ProjectionSpec,
-    ProjectionStore, Projector, indexed_value, validate_identifier,
+    CatchUpProgress, CatchUpRunner, Guard, MAX_INDEXED_FIELDS, MAX_INDEXED_VALUE_BYTES, NoGuard,
+    ProjectionSpec, ProjectionStore, Projector, indexed_value, indexed_values, validate_identifier,
 };
 
 mod atomic_blob;
@@ -576,16 +576,162 @@ pub fn validate_effect_boundary_inventory(
     Ok(())
 }
 
-/// A stable digest of a command body, for the idempotency check.
+/// A digest of a command body, for the idempotency check.
+///
+/// The compact JSON bytes are written straight into the hasher: the same bytes `to_vec` would
+/// produce, without holding a copy of the whole body.
+///
+/// **The digest depends on the order the body serialises its object keys in.** A struct keeps
+/// its field order, but a `HashMap` iterates in an order chosen per map, so one unchanged body can
+/// hash differently on a retry and be refused as an idempotency mismatch. New idempotency keys
+/// should use [`canonical_request_hash`]. A key already recorded with this digest keeps being
+/// retried with this function: the bytes it hashes never change, so recorded retry identities stay
+/// usable.
 ///
 /// # Errors
 /// Returns [`EventLogError::Invalid`] when the value cannot be serialised.
 pub fn request_hash<T: Serialize>(value: &T) -> Result<String, EventLogError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| EventLogError::Invalid(format!("command is not serialisable: {error}")))?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    serde_json::to_writer(&mut hasher, value)
+        .map_err(|error| EventLogError::Invalid(format!("command is not serialisable: {error}")))?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The version prefix of [`canonical_request_hash`], so its digests never collide with
+/// [`request_hash`]'s unprefixed ones.
+pub const CANONICAL_REQUEST_HASH_PREFIX: &str = "c1:";
+
+/// A digest of a command body that does not depend on object key order.
+///
+/// The body is serialised as compact JSON, then every object's keys are written in ascending
+/// UTF-8 byte order, recursively; arrays keep their order. The sort is done here rather than
+/// left to `serde_json::Value`, whose map order changes when any crate in a build enables
+/// `serde_json/preserve_order`. The result is `c1:` followed by the lower-case SHA-256 of those
+/// canonical bytes.
+///
+/// Migration rule: use it for new idempotency keys only. A key recorded with
+/// [`request_hash`] keeps [`request_hash`]; switching an in-flight key changes its digest and is
+/// refused as an idempotency mismatch.
+///
+/// # Errors
+/// Returns [`EventLogError::Invalid`] when the value cannot be serialised, or nests deeper than
+/// `serde_json` reads back (128 levels).
+pub fn canonical_request_hash<T: Serialize>(value: &T) -> Result<String, EventLogError> {
+    let invalid = |error: &dyn std::fmt::Display| {
+        EventLogError::Invalid(format!("command is not serialisable: {error}"))
+    };
+    let bytes = serde_json::to_vec(value).map_err(|error| invalid(&error))?;
+    let node: CanonicalNode = serde_json::from_slice(&bytes).map_err(|error| invalid(&error))?;
+    drop(bytes);
+    let mut hasher = Sha256::new();
+    node.write(&mut hasher).map_err(|error| invalid(&error))?;
+    Ok(format!(
+        "{CANONICAL_REQUEST_HASH_PREFIX}{:x}",
+        hasher.finalize()
+    ))
+}
+
+/// A JSON value with object entries in document order, so the canonical order is imposed here.
+enum CanonicalNode {
+    Null,
+    Bool(bool),
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+    Text(String),
+    Array(Vec<CanonicalNode>),
+    Object(Vec<(String, CanonicalNode)>),
+}
+
+impl CanonicalNode {
+    fn write(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Null => out.write_all(b"null"),
+            Self::Bool(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Unsigned(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Signed(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Float(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Text(value) => serde_json::to_writer(out, value).map_err(Into::into),
+            Self::Array(items) => {
+                out.write_all(b"[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.write_all(b",")?;
+                    }
+                    item.write(out)?;
+                }
+                out.write_all(b"]")
+            }
+            Self::Object(entries) => {
+                let mut sorted: Vec<&(String, CanonicalNode)> = entries.iter().collect();
+                sorted.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+                out.write_all(b"{")?;
+                for (index, (key, value)) in sorted.into_iter().enumerate() {
+                    if index > 0 {
+                        out.write_all(b",")?;
+                    }
+                    serde_json::to_writer(&mut *out, key)?;
+                    out.write_all(b":")?;
+                    value.write(out)?;
+                }
+                out.write_all(b"}")
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CanonicalNode;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Null)
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Bool(value))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Unsigned(value))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Signed(value))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Float(value))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Text(value.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<CanonicalNode, E> {
+                Ok(CanonicalNode::Text(value))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<CanonicalNode, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = sequence.next_element()? {
+                    items.push(item);
+                }
+                Ok(CanonicalNode::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<CanonicalNode, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(CanonicalNode::Object(entries))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// A new event id. Time-ordered, so a debug listing sorts the way history happened.
@@ -651,6 +797,9 @@ impl RecordedEvent {
 }
 
 /// The body a redacted event keeps, so that a reader can still say what is missing and why.
+///
+/// `reason` is an owner-defined code that [`validate_redaction_reason`] accepts; every provider
+/// checks it before it writes a tombstone.
 #[must_use]
 pub fn redaction_tombstone(reason: &str) -> Value {
     json!({ "redacted": true, "reason": reason })
@@ -778,6 +927,11 @@ pub enum EventLogError {
         report: BlobMigrationReport,
         cleanup: Box<EventLogError>,
     },
+    /// The commit is published and its outcome is known, but the cleanup after it failed (an
+    /// unreferenced object or cached snapshot was not removed). Do not retry the command as if it
+    /// failed; the next commit that changes bindings, or a reopen, retries the cleanup.
+    #[error("commit published, but cleanup after it failed: {cleanup}")]
+    Committed { cleanup: Box<EventLogError> },
 
     #[error("stream is at version {actual}, not {expected}")]
     Conflict { expected: u64, actual: u64 },
@@ -795,6 +949,14 @@ pub enum EventLogError {
     /// The store declared, in its [`Capabilities`], that it does not do this.
     #[error("this event store does not support {capability}")]
     Unsupported { capability: &'static str },
+    /// A projection row carries a value for an indexed field longer than every provider can
+    /// index ([`MAX_INDEXED_VALUE_BYTES`]). Nothing was written.
+    #[error("indexed field {field} holds {bytes} bytes; at most {limit} can be indexed")]
+    IndexedValueTooLarge {
+        field: &'static str,
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 /// Where facts are kept.
@@ -845,6 +1007,10 @@ pub trait EventStore: Send + Sync + 'static {
     /// retry — "that corpus already exists" — which is the opposite of what a retry means and is
     /// exactly what a caller who lost the first response would see.
     ///
+    /// Only an append records a command, so this answers only commands that wrote events. A
+    /// command that decided nothing appended nothing and answers `None`: its retry is decided
+    /// again against the stream as it is then (see [`Aggregate::decide`]).
+    ///
     /// # Errors
     /// Returns [`EventLogError::IdempotencyMismatch`] when the key was used for a different body.
     fn recorded_command<'a>(
@@ -887,8 +1053,13 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Erase one event's body, keeping its id, version and place.
     ///
+    /// `reason` is an owner-defined code such as `subject-request` and is kept in the tombstone;
+    /// any explanation stays outside the log.
+    ///
     /// # Errors
-    /// Returns [`EventLogError::NotFound`] when the stream has no such version.
+    /// Returns [`EventLogError::Invalid`], before anything is written, when `reason` is not a code
+    /// [`validate_redaction_reason`] accepts, and [`EventLogError::NotFound`] when the stream has
+    /// no such version.
     fn redact<'a>(
         &'a self,
         stream: &'a StreamId,
@@ -920,6 +1091,9 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Cache a fold only if its observed history still exists unchanged by redaction/erasure.
     /// Returns `false` when the observation is stale; no snapshot is written in that case.
+    /// Within one generation the cached revision never moves back: a save older than the cache
+    /// leaves the newer one in place and returns `true`. A cache from an earlier generation is
+    /// always replaced.
     ///
     /// # Errors
     /// Returns a store error, or [`EventLogError::Invalid`] for unsupported implementations.
@@ -936,6 +1110,10 @@ pub trait EventStore: Send + Sync + 'static {
         })
     }
 
+    /// The stream's cached fold, only while its persisted provenance still matches the stream's
+    /// history; a cache from before a redaction or erasure is never returned.
+    /// [`Repository::load`] reads it without capturing a generation, so a read writes nothing.
+    ///
     /// # Errors
     /// Returns [`EventLogError::Backend`] when the store is unavailable.
     fn load_snapshot<'a>(
@@ -981,7 +1159,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// Drive this projector inside every append transaction from now on.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered.
+    /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered,
+    /// or when catch-up on this handle has already driven the projector.
     fn register_inline(
         &self,
         projector: Arc<dyn Projector>,
@@ -993,7 +1172,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// Apply one batch of a catch-up projection under its own lock.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Backend`] when the store is unavailable.
+    /// Returns [`EventLogError::Backend`] when the store is unavailable, and
+    /// [`EventLogError::Invalid`] when the projector is driven inline.
     fn run_catch_up<'a>(
         &'a self,
         projector: Arc<dyn Projector>,
@@ -1077,14 +1257,26 @@ pub trait EventStore: Send + Sync + 'static {
         Box::pin(async move {
             let limit = bounded_limit(limit);
             let prefix = prefix.unwrap_or("");
-            let after = cursor.map_or_else(|| prefix.to_owned(), str::to_owned);
+            // The first unfiltered page has no lower bound: an empty-string key is a valid row,
+            // and "after the empty string" would skip it. A prefix stays exclusive of itself.
+            let after = match cursor {
+                Some(cursor) => Some(cursor),
+                None if prefix.is_empty() => None,
+                None => Some(prefix),
+            };
             let fetched = self
-                .projection_list(projection, tenant, Some(&after), limit + 1)
+                .projection_list(projection, tenant, after, limit + 1)
                 .await?;
+            // A provider clamps `projection_list` to the public maximum, so a full page of
+            // MAX_READ_LIMIT rows arrives without its lookahead row. Count what came back to tell
+            // the end of the rows from a clamped read.
+            let fetched_count = fetched.len();
             let mut rows = Vec::with_capacity(limit);
             let mut more = false;
+            let mut left_prefix = false;
             for (key, body) in fetched {
                 if !key.starts_with(prefix) {
+                    left_prefix = true;
                     break;
                 }
                 if rows.len() == limit {
@@ -1092,6 +1284,16 @@ pub trait EventStore: Send + Sync + 'static {
                     break;
                 }
                 rows.push((key, body));
+            }
+            if !more && !left_prefix && rows.len() == limit && fetched_count <= limit {
+                // The lookahead was clamped away: ask the boundary directly whether one more row
+                // of the prefix follows the last one returned.
+                if let Some((last, _)) = rows.last() {
+                    let next = self
+                        .projection_list(projection, tenant, Some(last), 1)
+                        .await?;
+                    more = next.first().is_some_and(|(key, _)| key.starts_with(prefix));
+                }
             }
             let next_cursor = more
                 .then(|| rows.last().map(|(key, _)| key.clone()))
@@ -1222,13 +1424,41 @@ pub fn validate_field(what: &str, value: &str) -> Result<(), EventLogError> {
 /// display name rather than an id.
 pub fn validate_identity(what: &str, value: &str) -> Result<(), EventLogError> {
     validate_field(what, value)?;
-    if value.contains('@') || value.contains(' ') {
+    if !is_opaque(value) {
         return Err(EventLogError::Invalid(format!(
             "{what} must be an opaque id: an address or display name in an append-only log \
              outlives every request to erase it"
         )));
     }
     Ok(())
+}
+
+/// A redaction reason is an opaque code the owner defines, such as `subject-request`, never an
+/// explanation.
+///
+/// The tombstone keeps the reason after the body is gone, so whatever a reason says is read
+/// back by everyone who reads the redacted event. An explanation is where a name or an address
+/// arrives, so the reason takes the grammar of an identity: printable, no space, no `@`. What a
+/// code means is the owner's to define and to keep outside the log; this kit names none.
+///
+/// # Errors
+/// Returns [`EventLogError::Invalid`] when the reason is not usable, or carries a space or an `@`
+/// and so reads as free text rather than a code.
+pub fn validate_redaction_reason(reason: &str) -> Result<(), EventLogError> {
+    validate_field("redaction reason", reason)?;
+    if !is_opaque(reason) {
+        return Err(EventLogError::Invalid(
+            "redaction reason must be an owner-defined code such as `subject-request`, not free \
+             text: the tombstone keeps it after the body is erased"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// No space and no `@`: what separates an id or a code from a name, an address or a sentence.
+fn is_opaque(value: &str) -> bool {
+    !value.contains('@') && !value.contains(' ')
 }
 
 /// Check an append request before any backend touches a connection.
@@ -1273,6 +1503,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_request_hash_is_one_digest_for_one_body_whatever_its_key_order() {
+        use std::collections::{BTreeMap, HashMap};
+
+        #[derive(Serialize)]
+        struct Command {
+            zeta: u32,
+            alpha: String,
+            fields: HashMap<String, Value>,
+        }
+        let entries = || {
+            (0..12).map(|index| {
+                (
+                    format!("field-{index:02}"),
+                    json!({"z": index, "a": [index, -1, 0.5], "m": {"y": null, "b": "\u{e9}\"\n"}}),
+                )
+            })
+        };
+        let pinned = canonical_request_hash(&Command {
+            zeta: 1,
+            alpha: "x".into(),
+            fields: entries().collect(),
+        })
+        .unwrap();
+        // Each HashMap draws its own hash keys, so 64 of them iterate in many orders.
+        for _ in 0..64 {
+            let command = Command {
+                zeta: 1,
+                alpha: "x".into(),
+                fields: entries().collect(),
+            };
+            assert_eq!(canonical_request_hash(&command).unwrap(), pinned);
+        }
+        let ordered: BTreeMap<String, Value> = entries().collect();
+        assert_eq!(
+            canonical_request_hash(&json!({"fields": ordered, "alpha": "x", "zeta": 1})).unwrap(),
+            pinned,
+            "a sorted map and a different field order are the same body"
+        );
+        // The canonical bytes, written out: keys sorted at every level, arrays in order.
+        let small = canonical_request_hash(&json!({"b": 1, "a": [{"d": 2, "c": "x"}]})).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(br#"{"a":[{"c":"x","d":2}],"b":1}"#);
+        assert_eq!(small, format!("c1:{:x}", expected.finalize()));
+        assert_eq!(
+            pinned,
+            "c1:3fdc370267345d86916f85eb55fa4ae38e97edb4947554d87f68bfff50176efc"
+        );
+        assert_ne!(
+            request_hash(&json!({"b": 1, "a": [{"d": 2, "c": "x"}]})).unwrap(),
+            small,
+            "canonical digests are versioned apart from the legacy ones"
+        );
+    }
+
+    #[test]
     fn a_head_set_digest_ignores_order_and_repeats_but_not_membership() {
         let one = HeadSetDigest::of(&["b", "a"]);
         assert_eq!(
@@ -1291,6 +1576,31 @@ mod tests {
             "heads that concatenate alike were not told apart"
         );
         assert_eq!(one.to_hex().len(), 64);
+    }
+
+    #[test]
+    fn a_redaction_reason_is_a_code_never_free_text() {
+        for code in [
+            "subject-request",
+            "legal_hold",
+            "gdpr.art17",
+            "retention:30d",
+        ] {
+            validate_redaction_reason(code).expect("an owner-defined code is a reason");
+        }
+        for free_text in ["the person asked", "jane@example.org", "Jane Doe"] {
+            let Err(EventLogError::Invalid(message)) = validate_redaction_reason(free_text) else {
+                panic!("{free_text:?} was accepted as a redaction reason");
+            };
+            assert!(
+                message.contains("owner-defined code"),
+                "{free_text:?} was refused for another reason: {message}"
+            );
+        }
+        let Err(EventLogError::Invalid(message)) = validate_redaction_reason("") else {
+            panic!("an empty redaction reason was accepted");
+        };
+        assert_eq!(message, "redaction reason is required");
     }
 
     /// Every stored idempotency hash is this function's output, so its bytes are a stored format.

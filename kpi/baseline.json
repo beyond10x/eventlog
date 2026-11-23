@@ -1,0 +1,167 @@
+{
+  "format": "eventlog-kpi-baseline/1",
+  "revision": "17828fc28fd2a2fe7a9790731d827df64ea4ec28",
+  "recorded_at": "2026-11-22T23:56:59.391018354Z",
+  "environment": {
+    "cpu": "Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz",
+    "cpus": 20,
+    "kernel": "6.18.55-1-MANJARO",
+    "load_average": "47.77 50.97 62.75",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "postgres": true
+  },
+  "counters": {
+    "core.capture_budget.alloc_bytes": 4188672.0,
+    "core.fingerprint.alloc_bytes": 3192488.0,
+    "core.fold_calls.151_commands": 22801.0,
+    "file.append.bytes_written": 2661.0,
+    "file.event_append.blob_dir_entries": 64.0,
+    "file.event_append.blob_dir_syncs": 1.0,
+    "file.feed.map_visits": 1103.0,
+    "file.idle_poll.journal_bytes": 7535.0,
+    "file.open.bytes_read": 119536.0,
+    "file.projection_page.cursor_present": 0.0,
+    "file.read_feed.bytes_read": 59768.0,
+    "file.read_stream.bytes_read": 59768.0,
+    "postgres.absent_reads.generation_rows": 100.0,
+    "postgres.append.round_trips": 20.0,
+    "postgres.blob_group.round_trips": 57.0,
+    "postgres.blob_group.write_transactions": 5.0,
+    "postgres.capture_preflight.buffers": 476.0,
+    "postgres.feed_one_row.buffers": 1103.0,
+    "postgres.feed_one_row.rows_filtered": 39936.0,
+    "postgres.open.round_trips": 1085.0,
+    "postgres.projection_page.cursor_present": 0.0,
+    "sqlite.absent_reads.generation_rows": 100.0,
+    "sqlite.append.bytes_written": 24760.0,
+    "sqlite.inline_rebuild.retained_events": 2048.0,
+    "sqlite.legacy_migration.vm_steps": 8499393.0,
+    "sqlite.open.bytes_read": 16484.0,
+    "sqlite.projection_find.vm_steps": 5046.0,
+    "sqlite.projection_page.cursor_present": 0.0,
+    "sqlite.read_stream.bytes_read": 32768.0,
+    "tree.append.bytes_written": 1062.0,
+    "tree.append.event_digests": 4.0,
+    "tree.append.group_files_listed": 64.0,
+    "tree.open.bytes_read": 81585.0,
+    "tree.projection_find.vm_steps": 5046.0,
+    "tree.projection_page.cursor_present": 0.0,
+    "tree.read_stream.bytes_read": 0.0
+  },
+  "timings": {
+    "file.append_single.latency": {
+      "p50": 102578.625,
+      "p95": 156095.594
+    },
+    "file.batch_append.throughput": {
+      "p50": 266.0794780398703,
+      "p95": 266.0794780398703
+    },
+    "file.group_blobs.latency": {
+      "p50": 136622.33,
+      "p95": 169121.11899999998
+    },
+    "file.open_128.latency": {
+      "p50": 12630.579,
+      "p95": 31047.695
+    },
+    "file.projection_find.latency": {
+      "p50": 85.819,
+      "p95": 210.385
+    },
+    "file.read_feed_page.latency": {
+      "p50": 60.538999999999994,
+      "p95": 65.16600000000001
+    },
+    "file.read_stream.latency": {
+      "p50": 115.604,
+      "p95": 182.583
+    },
+    "postgres.append_single.latency": {
+      "p50": 7889.874999999999,
+      "p95": 16250.346999999998
+    },
+    "postgres.batch_append.throughput": {
+      "p50": 2227.881815603931,
+      "p95": 2227.881815603931
+    },
+    "postgres.group_blobs.latency": {
+      "p50": 31020.848,
+      "p95": 46723.506
+    },
+    "postgres.open_128.latency": {
+      "p50": 141387.099,
+      "p95": 258398.34
+    },
+    "postgres.projection_find.latency": {
+      "p50": 223.525,
+      "p95": 297.134
+    },
+    "postgres.read_feed_page.latency": {
+      "p50": 661.043,
+      "p95": 989.6550000000001
+    },
+    "postgres.read_stream.latency": {
+      "p50": 617.6229999999999,
+      "p95": 1140.627
+    },
+    "sqlite.append_single.latency": {
+      "p50": 17852.881,
+      "p95": 27297.881
+    },
+    "sqlite.batch_append.throughput": {
+      "p50": 1494.1008230441146,
+      "p95": 1494.1008230441146
+    },
+    "sqlite.group_blobs.latency": {
+      "p50": 16883.927,
+      "p95": 23846.897999999997
+    },
+    "sqlite.open_128.latency": {
+      "p50": 386.903,
+      "p95": 710.472
+    },
+    "sqlite.projection_find.latency": {
+      "p50": 89.88300000000001,
+      "p95": 167.797
+    },
+    "sqlite.read_feed_page.latency": {
+      "p50": 63.617,
+      "p95": 85.345
+    },
+    "sqlite.read_stream.latency": {
+      "p50": 261.58099999999996,
+      "p95": 370.748
+    },
+    "tree.append_single.latency": {
+      "p50": 64257.761999999995,
+      "p95": 84356.19499999999
+    },
+    "tree.batch_append.throughput": {
+      "p50": 30.90862366904665,
+      "p95": 30.90862366904665
+    },
+    "tree.group_blobs.latency": {
+      "p50": 159332.85,
+      "p95": 593444.0090000001
+    },
+    "tree.open_128.latency": {
+      "p50": 9268.759999999998,
+      "p95": 9562.648
+    },
+    "tree.projection_find.latency": {
+      "p50": 93.80199999999999,
+      "p95": 131.115
+    },
+    "tree.read_feed_page.latency": {
+      "p50": 67.92200000000001,
+      "p95": 90.472
+    },
+    "tree.read_stream.latency": {
+      "p50": 350.84299999999996,
+      "p95": 405.153
+    }
+  },
+  "timing_rounds": 3
+}

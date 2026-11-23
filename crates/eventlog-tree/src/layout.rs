@@ -181,11 +181,9 @@ pub(crate) fn group_path(root: &Path, tenant: &str, key_digest: &str) -> PathBuf
 }
 
 pub(crate) fn blob_path(root: &Path, tenant: &str, digest: &str) -> PathBuf {
-    let shard = if digest.len() >= 2 {
-        &digest[..2]
-    } else {
-        "__"
-    };
+    // The first two bytes, or `__` when there are fewer or they end inside a character: a name
+    // read back from a file may be any string, and slicing it must not panic.
+    let shard = digest.get(..2).unwrap_or("__");
     tenant_dir(root, tenant)
         .join("blobs")
         .join(segment(shard))
@@ -345,6 +343,21 @@ pub(crate) fn write_once(path: &Path, bytes: &[u8]) -> Result<(), EventLogError>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_atomic(path, bytes),
         Err(error) => Err(backend(error)),
     }
+}
+
+/// Read the file at `path`: a blob, a text or a file of a verification baseline. A test counts
+/// these reads by path, to hold a scan to reading each such file once.
+pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    FILE_READS.with(|reads| *reads.borrow_mut().entry(path.to_owned()).or_insert(0) += 1);
+    fs::read(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread has passed each path to [`read_file`].
+    pub(crate) static FILE_READS: std::cell::RefCell<std::collections::BTreeMap<PathBuf, usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 pub(crate) fn sync_dir(directory: &Path) -> Result<(), EventLogError> {

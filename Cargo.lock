@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-conformance"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "eventlog-core",
  "serde",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-core"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "eventlog-capture-types",
  "serde",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-file"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "eventlog-conformance",
  "eventlog-core",
@@ -370,8 +370,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventlog-kpi"
+version = "0.10.0"
+dependencies = [
+ "clap",
+ "eventlog-conformance",
+ "eventlog-core",
+ "eventlog-file",
+ "eventlog-postgres",
+ "eventlog-sqlite",
+ "eventlog-tree",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "stats_alloc",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "eventlog-postgres"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "clap",
  "eventlog-conformance",
@@ -390,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-sqlite"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "eventlog-capture-types",
  "eventlog-conformance",
@@ -406,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-tree"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "eventlog-conformance",
  "eventlog-core",
@@ -1097,6 +1118,12 @@ dependencies = [
  "rsqlite-vfs",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "stats_alloc"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "stringprep"

@@ -3,8 +3,8 @@ use crate::{
     AppendResult, BoxFuture, CommandMeta, EventLogError, EventStore, Expected, Guard, NewEvent,
     NoGuard, StreamId, TenantId, request_hash, validate_append,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
 /// One ordered entry; repeated streams observe earlier entries in the same transaction.
@@ -57,8 +57,12 @@ impl AppendGroup {
                 // different requests, even under one idempotency key.
                 Expected::Merge(heads) => json!(["merge", heads.to_hex()]),
             };
-            entries
-                .push(json!({"stream":append.stream,"expected":expected,"events":append.events}));
+            let events: Vec<_> = append.events.iter().map(event_entry).collect();
+            entries.push(Spliced::new(
+                json!({"stream":append.stream,"expected":expected,"events":null}),
+                "events",
+                events,
+            ));
         }
         // Exhaustive destructuring makes an added metadata field require an explicit hash decision.
         let CommandMeta {
@@ -73,12 +77,69 @@ impl AppendGroup {
             occurred_at,
             claim: _,
         } = &self.meta;
-        request_hash(
-            &json!({"format":"eventlog-append-group/1","tenant":self.tenant,
-            "entries":entries,"meta":{"key":idempotency_key,"digest":digest,"subject":subject,
+        request_hash(&Spliced::new(
+            json!({"format":"eventlog-append-group/1","tenant":self.tenant,
+            "entries":null,"meta":{"key":idempotency_key,"digest":digest,"subject":subject,
             "actor":actor,"request_id":request_id,"trace_id":trace_id,"causation_id":causation_id,
             "causation_depth":causation_depth,"occurred_at":occurred_at}}),
-        )
+            "entries",
+            entries,
+        ))
+    }
+}
+
+/// One event as the fingerprint has always written it, borrowing the body instead of copying it.
+fn event_entry(event: &NewEvent) -> Spliced<&Value> {
+    // Exhaustive destructuring: an added event field needs an explicit hash decision, as the
+    // derived serialization this replaces would have hashed it.
+    let NewEvent {
+        name,
+        schema_version,
+        data,
+    } = event;
+    Spliced::new(
+        json!({"name":name,"schema_version":schema_version,"data":null}),
+        "data",
+        data,
+    )
+}
+
+/// A JSON object written in its skeleton's own key order, one value of which is borrowed.
+///
+/// The fingerprint hashes the bytes `serde_json` writes for an owned `Value`, whose key order is
+/// the map's (sorted, or insertion order under `preserve_order`). Building the skeleton with the
+/// same `json!` literal and writing the borrowed value in its slot keeps those bytes exactly, so
+/// recorded group fingerprints still recognise their retries, without a second copy of the bodies.
+struct Spliced<T> {
+    skeleton: Map<String, Value>,
+    key: &'static str,
+    value: T,
+}
+
+impl<T: Serialize> Spliced<T> {
+    fn new(skeleton: Value, key: &'static str, value: T) -> Self {
+        let Value::Object(skeleton) = skeleton else {
+            unreachable!("a json! object literal is an object")
+        };
+        Self {
+            skeleton,
+            key,
+            value,
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Spliced<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.skeleton.len()))?;
+        for (key, value) in &self.skeleton {
+            if key == self.key {
+                map.serialize_entry(key, &self.value)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
     }
 }
 
@@ -171,5 +232,123 @@ pub trait AtomicEventStore: EventStore {
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         let _ = (group, admission, blobs);
         Box::pin(async { Err(EventLogError::Invalid(UNAVAILABLE.into())) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HeadSetDigest;
+
+    /// The fingerprint as 0.9.4 computed it: owned entries inside one owned value, hashed whole.
+    /// Kept verbatim so a streaming implementation is held to the same bytes.
+    fn legacy_fingerprint(group: &AppendGroup) -> String {
+        let entries: Vec<Value> = group
+            .appends
+            .iter()
+            .map(|append| {
+                let expected = match append.expected {
+                    Expected::Any => json!(["any"]),
+                    Expected::NoStream => json!(["no-stream"]),
+                    Expected::Exact(version) => json!(["exact", version]),
+                    Expected::Merge(heads) => json!(["merge", heads.to_hex()]),
+                };
+                json!({"stream":append.stream,"expected":expected,"events":append.events})
+            })
+            .collect();
+        let meta = &group.meta;
+        request_hash(
+            &json!({"format":"eventlog-append-group/1","tenant":group.tenant,
+            "entries":entries,"meta":{"key":meta.idempotency_key,"digest":meta.request_hash,
+            "subject":meta.subject,"actor":meta.actor,"request_id":meta.request_id,
+            "trace_id":meta.trace_id,"causation_id":meta.causation_id,
+            "causation_depth":meta.causation_depth,"occurred_at":meta.occurred_at}}),
+        )
+        .unwrap()
+    }
+
+    fn meta(causation_id: Option<&str>) -> CommandMeta {
+        CommandMeta {
+            idempotency_key: "fixture-key".into(),
+            request_hash: "caller-hash".into(),
+            subject: "subject-1".into(),
+            actor: "actor-1".into(),
+            request_id: "request-1".into(),
+            trace_id: "trace-1".into(),
+            causation_id: causation_id.map(str::to_owned),
+            causation_depth: 3,
+            occurred_at: time::OffsetDateTime::from_unix_timestamp_nanos(1_795_239_429_916_189_123)
+                .unwrap()
+                .to_offset(time::UtcOffset::from_hms(5, 30, 0).unwrap()),
+            claim: None,
+        }
+    }
+
+    /// Every expectation variant, keys written out of order, escapes, non-ASCII, numbers of each
+    /// kind and nesting: the places a hand-written serialization could drift from the old one.
+    fn mixed_group() -> AppendGroup {
+        let tenant = TenantId::new("fixture-tenant").unwrap();
+        let stream = |id: &str| StreamId::new(tenant.clone(), "item", id).unwrap();
+        let event =
+            |name: &str, version: u32, data: Value| NewEvent::new(name, version, data).unwrap();
+        AppendGroup {
+            tenant: tenant.clone(),
+            meta: meta(Some("cause-1")),
+            appends: vec![
+                StreamAppend {
+                    stream: stream("one"),
+                    expected: Expected::NoStream,
+                    events: vec![
+                        event(
+                            "item.created",
+                            1,
+                            json!({"zeta":1,"alpha":"quote \" slash \\ tab \t nl \n ctl \u{1}",
+                                "mid":{"y":[1,-2,3.5,1e300,u64::MAX,i64::MIN],"x":null,"w":true}}),
+                        ),
+                        event(
+                            "item.named",
+                            7,
+                            json!({"name":"Grüße, 世界 😀","empty":{},"list":[]}),
+                        ),
+                    ],
+                },
+                StreamAppend {
+                    stream: stream("two"),
+                    expected: Expected::Exact(42),
+                    events: vec![event("item.moved", 2, json!({"to":"b"}))],
+                },
+                StreamAppend {
+                    stream: stream("one"),
+                    expected: Expected::Any,
+                    events: vec![event("item.seen", 1, json!({"by":"c","at":0.1}))],
+                },
+                StreamAppend {
+                    stream: stream("three"),
+                    expected: Expected::Merge(HeadSetDigest::of(&["head-b", "head-a"])),
+                    events: vec![event("item.merged", 1, json!({}))],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn group_fingerprint_keeps_the_bytes_existing_requests_were_recorded_with() {
+        let group = mixed_group();
+        let fingerprint = group.fingerprint().unwrap();
+        assert_eq!(fingerprint, legacy_fingerprint(&group));
+        // Computed by eventlog 0.9.4 (b8582219) for this fixture. A changed digest makes every
+        // stored group fingerprint stop recognizing its retry.
+        assert_eq!(
+            fingerprint,
+            "2fbbb9631ad33fd0bdcc495f65e8059d2c9110d786ac585e90ffcfbfb2fccae0"
+        );
+
+        let mut without_cause = group.clone();
+        without_cause.meta = meta(None);
+        assert_eq!(
+            without_cause.fingerprint().unwrap(),
+            legacy_fingerprint(&without_cause)
+        );
+        assert_ne!(without_cause.fingerprint().unwrap(), fingerprint);
     }
 }

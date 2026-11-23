@@ -234,7 +234,7 @@ async fn hosted_schema_admission_refuses_rewrite_rules() {
     )
     .await
     .unwrap();
-    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
+    observer.batch_execute("CREATE RULE discard_receipt AS ON INSERT TO review_rules_hosted.kit_commands DO INSTEAD NOTHING; GRANT USAGE ON SCHEMA review_rules_hosted TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA review_rules_hosted TO eventlog_test_application; REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON review_rules_hosted.kit_schema_version, review_rules_hosted.kit_projection_registry, review_rules_hosted.kit_settlement_floor FROM eventlog_test_application; GRANT USAGE ON ALL SEQUENCES IN SCHEMA review_rules_hosted TO eventlog_test_application").await.unwrap();
     let admitted = PostgresEventStore::open(
         PostgresConfig::verified(&app_url, "review_rules_hosted", "kit", roots).unwrap(),
         PoolOptions::default(),
@@ -792,6 +792,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
     for suffix in [
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",
@@ -802,6 +803,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
         "scope_counters",
         "schema_version",
         "projection_registry",
+        "settlement_floor",
     ] {
         sql.batch_execute(&format!("DROP TABLE IF EXISTS {prefix}_{suffix}"))
             .await
@@ -913,6 +915,94 @@ async fn the_inline_projection_exercise_passes_on_postgresql() {
     eventlog_conformance::run_inline_projections(&store).await;
 }
 
+/// PostgreSQL keeps a whole indexed value in a B-tree entry of about a third of a page. A row
+/// whose indexed value is far over the portable bound is refused by name before any SQL, rather
+/// than by the index aborting the append's transaction; a value at the bound under a tenant of
+/// the longest accepted length fits the entry and is found by its value.
+#[tokio::test]
+async fn an_oversized_indexed_value_is_refused_before_postgresql_aborts_the_append() {
+    struct WritesKind(TenantId, String);
+    impl eventlog_core::Guard for WritesKind {
+        fn check<'a>(
+            &'a self,
+            store: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async move {
+                store
+                    .upsert(
+                        &eventlog_conformance::TALLY,
+                        &self.0,
+                        "oversized",
+                        &serde_json::json!({ "kind": self.1 }),
+                    )
+                    .await
+            })
+        }
+    }
+    let Some(store) = store("idx_bound").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    drop_projection_tables(&store, &["idx_bound_p_tally"]).await;
+    store
+        .register_inline(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("registered");
+    let tenant = TenantId::new(format!(
+        "idx-bound-{}",
+        "b".repeat(eventlog_core::MAX_FIELD_LEN - "idx-bound-".len())
+    ))
+    .unwrap();
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let noise: String = (0..8_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'!' + u8::try_from(state % 94).unwrap())
+        })
+        .collect();
+    let append = |id: &'static str, kind: String| {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = &store;
+        let guard = Arc::new(WritesKind(tenant.clone(), kind));
+        async move {
+            let outcome = store
+                .append_guarded(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    guard,
+                )
+                .await
+                .map(|_| ());
+            (outcome, store.stream_version(&stream).await.unwrap())
+        }
+    };
+    assert_eq!(
+        append("oversized", noise.clone()).await,
+        (
+            Err(EventLogError::IndexedValueTooLarge {
+                field: "kind",
+                bytes: 8_000,
+                limit: eventlog_core::MAX_INDEXED_VALUE_BYTES,
+            }),
+            None
+        )
+    );
+    let at_bound = noise[..eventlog_core::MAX_INDEXED_VALUE_BYTES].to_owned();
+    assert_eq!(
+        append("at-bound", at_bound.clone()).await,
+        (Ok(()), Some(1))
+    );
+    let found = store
+        .projection_find(&eventlog_conformance::TALLY, &tenant, "kind", &at_bound, 10)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "the row at the bound is found by its value");
+}
+
 async fn drop_projection_tables(store: &PostgresEventStore, tables: &[&str]) {
     let Some(url) = url() else { return };
     let client = client(&url).await;
@@ -932,7 +1022,7 @@ async fn the_paging_rule_holds_on_postgresql() {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
     };
-    drop_projection_tables(&store, &["paging_p_tally"]).await;
+    drop_projection_tables(&store, &["paging_p_tally", "paging_p_page_rows"]).await;
     let store: std::sync::Arc<dyn eventlog_core::EventStore> = std::sync::Arc::new(store);
     eventlog_conformance::run_paging(&store).await;
 }
@@ -1102,6 +1192,183 @@ async fn scope_reservations_are_atomic_and_confined() {
         return;
     };
     eventlog_conformance::run_scope_atomicity(&store, &store.admission_permit()).await;
+}
+
+/// `count` reservations of `delta` against `ceiling` on distinct tenant scopes named `key-N`.
+fn quota_guard(
+    store: &PostgresEventStore,
+    tenant: &TenantId,
+    count: usize,
+    delta: i64,
+    ceiling: i64,
+) -> Arc<dyn eventlog_core::Guard> {
+    use eventlog_core::{AdmissionScope, Reservation};
+    Arc::new(eventlog_conformance::ReserveScopes {
+        permit: store.admission_permit(),
+        reservations: (0..count)
+            .map(|n| Reservation {
+                scope: AdmissionScope::Tenant {
+                    tenant: tenant.clone(),
+                    key: format!("key-{n}"),
+                },
+                delta,
+                ceiling,
+            })
+            .collect(),
+    })
+}
+
+/// A zero-delta reservation is a policy read: it takes the locks and checks the ceilings, and
+/// writes nothing — no row for an absent scope, no new row version for an existing one.
+#[tokio::test]
+async fn a_zero_delta_quota_check_writes_no_counter_rows() {
+    let Some(store) = store("quota_read").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url().expect("fixture URL")).await;
+    let tenant = TenantId::new("quota-read").unwrap();
+    let append = |id: &'static str, guard| {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = &store;
+        async move {
+            store
+                .append_guarded(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    guard,
+                )
+                .await
+                .expect("admitted append")
+        }
+    };
+    append("absent", quota_guard(&store, &tenant, 64, 0, 1)).await;
+    let rows: i64 = sql
+        .query_one("SELECT count(*) FROM quota_read_scope_counters", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0, "a zero-delta check created counter rows");
+    append("held", quota_guard(&store, &tenant, 1, 1, 1)).await;
+    let version = || async {
+        sql.query_one(
+            "SELECT xmin::text, held FROM quota_read_scope_counters",
+            &[],
+        )
+        .await
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .unwrap()
+    };
+    let before = version().await;
+    append("recheck", quota_guard(&store, &tenant, 1, 0, 1)).await;
+    assert_eq!(
+        version().await,
+        before,
+        "a zero-delta check rewrote an unchanged counter"
+    );
+}
+
+/// Forward one PostgreSQL connection and count the client's request boundaries: a simple
+/// `Query` or an extended-protocol `Sync` is one round trip.
+async fn count_round_trips(
+    client: tokio::net::TcpStream,
+    upstream: std::net::SocketAddr,
+    round_trips: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = tokio::net::TcpStream::connect(upstream).await?;
+    // Each message is forwarded as it arrives; without this, Nagle's algorithm holds every small
+    // write for the peer's delayed acknowledgement, about a second per append.
+    client.set_nodelay(true)?;
+    server.set_nodelay(true)?;
+    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_server, mut to_server) = server.into_split();
+    tokio::spawn(async move { tokio::io::copy(&mut from_server, &mut to_client).await });
+    // Untyped startup packets come first; an SSL or GSS encryption request precedes the real one.
+    loop {
+        let mut packet = vec![0_u8; 4];
+        from_client.read_exact(&mut packet).await?;
+        let length = u32::from_be_bytes(packet[..4].try_into().unwrap());
+        packet.resize(usize::try_from(length).unwrap(), 0);
+        from_client.read_exact(&mut packet[4..]).await?;
+        to_server.write_all(&packet).await?;
+        let code = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+        if code != 80_877_103 && code != 80_877_104 {
+            break;
+        }
+    }
+    loop {
+        let mut message = vec![0_u8; 5];
+        from_client.read_exact(&mut message).await?;
+        let length = u32::from_be_bytes(message[1..5].try_into().unwrap());
+        message.resize(usize::try_from(length).unwrap() + 1, 0);
+        from_client.read_exact(&mut message[5..]).await?;
+        if message[0] == b'Q' || message[0] == b'S' {
+            round_trips.fetch_add(1, Ordering::AcqRel);
+        }
+        to_server.write_all(&message).await?;
+    }
+}
+
+/// A reservation costs one statement per phase — lock, read, write — whatever its scope count,
+/// not three per scope: 64 scopes and one scope take the same number of round trips.
+#[tokio::test]
+async fn a_64_scope_reservation_takes_as_many_round_trips_as_one_scope() {
+    let Some(direct) = store("quota_trips").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    direct.shutdown().await.unwrap();
+    let url = url().expect("fixture URL");
+    let config: tokio_postgres::Config = url.parse().unwrap();
+    let tokio_postgres::config::Host::Tcp(host) = &config.get_hosts()[0] else {
+        panic!("the round-trip count needs a TCP fixture");
+    };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    let upstream = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .unwrap()
+        .next()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let round_trips = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&round_trips);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(count_round_trips(client, upstream, Arc::clone(&counter)));
+        }
+    });
+    let proxied = url.replacen(&format!("{host}:{port}"), &proxy.to_string(), 1);
+    assert_ne!(proxied, url, "the fixture URL names its host and port");
+    let store = PostgresEventStore::connect(&proxied, "quota_trips")
+        .await
+        .expect("a store behind the counting proxy");
+    let tenant = TenantId::new("quota-trips").unwrap();
+    let mut costs = Vec::new();
+    for (id, scopes) in [("warm", 1), ("one", 1), ("many", 64)] {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let before = round_trips.load(Ordering::Acquire);
+        store
+            .append_guarded(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 1)],
+                &eventlog_conformance::meta(id, &serde_json::json!({})),
+                quota_guard(&store, &tenant, scopes, 1, 3),
+            )
+            .await
+            .expect("admitted append");
+        costs.push(round_trips.load(Ordering::Acquire) - before);
+    }
+    assert_eq!(
+        costs[2], costs[1],
+        "round trips of an append reserving 64 scopes against one reserving 1 (warm-up {})",
+        costs[0]
+    );
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1361,6 +1628,55 @@ async fn verified_tls_requires_matching_server_and_separate_application_role() {
     sql.batch_execute("GRANT USAGE ON SCHEMA hosted_owner TO eventlog_test_application; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_owner TO eventlog_test_application; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_owner TO eventlog_test_application").await.expect("DML-only role grants");
     let config = PostgresConfig::verified(&app_url, "hosted_owner", "kit", roots.clone())
         .expect("verified application config");
+    // Migration metadata is the migration role's: an application role that can write the
+    // projection roster can unregister a projection, and erasure then skips its rows.
+    for table in [
+        "kit_schema_version",
+        "kit_projection_registry",
+        "kit_settlement_floor",
+    ] {
+        match PostgresEventStore::open(config.clone(), PoolOptions::default(), 16, 2, 8).await {
+            Err(EventLogError::Invalid(reason)) => assert_eq!(
+                reason,
+                "hosted application role can write migration metadata reserved for the migration role",
+                "{table}"
+            ),
+            Err(other) => panic!("{table}: refused for another reason: {other:?}"),
+            Ok(store) => {
+                store.shutdown().await.unwrap();
+                panic!("{table}: admitted an application role that can write migration metadata");
+            }
+        }
+        sql.batch_execute(&format!(
+            "REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_owner.{table} FROM eventlog_test_application"
+        ))
+        .await
+        .expect("migration metadata becomes read-only");
+    }
+    for privilege in ["DELETE", "TRUNCATE"] {
+        sql.batch_execute(&format!(
+            "GRANT {privilege} ON hosted_owner.kit_projection_registry TO eventlog_test_application"
+        ))
+        .await
+        .unwrap();
+        match PostgresEventStore::open(config.clone(), PoolOptions::default(), 16, 2, 8).await {
+            Err(EventLogError::Invalid(reason)) => assert_eq!(
+                reason,
+                "hosted application role can write migration metadata reserved for the migration role",
+                "{privilege}"
+            ),
+            Err(other) => panic!("{privilege}: refused for another reason: {other:?}"),
+            Ok(store) => {
+                store.shutdown().await.unwrap();
+                panic!("{privilege}: admitted a role that can empty the projection roster");
+            }
+        }
+        sql.batch_execute(&format!(
+            "REVOKE {privilege} ON hosted_owner.kit_projection_registry FROM eventlog_test_application"
+        ))
+        .await
+        .unwrap();
+    }
     sql.batch_execute(
         "REVOKE UPDATE ON hosted_owner.kit_snapshot_generations FROM eventlog_test_application",
     )
@@ -1535,6 +1851,402 @@ mod url_shim {
     pub type Config = tokio_postgres::Config;
 }
 
+/// A caller-owned authority that asserts verified transport and connects, call by call, as the
+/// next principal in its list (the last one repeats).
+struct ReconnectingAuthority {
+    principals: Vec<tokio_postgres::Config>,
+    calls: AtomicUsize,
+}
+
+impl PostgresConnectionAuthority for ReconnectingAuthority {
+    fn assurance(&self) -> PostgresTransportAssurance {
+        PostgresTransportAssurance::Verified
+    }
+
+    fn connect(
+        &self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        let mut config = self.principals[call.min(self.principals.len() - 1)].clone();
+        config.connect_timeout(timeout);
+        Box::pin(async move {
+            let (client, driver) = config
+                .connect(NoTls)
+                .await
+                .map_err(|error| EventLogError::Backend(error.to_string()))?;
+            Ok(AuthorizedConnection::new(client, driver))
+        })
+    }
+}
+
+/// Hosted admission judges the first pooled session; every later physical session must be the
+/// same database, role and schema and pass the same role rules before it is served. A
+/// caller-owned authority that reconnects as the admitted role is served; one that reconnects as
+/// a schema-owning superuser is refused.
+#[tokio::test]
+async fn a_hosted_pool_refuses_a_reconnected_session_of_another_principal() {
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url).await;
+    sql.batch_execute(
+        "DROP SCHEMA IF EXISTS hosted_rebind CASCADE; CREATE SCHEMA hosted_rebind; \
+         DO $$ BEGIN IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname='eventlog_test_rebind') \
+         THEN CREATE ROLE eventlog_test_rebind LOGIN CONNECTION LIMIT 8; END IF; END $$; \
+         ALTER ROLE eventlog_test_rebind CONNECTION LIMIT 8;",
+    )
+    .await
+    .expect("isolated role and schema");
+    let owner: tokio_postgres::Config = url.parse().unwrap();
+    let mut application = owner.clone();
+    application.user("eventlog_test_rebind");
+    let migration = Arc::new(ReconnectingAuthority {
+        principals: vec![owner.clone()],
+        calls: AtomicUsize::new(0),
+    });
+    PostgresEventStore::migrate(
+        PostgresConfig::caller_owned("hosted_rebind", "kit", migration).unwrap(),
+        PoolOptions::default(),
+        &[],
+    )
+    .await
+    .expect("migration role applies the schema");
+    sql.batch_execute(
+        "GRANT USAGE ON SCHEMA hosted_rebind TO eventlog_test_rebind; \
+         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_rebind TO eventlog_test_rebind; \
+         REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_rebind.kit_schema_version, hosted_rebind.kit_projection_registry, hosted_rebind.kit_settlement_floor FROM eventlog_test_rebind; \
+         GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_rebind TO eventlog_test_rebind",
+    )
+    .await
+    .expect("DML-only grants");
+    let authority = Arc::new(ReconnectingAuthority {
+        principals: vec![application.clone(), application, owner],
+        calls: AtomicUsize::new(0),
+    });
+    let store = PostgresEventStore::open(
+        PostgresConfig::caller_owned("hosted_rebind", "kit", authority.clone()).unwrap(),
+        PoolOptions::default(),
+        16,
+        2,
+        8,
+    )
+    .await
+    .expect("the application role is admitted");
+    let tenant = TenantId::new("rebind").unwrap();
+    // End the pool's idle session server-side, so its next lease opens a new physical session.
+    let reconnect = || async {
+        sql.batch_execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='eventlog_test_rebind'",
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            let left: i64 = sql
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE usename='eventlog_test_rebind'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let append = |id: &'static str| {
+        let stream = StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = &store;
+        async move {
+            let mut outcome = Err(EventLogError::Closed);
+            // A lease that met the terminated session before its driver saw the close fails as a
+            // backend error and retires it; the next attempt opens the new session.
+            for _ in 0..5 {
+                outcome = store
+                    .append(
+                        &stream,
+                        Expected::NoStream,
+                        &[eventlog_conformance::event("item.received", 1)],
+                        &eventlog_conformance::meta(id, &serde_json::json!({})),
+                    )
+                    .await
+                    .map(|_| ());
+                if !matches!(outcome, Err(EventLogError::Backend(_))) {
+                    break;
+                }
+            }
+            outcome
+        }
+    };
+    reconnect().await;
+    append("same")
+        .await
+        .expect("a reconnected session of the admitted role is served");
+    assert_eq!(authority.calls.load(Ordering::Acquire), 2);
+    reconnect().await;
+    assert_eq!(
+        append("other").await,
+        Err(EventLogError::Invalid(
+            "pooled PostgreSQL session is not the admitted hosted principal".into()
+        )),
+        "a session of another principal was served"
+    );
+    assert!(authority.calls.load(Ordering::Acquire) >= 3);
+    store.shutdown().await.unwrap();
+}
+
+/// Review L61, decided by Timo on 2026-11-23 (settlement floor). A logical restore copies each
+/// event's `committed_xid` from the source cluster. One restored event 100,000 transaction ids
+/// ahead of this cluster withholds every later event of the owner, in every tenant, from every
+/// feed. A hosted `open` refuses such a store; `migrate` records the settlement floor under the
+/// exclusive publication gate, and the feed then delivers the restored and the native events.
+#[tokio::test]
+async fn a_restored_history_is_settled_by_migrate_and_refused_by_open_until_then() {
+    use eventlog_postgres::{PoolOptions, PostgresConfig};
+    async fn floor(sql: &tokio_postgres::Client) -> (i64, i64) {
+        let row = sql
+            .query_one(
+                "SELECT COUNT(*), COALESCE(MAX(settled_through), 0) \
+                 FROM hosted_restore.kit_settlement_floor",
+                &[],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1))
+    }
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(url) = url() else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let sql = client(&url).await;
+    sql.batch_execute(
+        "DROP SCHEMA IF EXISTS hosted_restore CASCADE; CREATE SCHEMA hosted_restore; \
+         DO $$ BEGIN IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname='eventlog_test_restore') \
+         THEN CREATE ROLE eventlog_test_restore LOGIN CONNECTION LIMIT 8; END IF; END $$; \
+         ALTER ROLE eventlog_test_restore CONNECTION LIMIT 8;",
+    )
+    .await
+    .expect("isolated role and schema");
+    let owner: tokio_postgres::Config = url.parse().unwrap();
+    let mut application = owner.clone();
+    application.user("eventlog_test_restore");
+    let as_principal = |principal: &tokio_postgres::Config| {
+        PostgresConfig::caller_owned(
+            "hosted_restore",
+            "kit",
+            Arc::new(ReconnectingAuthority {
+                principals: vec![principal.clone()],
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap()
+    };
+    let migrate = || PostgresEventStore::migrate(as_principal(&owner), PoolOptions::default(), &[]);
+    let open =
+        || PostgresEventStore::open(as_principal(&application), PoolOptions::default(), 16, 2, 8);
+    migrate().await.expect("migration role applies the schema");
+    sql.batch_execute(
+        "GRANT USAGE ON SCHEMA hosted_restore TO eventlog_test_restore; \
+         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA hosted_restore TO eventlog_test_restore; \
+         REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON hosted_restore.kit_schema_version, hosted_restore.kit_projection_registry, hosted_restore.kit_settlement_floor FROM eventlog_test_restore; \
+         GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA hosted_restore TO eventlog_test_restore",
+    )
+    .await
+    .expect("DML-only grants");
+    assert_eq!(
+        floor(&sql).await,
+        (0, 0),
+        "a native history records no floor"
+    );
+    let writer = open().await.expect("admitted before the restore");
+    let append = |tenant: &'static str| {
+        let stream = StreamId::new(TenantId::new(tenant).unwrap(), "item", "one").unwrap();
+        let writer = &writer;
+        async move {
+            writer
+                .append(
+                    &stream,
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.received", 1)],
+                    &eventlog_conformance::meta(tenant, &serde_json::json!({})),
+                )
+                .await
+                .expect("appended")
+                .events[0]
+                .global_seq
+        }
+    };
+    let restored = append("restored").await;
+    // The restore: the event keeps the source cluster's transaction id, 100,000 ahead of ours.
+    let moved = sql
+        .execute(
+            "UPDATE hosted_restore.kit_events SET committed_xid = \
+             (pg_snapshot_xmax(pg_current_snapshot())::text::bigint + 100000)::text::xid8 \
+             WHERE global_seq = $1",
+            &[&i64::try_from(restored).unwrap()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+    let first = append("tenant-a").await;
+    let second = append("tenant-b").await;
+    assert!(restored < first && first < second);
+    // Until the native appends pass this cluster's watermark an empty feed proves nothing.
+    let mut passed = false;
+    for _ in 0..200 {
+        passed = sql
+            .query_one(
+                "SELECT bool_and(committed_xid < pg_snapshot_xmin(pg_current_snapshot())) \
+                 FROM hosted_restore.kit_events WHERE global_seq > $1",
+                &[&i64::try_from(restored).unwrap()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if passed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(passed, "the native appends never passed the watermark");
+    for tenant in ["restored", "tenant-a", "tenant-b"] {
+        let page = writer
+            .read_feed(&TenantId::new(tenant).unwrap(), 0, 10)
+            .await
+            .unwrap();
+        assert!(
+            page.events.is_empty(),
+            "{tenant}: the restored transaction id no longer withholds the feed before migrate"
+        );
+    }
+    match open().await {
+        Err(EventLogError::Invalid(reason)) => assert_eq!(
+            reason,
+            "PostgreSQL events carry another cluster's transaction ids (a restored history); \
+             run migrate with the migration role before opening"
+        ),
+        Err(other) => panic!("refused for another reason: {other:?}"),
+        Ok(store) => {
+            store.shutdown().await.unwrap();
+            panic!("admitted a restored history before migrate settled it");
+        }
+    }
+    assert_eq!(floor(&sql).await, (0, 0), "open records no floor");
+    // An append still in flight holds the publication gate shared; the floor waits for it, or a
+    // position below the floor could commit after the feed passed it.
+    let holder = client(&url).await;
+    let identity = serde_json::to_string(&["kit", "publication"]).unwrap();
+    let key: i64 = holder
+        .query_one(
+            "SELECT hashtextextended(current_database() || ':' || 'hosted_restore' || $1, 0)",
+            &[&identity],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    holder
+        .execute("SELECT pg_advisory_lock_shared($1)", &[&key])
+        .await
+        .unwrap();
+    let settling = migrate();
+    tokio::pin!(settling);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut settling)
+            .await
+            .is_err(),
+        "migrate recorded the floor while an append held the publication gate"
+    );
+    assert_eq!(floor(&sql).await, (0, 0), "no floor while the gate is held");
+    holder
+        .execute("SELECT pg_advisory_unlock_shared($1)", &[&key])
+        .await
+        .unwrap();
+    settling
+        .await
+        .expect("migrate settles the restored history");
+    let through = i64::try_from(second).unwrap();
+    assert_eq!(floor(&sql).await, (1, through));
+    migrate().await.expect("a second migrate");
+    assert_eq!(
+        floor(&sql).await,
+        (1, through),
+        "nothing foreign is left above the floor"
+    );
+    let reader = open()
+        .await
+        .expect("admitted once migrate settled the restore");
+    for (tenant, position) in [
+        ("restored", restored),
+        ("tenant-a", first),
+        ("tenant-b", second),
+    ] {
+        let delivered = feed_from(&reader, &TenantId::new(tenant).unwrap(), 0, Vec::new(), 1).await;
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|event| event.global_seq)
+                .collect::<Vec<_>>(),
+            vec![position],
+            "{tenant}"
+        );
+    }
+    let later = StreamId::new(TenantId::new("tenant-a").unwrap(), "item", "two").unwrap();
+    let above = reader
+        .append(
+            &later,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("above", &serde_json::json!({})),
+        )
+        .await
+        .unwrap()
+        .events[0]
+        .global_seq;
+    let delivered = feed_from(
+        &reader,
+        &TenantId::new("tenant-a").unwrap(),
+        first,
+        Vec::new(),
+        1,
+    )
+    .await;
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|event| event.global_seq)
+            .collect::<Vec<_>>(),
+        vec![above],
+        "an event above the floor is delivered through the watermark"
+    );
+    // The floor is migration metadata: a role that could raise it could settle an append still in
+    // flight, and a feed cursor would pass it.
+    sql.batch_execute(
+        "GRANT INSERT ON hosted_restore.kit_settlement_floor TO eventlog_test_restore",
+    )
+    .await
+    .unwrap();
+    match open().await {
+        Err(EventLogError::Invalid(reason)) => assert_eq!(
+            reason,
+            "hosted application role can write migration metadata reserved for the migration role"
+        ),
+        Err(other) => panic!("refused for another reason: {other:?}"),
+        Ok(store) => {
+            store.shutdown().await.unwrap();
+            panic!("admitted an application role that can write the settlement floor");
+        }
+    }
+    writer.shutdown().await.unwrap();
+    reader.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid() {
     use eventlog_core::{AdmissionScope, EventLogError, Projector, Reservation};
@@ -1641,14 +2353,14 @@ async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid()
         resume: resume_second.clone(),
         position: position.clone(),
     });
-    first
-        .register_inline(projector.clone())
-        .await
-        .expect("first setup");
+    // Only the newer writer's handle drives the inline projector. An attached projector's lock is
+    // taken before the guard and held to commit, so an older writer paused in its guard on a
+    // handle that drove it would keep the newer writer out of the projector, and the XID/position
+    // reversal this regression stages could not happen.
     second
         .register_inline(projector)
         .await
-        .expect("second setup");
+        .expect("newer writer setup");
     let (writer, first_tenant) = (first.clone(), tenant.clone());
     let guard = Arc::new(OlderGuard {
         permit: first.admission_permit(),
@@ -1929,24 +2641,28 @@ async fn caught_reservation_cancellation_cannot_commit_an_unchecked_append() {
         tenant: tenant.clone(),
         key: "quota".into(),
     };
-    let stream = StreamId::new(tenant.clone(), "item", "seed").expect("stream");
-    store
-        .append_guarded(
-            &stream,
-            Expected::NoStream,
-            &[eventlog_conformance::event("item.received", 0)],
-            &eventlog_conformance::meta("seed", &serde_json::json!({})),
-            Arc::new(eventlog_conformance::ReserveScopes {
-                permit: store.admission_permit(),
-                reservations: vec![Reservation {
-                    scope: scope.clone(),
-                    delta: 0,
-                    ceiling: 1,
-                }],
-            }),
-        )
-        .await
-        .expect("zero counter");
+    // A zero counter row for the competing transaction to lock: hold one slot and release it (a
+    // zero-delta check writes no row).
+    for (id, delta) in [("seed", 1), ("seed-release", -1)] {
+        let stream = StreamId::new(tenant.clone(), "item", id).expect("stream");
+        store
+            .append_guarded(
+                &stream,
+                Expected::NoStream,
+                &[eventlog_conformance::event("item.received", 0)],
+                &eventlog_conformance::meta(id, &serde_json::json!({})),
+                Arc::new(eventlog_conformance::ReserveScopes {
+                    permit: store.admission_permit(),
+                    reservations: vec![Reservation {
+                        scope: scope.clone(),
+                        delta,
+                        ceiling: 1,
+                    }],
+                }),
+            )
+            .await
+            .expect("zero counter");
+    }
     let ready = Arc::new(tokio::sync::Notify::new());
     let caught = Arc::new(tokio::sync::Notify::new());
     let (ready_child, caught_child) = (ready.clone(), caught.clone());
@@ -2311,7 +3027,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
     original.shutdown().await.expect("old writer stopped");
     let sql = client(&url).await;
     downgrade_blob_table(&sql, "schema_upgrade").await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("exact original populated schema");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches; DROP TABLE schema_upgrade_settlement_floor").await.expect("exact original populated schema");
     let config = PostgresConfig::isolated(&url, "schema_upgrade").expect("config");
     let (a, b) = tokio::join!(
         PostgresEventStore::migrate(config.clone(), PoolOptions::default(), &[]),
@@ -2341,7 +3057,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
         "unknown version/checksum refuses before serving"
     );
     downgrade_blob_table(&sql, "schema_upgrade").await;
-    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups").await.expect("restore old fixture");
+    sql.batch_execute("DROP TABLE schema_upgrade_schema_version; DROP TABLE schema_upgrade_scope_counters; DROP TABLE schema_upgrade_projection_registry; DROP TABLE schema_upgrade_snapshot_generations; DROP TABLE schema_upgrade_append_groups; DROP TABLE schema_upgrade_group_batches; DROP TABLE schema_upgrade_settlement_floor").await.expect("restore old fixture");
     PostgresEventStore::migrate(
         PostgresConfig::isolated(&url, "schema_upgrade").expect("config"),
         PoolOptions::default(),
@@ -2840,6 +3556,68 @@ async fn committed_commands_survive_snapshot_storage_failure() {
     );
     assert_eq!(sql.query_one("SELECT count(*) FROM cache_failure_snapshot_generations WHERE cached_generation IS NOT NULL", &[]).await.unwrap().get::<_, i64>(0), 0, "failed cache write rolls back its proof");
     sql.batch_execute("DROP TRIGGER cache_failure_injected ON cache_failure_snapshots; DROP FUNCTION cache_failure_injected()").await.unwrap();
+}
+#[tokio::test]
+async fn loading_an_absent_aggregate_writes_no_storage_rows() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("absent_reads").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let store = std::sync::Arc::new(adapter);
+    let sql = client(&url().unwrap()).await;
+    let repository =
+        eventlog_core::Repository::<eventlog_conformance::SnapshotCounter>::new(store.clone());
+    let tenant = TenantId::new("tenant").unwrap();
+    for i in 0..3 {
+        assert!(
+            repository
+                .load(&tenant, &format!("absent-{i}"))
+                .await
+                .unwrap()
+                .is_new
+        );
+    }
+    assert_eq!(
+        sql.query_one(
+            "SELECT count(*) FROM absent_reads_snapshot_generations",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0,
+        "a read leaves nothing behind"
+    );
+    repository
+        .handle(
+            &tenant,
+            "present",
+            &(),
+            &eventlog_conformance::meta("present", &serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+    repository.snapshot_now(&tenant, "present").await.unwrap();
+    assert_eq!(
+        repository
+            .load(&tenant, "present")
+            .await
+            .unwrap()
+            .state
+            .total,
+        1,
+        "a read still folds from the proven cache"
+    );
+}
+#[tokio::test]
+async fn a_delayed_older_snapshot_does_not_move_the_replay_point_back() {
+    let _exclusive = EXCLUSIVE.lock().await;
+    let Some(adapter) = store("snapshot_monotonic").await else {
+        eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    eventlog_conformance::run_snapshot_revision_is_monotonic(&adapter).await;
 }
 #[tokio::test]
 async fn snapshot_capture_waits_for_complete_tenant_erasure() {

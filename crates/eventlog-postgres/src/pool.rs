@@ -40,6 +40,90 @@ async fn check_client_connection(client: &Client) -> Result<(), tokio_postgres::
     }
 }
 
+/// A server-side limit in whole milliseconds, rounded up: PostgreSQL reads 0 as no limit, so a
+/// positive duration under a millisecond must never become 0.
+fn server_millis(duration: Duration) -> u128 {
+    duration.as_micros().div_ceil(1000)
+}
+
+/// Who a hosted session is: the database, role and schema its statements run against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostedPrincipal {
+    database: String,
+    user: String,
+    schema: Option<String>,
+}
+
+/// One session's hosted identity and the role facts hosted admission judges.
+pub(crate) struct HostedRole {
+    pub(crate) principal: HostedPrincipal,
+    can_ddl: bool,
+    connection_limit: i32,
+}
+
+impl HostedRole {
+    /// Read them in one statement on `client`.
+    pub(crate) async fn of(client: &Client) -> Result<Self, EventLogError> {
+        let row = client
+            .query_one(
+                "SELECT current_database()::text, current_user::text, current_schema()::text, \
+                 COALESCE(has_schema_privilege(current_user,current_schema(),'CREATE'),true) \
+                 OR EXISTS(SELECT FROM pg_roles WHERE rolname=current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) \
+                 OR EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user)) \
+                 OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND c.relkind IN ('r','p','S','v','m','f')), \
+                 COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname=current_user), -1)",
+                &[],
+            )
+            .await
+            .map_err(super::backend)?;
+        Ok(Self {
+            principal: HostedPrincipal {
+                database: row.get(0),
+                user: row.get(1),
+                schema: row.get(2),
+            },
+            can_ddl: row.get(3),
+            connection_limit: row.get(4),
+        })
+    }
+
+    /// Refuse a role that can change the schema, or whose finite connection limit does not fit
+    /// within `share`, the admitted replicas' pool connections.
+    pub(crate) fn admit(&self, share: usize) -> Result<(), EventLogError> {
+        if self.can_ddl {
+            return Err(EventLogError::Invalid(
+                "hosted application role must not own schema DDL".into(),
+            ));
+        }
+        if self.connection_limit <= 0
+            || usize::try_from(self.connection_limit)
+                .ok()
+                .is_none_or(|limit| limit > share)
+        {
+            return Err(EventLogError::Invalid("hosted application role requires a finite connection limit within its admitted replica pool share".into()));
+        }
+        Ok(())
+    }
+}
+
+/// What hosted open admitted; every physical session the pool opens later must match it.
+struct HostedAdmission {
+    principal: HostedPrincipal,
+    share: usize,
+}
+
+/// The settings every new physical session gets before a lease hands it out.
+fn session_configuration(schema: &str, options: &PoolOptions) -> String {
+    format!(
+        "SET search_path TO {schema}; SET default_transaction_isolation = 'read committed'; \
+         SET default_transaction_read_only = off; SET statement_timeout = {}; \
+         SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
+        server_millis(options.statement_timeout),
+        server_millis(options.lock_timeout),
+        server_millis(options.transaction_timeout)
+    )
+}
+
 /// Host assertion about the transport created by a caller-owned authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostgresTransportAssurance {
@@ -93,6 +177,33 @@ pub trait PostgresConnectionAuthority: Send + Sync + 'static {
         &self,
         timeout: Duration,
     ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>>;
+
+    /// Sends PostgreSQL's cancel request for the session `token` names, over a transport this
+    /// authority opens, within `timeout`.
+    ///
+    /// The pool calls it when it retires an unsettled lease (a cancelled, timed-out or failed
+    /// operation), on a thread of its own with a current-thread Tokio runtime, and ignores the
+    /// outcome: the retirement proceeds either way.
+    ///
+    /// The default reports [`EventLogError::Unsupported`]. Without a cancel request a retired
+    /// query keeps running server-side, holding its locks, until it finishes or reaches its
+    /// statement or lock timeout, unless the server ends it on the closed socket
+    /// (`client_connection_check_interval`, PostgreSQL 14 and later where the platform supports
+    /// it). The pool returns the lease's permit before that, so a host that needs server work to
+    /// end with its permit implements this.
+    ///
+    /// # Errors
+    /// [`EventLogError::Unsupported`] by default, or the implementation's own failure.
+    fn cancel(
+        &self,
+        token: CancelToken,
+        timeout: Duration,
+    ) -> BoxFuture<'_, Result<(), EventLogError>> {
+        let _ = (token, timeout);
+        Box::pin(std::future::ready(Err(EventLogError::Unsupported {
+            capability: "server-side query cancellation",
+        })))
+    }
 }
 
 /// Limits are per process. A host must also admit the sum across its replicas.
@@ -364,6 +475,7 @@ pub(crate) struct Pool {
     waiters: Arc<Semaphore>,
     state: Mutex<PoolState>,
     returned: Notify,
+    hosted: std::sync::OnceLock<HostedAdmission>,
     #[cfg(test)]
     recycle_pause: Mutex<Option<RecyclePause>>,
     #[cfg(test)]
@@ -425,6 +537,7 @@ impl Pool {
             options,
             state: Mutex::new(PoolState::default()),
             returned: Notify::new(),
+            hosted: std::sync::OnceLock::new(),
             #[cfg(test)]
             recycle_pause: Mutex::new(None),
             #[cfg(test)]
@@ -436,6 +549,12 @@ impl Pool {
             #[cfg(test)]
             fail_shutdown: AtomicBool::new(false),
         }))
+    }
+    /// Hold every physical session opened from now on to the principal hosted open admitted and
+    /// to the hosted role rules, before a lease serves it. A caller-owned authority that
+    /// reconnects as another role, database or schema is refused, not served.
+    pub(crate) fn bind_hosted(&self, principal: HostedPrincipal, share: usize) {
+        let _ = self.hosted.set(HostedAdmission { principal, share });
     }
     pub(crate) async fn acquire(self: &Arc<Self>) -> Result<Lease, EventLogError> {
         let mut waiting = None;
@@ -506,25 +625,33 @@ impl Pool {
                 self.state.lock().map_err(super::poisoned)?.churn.open();
                 lease.client = Some(connection);
                 let connection = lease.client.as_ref().expect("connected lease");
-                let configuration = format!(
-                    "SET search_path TO {}; SET default_transaction_isolation = 'read committed'; \
-                     SET default_transaction_read_only = off; SET statement_timeout = {}; \
-                     SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
-                    self.config.schema,
-                    self.options.statement_timeout.as_millis(),
-                    self.options.lock_timeout.as_millis(),
-                    self.options.transaction_timeout.as_millis()
-                );
+                let configuration = session_configuration(&self.config.schema, &self.options);
                 let configure = async {
-                    connection.client.batch_execute(&configuration).await?;
-                    check_client_connection(&connection.client).await
+                    connection
+                        .client
+                        .batch_execute(&configuration)
+                        .await
+                        .map_err(super::backend)?;
+                    check_client_connection(&connection.client)
+                        .await
+                        .map_err(super::backend)?;
+                    if let Some(admitted) = self.hosted.get() {
+                        let role = HostedRole::of(&connection.client).await?;
+                        if role.principal != admitted.principal {
+                            return Err(EventLogError::Invalid(
+                                "pooled PostgreSQL session is not the admitted hosted principal"
+                                    .into(),
+                            ));
+                        }
+                        role.admit(admitted.share)?;
+                    }
+                    Ok(())
                 };
                 tokio::time::timeout(self.options.connect_timeout, configure)
                     .await
                     .map_err(|_| EventLogError::Deadline {
                         operation: "session configuration",
-                    })?
-                    .map_err(super::backend)?;
+                    })??;
                 break;
             }
         }
@@ -540,6 +667,7 @@ impl Pool {
             client: state.idle.pop(),
             reusable: false,
             connection_permit: Some(permit),
+            runtime: tokio::runtime::Handle::current(),
         }
     }
     async fn connect(&self) -> Result<Connection, EventLogError> {
@@ -569,11 +697,13 @@ impl Pool {
                         )
                     }
                 }
-                // A caller-owned transport has no stream factory the pool could open a cancel
-                // request with; its sessions rely on the server's client-connection check.
-                ConnectionSource::CallerOwned(authority) => {
-                    (authority.connect(self.options.connect_timeout).await?, None)
-                }
+                // The pool has no stream factory for a caller-owned transport: the authority
+                // sends the cancel request, or reports that it cannot and the session relies on
+                // the server's client-connection check and its own timeouts.
+                ConnectionSource::CallerOwned(authority) => (
+                    authority.connect(self.options.connect_timeout).await?,
+                    Some(CancelTransport::Authority(Arc::clone(authority))),
+                ),
             };
             let (client, connection) = authorized.into_parts();
             let cancel = transport.map(|transport| ServerCancel {
@@ -666,6 +796,7 @@ impl Pool {
                 client: Some(connection),
                 reusable: true,
                 connection_permit: None,
+                runtime: tokio::runtime::Handle::current(),
             });
         }
         tokio::time::timeout(self.options.shutdown_timeout, async {
@@ -702,6 +833,11 @@ pub(crate) struct Lease {
     client: Option<Connection>,
     reusable: bool,
     connection_permit: Option<OwnedSemaphorePermit>,
+    /// The runtime the lease was acquired on. Retirement is spawned there, so a lease whose
+    /// operation future is dropped on a thread outside any Tokio runtime does not panic in this
+    /// destructor. Once that runtime has shut down, the retirement future is dropped unrun,
+    /// which releases its occupancy like any unfinished retirement.
+    runtime: tokio::runtime::Handle,
 }
 impl Lease {
     pub(crate) fn quarantine(&mut self) {
@@ -782,7 +918,7 @@ impl Drop for Lease {
             pool: Arc::clone(&self.pool),
             permit: self.connection_permit.take(),
         };
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             if let Some(cancelled) = cancelled {
                 // Finished or timed out; a dropped sender means the attempt could not start.
                 let _ = cancelled.await;
@@ -885,6 +1021,7 @@ impl DriverSlot {
 enum CancelTransport {
     Plain,
     Tls(Arc<rustls::ClientConfig>),
+    Authority(Arc<dyn PostgresConnectionAuthority>),
 }
 
 /// The server-side cancel for one connection: closing the socket alone does not end a query
@@ -914,11 +1051,16 @@ impl ServerCancel {
                     runtime.block_on(async {
                         let request = async {
                             match transport {
-                                CancelTransport::Plain => token.cancel_query(NoTls).await,
+                                CancelTransport::Plain => {
+                                    let _ = token.cancel_query(NoTls).await;
+                                }
                                 CancelTransport::Tls(tls) => {
-                                    token
+                                    let _ = token
                                         .cancel_query(MakeRustlsConnect::new((*tls).clone()))
-                                        .await
+                                        .await;
+                                }
+                                CancelTransport::Authority(authority) => {
+                                    let _ = authority.cancel(token, timeout).await;
                                 }
                             }
                         };
@@ -940,6 +1082,32 @@ mod tests {
         pin::Pin,
         task::{Context, Poll, Waker},
     };
+
+    /// PostgreSQL reads a limit of 0 as none: an accepted 500 µs timeout must reach the session
+    /// as 1 ms, and a fraction of a millisecond rounds up rather than down.
+    #[test]
+    fn submillisecond_timeouts_keep_their_server_side_limits() {
+        let options = PoolOptions {
+            statement_timeout: Duration::from_micros(500),
+            lock_timeout: Duration::from_micros(1),
+            transaction_timeout: Duration::from_micros(2_500),
+            ..PoolOptions::default()
+        };
+        options.validate().expect("positive bounded timeouts");
+        assert_eq!(
+            session_configuration("hosted", &options),
+            "SET search_path TO hosted; SET default_transaction_isolation = 'read committed'; \
+             SET default_transaction_read_only = off; SET statement_timeout = 1; \
+             SET lock_timeout = 1; SET idle_in_transaction_session_timeout = 3"
+        );
+        let defaults = session_configuration("hosted", &PoolOptions::default());
+        assert!(
+            defaults.contains("statement_timeout = 5000;")
+                && defaults.contains("lock_timeout = 2000;")
+                && defaults.ends_with("idle_in_transaction_session_timeout = 10000"),
+            "{defaults}"
+        );
+    }
 
     struct TestAuthority {
         url: Option<String>,
@@ -982,6 +1150,129 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// A caller-owned authority that also sends the cancel request, over plaintext to the
+    /// isolated test server, and counts the requests.
+    struct CancellingAuthority {
+        url: String,
+        cancels: AtomicUsize,
+    }
+
+    impl PostgresConnectionAuthority for CancellingAuthority {
+        fn assurance(&self) -> PostgresTransportAssurance {
+            PostgresTransportAssurance::Isolated
+        }
+
+        fn connect(
+            &self,
+            _timeout: Duration,
+        ) -> BoxFuture<'_, Result<AuthorizedConnection, EventLogError>> {
+            Box::pin(async move {
+                let (client, driver) = tokio_postgres::connect(&self.url, NoTls)
+                    .await
+                    .map_err(super::super::backend)?;
+                Ok(AuthorizedConnection::new(client, driver))
+            })
+        }
+
+        fn cancel(
+            &self,
+            token: CancelToken,
+            _timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), EventLogError>> {
+            self.cancels.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                token
+                    .cancel_query(NoTls)
+                    .await
+                    .map_err(super::super::backend)
+            })
+        }
+    }
+
+    /// A caller-owned lease dropped while its backend waits on a lock is cancelled server-side
+    /// through its authority. The socket check is switched off for this session so that only
+    /// the cancel request can end the wait, as on a server without disconnect polling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_owned_lease_blocked_in_a_query_is_cancelled_through_its_authority() {
+        const KEY: i64 = 0x0e7e_c105_e0b2;
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none());
+            eprintln!("skipped: caller-owned cancel needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let (holder, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(connection);
+        holder
+            .query_one("SELECT pg_advisory_lock($1)", &[&KEY])
+            .await
+            .unwrap();
+        let authority = Arc::new(CancellingAuthority {
+            url: url.clone(),
+            cancels: AtomicUsize::new(0),
+        });
+        let pool = Pool::new(
+            PostgresConfig::caller_owned("public", "caller_cancel", authority.clone()).unwrap(),
+            PoolOptions {
+                max_connections: 1,
+                statement_timeout: Duration::from_secs(60),
+                lock_timeout: Duration::from_secs(60),
+                ..PoolOptions::default()
+            },
+        )
+        .unwrap();
+        let lease = pool.acquire().await.unwrap();
+        lease
+            .batch_execute("SET client_connection_check_interval = 0")
+            .await
+            .unwrap();
+        let pid: i32 = lease
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            lease.query_one("SELECT pg_advisory_lock($1)", &[&KEY]),
+        )
+        .await;
+        assert!(blocked.is_err(), "the lease waits on the holder's lock");
+        drop(lease);
+        let dropped = std::time::Instant::now();
+        let present = || async {
+            holder
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
+                    &[&pid],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+        let mut seen = present().await;
+        while seen != 0 && dropped.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen = present().await;
+        }
+        let elapsed = dropped.elapsed();
+        holder
+            .query_one("SELECT pg_advisory_unlock($1)", &[&KEY])
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.cancels.load(Ordering::Acquire),
+            1,
+            "the pool did not ask the authority to cancel"
+        );
+        assert_eq!(
+            seen, 0,
+            "the blocked backend outlived its dropped lease by {elapsed:?}"
+        );
+        pool.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1673,6 +1964,49 @@ mod tests {
         );
         drop(pool);
         drop(caller);
+    }
+
+    /// An unsettled lease dropped on a thread outside any Tokio runtime, as a `Send` operation
+    /// future cancelled there drops it, retires on the runtime that acquired it instead of
+    /// panicking in its destructor, and its capacity returns.
+    #[test]
+    fn an_unsettled_lease_dropped_outside_tokio_retires_on_its_own_runtime() {
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none());
+            eprintln!("skipped: off-runtime lease drop needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = Pool::new(
+            PostgresConfig::isolated(&url, "pool").unwrap(),
+            PoolOptions {
+                max_connections: 1,
+                ..PoolOptions::default()
+            },
+        )
+        .unwrap();
+        let lease = runtime.block_on(pool.acquire()).unwrap();
+        let dropped = std::thread::spawn(move || drop(lease)).join();
+        assert!(
+            dropped.is_ok(),
+            "dropping an unsettled lease outside Tokio panicked"
+        );
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pool.status().checked_out != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retirement ran on the lease's runtime and returned its capacity");
+            let mut again = pool.acquire().await.unwrap();
+            again.settled();
+            drop(again);
+            pool.shutdown().await.unwrap();
+        });
     }
 
     /// A backend whose client socket is gone aborts a running query even when no cancel request

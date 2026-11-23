@@ -17,7 +17,7 @@
 //! `xid8`, `pg_current_xact_id()` and `pg_snapshot_xmin()` require PostgreSQL 13 or later.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -26,15 +26,21 @@ use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
     MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, Read,
     ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId,
-    VerifiedContent, blob_integrity_sha256, bounded_limit, indexed_value, new_event_id,
+    VerifiedContent, blob_integrity_sha256, bounded_limit, indexed_values, new_event_id,
     redaction_tombstone, validate_append, validate_field,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
 mod atomic_group;
 mod capture;
+#[cfg(test)]
+mod capture_pages;
 mod inline_admin;
 mod pool;
+#[cfg(test)]
+mod receipt_snapshot;
+#[cfg(test)]
+mod registration_deadline;
 mod schema;
 #[cfg(test)]
 mod verify_content_once;
@@ -54,6 +60,15 @@ const COLUMNS: &str = "global_seq, tenant_id, stream_type, stream_id, version, e
 /// The predicate that keeps a feed reader behind anything still in flight.
 const WATERMARK: &str = "committed_xid < pg_snapshot_xmin(pg_current_snapshot())";
 
+/// The watermark above the settlement floor of [`watermarked_source`]: a position at or below the
+/// floor was settled by `migrate` after a restore, whatever transaction id it carries.
+const SETTLED: &str =
+    "(global_seq <= settled_through OR committed_xid < pg_snapshot_xmin(pg_current_snapshot()))";
+
+/// A visible row whose transaction id this cluster has not handed out yet was not written here:
+/// a logical restore copied it from another cluster's clock.
+const FOREIGN: &str = "committed_xid >= pg_snapshot_xmax(pg_current_snapshot())";
+
 /// How many reads, stream locks, heads or event rows one batched statement carries.
 ///
 /// One statement per item costs a round trip each, about 0.6 ms on localhost: 10,000 stream reads
@@ -70,9 +85,15 @@ pub struct PostgresEventStore {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    /// Projectors this handle has driven by catch-up. Locked after `inline`, so one projector is
+    /// driven inline or by catch-up, never both, whichever is registered first.
+    catch_up: Mutex<BTreeSet<String>>,
     /// Blob content this handle has verified or hashed at write time; see
     /// [`eventlog_core::VerifiedContent`].
     verified: VerifiedContent,
+    /// Stored blob rows a group binding read back because the digest was already bound.
+    #[cfg(test)]
+    blob_read_backs: std::sync::atomic::AtomicUsize,
 }
 
 impl PostgresEventStore {
@@ -127,6 +148,7 @@ impl PostgresEventStore {
             let mut client = pool.acquire().await?;
             let report =
                 schema::migrate_with_blob_migration(&mut client, &prefix, &[], migration).await?;
+            settle_restored_history(&mut client, &prefix).await?;
             client.settled();
             report
         };
@@ -177,6 +199,7 @@ impl PostgresEventStore {
             let report =
                 schema::migrate_with_blob_migration(&mut client, prefix, projections, migration)
                     .await?;
+            settle_restored_history(&mut client, prefix).await?;
             client.settled();
             Ok(report)
         }
@@ -220,30 +243,20 @@ impl PostgresEventStore {
         let pool = Pool::new(config, options)?;
         {
             let mut client = pool.acquire().await?;
-            let can_ddl:bool=client.query_one("SELECT COALESCE(has_schema_privilege(current_user,current_schema(),'CREATE'),true) OR EXISTS(SELECT FROM pg_roles WHERE rolname=current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) OR EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user)) OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND c.relkind IN ('r','p','S','v','m','f'))",&[]).await.map_err(backend)?.get(0);
-            if can_ddl {
-                return Err(EventLogError::Invalid(
-                    "hosted application role must not own schema DDL".into(),
-                ));
-            }
-            let role_limit: i32 = client
-                .query_one(
-                    "SELECT rolconnlimit FROM pg_roles WHERE rolname=current_user",
-                    &[],
-                )
-                .await
-                .map_err(backend)?
-                .get(0);
-            if role_limit <= 0
-                || usize::try_from(role_limit)
-                    .ok()
-                    .is_none_or(|limit| limit > replicas * pool.options.max_connections)
-            {
-                return Err(EventLogError::Invalid("hosted application role requires a finite connection limit within its admitted replica pool share".into()));
-            }
+            let share = replicas * pool.options.max_connections;
+            let role = pool::HostedRole::of(&client).await?;
+            role.admit(share)?;
             schema::validate(&mut client, &prefix).await?;
             schema::permissions(&client, &prefix).await?;
+            if first_foreign(&*client, &prefix).await?.is_some() {
+                return Err(EventLogError::Invalid(
+                    "PostgreSQL events carry another cluster's transaction ids (a restored \
+                     history); run migrate with the migration role before opening"
+                        .into(),
+                ));
+            }
             client.settled();
+            pool.bind_hosted(role.principal, share);
         }
         Ok(Self::from_pool(pool, prefix, false))
     }
@@ -257,7 +270,10 @@ impl PostgresEventStore {
             admission_permit: eventlog_core::AdmissionPermit::default(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            catch_up: Mutex::new(BTreeSet::new()),
             verified: VerifiedContent::default(),
+            #[cfg(test)]
+            blob_read_backs: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     /// Issue the owner host's transaction-admission grant before handing the store to domains.
@@ -304,6 +320,31 @@ impl PostgresEventStore {
             outcome
         })
     }
+    /// Called with `inline` held, so no catch-up pass can claim the projector meanwhile.
+    fn refuse_catch_up_driven(&self, name: &str) -> Result<(), EventLogError> {
+        if self.catch_up.lock().map_err(poisoned)?.contains(name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven by catch-up"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that catch-up drives this projector, unless it is driven inline.
+    fn claim_catch_up(&self, name: &str) -> Result<(), EventLogError> {
+        let projectors = self.inline.lock().map_err(poisoned)?;
+        if projectors.iter().any(|projector| projector.name() == name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven inline"
+            )));
+        }
+        self.catch_up
+            .lock()
+            .map_err(poisoned)?
+            .insert(name.to_owned());
+        Ok(())
+    }
+
     fn bounded<'a, T: Send + 'a>(
         &'a self,
         future: impl std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
@@ -314,6 +355,26 @@ impl PostgresEventStore {
                 .map_err(|_| EventLogError::Deadline {
                     operation: "store operation",
                 })?
+        })
+    }
+
+    /// [`Self::bounded`] for a write that commits. `write` is handed the flag it sets right
+    /// before sending `COMMIT`: a deadline that fires after that cannot say whether the change was
+    /// applied and reports [`EventLogError::UnknownCommit`], as append does ([`timed_out_write`]);
+    /// one that fires before it reports the deadline.
+    fn bounded_commit<'a, T: Send + 'a, F>(
+        &'a self,
+        write: impl FnOnce(Arc<AtomicBool>) -> F,
+    ) -> BoxFuture<'a, Result<T, EventLogError>>
+    where
+        F: std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
+    {
+        let commit_started = Arc::new(AtomicBool::new(false));
+        let write = write(Arc::clone(&commit_started));
+        Box::pin(async move {
+            tokio::time::timeout(self.pool.options.transaction_timeout, write)
+                .await
+                .map_err(|_| timed_out_write(&commit_started))?
         })
     }
 
@@ -333,6 +394,7 @@ impl PostgresEventStore {
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {prefix}_events;
                  DROP TABLE IF EXISTS {prefix}_append_groups;
+                 DROP TABLE IF EXISTS {prefix}_group_batches;
                  DROP TABLE IF EXISTS {prefix}_commands;
                  DROP TABLE IF EXISTS {prefix}_claims;
                  DROP TABLE IF EXISTS {prefix}_snapshots;
@@ -342,7 +404,8 @@ impl PostgresEventStore {
                  DROP TABLE IF EXISTS {prefix}_identity;
                  DROP TABLE IF EXISTS {prefix}_scope_counters;
                  DROP TABLE IF EXISTS {prefix}_schema_version;
-                 DROP TABLE IF EXISTS {prefix}_projection_registry;"
+                 DROP TABLE IF EXISTS {prefix}_projection_registry;
+                 DROP TABLE IF EXISTS {prefix}_settlement_floor;"
             ))
             .await
             .map_err(backend)
@@ -463,7 +526,16 @@ impl EventStore for PostgresEventStore {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
-            let transaction = client.transaction().await.map_err(backend)?;
+            // The receipt and its events are one observation. Under READ COMMITTED a tenant
+            // erasure committing between the two statements paired a receipt with no events, or
+            // with events of recreated stream coordinates.
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await
+                .map_err(backend)?;
             let recorded = transaction
                 .query_opt(
                     &format!(
@@ -489,14 +561,25 @@ impl EventStore for PostgresEventStore {
             let first_version: i64 = row.get(1);
             let last_version: i64 = row.get(2);
             if stored_hash != request_hash {
+                // A known answer, not an interrupted operation: end the read and keep the
+                // connection rather than retiring a healthy one through the quarantine.
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
                 return Err(EventLogError::IdempotencyMismatch {
                     key: idempotency_key.to_owned(),
                 });
             }
+            #[cfg(test)]
+            receipt_snapshot::after_receipt(&self.prefix).await;
             let events =
                 select_versions(&transaction, &prefix, stream, first_version, last_version).await?;
             transaction.rollback().await.map_err(backend)?;
             client.settled();
+            if !is_complete_interval(&events, first_version, last_version) {
+                return Err(EventLogError::Backend(
+                    "recorded command interval is incomplete".into(),
+                ));
+            }
             Ok(Some(AppendResult {
                 first_version: to_u64(first_version)?,
                 last_version: to_u64(last_version)?,
@@ -518,18 +601,13 @@ impl EventStore for PostgresEventStore {
             let mut client = self.pool.acquire().await?;
             let rows = client
                 .query(
-                    &format!(
-                        "SELECT {COLUMNS} FROM {prefix}_events
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
-                           AND version > $4
-                         ORDER BY version LIMIT $5"
-                    ),
+                    &stream_page_sql(prefix),
                     &[
                         &stream.tenant().as_str(),
                         &stream.stream_type(),
                         &stream.stream_id(),
                         &to_i64(after_version)?,
-                        &to_i64(limit as u64 + 1)?,
+                        &to_i64(limit as u64)?,
                     ],
                 )
                 .await
@@ -573,7 +651,7 @@ impl EventStore for PostgresEventStore {
                                     stream,
                                     after,
                                     through: i64::MAX,
-                                    fetch: to_i64(limit as u64 + 1)?,
+                                    fetch: to_i64(limit as u64)?,
                                 },
                             ));
                         }
@@ -591,6 +669,9 @@ impl EventStore for PostgresEventStore {
                     None => Ok(Vec::new()),
                 };
             }
+            // Noted before the snapshot exists: a same-handle deletion that settles while the
+            // rows are fetched or the transaction commits must keep them out of the memory.
+            let noted = self.verified.generation()?;
             let mut client = paced(Some(one.deadline), self.pool.acquire()).await?;
             let transaction = paced(Some(one.deadline), async {
                 client
@@ -615,6 +696,8 @@ impl EventStore for PostgresEventStore {
             })
             .await?;
             client.settled();
+            #[cfg(test)]
+            verify_content_once::after_blob_fetch(&self.prefix).await;
 
             let mut answers: Vec<Option<Result<ReadResult, EventLogError>>> =
                 (0..reads.len()).map(|_| None).collect();
@@ -625,7 +708,8 @@ impl EventStore for PostgresEventStore {
             for ((index, _, _), row) in blobs.iter().zip(blob_rows) {
                 answers[*index] = Some(
                     row.map(|row| {
-                        self.verified.check_stored(
+                        self.verified.check_stored_since(
+                            noted,
                             row.get(0),
                             row.get(1),
                             row.get(2),
@@ -690,7 +774,7 @@ impl EventStore for PostgresEventStore {
                 .query(
                     &format!(
                         "SELECT {COLUMNS} FROM {}
-                         WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK}
+                         WHERE tenant_id = $1 AND global_seq > $2 AND {SETTLED}
                            AND (first_unsettled IS NULL OR global_seq < first_unsettled)
                          ORDER BY global_seq LIMIT $3",
                         watermarked_source(prefix)
@@ -728,8 +812,8 @@ impl EventStore for PostgresEventStore {
         version: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
-        self.bounded(async move {
-            validate_field("redaction reason", reason)?;
+        self.bounded_commit(move |commit_started| async move {
+            eventlog_core::validate_redaction_reason(reason)?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -782,6 +866,7 @@ impl EventStore for PostgresEventStore {
                 to_i64(version)?,
             )
             .await?;
+            commit_started.store(true, Ordering::Release);
             transaction
                 .commit()
                 .await
@@ -831,12 +916,18 @@ impl EventStore for PostgresEventStore {
             client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
             publication_gate(&transaction, prefix, false).await?;
-            let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)?;
-            if accepted == 0 {
+            // The row lock orders concurrent saves of one stream; the prior proof says whether
+            // the cached snapshot belongs to this generation.
+            let Some(prior) = transaction.query_opt(&format!("SELECT cached_generation FROM {prefix}_snapshot_generations WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4 FOR UPDATE"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)? else {
                 transaction.rollback().await.map_err(backend)?;
                 client.settled();
                 return Ok(false);
-            }
+            };
+            let replace_any = prior.get::<_, Option<uuid::Uuid>>(0).as_ref() != Some(generation.as_uuid());
+            transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=$1 AND stream_type=$2 AND stream_id=$3 AND generation=$4"), &[&stream.tenant().as_str(), &stream.stream_type(), &stream.stream_id(), generation.as_uuid()]).await.map_err(backend)?;
+            // Within one generation the cached revision only moves forward: a delayed save of an
+            // older fold must not move the replay point back. A cache from an earlier generation
+            // is not proven and is always replaced.
             transaction
                 .execute(
                     &format!(
@@ -848,7 +939,8 @@ impl EventStore for PostgresEventStore {
                              version = EXCLUDED.version,
                              state_schema_version = EXCLUDED.state_schema_version,
                              state = EXCLUDED.state,
-                             recorded_at = EXCLUDED.recorded_at"
+                             recorded_at = EXCLUDED.recorded_at
+                         WHERE $8 OR {prefix}_snapshots.version <= EXCLUDED.version"
                     ),
                     &[
                         &stream.tenant().as_str(),
@@ -858,6 +950,7 @@ impl EventStore for PostgresEventStore {
                         &to_i32(snapshot.state_schema_version)?,
                         &snapshot.state,
                         &snapshot.recorded_at,
+                        &replace_any,
                     ],
                 )
                 .await
@@ -913,7 +1006,7 @@ impl EventStore for PostgresEventStore {
         &'a self,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
-        self.forgetting(self.bounded(async move {
+        self.forgetting(self.bounded_commit(move |commit_started| async move {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -922,6 +1015,7 @@ impl EventStore for PostgresEventStore {
             for table in [
                 "events",
                 "append_groups",
+                "group_batches",
                 "commands",
                 "claims",
                 "identity",
@@ -960,16 +1054,12 @@ impl EventStore for PostgresEventStore {
                     .await
                     .map_err(backend)?;
             }
-            let coordinate_prefix = format!("t{}:{}", tenant.as_str().len(), tenant.as_str());
+            let (from, until) = tenant_counters(tenant);
             transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {prefix}_scope_counters WHERE left(coordinate,length($1))=$1"
-                    ),
-                    &[&coordinate_prefix],
-                )
+                .execute(&forget_counters(&prefix), &[&from, &until])
                 .await
                 .map_err(backend)?;
+            commit_started.store(true, Ordering::Release);
             transaction
                 .commit()
                 .await
@@ -991,12 +1081,20 @@ impl EventStore for PostgresEventStore {
             projection.validate()?;
             let table = projection_table(&self.prefix, projection.name);
             let mut client = self.pool.acquire().await?;
+            // Bytewise, like every other provider: the shared pager reads a prefix as one
+            // contiguous run of keys and a cursor as "after these bytes". Under the database
+            // collation (ICU `und`, glibc `en_US`) `Desk/2` sorts between `desk/1` and `desk/3`,
+            // and the pager stopped at it, silently dropping `desk/3`.
+            // No cursor is the first page, which starts at the empty key itself: `> ''` would
+            // skip a row keyed by the empty string. A supplied cursor, even an empty one, is
+            // exclusive.
+            let bound = if after_key.is_some() { ">" } else { ">=" };
             let rows = client
                 .query(
                     &format!(
                         "SELECT row_key, body FROM {table}
-                         WHERE tenant_id = $1 AND row_key > $2
-                         ORDER BY row_key LIMIT $3"
+                         WHERE tenant_id = $1 AND row_key COLLATE \"C\" {bound} $2
+                         ORDER BY row_key COLLATE \"C\" LIMIT $3"
                     ),
                     &[
                         &tenant.as_str(),
@@ -1149,6 +1247,7 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
         self.bounded(async move {
             let prefix = &self.prefix;
+            let noted = self.verified.generation()?;
             let mut client = self.pool.acquire().await?;
             let row = client
                 .query_opt(
@@ -1161,8 +1260,11 @@ impl EventStore for PostgresEventStore {
                 .await
                 .map_err(backend)?;
             client.settled();
+            #[cfg(test)]
+            verify_content_once::after_blob_fetch(&self.prefix).await;
             row.map(|row| {
-                self.verified.check_stored(
+                self.verified.check_stored_since(
+                    noted,
                     row.get(0),
                     row.get(1),
                     row.get(2),
@@ -1252,6 +1354,8 @@ impl EventStore for PostgresEventStore {
                 }
             }
             self.create_projections(Arc::clone(&projector)).await?;
+            let mut projectors = self.inline.lock().map_err(poisoned)?;
+            self.refuse_catch_up_driven(projector.name())?;
             let mut names = self.inline_names.lock().map_err(poisoned)?;
             for spec in projector.projections() {
                 if !names.insert(spec.name.to_owned()) {
@@ -1262,7 +1366,7 @@ impl EventStore for PostgresEventStore {
                 }
             }
             drop(names);
-            self.inline.lock().map_err(poisoned)?.push(projector);
+            projectors.push(projector);
             Ok(())
         })
     }
@@ -1281,6 +1385,7 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<CatchUpProgress, EventLogError>> {
         self.bounded(async move {
             let batch = bounded_limit(batch);
+            self.claim_catch_up(projector.name())?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -1323,7 +1428,7 @@ impl EventStore for PostgresEventStore {
                 .query(
                     &format!(
                         "SELECT {COLUMNS} FROM {}
-                         WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK}
+                         WHERE tenant_id = $1 AND global_seq > $2 AND {SETTLED}
                            AND (first_unsettled IS NULL OR global_seq < first_unsettled)
                          ORDER BY global_seq LIMIT $3",
                         watermarked_source(&prefix)
@@ -1422,7 +1527,7 @@ impl EventStore for PostgresEventStore {
             }
             // Rebuild the same contiguous eligible prefix used by feed and catch-up. An unrelated
             // transaction can hold xmin between two already-committed append XIDs.
-            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND {WATERMARK} AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
+            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND {SETTLED} AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
             let mut position=0_i64; let mut applied=0_u64;
             loop {
                 let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
@@ -1484,6 +1589,29 @@ impl EventStore for PostgresEventStore {
             let table = projection_table(&self.prefix, projection.name);
             let limit = bounded_limit(limit);
             let mut client = self.pool.acquire().await?;
+            // `idx_N` is the N-th field of the registered declaration. A reader that swapped two
+            // field names would otherwise query the other field's column.
+            let prefix = &self.prefix;
+            let recorded = client
+                .query_opt(
+                    &format!(
+                        "SELECT indexed_fields FROM {prefix}_projection_registry
+                         WHERE projection_name = $1"
+                    ),
+                    &[&projection.name],
+                )
+                .await
+                .map_err(backend)?;
+            if let Some(recorded) = recorded.map(|row| row.get::<_, Value>(0))
+                && recorded != serde_json::json!(projection.indexed)
+            {
+                client.settled();
+                return Err(EventLogError::Invalid(format!(
+                    "projection {} is read with indexed fields {} but registered with {recorded}",
+                    projection.name,
+                    serde_json::json!(projection.indexed)
+                )));
+            }
             let rows = client
                 .query(
                     &format!(
@@ -1524,6 +1652,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
         Box::pin(async move {
             validate_field("digest", digest)?;
+            let noted = self.verified.generation()?;
             let row = self
                 .client
                 .query_opt(
@@ -1538,7 +1667,8 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .map_err(backend)?;
             let result = row
                 .map(|row| {
-                    self.verified.check_stored(
+                    self.verified.check_stored_since(
+                        noted,
                         row.get(0),
                         row.get(1),
                         row.get(2),
@@ -1578,19 +1708,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .batch_execute("SAVEPOINT eventlog_reservation")
                 .await
                 .map_err(backend)?;
-            let result=async {
-                for (coordinate,_) in &ordered {lock_identity(self.client,self.lock_prefix,"admission",&[coordinate]).await?;}
-                let table=format!("{}_scope_counters",self.lock_prefix);
-                let mut next=Vec::with_capacity(ordered.len());
-                // Validate every scope before any writes, including absent zero counters.
-                for (coordinate,reservation) in &ordered {
-                    let held=self.client.query_opt(&format!("SELECT held FROM {table} WHERE coordinate=$1 FOR UPDATE"), &[coordinate]).await.map_err(backend)?.map_or(0,|row|row.get::<_,i64>(0));
-                    let updated=held.checked_add(reservation.delta).filter(|value|*value>=0 && *value<=reservation.ceiling).ok_or_else(||EventLogError::Invalid("admission ceiling or release bound refused".into()))?;
-                    next.push(updated);
-                }
-                for ((coordinate,_),held) in ordered.iter().zip(&next) {self.client.execute(&format!("INSERT INTO {table}(coordinate,held) VALUES($1,$2) ON CONFLICT(coordinate) DO UPDATE SET held=EXCLUDED.held"), &[coordinate,held]).await.map_err(backend)?;}
-                Ok(next)
-            }.await;
+            let result = reserve_ordered(self.client, self.lock_prefix, &ordered).await;
             if result.is_err() {
                 self.client
                     .batch_execute("ROLLBACK TO SAVEPOINT eventlog_reservation")
@@ -1631,11 +1749,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
             let updates: String = joined(projection.indexed.len(), |position| {
                 format!(", idx_{position} = EXCLUDED.idx_{position}")
             });
-            let indexed: Vec<Option<String>> = projection
-                .indexed
-                .iter()
-                .map(|field| indexed_value(body, field))
-                .collect();
+            let indexed = indexed_values(projection, body)?;
             let statement = format!(
                 "INSERT INTO {table} (tenant_id, row_key, body{columns})
                  VALUES ($1, $2, $3{placeholders})
@@ -1828,6 +1942,42 @@ fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
 }
 
+/// The byte range holding every admission counter of `tenant`: its coordinates are
+/// `t{len}:{tenant}{keylen}:{key}`, so each starts with the tenant part and continues with an
+/// ASCII digit, which sorts below `:` byte-wise.
+fn tenant_counters(tenant: &TenantId) -> (String, String) {
+    let from = format!("t{}:{}", tenant.as_str().len(), tenant.as_str());
+    let until = format!("{from}:");
+    (from, until)
+}
+
+/// Erasure's counter cleanup: a byte-wise range the owner's `scope_counters_bytes` index answers,
+/// under the exclusive publication lock, instead of reading every counter of every tenant. The
+/// exact prefix test stays as a recheck.
+fn forget_counters(prefix: &str) -> String {
+    format!(
+        "DELETE FROM {prefix}_scope_counters WHERE (coordinate COLLATE \"C\") >= $1 \
+         AND (coordinate COLLATE \"C\") < $2 AND left(coordinate,length($1))=$1"
+    )
+}
+
+/// Whether `events` are exactly the versions `first ..= last`, in order: a receipt's interval
+/// that a read returns short is refused rather than handed back as a complete answer.
+fn is_complete_interval(events: &[RecordedEvent], first: i64, last: i64) -> bool {
+    let (Ok(first), Ok(last)) = (u64::try_from(first), u64::try_from(last)) else {
+        return false;
+    };
+    // An empty interval is written as `last = first - 1`.
+    let Some(expected) = (last + 1).checked_sub(first) else {
+        return false;
+    };
+    events.len() as u64 == expected
+        && events
+            .iter()
+            .zip(first..)
+            .all(|(event, version)| event.version == version)
+}
+
 async fn select_versions<C: GenericClient>(
     client: &C,
     prefix: &str,
@@ -1856,24 +2006,180 @@ async fn select_versions<C: GenericClient>(
     rows.iter().map(read_event).collect()
 }
 
-/// The page `read_stream` returns from up to `limit + 1` rows read past `after_version`.
+/// The columns of a stream page `p` read with one row past the page: [`COLUMNS`] in their order,
+/// with `data` withheld (NULL) on the row past `fetch`, then whether the row is that lookahead.
+///
+/// The lookahead row comes from the same index scan as the page, so it costs no extra probe, but
+/// its body is never output: a stored body is not detoasted, sent or decoded for it, and is read
+/// once, when the next page asks for it.
+fn stream_page_columns(fetch: &str) -> String {
+    let leading = COLUMNS
+        .strip_suffix(", data")
+        .unwrap_or(COLUMNS)
+        .split(", ")
+        .map(|column| format!("p.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{leading}, CASE WHEN p.n <= {fetch} THEN p.data END AS data, p.n > {fetch} AS lookahead"
+    )
+}
+
+/// `read_stream`'s statement: at most `$5` events past version `$4`, plus the lookahead row
+/// [`stream_page_columns`] describes, in one observation.
+fn stream_page_sql(prefix: &str) -> String {
+    let columns = stream_page_columns("$5::int8");
+    format!(
+        "SELECT {columns}
+         FROM (SELECT {COLUMNS}, row_number() OVER (ORDER BY version) AS n FROM {prefix}_events
+               WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3 AND version > $4
+               ORDER BY version LIMIT $5::int8 + 1) AS p
+         ORDER BY p.version"
+    )
+}
+
+/// The page `read_stream` returns from up to `limit` rows read past `after_version`, plus at
+/// most one lookahead row ([`stream_page_columns`]) that only decides `end_of_stream` and is
+/// not decoded.
 fn stream_slice(
     rows: &[Row],
     after_version: u64,
     limit: usize,
 ) -> Result<StreamSlice, EventLogError> {
-    let mut events = rows
+    let lookahead = |row: &Row| {
+        row.try_get::<_, bool>(COLUMN_COUNT)
+            .map_err(|_| EventLogError::Backend("stream page lookahead is missing".into()))
+    };
+    let (page, more) = match rows.split_last() {
+        Some((last, page)) if lookahead(last)? => (page, true),
+        _ => (rows, false),
+    };
+    if page.len() > limit {
+        return Err(EventLogError::Backend(
+            "a stream page returned more rows than it asked for".into(),
+        ));
+    }
+    let events = page
         .iter()
         .map(read_event)
         .collect::<Result<Vec<_>, EventLogError>>()?;
-    let end_of_stream = events.len() <= limit;
-    events.truncate(limit);
+    let end_of_stream = !more;
     let next_version = events.last().map_or(after_version, |event| event.version);
     Ok(StreamSlice {
         events,
         next_version,
         end_of_stream,
     })
+}
+
+#[cfg(test)]
+mod stream_page_tests {
+    use super::*;
+
+    /// The rows of a page that carry an event body; a lookahead row carries none.
+    fn bodies(rows: &[Row]) -> usize {
+        rows.iter()
+            .filter(|row| row.get::<_, Option<Value>>(COLUMN_COUNT - 1).is_some())
+            .count()
+    }
+
+    #[test]
+    fn the_body_is_the_last_of_the_event_columns() {
+        assert!(COLUMNS.ends_with(", data"));
+        assert_eq!(COLUMNS.split(", ").count(), COLUMN_COUNT);
+    }
+
+    /// Page through a three-event stream one event at a time, through the single read's
+    /// statement and through the batched windows: every page selects the body of exactly the event
+    /// it returns, and only its body-less lookahead row says whether the stream continues.
+    #[tokio::test]
+    async fn a_stream_page_selects_only_the_bodies_it_returns() {
+        let Ok(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL") else {
+            panic!("stream page proof requires EVENTLOG_TEST_POSTGRES_URL");
+        };
+        let prefix = "stream_page_lookahead";
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        store.drop_tables().await.unwrap();
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        let stream = StreamId::new(TenantId::new("paged").unwrap(), "item", "one").unwrap();
+        let events: Vec<NewEvent> = (1..=3)
+            .map(|value| {
+                NewEvent::new("item.recorded", 1, serde_json::json!({ "value": value })).unwrap()
+            })
+            .collect();
+        let meta = CommandMeta {
+            idempotency_key: "seed".into(),
+            request_hash: eventlog_core::request_hash(&serde_json::json!({})).unwrap(),
+            subject: "person-1".into(),
+            actor: "service-1".into(),
+            request_id: "request-seed".into(),
+            trace_id: "trace-seed".into(),
+            causation_id: None,
+            causation_depth: 0,
+            occurred_at: OffsetDateTime::UNIX_EPOCH,
+            claim: None,
+        };
+        store
+            .append(&stream, Expected::NoStream, &events, &meta)
+            .await
+            .unwrap();
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let mut seen = Vec::new();
+        for after in 0..3_i64 {
+            let rows = sql
+                .query(
+                    &stream_page_sql(prefix),
+                    &[
+                        &stream.tenant().as_str(),
+                        &stream.stream_type(),
+                        &stream.stream_id(),
+                        &after,
+                        &1_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bodies(&rows),
+                1,
+                "page after {after} selected the next event's body"
+            );
+            let windowed = select_windows(
+                &sql,
+                prefix,
+                &[&Window {
+                    stream: &stream,
+                    after,
+                    through: i64::MAX,
+                    fetch: 1,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                bodies(&windowed[0]),
+                1,
+                "window after {after} selected the next event's body"
+            );
+            for page in [&rows[..], &windowed[0][..]] {
+                let slice = stream_slice(page, u64::try_from(after).unwrap(), 1).unwrap();
+                assert_eq!(slice.events.len(), 1);
+                assert_eq!(slice.end_of_stream, after == 2, "page after {after}");
+                seen.push(slice.next_version);
+            }
+        }
+        assert_eq!(seen, [1, 1, 2, 2, 3, 3]);
+        let past = store.read_stream(&stream, 3, 1).await.unwrap();
+        assert!(past.events.is_empty() && past.end_of_stream);
+        store.drop_tables().await.unwrap();
+    }
 }
 
 /// One stream's versions in `(after, through]`, at most `fetch` of them, in version order.
@@ -1887,8 +2193,10 @@ struct Window<'a> {
 /// Every window's rows, in request order, [`STATEMENT_BATCH`] windows per statement.
 ///
 /// Each window is the statement [`select_versions`] and `read_stream` issue for one stream, run
-/// as a lateral subquery per array element; the element's ordinal is appended after
-/// [`COLUMNS`], so [`read_event`] reads the rows unchanged.
+/// as a lateral subquery per array element. Each window also returns the lookahead row of
+/// [`stream_page_columns`] when a version past its `fetch` rows exists up to `through`; after
+/// [`COLUMNS`] each row carries that flag and then the element's ordinal, so [`read_event`]
+/// reads the page rows unchanged. A window whose `fetch` covers its whole range never has one.
 ///
 /// With a `pace`, each statement runs under that pace times the windows it carries; without
 /// one, under whatever already bounds the caller's transaction.
@@ -1902,6 +2210,7 @@ async fn select_windows<C: GenericClient>(
     if windows.is_empty() {
         return Ok(answers);
     }
+    let columns = stream_page_columns("r.r_fetch");
     let statement = paced(pace.map(|one| one.deadline), async {
         client
             .prepare(&format!(
@@ -1909,10 +2218,13 @@ async fn select_windows<C: GenericClient>(
                                           $5::int8[], $6::int8[])
                  WITH ORDINALITY AS r(r_tenant, r_type, r_id, r_after, r_through, r_fetch, ord)
              CROSS JOIN LATERAL (
-                 SELECT {COLUMNS} FROM {prefix}_events
-                 WHERE tenant_id = r.r_tenant AND stream_type = r.r_type AND stream_id = r.r_id
-                   AND version > r.r_after AND version <= r.r_through
-                 ORDER BY version LIMIT r.r_fetch) AS e
+                 SELECT {columns}
+                 FROM (SELECT {COLUMNS}, row_number() OVER (ORDER BY version) AS n
+                       FROM {prefix}_events
+                       WHERE tenant_id = r.r_tenant AND stream_type = r.r_type
+                         AND stream_id = r.r_id
+                         AND version > r.r_after AND version <= r.r_through
+                       ORDER BY version LIMIT r.r_fetch + 1) AS p) AS e
              ORDER BY r.ord, e.version"
             ))
             .await
@@ -1941,7 +2253,7 @@ async fn select_windows<C: GenericClient>(
         })
         .await?;
         for row in rows {
-            let index = batch * STATEMENT_BATCH + ordinal(row.get(COLUMN_COUNT))?;
+            let index = batch * STATEMENT_BATCH + ordinal(row.get(COLUMN_COUNT + 1))?;
             answers
                 .get_mut(index)
                 .ok_or_else(|| EventLogError::Backend("batched read out of range".into()))?
@@ -2240,15 +2552,162 @@ async fn lock_identity(
     Ok(())
 }
 
+/// One reservation's locks, reads and writes: one statement per phase, whatever the scope count.
+///
+/// The advisory locks are taken in one statement over the coordinates in their sorted order, so
+/// two reservations still lock overlapping scopes in the same order. Every ceiling is checked
+/// before anything is written, and a scope whose value does not change is not written at all: a
+/// zero delta reads the counter under the same locks without creating a row or writing WAL, and
+/// an absent counter is zero.
+async fn reserve_ordered(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    ordered: &[(String, &eventlog_core::Reservation)],
+) -> Result<Vec<i64>, EventLogError> {
+    let identities = ordered
+        .iter()
+        .map(|(coordinate, _)| lock_coordinates(prefix, "admission", &[coordinate]))
+        .collect::<Result<Vec<_>, _>>()?;
+    // A function in FROM yields the array's elements in order, and nothing above it re-sorts.
+    let key = ADVISORY_KEY.replace("$1", "scope.identity");
+    transaction
+        .query_one(
+            &format!(
+                "SELECT count(pg_advisory_xact_lock({key})) FROM unnest($1::text[]) AS scope(identity)"
+            ),
+            &[&identities],
+        )
+        .await
+        .map_err(backend)?;
+    let table = format!("{prefix}_scope_counters");
+    let coordinates: Vec<&str> = ordered
+        .iter()
+        .map(|(coordinate, _)| coordinate.as_str())
+        .collect();
+    let held: BTreeMap<String, i64> = transaction
+        .query(
+            &format!(
+                "SELECT coordinate, held FROM {table} WHERE coordinate = ANY($1::text[]) FOR UPDATE"
+            ),
+            &[&coordinates],
+        )
+        .await
+        .map_err(backend)?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let mut next = Vec::with_capacity(ordered.len());
+    let mut changed: (Vec<&str>, Vec<i64>) = (Vec::new(), Vec::new());
+    for (coordinate, reservation) in ordered {
+        let current = held.get(coordinate).copied().unwrap_or(0);
+        let updated = current
+            .checked_add(reservation.delta)
+            .filter(|value| *value >= 0 && *value <= reservation.ceiling)
+            .ok_or_else(|| {
+                EventLogError::Invalid("admission ceiling or release bound refused".into())
+            })?;
+        if updated != current {
+            changed.0.push(coordinate);
+            changed.1.push(updated);
+        }
+        next.push(updated);
+    }
+    if !changed.0.is_empty() {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {table}(coordinate,held) SELECT * FROM unnest($1::text[],$2::bigint[]) \
+                     ON CONFLICT(coordinate) DO UPDATE SET held=EXCLUDED.held"
+                ),
+                &[&changed.0, &changed.1],
+            )
+            .await
+            .map_err(backend)?;
+    }
+    Ok(next)
+}
+
 // Evaluate both the row watermark and the first withheld position in one statement snapshot.
 // The publication gate settles owner writers, but unrelated transactions can still hold xmin
 // between committed XIDs. Never publish a higher position past such a withheld lower position.
+// Positions at or below the settlement floor are settled; the watermark applies above it.
 fn watermarked_source(prefix: &str) -> String {
     format!(
         "{prefix}_events CROSS JOIN \
+         (SELECT COALESCE(MAX(settled_through), 0) AS settled_through \
+          FROM {prefix}_settlement_floor) AS settlement_floor CROSS JOIN \
          (SELECT MIN(global_seq) AS first_unsettled FROM {prefix}_events \
-          WHERE NOT ({WATERMARK})) AS publication_prefix"
+          WHERE NOT ({WATERMARK}) AND global_seq > \
+          (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)) \
+         AS publication_prefix"
     )
+}
+
+/// The first position above the settlement floor whose transaction id comes from another
+/// cluster, if any.
+///
+/// One simple-protocol query: it takes no parameters, and a prepared statement would cost a
+/// prepare round trip plus a `Close` that the driver sends when the statement drops, after
+/// `open` returned, so it lands on the caller's next operation (the KPI
+/// `postgres.append.round_trips` counted it in the first append).
+async fn first_foreign<C: GenericClient>(
+    client: &C,
+    prefix: &str,
+) -> Result<Option<i64>, EventLogError> {
+    let messages = client
+        .simple_query(&format!(
+            "SELECT MIN(global_seq) FROM {prefix}_events \
+             WHERE {FOREIGN} AND global_seq > \
+             (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)"
+        ))
+        .await
+        .map_err(backend)?;
+    let Some(row) = messages.iter().find_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+        _ => None,
+    }) else {
+        return Err(EventLogError::Backend(
+            "PostgreSQL settlement-floor check returned no row".into(),
+        ));
+    };
+    row.try_get(0)
+        .map_err(backend)?
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                EventLogError::Backend("PostgreSQL settlement-floor check is not a position".into())
+            })
+        })
+        .transpose()
+}
+
+/// After a logical restore every event carries the source cluster's transaction id, and the
+/// watermark would withhold the restored history, and every later event, until this cluster's
+/// clock passed it. When a restored id is found, record the highest position as settled, under
+/// the exclusive publication gate so no append is in flight below it. Runs after the migration
+/// committed: the gate must be taken before every other owner lock.
+async fn settle_restored_history(
+    client: &mut tokio_postgres::Client,
+    prefix: &str,
+) -> Result<(), EventLogError> {
+    if first_foreign(&*client, prefix).await?.is_none() {
+        return Ok(());
+    }
+    let transaction = client.transaction().await.map_err(backend)?;
+    publication_gate(&transaction, prefix, true).await?;
+    if first_foreign(&transaction, prefix).await?.is_some() {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}_settlement_floor (settled_through, recorded_at) \
+                     SELECT MAX(global_seq), now() FROM {prefix}_events \
+                     ON CONFLICT (settled_through) DO NOTHING"
+                ),
+                &[],
+            )
+            .await
+            .map_err(backend)?;
+    }
+    transaction.commit().await.map_err(backend)
 }
 
 // Transaction publication gate: XID order can differ from global sequence allocation order.
@@ -2345,6 +2804,7 @@ mod blob_migration_tests {
     const BASE_TABLES_FOR_TEST: &[&str] = &[
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",
@@ -2355,5 +2815,197 @@ mod blob_migration_tests {
         "scope_counters",
         "schema_version",
         "projection_registry",
+        "settlement_floor",
     ];
+}
+
+#[cfg(test)]
+mod publication_boundary_tests {
+    use super::{COLUMNS, PostgresEventStore, SETTLED, watermarked_source};
+
+    /// Every plan node of `plan` that reads `relation` sequentially.
+    fn sequential_reads(plan: &serde_json::Value, relation: &str, found: &mut Vec<String>) {
+        if plan["Node Type"] == "Seq Scan" && plan["Relation Name"] == relation {
+            found.push(plan.to_string());
+        }
+        for child in plan["Plans"].as_array().into_iter().flatten() {
+            sequential_reads(child, relation, found);
+        }
+    }
+
+    /// The feed's publication boundary (`MIN(global_seq)` over events whose transaction is not
+    /// yet visible) is answered from the owner's index on `(committed_xid, global_seq)`, not by
+    /// reading every event of every tenant for each page.
+    #[tokio::test]
+    async fn a_feed_page_finds_the_publication_boundary_without_scanning_the_history() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let prefix: String = std::iter::once("pb_".to_owned())
+            .chain(
+                nanos
+                    .to_string()
+                    .bytes()
+                    .rev()
+                    .take(12)
+                    .map(|digit| char::from(b'a' + digit - b'0').to_string()),
+            )
+            .collect();
+        let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        sql.batch_execute(&format!(
+            "INSERT INTO {prefix}_events (tenant_id,stream_type,stream_id,version,event_id,event_name,
+                 event_schema_version,occurred_at,recorded_at,subject,actor,request_id,trace_id,data)
+             SELECT 'tenant-' || (n % 8), 'item', 'subject-' || (n % 8), n / 8 + 1,
+                 gen_random_uuid(), 'item.changed', 1, now(), now(), 's', 'a', 'r', 't', '{{}}'
+             FROM generate_series(0, 8191) AS n;
+             ANALYZE {prefix}_events;"
+        ))
+        .await
+        .unwrap();
+        let feed = format!(
+            "SELECT {COLUMNS} FROM {}
+             WHERE tenant_id = 'tenant-3' AND global_seq > 8000 AND {SETTLED}
+               AND (first_unsettled IS NULL OR global_seq < first_unsettled)
+             ORDER BY global_seq LIMIT 2",
+            watermarked_source(&prefix)
+        );
+        let plan: serde_json::Value = sql
+            .query_one(&format!("EXPLAIN (FORMAT JSON) {feed}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut found = Vec::new();
+        sequential_reads(&plan[0]["Plan"], &format!("{prefix}_events"), &mut found);
+        assert!(
+            found.is_empty(),
+            "a feed page read the owner's events sequentially: {found:?}"
+        );
+        // The watermark is cluster-wide: a transaction open anywhere in the instance withholds the
+        // rows just inserted, so one read asks whether the machine happened to be idle.
+        let mut rows = 0;
+        for _ in 0..200 {
+            rows = sql.query(&feed, &[]).await.unwrap().len();
+            if rows == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rows, 2, "the page still returns the settled rows");
+        store.drop_tables().await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod counter_cleanup_tests {
+    use super::{PostgresEventStore, forget_counters, tenant_counters};
+    use eventlog_core::{EventStore, TenantId};
+
+    fn sequential_reads(plan: &serde_json::Value, relation: &str, found: &mut Vec<String>) {
+        if plan["Node Type"] == "Seq Scan" && plan["Relation Name"] == relation {
+            found.push(plan.to_string());
+        }
+        for child in plan["Plans"].as_array().into_iter().flatten() {
+            sequential_reads(child, relation, found);
+        }
+    }
+
+    /// Erasure removes one tenant's admission counters through the owner's byte-wise coordinate
+    /// index, not by reading every counter while it holds the exclusive publication lock, and
+    /// removes exactly that tenant's counters.
+    #[tokio::test]
+    async fn erasure_removes_one_tenants_counters_without_scanning_all_of_them() {
+        let url = std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture");
+        let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let prefix: String = std::iter::once("cc_".to_owned())
+            .chain(
+                nanos
+                    .to_string()
+                    .bytes()
+                    .rev()
+                    .take(12)
+                    .map(|digit| char::from(b'a' + digit - b'0').to_string()),
+            )
+            .collect();
+        let store = PostgresEventStore::connect(&url, &prefix).await.unwrap();
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        // 64 tenants of 64 counters each, named `tenant-NN` (nine bytes), plus deployment
+        // counters, and one tenant whose name starts with another tenant's name.
+        sql.batch_execute(&format!(
+            "INSERT INTO {prefix}_scope_counters (coordinate,held)
+             SELECT 't9:tenant-' || lpad((n % 64)::text, 2, '0') || length('k' || n) || ':k' || n, 1
+             FROM generate_series(0, 4095) AS n;
+             INSERT INTO {prefix}_scope_counters (coordinate,held)
+             SELECT 'd' || length('k' || n) || ':k' || n, 1 FROM generate_series(0, 1023) AS n;
+             INSERT INTO {prefix}_scope_counters (coordinate,held) VALUES ('t10:tenant-033' || '2:kk', 1);
+             ANALYZE {prefix}_scope_counters;"
+        ))
+        .await
+        .unwrap();
+        let tenant = TenantId::new("tenant-03").unwrap();
+        let (from, until) = tenant_counters(&tenant);
+        let plan: serde_json::Value = sql
+            .query_one(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    forget_counters(&prefix)
+                        .replace("$1", &format!("'{from}'"))
+                        .replace("$2", &format!("'{until}'"))
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let mut found = Vec::new();
+        sequential_reads(
+            &plan[0]["Plan"],
+            &format!("{prefix}_scope_counters"),
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "erasure read every admission counter sequentially: {found:?}"
+        );
+        store.forget_tenant(&tenant).await.unwrap();
+        let count = |pattern: &'static str| {
+            let sql = &sql;
+            let prefix = &prefix;
+            async move {
+                sql.query_one(
+                    &format!(
+                        "SELECT count(*) FROM {prefix}_scope_counters WHERE coordinate LIKE $1"
+                    ),
+                    &[&pattern],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+            }
+        };
+        assert_eq!(
+            count("t9:tenant-03%").await,
+            0,
+            "the tenant's counters are gone"
+        );
+        assert_eq!(
+            count("t9:tenant-%").await,
+            63 * 64,
+            "other tenants keep theirs"
+        );
+        assert_eq!(count("d%").await, 1024, "deployment counters stay");
+        assert_eq!(
+            count("t10:%").await,
+            1,
+            "a longer tenant name is another tenant"
+        );
+        store.drop_tables().await.unwrap();
+        store.shutdown().await.unwrap();
+    }
 }

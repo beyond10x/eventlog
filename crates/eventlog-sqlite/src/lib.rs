@@ -16,6 +16,9 @@ mod capture;
 mod durable_capture;
 mod inline_admin;
 mod inspection;
+#[cfg(feature = "kpi-counters")]
+pub mod kpi;
+mod table_owners;
 mod tracked_capture;
 mod verified;
 pub use inspection::SqliteHistoryInspector;
@@ -34,7 +37,7 @@ use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
     MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
     Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, blob_integrity_sha256,
-    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
+    bounded_limit, indexed_values, new_event_id, redaction_tombstone, validate_append,
     validate_field, validate_legacy_blob_count, validate_stored_blob,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, TransactionBehavior, params};
@@ -58,11 +61,16 @@ struct Inner {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    /// Projectors this handle has driven by catch-up. Locked after `inline`, so one projector is
+    /// driven inline or by catch-up, never both, whichever is registered first.
+    catch_up: Mutex<BTreeSet<String>>,
     admission_permit: eventlog_core::AdmissionPermit,
     registration: Mutex<bool>,
     /// Identities and instants the next appended events take instead of minting their own, in
-    /// order. Empty except while [`SqliteEventStore::restore_events`] replays history.
-    restored: Mutex<std::collections::VecDeque<RestoredEvent>>,
+    /// order, each with the global position it takes when one was given. Empty except while
+    /// [`SqliteEventStore::restore_events`] or [`SqliteEventStore::restore_events_at`] replays
+    /// history.
+    restored: Mutex<std::collections::VecDeque<(RestoredEvent, Option<u64>)>>,
     /// Blob rows this handle has already validated; see [`verified`].
     verified: verified::VerifiedBlobs,
     tracked: tracked_capture::TrackedCapture,
@@ -88,6 +96,16 @@ pub struct EventOrigin {
     pub version: u64,
     pub digest: String,
     pub parents: Vec<String>,
+}
+
+/// Where each event stands in a store's global order, as [`SqliteEventStore::positions`] reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventPositions {
+    /// Each event's global position, by event id.
+    pub by_event: BTreeMap<String, u64>,
+    /// The highest position the store has assigned, held now or by an event since erased.
+    pub high_water: u64,
 }
 
 /// Each copied event's origin, by `(stream_type, stream_id, version)` in the linear store.
@@ -164,8 +182,108 @@ impl SqliteEventStore {
                 "restored identities from an earlier replay were never used".into(),
             ));
         }
-        queue.extend(events);
+        queue.extend(events.into_iter().map(|event| (event, None)));
         Ok(())
+    }
+
+    /// [`SqliteEventStore::restore_events`], with the global position each event takes.
+    ///
+    /// For a provider that rebuilds its in-memory store while it is open: an event a reader was
+    /// already served keeps the position the reader may have saved, so a feed cursor never falls
+    /// behind an event it has not seen. Positions need not follow replay order and may leave gaps;
+    /// a position this store already holds refuses the append that takes it.
+    ///
+    /// # Errors
+    /// As [`SqliteEventStore::restore_events`], and [`EventLogError::Invalid`] when `positions`
+    /// does not hold one position, above zero, for each event.
+    pub fn restore_events_at(
+        &self,
+        events: Vec<RestoredEvent>,
+        positions: Vec<u64>,
+    ) -> Result<(), EventLogError> {
+        if positions.len() != events.len() || positions.contains(&0) {
+            return Err(EventLogError::Invalid(
+                "each restored event takes one position above zero".into(),
+            ));
+        }
+        let mut queue = self.inner.restored.lock().map_err(poisoned)?;
+        if !queue.is_empty() {
+            return Err(EventLogError::Invalid(
+                "restored identities from an earlier replay were never used".into(),
+            ));
+        }
+        queue.extend(events.into_iter().zip(positions.into_iter().map(Some)));
+        Ok(())
+    }
+
+    /// Every event's global position, by event id, and the highest position this store has ever
+    /// assigned, which an event since erased may have held.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the events cannot be read.
+    pub async fn positions(&self) -> Result<EventPositions, EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || {
+            let prefix = &inner.prefix;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let mut statement = connection
+                .prepare(&format!("SELECT event_id, global_seq FROM {prefix}_events"))
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(backend)?;
+            let mut positions = EventPositions::default();
+            for row in rows {
+                let (event_id, position) = row.map_err(backend)?;
+                let position = to_u64(position)?;
+                positions.high_water = positions.high_water.max(position);
+                positions.by_event.insert(event_id, position);
+            }
+            let assigned: Option<i64> = connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                    params![format!("{prefix}_events")],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if let Some(assigned) = assigned {
+                positions.high_water = positions.high_water.max(to_u64(assigned)?);
+            }
+            Ok(positions)
+        })
+        .await
+    }
+
+    /// Make every global position this store assigns from now on greater than `position`.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the position cannot be recorded.
+    pub async fn reserve_positions_through(&self, position: u64) -> Result<(), EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || {
+            let name = format!("{}_events", inner.prefix);
+            let position = to_i64(position)?;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let updated = connection
+                .execute(
+                    "UPDATE sqlite_sequence SET seq = max(seq, ?2) WHERE name = ?1",
+                    params![name, position],
+                )
+                .map_err(backend)?;
+            if updated == 0 {
+                connection
+                    .execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                        params![name, position],
+                    )
+                    .map_err(backend)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// How many queued restored identities no append has taken yet.
@@ -351,11 +469,18 @@ impl Inner {
     }
 
     fn new(connection: Connection, prefix: &str) -> Self {
+        #[cfg(feature = "kpi-counters")]
+        let connection = {
+            let mut connection = connection;
+            kpi::instrument(&mut connection);
+            connection
+        };
         Self {
             connection: Mutex::new(connection),
             prefix: prefix.to_owned(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            catch_up: Mutex::new(BTreeSet::new()),
             admission_permit: eventlog_core::AdmissionPermit::default(),
             registration: Mutex::new(false),
             restored: Mutex::new(std::collections::VecDeque::new()),
@@ -538,10 +663,14 @@ impl Inner {
                  indexed_fields TEXT NOT NULL
              );
              {}
+             {}
+             {}
              {}",
             atomic_group::ddl(prefix),
             origins_ddl(prefix),
-            atomic_group::batches_ddl(prefix)
+            atomic_group::batches_ddl(prefix),
+            capture::malformed_tenant_index(&format!("{prefix}_identity")),
+            capture::malformed_tenant_index(&format!("{prefix}_events")),
         );
         let mut connection = self.connection.lock().map_err(poisoned)?;
         self.refuse_foreign_tables(&connection)?;
@@ -589,11 +718,7 @@ impl Inner {
                     let row = if let Some((tenant, digest)) = &after {
                         transaction
                             .query_row(
-                                &format!(
-                            "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
-                             WHERE tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)
-                             ORDER BY tenant_id,digest LIMIT 1"
-                        ),
+                                &legacy_blob_cursor_sql(&table),
                                 params![tenant, digest],
                                 read,
                             )
@@ -1213,6 +1338,18 @@ impl EventStore for SqliteEventStore {
         }))
     }
 
+    /// One read transaction answers the batch, so a group committed by another handle on the
+    /// same database is seen whole or not at all. Each result is shaped exactly as
+    /// [`EventStore::read_stream`] or [`EventStore::get_blob`] shapes it.
+    fn read_many<'a>(
+        &'a self,
+        reads: &'a [eventlog_core::Read],
+    ) -> BoxFuture<'a, Result<Vec<eventlog_core::ReadResult>, EventLogError>> {
+        let inner = Arc::clone(&self.inner);
+        let reads = reads.to_vec();
+        Box::pin(run_blocking(move || inner.read_many(&reads)))
+    }
+
     fn stream_version<'a>(
         &'a self,
         stream: &'a StreamId,
@@ -1619,21 +1756,28 @@ impl Inner {
         let mut written = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
             let version = head + 1 + offset as u64;
-            let (event_id, now, origin) = match self.restored.lock().map_err(poisoned)?.pop_front()
-            {
-                Some(restored) => (restored.event_id, restored.recorded_at, restored.origin),
-                None => (new_event_id(), minted, None),
-            };
+            let (event_id, now, origin, position) =
+                match self.restored.lock().map_err(poisoned)?.pop_front() {
+                    Some((restored, position)) => (
+                        restored.event_id,
+                        restored.recorded_at,
+                        restored.origin,
+                        position.map(to_i64).transpose()?,
+                    ),
+                    None => (new_event_id(), minted, None, None),
+                };
             let recorded_at = format_time(now)?;
+            // A restored position is taken as given; otherwise `?17` is NULL and the store
+            // assigns the next one.
             connection
                 .execute(
                     &format!(
                         "INSERT INTO {prefix}_events (
                              tenant_id, stream_type, stream_id, version, event_id, event_name,
                              event_schema_version, occurred_at, recorded_at, subject, actor,
-                             request_id, trace_id, causation_id, causation_depth, data)
+                             request_id, trace_id, causation_id, causation_depth, data, global_seq)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16)"
+                                 ?15, ?16, ?17)"
                     ),
                     params![
                         stream.tenant().as_str(),
@@ -1652,6 +1796,7 @@ impl Inner {
                         meta.causation_id,
                         i64::from(meta.causation_depth),
                         event.data.to_string(),
+                        position,
                     ],
                 )
                 .map_err(backend)?;
@@ -1877,10 +2022,52 @@ impl Inner {
         after_version: u64,
         limit: usize,
     ) -> Result<StreamSlice, EventLogError> {
+        let guard = self.connection.lock().map_err(poisoned)?;
+        self.read_stream_on(&guard, stream, after_version, limit)
+    }
+
+    /// Every read of the batch inside one deferred transaction: SQLite fixes the snapshot at the
+    /// first statement, and a commit by another connection after it stays invisible until the end.
+    fn read_many(
+        &self,
+        reads: &[eventlog_core::Read],
+    ) -> Result<Vec<eventlog_core::ReadResult>, EventLogError> {
+        let mut guard = self.connection.lock().map_err(poisoned)?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(backend)?;
+        let mut results = Vec::with_capacity(reads.len());
+        for read in reads {
+            results.push(match read {
+                eventlog_core::Read::Stream {
+                    stream,
+                    after_version,
+                    limit,
+                } => eventlog_core::ReadResult::Stream(self.read_stream_on(
+                    &transaction,
+                    stream,
+                    *after_version,
+                    *limit,
+                )?),
+                eventlog_core::Read::Blob { tenant, digest } => eventlog_core::ReadResult::Blob(
+                    self.get_blob_on(&transaction, tenant, digest)?,
+                ),
+            });
+        }
+        transaction.commit().map_err(backend)?;
+        Ok(results)
+    }
+
+    fn read_stream_on(
+        &self,
+        connection: &Connection,
+        stream: &StreamId,
+        after_version: u64,
+        limit: usize,
+    ) -> Result<StreamSlice, EventLogError> {
         let limit = bounded_limit(limit);
         let prefix = &self.prefix;
-        let guard = self.connection.lock().map_err(poisoned)?;
-        let mut statement = guard
+        let mut statement = connection
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM {prefix}_events
                  WHERE tenant_id = ?1 AND stream_type = ?2 AND stream_id = ?3 AND version > ?4
@@ -1983,7 +2170,7 @@ impl Inner {
         version: u64,
         reason: &str,
     ) -> Result<RecordedEvent, EventLogError> {
-        validate_field("redaction reason", reason)?;
+        eventlog_core::validate_redaction_reason(reason)?;
         let prefix = self.prefix.clone();
         let mut guard = self.connection.lock().map_err(poisoned)?;
         let transaction = guard
@@ -2079,11 +2266,18 @@ impl Inner {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
         let before = tracked_capture::Stamp::read(&transaction).ok();
-        let accepted = transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation.as_uuid().to_string()]).map_err(backend)?;
-        if accepted == 0 {
+        let generation = generation.as_uuid().to_string();
+        // Whether the cached snapshot was proven in this generation, read before this save
+        // proves its own; the immediate transaction keeps the two in one write.
+        let Some(prior) = transaction.query_row(&format!("SELECT cached_generation FROM {prefix}_snapshot_generations WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation],|row| row.get::<_, Option<String>>(0)).optional().map_err(backend)? else {
             transaction.rollback().map_err(backend)?;
             return Ok(false);
-        }
+        };
+        let replace_any = prior.as_deref() != Some(generation.as_str());
+        transaction.execute(&format!("UPDATE {prefix}_snapshot_generations SET cached_generation=generation WHERE tenant_id=?1 AND stream_type=?2 AND stream_id=?3 AND generation=?4"),params![stream.tenant().as_str(),stream.stream_type(),stream.stream_id(),generation]).map_err(backend)?;
+        // Within one generation the cached revision only moves forward: a delayed save of an
+        // older fold must not move the replay point back. A cache from an earlier generation is
+        // not proven and is always replaced.
         transaction
             .execute(
                 &format!(
@@ -2095,7 +2289,8 @@ impl Inner {
                          version = excluded.version,
                          state_schema_version = excluded.state_schema_version,
                          state = excluded.state,
-                         recorded_at = excluded.recorded_at"
+                         recorded_at = excluded.recorded_at
+                     WHERE ?8 OR {prefix}_snapshots.version <= excluded.version"
                 ),
                 params![
                     stream.tenant().as_str(),
@@ -2105,6 +2300,7 @@ impl Inner {
                     i64::from(snapshot.state_schema_version),
                     snapshot.state.to_string(),
                     format_time(snapshot.recorded_at)?,
+                    replace_any,
                 ],
             )
             .map_err(backend)?;
@@ -2296,10 +2492,13 @@ impl Inner {
         projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
+        // No cursor is the first page, which starts at the empty key itself: `> ''` would skip
+        // a row keyed by the empty string. A supplied cursor, even an empty one, is exclusive.
+        let bound = if after_key.is_some() { ">" } else { ">=" };
         let mut statement = guard
             .prepare(&format!(
                 "SELECT row_key, body FROM {table}
-                 WHERE tenant_id = ?1 AND row_key > ?2
+                 WHERE tenant_id = ?1 AND row_key {bound} ?2
                  ORDER BY row_key LIMIT ?3"
             ))
             .map_err(backend)?;
@@ -2489,9 +2688,18 @@ impl Inner {
     }
 
     fn get_blob(&self, tenant: &TenantId, digest: &str) -> Result<Option<Vec<u8>>, EventLogError> {
-        let prefix = &self.prefix;
         let guard = self.connection.lock().map_err(poisoned)?;
-        let stored = guard
+        self.get_blob_on(&guard, tenant, digest)
+    }
+
+    fn get_blob_on(
+        &self,
+        connection: &Connection,
+        tenant: &TenantId,
+        digest: &str,
+    ) -> Result<Option<Vec<u8>>, EventLogError> {
+        let prefix = &self.prefix;
+        let stored = connection
             .query_row(
                 &format!(
                     "SELECT bytes,byte_count,integrity_sha256,integrity_v1 FROM {prefix}_blobs
@@ -2511,7 +2719,7 @@ impl Inner {
             .map_err(backend)?;
         stored
             .map(|(bytes, count, hash, version)| {
-                self.verified.check(&guard, bytes, count, hash, version)
+                self.verified.check(connection, bytes, count, hash, version)
             })
             .transpose()
     }
@@ -2541,19 +2749,21 @@ impl Inner {
         begin_immediate(&guard)?;
         let result = (|| {
             for spec in projector.projections() {
+                table_owners::claim_projection(&guard, prefix, spec.name)?;
                 let table = projection_table(prefix, spec.name);
                 let body = projection_table_body(spec.indexed.len());
+                guard
+                    .execute_batch(&format!("CREATE TABLE IF NOT EXISTS {table} ({body});"))
+                    .map_err(backend)?;
+                for position in 0..spec.indexed.len() {
+                    upgrade_projection_index(&guard, &table, position)?;
+                }
                 let indexes: String = joined(spec.indexed.len(), |position| {
                     let index = projection_index(&table, position);
-                    format!(
-                        "CREATE INDEX IF NOT EXISTS {index} ON {table} (tenant_id, idx_{position});"
-                    )
+                    let columns = projection_index_columns(position).join(", ");
+                    format!("CREATE INDEX IF NOT EXISTS {index} ON {table} ({columns});")
                 });
-                guard
-                    .execute_batch(&format!(
-                        "CREATE TABLE IF NOT EXISTS {table} ({body});{indexes}"
-                    ))
-                    .map_err(backend)?;
+                guard.execute_batch(&indexes).map_err(backend)?;
                 durable_capture::cover_projection(&guard, prefix, &table)?;
             }
             for spec in projector.projections() {
@@ -2562,9 +2772,7 @@ impl Inner {
                 guard.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES(?1,?2) ON CONFLICT(projection_name) DO NOTHING"),params![spec.name,&indexed]).map_err(backend)?;
                 let recorded:String=guard.query_row(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"),params![spec.name],|row|row.get(0)).map_err(backend)?;
                 if recorded != indexed {
-                    return Err(EventLogError::Invalid(
-                        "projection registration shape changed".into(),
-                    ));
+                    return Err(changed_registration(prefix, spec.name, &recorded));
                 }
             }
             Ok(())
@@ -2608,6 +2816,8 @@ impl Inner {
             }
         }
         self.create_projections(projector.as_ref())?;
+        let mut projectors = self.inline.lock().map_err(poisoned)?;
+        self.refuse_catch_up_driven(projector.name())?;
         let mut names = self.inline_names.lock().map_err(poisoned)?;
         for spec in projector.projections() {
             if !names.insert(spec.name.to_owned()) {
@@ -2617,7 +2827,33 @@ impl Inner {
                 )));
             }
         }
-        self.inline.lock().map_err(poisoned)?.push(projector);
+        drop(names);
+        projectors.push(projector);
+        Ok(())
+    }
+
+    /// Called with `inline` held, so no catch-up pass can claim the projector meanwhile.
+    fn refuse_catch_up_driven(&self, name: &str) -> Result<(), EventLogError> {
+        if self.catch_up.lock().map_err(poisoned)?.contains(name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven by catch-up"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that catch-up drives this projector, unless it is driven inline.
+    fn claim_catch_up(&self, name: &str) -> Result<(), EventLogError> {
+        let projectors = self.inline.lock().map_err(poisoned)?;
+        if projectors.iter().any(|projector| projector.name() == name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven inline"
+            )));
+        }
+        self.catch_up
+            .lock()
+            .map_err(poisoned)?
+            .insert(name.to_owned());
         Ok(())
     }
 
@@ -2634,6 +2870,7 @@ impl Inner {
         batch: usize,
     ) -> Result<CatchUpProgress, EventLogError> {
         let batch = bounded_limit(batch);
+        self.claim_catch_up(projector.name())?;
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
@@ -2734,13 +2971,27 @@ impl Inner {
                 "rebuild requires a catch-up projection".into(),
             ));
         }
+        // A host can hand in a projector assembled apart from registration. Its names are put into
+        // the maintenance SQL below, so every one is checked before the transaction starts.
+        let mut declared = BTreeSet::new();
+        for spec in projector.projections() {
+            spec.validate()?;
+            if !declared.insert(spec.name) {
+                return Err(EventLogError::Invalid(
+                    "duplicate projection in one rebuild".into(),
+                ));
+            }
+        }
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
         let callback_failed = Arc::new(AtomicBool::new(false));
         let result = (|| {
             for spec in projector.projections() {
-                let shadow = projection_table("eventlog_rebuild", spec.name);
+                refuse_unadmitted_rebuild(connection, &self.prefix, spec)?;
+            }
+            for spec in projector.projections() {
+                let shadow = projection_table(REBUILD_STAGING, spec.name);
                 let columns = joined(spec.indexed.len(), |position| {
                     format!(",idx_{position} TEXT")
                 });
@@ -2771,7 +3022,7 @@ impl Inner {
                     blob_prefix: &self.prefix,
                     verified: &self.verified,
                     tracked: &self.tracked,
-                    projection_prefix: "eventlog_rebuild",
+                    projection_prefix: REBUILD_STAGING,
                     inline: &self.inline_names,
                     tenant,
                     admission: None,
@@ -2787,8 +3038,8 @@ impl Inner {
                 }
             }
             for spec in projector.projections() {
-                let active = projection_table(&self.prefix, spec.name);
-                let shadow = projection_table("eventlog_rebuild", spec.name);
+                let active = durable_projection_table(&self.prefix, spec.name);
+                let shadow = projection_table(REBUILD_STAGING, spec.name);
                 connection
                     .execute(
                         &format!("DELETE FROM {active} WHERE tenant_id=?1"),
@@ -2856,6 +3107,7 @@ impl Inner {
         projection.validate()?;
         let table = projection_table(&self.prefix, projection.name);
         let guard = self.connection.lock().map_err(poisoned)?;
+        refuse_stale_declaration(&guard, &self.prefix, projection)?;
         let mut statement = guard
             .prepare(&format!(
                 "SELECT body FROM {table}
@@ -3148,6 +3400,7 @@ impl SqliteProjections<'_> {
             ));
         }
         projection.validate()?;
+        let indexed = indexed_values(projection, body)?;
         let before = self.tracked_before(projection, tenant, key);
         let table = projection_table(self.projection_prefix, projection.name);
         let columns: String = joined(projection.indexed.len(), |position| {
@@ -3166,8 +3419,8 @@ impl SqliteProjections<'_> {
             Box::new(key.to_owned()),
             Box::new(text.clone()),
         ];
-        for field in projection.indexed {
-            values.push(Box::new(indexed_value(body, field)));
+        for value in indexed {
+            values.push(Box::new(value));
         }
         let statement = format!(
             "INSERT INTO {table} (tenant_id, row_key, body{columns})
@@ -3364,6 +3617,19 @@ fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
 }
 
+/// Where a rebuild stages its rows: the connection's `temp` schema, named with the schema.
+///
+/// `eventlog_rebuild` is also a valid owner prefix. Unqualified, an owner of that name has live
+/// tables whose names equal the staging tables, SQLite resolves the name to `temp` first, and the
+/// publication step would empty and refill the staging table while the live view stayed as it was.
+const REBUILD_STAGING: &str = "temp.eventlog_rebuild";
+
+/// The live projection table a rebuild publishes into, named with the `main` schema so it can never
+/// resolve to a staging table of the same name.
+fn durable_projection_table(prefix: &str, name: &str) -> String {
+    format!("main.{}", projection_table(prefix, name))
+}
+
 /// The one `CREATE TABLE` body every projection table in this kit is written with.
 ///
 /// Capture admits an actual stored table by comparing its whole declared body against this, so the
@@ -3381,6 +3647,170 @@ fn projection_table_body(indexed: usize) -> String {
 /// The one name a declared field's index is created and recognised under.
 fn projection_index(table: &str, position: usize) -> String {
     format!("{table}_idx_{position}")
+}
+
+/// The refusal of a registration whose declaration differs from the persisted one.
+///
+/// Releases up to 0.9.4 admitted a declaration that repeats an indexed field, which capture
+/// cannot read. Its persisted declaration can no longer be registered, and the corrected one
+/// differs from it, so the refusal names the projection's table and the way out: the table is
+/// derived from the log and is dropped and rebuilt, never edited in place.
+fn changed_registration(prefix: &str, name: &str, recorded: &str) -> EventLogError {
+    let repeats = serde_json::from_str::<Vec<String>>(recorded).is_ok_and(|fields| {
+        fields
+            .iter()
+            .enumerate()
+            .any(|(position, field)| fields[..position].contains(field))
+    });
+    if repeats {
+        return EventLogError::Invalid(format!(
+            "projection {name} is persisted with indexed fields {recorded}, which repeat a field \
+             capture cannot read; drop table {} and its {prefix}_projection_registry row, then \
+             register the corrected declaration and rebuild the projection",
+            projection_table(prefix, name)
+        ));
+    }
+    EventLogError::Invalid("projection registration shape changed".into())
+}
+
+/// Refuse a rebuild of a projection this owner has not admitted with exactly this declaration.
+///
+/// A rebuild replaces the live rows from a staging table shaped by the supplied declaration. One
+/// that no registration created, or whose fields differ from the registered ones, would publish
+/// rows into a table of another shape, so it is refused before any staging table exists.
+fn refuse_unadmitted_rebuild(
+    connection: &Connection,
+    prefix: &str,
+    projection: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"
+            ),
+            params![projection.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let declared = serde_json::to_string(projection.indexed)
+        .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+    match recorded {
+        None => Err(EventLogError::Invalid(format!(
+            "projection {} is not registered on this owner; create it before a rebuild",
+            projection.name
+        ))),
+        Some(recorded) if recorded != declared => Err(EventLogError::Invalid(format!(
+            "projection {} is rebuilt with indexed fields {declared} but registered with {recorded}",
+            projection.name
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Refuse a reader whose declared field order differs from the projection's registration.
+///
+/// `idx_N` is the N-th field of the registered declaration. A reader that swaps two field names
+/// passes syntax validation, and the position taken from its declaration would query the other
+/// field's column. A projection with no registry row (a file older than the registry that no
+/// registration has touched) has nothing to compare against and is read as declared.
+fn refuse_stale_declaration(
+    connection: &Connection,
+    prefix: &str,
+    projection: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"
+            ),
+            params![projection.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let declared = serde_json::to_string(projection.indexed)
+        .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+    match recorded {
+        Some(recorded) if recorded != declared => Err(EventLogError::Invalid(format!(
+            "projection {} is read with indexed fields {declared} but registered with {recorded}",
+            projection.name
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The columns of a declared field's index: the filter, then the order `projection_find` returns.
+///
+/// With `row_key` in the index, `WHERE tenant_id = ? AND idx_N = ? ORDER BY row_key LIMIT ?`
+/// walks the index in order and stops at the limit; without it SQLite visits every match.
+fn projection_index_columns(position: usize) -> [String; 3] {
+    [
+        String::from("tenant_id"),
+        format!("idx_{position}"),
+        String::from("row_key"),
+    ]
+}
+
+/// The columns a declared field's index had before `row_key` joined it. Capture still admits
+/// them, read-only, on a file no registration has upgraded yet.
+fn legacy_projection_index_columns(position: usize) -> [String; 2] {
+    [String::from("tenant_id"), format!("idx_{position}")]
+}
+
+/// Replace a declared field's index that still has those earlier columns.
+///
+/// An index holds no data of its own, so this changes no table, row or column: the index is
+/// dropped and created again under the same name, inside the registration transaction. Any other
+/// shape under that name is left for capture admission to refuse.
+fn upgrade_projection_index(
+    connection: &Connection,
+    table: &str,
+    position: usize,
+) -> Result<(), EventLogError> {
+    let index = projection_index(table, position);
+    // Only the plain index this kit created: not unique, not partial, made by CREATE INDEX.
+    let plain = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut plain = false;
+        for row in rows {
+            let (name, unique, origin, partial) = row.map_err(backend)?;
+            if name == index {
+                plain = !unique && origin == "c" && !partial;
+            }
+        }
+        plain
+    };
+    if !plain {
+        return Ok(());
+    }
+    let columns: Vec<String> = {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_info({index})"))
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)?
+    };
+    if columns == legacy_projection_index_columns(position) {
+        connection
+            .execute_batch(&format!("DROP INDEX {index};"))
+            .map_err(backend)?;
+    }
+    Ok(())
 }
 
 fn select_versions(
@@ -3678,11 +4108,106 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
 }
 
+/// The next legacy blob after a `(tenant_id, digest)` cursor, one row per query.
+///
+/// The row-value comparison is a single range on the primary key. The expanded
+/// `tenant_id > ?1 OR (tenant_id = ?1 AND digest > ?2)` form rescanned the current tenant's
+/// earlier digests on every step, quadratic in a tenant's blob count.
+fn legacy_blob_cursor_sql(table: &str) -> String {
+    format!(
+        "SELECT tenant_id,digest,bytes,byte_count,recorded_at FROM {table}
+         WHERE (tenant_id, digest) > (?1, ?2)
+         ORDER BY tenant_id,digest LIMIT 1"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, recognized_sqlite_blob_shape,
+        SqliteBlobShape, has_exact_sqlite_blob_integrity_check, legacy_blob_cursor_sql,
+        recognized_sqlite_blob_shape,
     };
+
+    #[test]
+    fn the_legacy_blob_cursor_walks_every_key_in_order_in_linear_steps() {
+        let connection = rusqlite::Connection::open_in_memory().expect("a database");
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_blobs (tenant_id TEXT NOT NULL, digest TEXT NOT NULL,
+                     bytes BLOB NOT NULL, byte_count INTEGER NOT NULL, recorded_at TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, digest));",
+            )
+            .expect("a legacy table");
+        let mut expected = Vec::new();
+        for tenant in ["a", "b"] {
+            for i in 0..512 {
+                let digest = format!("item-{i:06}");
+                connection
+                    .execute(
+                        "INSERT INTO legacy_blobs VALUES (?1, ?2, x'616263', 3, '1970-01-01T00:00:00Z')",
+                        rusqlite::params![tenant, digest],
+                    )
+                    .expect("a row");
+                expected.push((tenant.to_owned(), digest));
+            }
+        }
+        let mut statement = connection
+            .prepare(&legacy_blob_cursor_sql("legacy_blobs"))
+            .expect("a statement");
+        let mut walked = vec![expected[0].clone()];
+        loop {
+            let (tenant, digest) = walked.last().expect("a cursor").clone();
+            let next: Option<(String, String)> = rusqlite::OptionalExtension::optional(
+                statement.query_row(rusqlite::params![tenant, digest], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                }),
+            )
+            .expect("a step");
+            let Some(next) = next else { break };
+            walked.push(next);
+        }
+        assert_eq!(
+            walked, expected,
+            "every key once, in key order, across tenants"
+        );
+        let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+        // A range seek per row is a few dozen VM steps; the expanded OR predicate rescans the
+        // tenant's earlier keys and takes millions here.
+        assert!(steps < 200_000, "{steps} VM steps for 1,024 rows");
+    }
+
+    #[test]
+    fn capture_continuation_pages_seek_the_feed_index_on_tenant_and_position() {
+        let (inner, _) = super::Inner::in_memory("pages").expect("an in-memory store");
+        let connection = inner.connection.lock().expect("the connection");
+        let plan = |continued: bool| -> String {
+            let sql = super::capture::events_page_sql("pages", continued);
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("a plan");
+            let detail = |row: &rusqlite::Row<'_>| row.get::<_, String>(3);
+            let rows = if continued {
+                statement.query_map(rusqlite::params!["tenant", 1_000_i64, 1_000_i64], detail)
+            } else {
+                statement.query_map(rusqlite::params!["tenant", 1_000_i64], detail)
+            };
+            let details = rows
+                .expect("plan rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan details");
+            details.join(" | ")
+        };
+        let continued = plan(true);
+        assert!(
+            continued.contains("pages_events_feed (tenant_id=? AND global_seq>?)"),
+            "a continuation page filters positions instead of seeking them: {continued}"
+        );
+        let first = plan(false);
+        assert!(
+            first.contains("pages_events_feed (tenant_id=?)") && !first.contains("TEMP B-TREE"),
+            "the first page does not walk the feed index in order: {first}"
+        );
+    }
 
     #[test]
     fn a_file_database_hashes_a_blob_again_and_an_in_memory_one_checks_its_metadata() {

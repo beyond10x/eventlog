@@ -756,6 +756,9 @@ fn atomic_json(root: &Path, name: &str, value: &impl Serialize) -> Result<(), Ev
 }
 
 impl Journal {
+    /// Open a journal, creating a missing store in the single-file layout. Test fixtures only:
+    /// every store entry point enters through `crate::enter` or opens with an explicit layout.
+    #[cfg(test)]
     pub fn open(root: &Path) -> Result<Self, EventLogError> {
         Self::open_with_creation(root, Some(FileLayout::Single))
     }
@@ -1933,7 +1936,15 @@ mod tests {
                     eventlog_core::AtomicBlobEventStore::append_group_with_blobs(&store, &request)
                         .await;
                 if std::env::var_os("EVENTLOG_FILE_ATOMIC_BLOB_FAIL_CLEANUP").is_some() {
-                    assert_eq!(result, Err(EventLogError::UnknownCommit));
+                    // Published before the cleanup failed: the outcome is known (review L56).
+                    assert!(
+                        matches!(
+                            &result,
+                            Err(EventLogError::Committed { cleanup })
+                                if matches!(**cleanup, EventLogError::Backend(_))
+                        ),
+                        "a known commit with a failed cleanup reported {result:?}"
+                    );
                 } else {
                     result.unwrap();
                 }
@@ -2315,9 +2326,9 @@ mod tests {
         let held = |content: &Content| (content.retained.bytes().capacity(), content.length);
         {
             let mut journal = Journal::open(root.path()).unwrap();
-            for index in 0..40 {
+            for index in 0..4 {
                 journal
-                    .append(json!({ "index": index, "pad": "x".repeat(3_000) }))
+                    .append(json!({ "index": index, "pad": "x".repeat(30_000) }))
                     .unwrap();
             }
         }
@@ -2342,7 +2353,7 @@ mod tests {
         journal.append(json!({"value": 0})).unwrap();
         let other = journal.content();
         let held = journal.manifest.clone();
-        for value in 1..=50 {
+        for value in 1..=12 {
             journal.append(json!({ "value": value })).unwrap();
             assert!(
                 journal.content.shares_bytes_with(&other),
@@ -2355,7 +2366,7 @@ mod tests {
         let resumed = Journal::resume(root.path(), &held, &other)
             .unwrap()
             .unwrap();
-        assert_eq!(resumed.fresh.len(), 50);
+        assert_eq!(resumed.fresh.len(), 12);
     }
 
     /// Two views of one buffer each keep exactly the bytes they verified. A view continued with

@@ -24,8 +24,30 @@ pub struct ProjectionSpec {
 
 impl ProjectionSpec {
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] for a name or field that cannot be a table or column.
+    /// Returns [`EventLogError::Invalid`] for a name or field that cannot be a table or column,
+    /// and for a field declared twice.
+    ///
+    /// A repeated field is refused here, where registration, migration and every read and write
+    /// check a declaration, because consistent capture refuses it: a shape registration admitted
+    /// and capture cannot read is a projection that can never be captured.
     pub fn validate(&self) -> Result<(), EventLogError> {
+        self.validate_identifiers()?;
+        for (position, field) in self.indexed.iter().enumerate() {
+            if self.indexed[..position].contains(field) {
+                return Err(EventLogError::Invalid(format!(
+                    "indexed field {field} is declared twice in projection {}",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The name, the field count and every field name, without the uniqueness of the fields.
+    ///
+    /// Capture checks uniqueness itself, after its duplicate-projection check, so that each
+    /// refusal keeps the reason the conformance contract names for it.
+    pub(crate) fn validate_identifiers(&self) -> Result<(), EventLogError> {
         validate_identifier("projection name", self.name)?;
         if self.indexed.len() > MAX_INDEXED_FIELDS {
             return Err(EventLogError::Invalid(format!(
@@ -163,6 +185,16 @@ pub trait Projector: Send + Sync {
         event: &'a RecordedEvent,
         store: &'a mut dyn ProjectionStore,
     ) -> BoxFuture<'a, Result<(), EventLogError>>;
+
+    /// A digest of everything besides [`Projector::name`] that decides what [`Projector::apply`]
+    /// writes: the projector's configuration, and its version where its code can change under
+    /// one name. A store that keeps a folded read model across opens (the tree store's kept
+    /// state) reuses it only while every registered projector returns one and it is unchanged.
+    /// `None`, the default, means the projector cannot vouch for its output, and the history is
+    /// folded through it again.
+    fn fingerprint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A check run inside the append transaction, against inline read models.
@@ -304,5 +336,94 @@ pub fn indexed_value(body: &Value, field: &str) -> Option<String> {
         Some(Value::String(value)) => Some(value.clone()),
         Some(Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
+    }
+}
+
+/// The longest indexed value, in UTF-8 bytes, a projection row may carry.
+///
+/// PostgreSQL keeps the whole value in a `(tenant_id, idx_N)` B-tree, whose entries must fit in
+/// about a third of a page (2,704 bytes at the default 8 KiB): a 512-byte tenant, this many
+/// incompressible bytes and the entry's headers still fit. Every provider refuses a longer value
+/// before writing, so a projector behaves the same on each.
+pub const MAX_INDEXED_VALUE_BYTES: usize = 2048;
+
+/// Every declared field's value for one row, in declaration order, as the backend stores it.
+///
+/// # Errors
+/// Returns [`EventLogError::IndexedValueTooLarge`] for a value over
+/// [`MAX_INDEXED_VALUE_BYTES`].
+pub fn indexed_values(
+    projection: &ProjectionSpec,
+    body: &Value,
+) -> Result<Vec<Option<String>>, EventLogError> {
+    projection
+        .indexed
+        .iter()
+        .map(|field| {
+            let value = indexed_value(body, field);
+            match &value {
+                Some(text) if text.len() > MAX_INDEXED_VALUE_BYTES => {
+                    Err(EventLogError::IndexedValueTooLarge {
+                        field,
+                        bytes: text.len(),
+                        limit: MAX_INDEXED_VALUE_BYTES,
+                    })
+                }
+                _ => Ok(value),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_indexed_value_one_byte_over_the_bound_is_refused_by_name() {
+        const SPEC: ProjectionSpec = ProjectionSpec {
+            name: "bound",
+            indexed: &["small", "large"],
+        };
+        let at = "é".repeat(MAX_INDEXED_VALUE_BYTES / 2);
+        assert_eq!(
+            indexed_values(&SPEC, &serde_json::json!({"small": 1, "large": at})),
+            Ok(vec![Some("1".into()), Some(at)])
+        );
+        assert_eq!(
+            indexed_values(
+                &SPEC,
+                &serde_json::json!({"large": format!("{}x", "é".repeat(MAX_INDEXED_VALUE_BYTES / 2))})
+            ),
+            Err(EventLogError::IndexedValueTooLarge {
+                field: "large",
+                bytes: MAX_INDEXED_VALUE_BYTES + 1,
+                limit: MAX_INDEXED_VALUE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn a_declaration_with_a_repeated_indexed_field_is_refused() {
+        let repeated = ProjectionSpec {
+            name: "by_kind",
+            indexed: &["kind", "owner", "kind"],
+        };
+        let Err(EventLogError::Invalid(reason)) = repeated.validate() else {
+            panic!("a declaration capture refuses was admitted");
+        };
+        assert_eq!(
+            reason,
+            "indexed field kind is declared twice in projection by_kind"
+        );
+        assert!(
+            repeated.validate_identifiers().is_ok(),
+            "the identifiers alone are valid; only their repetition is refused"
+        );
+        let distinct = ProjectionSpec {
+            name: "by_kind",
+            indexed: &["kind", "owner"],
+        };
+        assert!(distinct.validate().is_ok());
     }
 }

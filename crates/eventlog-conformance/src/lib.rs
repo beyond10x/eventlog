@@ -180,6 +180,7 @@ pub async fn run(store: &dyn EventStore) {
     bytes_live_outside_the_log_and_can_be_erased_alone(store, &tenant).await;
     run_blob_binding_race(store, store).await;
     a_stream_identity_is_stable(store, &tenant, &other).await;
+    a_free_text_redaction_reason_is_refused_before_writing(store, &stream).await;
     redaction_keeps_the_place_and_drops_the_snapshot(store, &stream).await;
     forgetting_a_tenant_leaves_nothing(store, &other, &twin).await;
 }
@@ -960,6 +961,142 @@ pub async fn run_snapshot_generations(store: std::sync::Arc<dyn EventStore>) {
     );
 }
 
+/// Exercise the cached revision: within one generation it never moves back, and a cache from an
+/// earlier generation is replaced by a save at any revision.
+///
+/// # Panics
+/// Panics when a delayed older save moves the replay point back, or when a save in a new
+/// generation cannot replace the previous generation's cache.
+pub async fn run_snapshot_revision_is_monotonic(store: &dyn EventStore) {
+    let tenant = TenantId::new("snapshot-monotonic").unwrap();
+    let stream = StreamId::new(tenant, "item", "one").unwrap();
+    let events: Vec<NewEvent> = (1..=4).map(|value| event("item.counted", value)).collect();
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &events,
+            &meta("monotonic", &json!({})),
+        )
+        .await
+        .unwrap();
+    let at = |version: u64| Snapshot {
+        version,
+        state_schema_version: 1,
+        state: json!({ "version": version }),
+        recorded_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    let observed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(3), &observed)
+            .await
+            .unwrap()
+    );
+    // A save of an older fold of the same history finishes late.
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(1), &observed)
+            .await
+            .unwrap(),
+        "an older fold of current history is not a stale observation"
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        3,
+        "the replay point does not move back within a generation"
+    );
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(4), &observed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        4
+    );
+
+    // A redaction after the cached revision starts a new generation and leaves that cache in
+    // place but unproven; the first save of the new generation replaces it whatever its revision.
+    store
+        .append(
+            &stream,
+            Expected::Exact(4),
+            &[event("item.counted", 5)],
+            &meta("monotonic-5", &json!({})),
+        )
+        .await
+        .unwrap();
+    store.redact(&stream, 5, "erased").await.unwrap();
+    assert_eq!(
+        store
+            .load_snapshot(&stream)
+            .await
+            .unwrap()
+            .map(|s| s.version),
+        None,
+        "the revision 4 cache is not proven in the new generation"
+    );
+    let renewed = store.snapshot_generation(&stream).await.unwrap().unwrap();
+    assert_ne!(renewed, observed);
+    assert!(
+        store
+            .save_snapshot_checked(&stream, &at(1), &renewed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream).await.unwrap().unwrap().version,
+        1,
+        "a new generation replaces the previous generation's cache"
+    );
+}
+
+/// A redaction reason is an owner-defined code. The tombstone keeps it after the body is gone,
+/// so free text, where a name or an address arrives, is refused before anything is written: the
+/// body, the snapshot and the snapshot generation stay as they were.
+async fn a_free_text_redaction_reason_is_refused_before_writing(
+    store: &dyn EventStore,
+    stream: &StreamId,
+) {
+    let events = store.read_stream(stream, 0, 100).await.expect("readable");
+    let snapshot = store.load_snapshot(stream).await.expect("readable");
+    let generation = store.snapshot_generation(stream).await.expect("readable");
+    assert!(
+        snapshot.is_some() && generation.is_some(),
+        "control: the stream holds a snapshot a redaction would drop"
+    );
+    let target = events.events[1].version;
+    for free_text in ["the person asked", "jane@example.org", "Jane Doe"] {
+        let refused = store.redact(stream, target, free_text).await;
+        let Err(EventLogError::Invalid(message)) = refused else {
+            panic!(
+                "a redaction with the free-text reason {free_text:?} was not refused: {refused:?}"
+            );
+        };
+        assert!(
+            message.contains("redaction reason"),
+            "{free_text:?} was refused for another reason: {message}"
+        );
+    }
+    assert_eq!(
+        store.read_stream(stream, 0, 100).await.expect("readable"),
+        events,
+        "a refused redaction changed the stream"
+    );
+    assert_eq!(
+        store.load_snapshot(stream).await.expect("readable"),
+        snapshot,
+        "a refused redaction dropped the snapshot"
+    );
+    assert_eq!(
+        store.snapshot_generation(stream).await.expect("readable"),
+        generation,
+        "a refused redaction moved the snapshot generation"
+    );
+}
+
 async fn redaction_keeps_the_place_and_drops_the_snapshot(
     store: &dyn EventStore,
     stream: &StreamId,
@@ -969,14 +1106,14 @@ async fn redaction_keeps_the_place_and_drops_the_snapshot(
     assert!(!target.is_redacted());
 
     let redacted = store
-        .redact(stream, target.version, "the person asked")
+        .redact(stream, target.version, "subject-request")
         .await
         .expect("redactable");
     assert_eq!(redacted.event_id, target.event_id, "the fact keeps its id");
     assert_eq!(redacted.version, target.version, "and its place");
     assert!(redacted.is_redacted());
     assert_eq!(redacted.data["redacted"], json!(true));
-    assert_eq!(redacted.data["reason"], json!("the person asked"));
+    assert_eq!(redacted.data["reason"], json!("subject-request"));
 
     assert!(
         store
@@ -995,7 +1132,7 @@ async fn redaction_keeps_the_place_and_drops_the_snapshot(
     );
 
     let error = store
-        .redact(stream, 9_999, "no such version")
+        .redact(stream, 9_999, "subject-request")
         .await
         .expect_err("there is nothing there to redact");
     assert_eq!(error, EventLogError::NotFound);
@@ -1441,6 +1578,107 @@ pub async fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
         "the guard's projection write was rolled back with its refused append"
     );
     assert_eq!(row["last"], json!("item.extracted"));
+    run_indexed_value_bound(store).await;
+}
+
+/// A guard that writes one tally row whose indexed `kind` is the given text.
+struct WritesIndexedKind {
+    tenant: TenantId,
+    kind: String,
+}
+
+impl eventlog_core::Guard for WritesIndexedKind {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            store
+                .upsert(
+                    &TALLY,
+                    &self.tenant,
+                    "bound/row",
+                    &json!({"stream": "bound", "kind": self.kind, "count": 0, "last": "bound"}),
+                )
+                .await
+        })
+    }
+}
+
+/// `length` printable ASCII bytes with no repetition a compressor could use.
+fn incompressible(length: usize) -> String {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'!' + u8::try_from(state % 94).expect("below 94"))
+        })
+        .collect()
+}
+
+/// Every provider indexes a value of [`eventlog_core::MAX_INDEXED_VALUE_BYTES`] incompressible
+/// bytes and refuses one byte more with a typed error before writing anything. (PostgreSQL's
+/// own test also indexes it under a tenant of the longest accepted length.)
+async fn run_indexed_value_bound(store: &std::sync::Arc<dyn EventStore>) {
+    let limit = eventlog_core::MAX_INDEXED_VALUE_BYTES;
+    let tenant = TenantId::new("tenant-bound").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "bound").expect("valid stream");
+    let guard = |kind: String| {
+        std::sync::Arc::new(WritesIndexedKind {
+            tenant: tenant.clone(),
+            kind,
+        }) as std::sync::Arc<dyn eventlog_core::Guard>
+    };
+    let refused = store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("bound-over", &json!({})),
+            guard(incompressible(limit + 1)),
+        )
+        .await;
+    assert_eq!(
+        refused.map(|_| ()),
+        Err(EventLogError::IndexedValueTooLarge {
+            field: "kind",
+            bytes: limit + 1,
+            limit,
+        }),
+        "an indexed value over the portable bound is refused by name"
+    );
+    assert_eq!(
+        store.stream_version(&stream).await.expect("readable"),
+        None,
+        "a refused indexed value wrote no event"
+    );
+    assert_eq!(
+        store
+            .projection_get(&TALLY, &tenant, "bound/row")
+            .await
+            .expect("readable"),
+        None,
+        "a refused indexed value wrote no row"
+    );
+    let kind = incompressible(limit);
+    store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("bound-at", &json!({})),
+            guard(kind.clone()),
+        )
+        .await
+        .expect("a value at the bound is indexed");
+    let found = store
+        .projection_find(&TALLY, &tenant, "kind", &kind, 10)
+        .await
+        .expect("readable");
+    assert_eq!(found.len(), 1, "the row at the bound is found by its value");
+    assert_eq!(found[0]["kind"], json!(kind));
 }
 
 /// One stored event body, exactly as some past version of the code wrote it.
@@ -1721,6 +1959,11 @@ pub async fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
         .register_inline(std::sync::Arc::new(Tally) as std::sync::Arc<dyn Projector>)
         .await
         .expect("registered");
+    // Registration freezes once serving begins, so the boundary projector registers here too.
+    store
+        .register_inline(std::sync::Arc::new(PageRows) as std::sync::Arc<dyn Projector>)
+        .await
+        .expect("registered");
     let body = json!({ "command": "create" });
     for index in 0..5 {
         let stream =
@@ -1802,6 +2045,289 @@ pub async fn run_paging(store: &std::sync::Arc<dyn EventStore>) {
         bounded.rows.len(),
         5,
         "a prefix bounds the page to one contiguous run of keys, and the note is not in it"
+    );
+
+    run_paging_at_the_read_limit(store).await;
+    run_paging_bytewise_prefix(store).await;
+    run_paging_from_the_empty_key(store).await;
+
+    // A reader whose declaration names other indexed fields than the registration must not have
+    // its field position applied to the registered columns: `stream` in position 0 would query
+    // the `kind` column and answer with the five item rows.
+    let stale = eventlog_core::ProjectionSpec {
+        name: TALLY.name,
+        indexed: &["stream"],
+    };
+    let found = store
+        .projection_find(&stale, &tenant, "stream", "item", 10)
+        .await;
+    assert!(
+        matches!(found, Err(EventLogError::Invalid(_))),
+        "a stale declaration is refused before any row is read: {found:?}"
+    );
+}
+
+/// The first unfiltered listing starts at the empty key, and an empty cursor is still exclusive.
+///
+/// SQLite and PostgreSQL turned an absent `after_key` into `row_key > ''`, so a row keyed by the
+/// empty string, which writers may produce, was missing from list and page while a point read
+/// found it.
+async fn run_paging_from_the_empty_key(store: &std::sync::Arc<dyn EventStore>) {
+    let tenant = TenantId::new("tenant-page-empty").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "rows", "empty").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[event("rows.empty_key", 1)],
+            &meta("page-empty", &json!({ "command": "write" })),
+        )
+        .await
+        .expect("append");
+    let keys = |rows: &[(String, serde_json::Value)]| -> Vec<String> {
+        rows.iter().map(|(key, _)| key.clone()).collect()
+    };
+
+    let listed = store
+        .projection_list(&PAGE_ROWS, &tenant, None, 10)
+        .await
+        .expect("listable");
+    assert_eq!(
+        keys(&listed),
+        ["", "open"],
+        "an unbounded listing starts at the empty key"
+    );
+    let after_empty = store
+        .projection_list(&PAGE_ROWS, &tenant, Some(""), 10)
+        .await
+        .expect("listable");
+    assert_eq!(
+        keys(&after_empty),
+        ["open"],
+        "a supplied empty cursor is exclusive"
+    );
+
+    let page = store
+        .projection_page(&PAGE_ROWS, &tenant, None, None, 10)
+        .await
+        .expect("pageable");
+    assert_eq!(keys(&page.rows), ["", "open"]);
+    assert!(page.next_cursor.is_none());
+
+    let first = store
+        .projection_page(&PAGE_ROWS, &tenant, None, None, 1)
+        .await
+        .expect("pageable");
+    assert_eq!(keys(&first.rows), [""]);
+    assert_eq!(
+        first.next_cursor.as_deref(),
+        Some(""),
+        "the empty key is a cursor like any other"
+    );
+    let second = store
+        .projection_page(&PAGE_ROWS, &tenant, None, first.next_cursor.as_deref(), 1)
+        .await
+        .expect("pageable");
+    assert_eq!(keys(&second.rows), ["open"]);
+    assert!(second.next_cursor.is_none());
+}
+
+/// Keys whose bytewise order differs from a case-insensitive collation's order.
+const MIXED_CASE_KEYS: [&str; 3] = ["desk/1", "Desk/2", "desk/3"];
+
+/// A prefix and a cursor are bytes, whatever the backend's collation.
+///
+/// Bytewise, `Desk/2` sorts before both `desk/` keys, so `desk/` is one contiguous run. Under a
+/// case-insensitive database collation (PostgreSQL with ICU `und` or glibc `en_US`) it sorted
+/// between them, the pager stopped at the first key outside the prefix, and `desk/3` was lost.
+async fn run_paging_bytewise_prefix(store: &std::sync::Arc<dyn EventStore>) {
+    let tenant = TenantId::new("tenant-page-case").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "rows", "mixed").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[event("rows.mixed_case", 1)],
+            &meta("page-case", &json!({ "command": "write" })),
+        )
+        .await
+        .expect("append");
+
+    let all = store
+        .projection_page(&PAGE_ROWS, &tenant, Some("desk/"), None, 10)
+        .await
+        .expect("pageable");
+    let keys: Vec<&str> = all.rows.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["desk/1", "desk/3"],
+        "a prefix selects by bytes, in byte order, and no other-case key ends it early"
+    );
+    assert!(all.next_cursor.is_none());
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = store
+            .projection_page(&PAGE_ROWS, &tenant, Some("desk/"), cursor.as_deref(), 1)
+            .await
+            .expect("pageable");
+        seen.extend(page.rows.iter().map(|(key, _)| key.clone()));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        vec!["desk/1".to_owned(), "desk/3".to_owned()],
+        "a cursor continues after its bytes"
+    );
+
+    let everything = store
+        .projection_page(&PAGE_ROWS, &tenant, None, None, 10)
+        .await
+        .expect("pageable");
+    let keys: Vec<&str> = everything
+        .rows
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["Desk/2", "desk/1", "desk/3"],
+        "rows come in byte order"
+    );
+}
+
+/// The page size every provider clamps to, plus the one row that must not vanish behind it.
+const PAGE_BOUNDARY_ROWS: usize = eventlog_core::MAX_READ_LIMIT + 1;
+
+/// One wide read model, written by one event, for the full-page boundary.
+const PAGE_ROWS: eventlog_core::ProjectionSpec = eventlog_core::ProjectionSpec {
+    name: "page_rows",
+    indexed: &[],
+};
+
+/// Writes `PAGE_BOUNDARY_ROWS` rows from one event, so the boundary costs one commit.
+struct PageRows;
+
+impl eventlog_core::Projector for PageRows {
+    fn name(&self) -> &'static str {
+        "page_rows"
+    }
+
+    fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+        std::slice::from_ref(&PAGE_ROWS)
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a eventlog_core::RecordedEvent,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if event.name == "rows.empty_key" {
+                for key in ["", "open"] {
+                    store
+                        .upsert(&PAGE_ROWS, &event.tenant, key, &json!({ "key": key }))
+                        .await?;
+                }
+                return Ok(());
+            }
+            if event.name == "rows.mixed_case" {
+                for key in MIXED_CASE_KEYS {
+                    store
+                        .upsert(&PAGE_ROWS, &event.tenant, key, &json!({ "key": key }))
+                        .await?;
+                }
+                return Ok(());
+            }
+            if event.name != "rows.written" {
+                return Ok(());
+            }
+            for index in 0..PAGE_BOUNDARY_ROWS {
+                store
+                    .upsert(
+                        &PAGE_ROWS,
+                        &event.tenant,
+                        &format!("row/{index:05}"),
+                        &json!({ "index": index }),
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A full page at the public read limit still says that a row follows it.
+///
+/// The paginator asks for one row more than the page, and every provider clamps that request to
+/// `MAX_READ_LIMIT`. Without a boundary check, the 1,000-row page of 1,001 rows came back with no
+/// cursor and row 1,001 was unreachable by paging while a point read still found it.
+async fn run_paging_at_the_read_limit(store: &std::sync::Arc<dyn EventStore>) {
+    let limit = eventlog_core::MAX_READ_LIMIT;
+    let tenant = TenantId::new("tenant-page-limit").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "rows", "all").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[event("rows.written", 1)],
+            &meta("page-limit", &json!({ "command": "write" })),
+        )
+        .await
+        .expect("append");
+    let last_key = format!("row/{:05}", PAGE_BOUNDARY_ROWS - 1);
+
+    for prefix in [None, Some("row/")] {
+        let first = store
+            .projection_page(&PAGE_ROWS, &tenant, prefix, None, limit)
+            .await
+            .expect("pageable");
+        assert_eq!(first.rows.len(), limit, "the first page is full");
+        assert_eq!(
+            first.next_cursor.as_deref(),
+            Some(first.rows[limit - 1].0.as_str()),
+            "a full page at the read limit carries a cursor when row {PAGE_BOUNDARY_ROWS} follows it"
+        );
+        let second = store
+            .projection_page(
+                &PAGE_ROWS,
+                &tenant,
+                prefix,
+                first.next_cursor.as_deref(),
+                limit,
+            )
+            .await
+            .expect("pageable");
+        let keys: Vec<&str> = second.rows.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![last_key.as_str()],
+            "the cursor reaches the row behind the full page"
+        );
+        assert!(
+            second.next_cursor.is_none(),
+            "the last page carries no cursor"
+        );
+    }
+
+    let exact = store
+        .projection_page(
+            &PAGE_ROWS,
+            &tenant,
+            Some("row/"),
+            Some(&format!("row/{:05}", 0)),
+            limit,
+        )
+        .await
+        .expect("pageable");
+    assert_eq!(exact.rows.len(), limit);
+    assert!(
+        exact.next_cursor.is_none(),
+        "a full page that reached the last row carries no cursor"
     );
 }
 
