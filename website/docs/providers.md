@@ -3,7 +3,7 @@ title: Choose a provider
 ---
 
 All three providers implement the applicable Eventlog contracts. In-memory operation is SQLite
-`:memory:`; File is a separate durable provider.
+`:memory:`, and File is a separate durable provider.
 
 | Concern | File | SQLite | PostgreSQL |
 |---|---|---|---|
@@ -29,15 +29,16 @@ are authority, alongside referenced content. A manifest cannot be recreated from
 
 A store is created in the layout `eventlog-file/1` unless its owner opts in to the segmented
 layout `eventlog-file/2` with `FileEventStore::open_with_layout(path, FileLayout::segmented())`.
-Segmented stores keep sealed segments under `segments/`; those files are authority too. A segmented
-store's resumes after a write compare only the segments that changed recently, not the whole
-history. The layout is chosen when a store is created: an existing store keeps its own, nothing
-migrates, and every release reads both. Releases before the segmented layout refuse an
-`eventlog-file/2` store.
+The layout is chosen when a store is created: an existing store keeps its own, nothing migrates,
+and every release reads both. Releases before the segmented layout refuse an `eventlog-file/2`
+store.
+
+Segmented stores keep sealed segments under `segments/`, and those files are authority too. A
+segmented store's resumes after a write compare only the segments that changed recently.
 
 Each handle indexes the events it has folded by stream. Within a call, a `stream_version` head
 lookup reads no event and a `read_stream` window reads the events it returns plus one, however
-many events other streams hold; feed, catch-up and projection rebuild reads walk the store in
+many events other streams hold. Feed, catch-up and projection rebuild reads walk the store in
 global order.
 
 ## SQLite
@@ -47,7 +48,7 @@ the pinned SQLite dependency. A successful SQLite test does not establish Postgr
 Existing-only open refuses absent databases or owner tables without creating them.
 
 A fresh atomic group reusing an existing blob binding validates its stored length, integrity hash
-and edition before reuse; a corrupt binding refuses the complete group. An exact
+and edition before reuse, and a corrupt binding refuses the complete group. An exact
 already-committed retry returns its retained receipt without re-reading content.
 
 ## PostgreSQL

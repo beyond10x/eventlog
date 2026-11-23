@@ -27,12 +27,13 @@ cargo test --locked -p eventlog-sqlite -- --test-threads=1
 ```
 
 The full `bash scripts/gate.sh` gate runs tests, formatting and Clippy. Its PostgreSQL cases need
-an explicit disposable fixture; some refuse a missing URL while others report a skip.
+an explicit disposable fixture, and without it some refuse a missing URL while others report a
+skip.
 [Quickstart](website/docs/quickstart.md) · [Production proof](website/docs/operations.md#validate-a-deployment).
 
 ## Public input validation
 
-Tenant and stream constructors and deserialization enforce the same checks. Invalid public
+Tenant and stream constructors and deserialization enforce the same checks, and invalid public
 append input refuses before durable changes. [Storage guarantees](website/docs/guarantees.md).
 
 ## Hosted PostgreSQL composition
@@ -43,8 +44,8 @@ only. [Hosted setup and recovery](website/docs/operations.md#hosted-postgresql-c
 
 ## Atomic storage admission
 
-Trusted guards can reserve storage counters in the append transaction. The permit remains with
-the owning host. [Admission and effects](website/docs/operations.md#storage-admission-and-effects).
+Trusted guards can reserve storage counters in the append transaction, and the permit remains
+with the owning host. [Admission and effects](website/docs/operations.md#storage-admission-and-effects).
 
 ## Snapshot provenance
 
@@ -54,13 +55,13 @@ Snapshots are disposable caches. Observe the history generation before folding a
 ## Guard refusals and effect metadata
 
 Guards return stable owner-defined refusal codes and roll back refused changes. Effect metadata
-records evidence; the application decides effect policy.
+records evidence, and the application decides effect policy.
 [Admission and effects](website/docs/operations.md#storage-admission-and-effects).
 
 ## Required proof and comparative laboratory
 
 Run production, capacity and restart fixtures only against disposable storage. Conformance proves
-behavior; deployment capacity needs the owner's workload and budgets.
+behavior, but deployment capacity needs the owner's workload and budgets.
 [Proof prerequisites](website/docs/operations.md#validate-a-deployment).
 
 ## Layout
