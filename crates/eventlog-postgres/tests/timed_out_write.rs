@@ -374,7 +374,7 @@ async fn redaction_deadline_during_commit_is_unknown_commit() {
     let stream = StreamId::new(TenantId::new("timed-out").unwrap(), "item", "one").unwrap();
     append_one(&setup, &stream).await;
     let admin = slow_commit(&prefix).await;
-    let outcome = timed.redact(&stream, 1, "privacy request").await;
+    let outcome = timed.redact(&stream, 1, "privacy-request").await;
     assert_eq!(
         outcome.map(|_| ()),
         Err(EventLogError::UnknownCommit),

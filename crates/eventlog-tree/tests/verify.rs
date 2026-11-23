@@ -156,7 +156,7 @@ async fn a_second_redaction_with_another_reason_is_not_v2(layout: TreeLayout) {
     TreeEventStore::open_in(tree.path(), layout)
         .await
         .unwrap()
-        .redact(&stream("x"), 1, "erased again, for another reason")
+        .redact(&stream("x"), 1, "erased-again")
         .await
         .unwrap();
     assert_eq!(
