@@ -345,6 +345,21 @@ pub(crate) fn write_once(path: &Path, bytes: &[u8]) -> Result<(), EventLogError>
     }
 }
 
+/// Read the file at `path`: a blob, a text or a file of a verification baseline. A test counts
+/// these reads by path, to hold a scan to reading each such file once.
+pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    FILE_READS.with(|reads| *reads.borrow_mut().entry(path.to_owned()).or_insert(0) += 1);
+    fs::read(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread has passed each path to [`read_file`].
+    pub(crate) static FILE_READS: std::cell::RefCell<std::collections::BTreeMap<PathBuf, usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
 pub(crate) fn sync_dir(directory: &Path) -> Result<(), EventLogError> {
     File::open(directory)
         .and_then(|handle| handle.sync_all())

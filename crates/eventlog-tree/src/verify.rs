@@ -4,9 +4,9 @@
 //! opened, such as on the checked-out tree of a pull request and its merge base.
 
 use crate::history;
-use crate::layout::{StoreFormat, canonical, json_files, subdirectories};
+use crate::layout::{StoreFormat, canonical, json_files, read_file, subdirectories};
 use crate::split;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -299,29 +299,41 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
         ));
         return;
     }
-    let mut before: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    // One base file at a time: nothing of the base is held beyond the file being compared, and a
+    // blob is read once, in whichever form, by the comparison that needs its served bytes.
+    let mut blobs_compared = BTreeSet::new();
     for path in files(base, findings) {
-        match fs::read(base.join(&path)) {
-            Ok(bytes) => {
-                before.insert(path, bytes);
+        if let Some(blob) = blob_of(&path) {
+            // A blob the base holds in both forms is compared once: the comparison reads both.
+            if blobs_compared.contains(&blob) {
+                continue;
             }
-            Err(error) => findings.push(incomplete(
-                base.join(&path),
-                format!("a file of the base that cannot be read: {error}"),
-            )),
-        }
-    }
-    for (path, old) in before {
-        if let Some(same) = blob_served_alike(base, root, &path) {
-            if !same {
-                findings.push(Finding {
+            let compared = blob_served_alike(base, root, &blob);
+            blobs_compared.insert(blob);
+            match compared {
+                Ok(true) => {}
+                Ok(false) => findings.push(Finding {
                     rule: "V2",
                     path,
                     detail: "a committed blob is no longer served with the same bytes".into(),
-                });
+                }),
+                Err(error) => findings.push(incomplete(
+                    base.join(&path),
+                    format!("a file of the base that cannot be read: {error}"),
+                )),
             }
             continue;
         }
+        let old = match read_file(&base.join(&path)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                findings.push(incomplete(
+                    base.join(&path),
+                    format!("a file of the base that cannot be read: {error}"),
+                ));
+                continue;
+            }
+        };
         let Ok(new) = fs::read(root.join(&path)) else {
             findings.push(Finding {
                 rule: "V2",
@@ -346,9 +358,9 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
     }
 }
 
-/// For a base file that holds a blob — a raw file or a split blob — whether the tree at `root`
-/// still serves that digest with the bytes the base served. `None` for any other file.
-fn blob_served_alike(base: &Path, root: &Path, path: &Path) -> Option<bool> {
+/// For a base file that holds a blob — a raw file or a split blob — its tenant and digest. `None`
+/// for any other file.
+fn blob_of(path: &Path) -> Option<(String, String)> {
     let parts: Vec<String> = path
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -366,10 +378,29 @@ fn blob_served_alike(base: &Path, root: &Path, path: &Path) -> Option<bool> {
         ),
         _ => return None,
     };
-    let tenant = history::unescape(tenant).ok()?;
-    let old = split::read_blob(base, &tenant, &digest).ok().flatten();
-    let new = split::read_blob(root, &tenant, &digest).ok().flatten();
-    Some(old.is_some() && old == new)
+    Some((history::unescape(tenant).ok()?, digest))
+}
+
+/// Whether the tree at `root` still serves blob `(tenant, digest)` with the bytes the base
+/// served, comparing what each serves rather than which form holds it, so a blob the tree split
+/// since the base is still the same blob.
+///
+/// # Errors
+/// The base's blob cannot be read: the comparison is then incomplete, not a finding of the tree.
+fn blob_served_alike(
+    base: &Path,
+    root: &Path,
+    (tenant, digest): &(String, String),
+) -> Result<bool, String> {
+    let old = match split::read_blob(base, tenant, digest) {
+        Ok(old) => old,
+        // A base blob that reads but does not verify is not served by the base either; only one
+        // that cannot be read leaves the comparison unproved.
+        Err(error) if error.to_string().contains("tree store is corrupt") => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let new = split::read_blob(root, tenant, digest).ok().flatten();
+    Ok(old.is_some() && old == new)
 }
 
 /// The identity the `store.json` under `root` declares.
@@ -442,4 +473,67 @@ fn tombstone_reason(event: &serde_json::Map<String, serde_json::Value>) -> Optio
     }
     let reason = redaction.get("reason")?.as_str()?;
     (event.get("data") == Some(&eventlog_core::redaction_tombstone(reason))).then_some(reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify;
+    use crate::{TreeEventStore, TreeLayout};
+    use eventlog_core::{EventStore, TenantId};
+    use std::fs;
+    use std::path::Path;
+
+    fn copy(from: &Path, into: &Path) {
+        fs::create_dir_all(into).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = into.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy(&path, &target);
+            } else {
+                fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    /// Comparing a tree with its base reads each of the base's blob files once: the comparison
+    /// of served bytes reads it, and nothing reads it before that only to hold it.
+    #[test]
+    fn a_comparison_reads_each_base_blob_once() {
+        const BLOBS: usize = 8;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base");
+        let tree = directory.path().join("tree");
+        runtime.block_on(async {
+            let store = TreeEventStore::open_in(&base, TreeLayout::Hashed)
+                .await
+                .unwrap();
+            let tenant = TenantId::new("tenant-a").unwrap();
+            for index in 0..BLOBS {
+                let bytes = vec![u8::try_from(index).unwrap(); 4096];
+                store
+                    .put_blob(&tenant, &format!("sha256:blob-{index}"), &bytes)
+                    .await
+                    .unwrap();
+            }
+        });
+        copy(&base, &tree);
+        crate::layout::FILE_READS.with(|reads| reads.borrow_mut().clear());
+
+        assert_eq!(verify(&tree, Some(&base)), Vec::new());
+
+        let reads = crate::layout::FILE_READS.with(|reads| reads.borrow().clone());
+        let base_blobs: Vec<_> = reads
+            .iter()
+            .filter(|(path, _)| {
+                path.starts_with(&base) && path.components().any(|part| part.as_os_str() == "blobs")
+            })
+            .collect();
+        assert_eq!(base_blobs.len(), BLOBS, "{reads:#?}");
+        assert!(
+            base_blobs.iter().all(|(_, count)| **count == 1),
+            "a base blob file was read more than once: {base_blobs:#?}"
+        );
+    }
 }
