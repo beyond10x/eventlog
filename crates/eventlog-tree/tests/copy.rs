@@ -573,6 +573,7 @@ async fn a_copy_refuses_a_target_with_queued_restored_identities_and_writes_noth
             event_id: "someone-else".to_owned(),
             recorded_at: time::OffsetDateTime::UNIX_EPOCH,
             origin: None,
+            redacted: None,
         }])
         .unwrap();
 
@@ -665,7 +666,90 @@ async fn a_store_redacted_with_free_text_by_an_earlier_release_reopens_and_copie
     );
 }
 
+const MARKS: eventlog_core::ProjectionSpec = eventlog_core::ProjectionSpec {
+    name: "marks",
+    indexed: &[],
+};
+
+/// An inline projector that relies on the redaction mark: it refuses a live event whose body is a
+/// redaction tombstone, and records for every event whether it was handed it redacted.
+struct Marks;
+
+impl eventlog_core::Projector for Marks {
+    fn name(&self) -> &'static str {
+        "marks"
+    }
+
+    fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+        &[MARKS]
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a RecordedEvent,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if !event.is_redacted() && event.data.get("redacted") == Some(&json!(true)) {
+                return Err(EventLogError::Invalid(format!(
+                    "a tombstone handed as a live event: {}",
+                    event.data
+                )));
+            }
+            let key = format!("{}-{}", event.stream_id, event.version);
+            store
+                .upsert(
+                    &MARKS,
+                    &event.tenant,
+                    &key,
+                    &json!({ "redacted": event.is_redacted() }),
+                )
+                .await
+        })
+    }
+}
+
+/// Review L43's remainder: a copy into a target with inline projectors hands each a redacted event
+/// as redacted, as a cold replay of the tree does, never its tombstone body as a live event.
+async fn a_copy_hands_an_inline_projector_a_redacted_event_as_redacted(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let x = stream("tenant-a", "x");
+    let tree = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    tree.append(
+        &x,
+        Expected::NoStream,
+        &[event("item.received", 1), event("item.indexed", 2)],
+        &meta("key-1", &json!({ "command": "one" })),
+    )
+    .await
+    .unwrap();
+    tree.redact(&x, 1, "erased").await.unwrap();
+
+    let target = SqliteEventStore::in_memory("copy").await.unwrap();
+    target.register_inline(Arc::new(Marks)).await.unwrap();
+    let report = copy(&tree, &target)
+        .await
+        .expect("the copy handed the inline projector a tombstone as a live event");
+    assert_eq!((report.events, report.redactions), (2, 1));
+    let owner = tenant("tenant-a");
+    assert_eq!(
+        target.projection_get(&MARKS, &owner, "x-1").await.unwrap(),
+        Some(json!({ "redacted": true })),
+        "the projector was not handed the redacted event with its redaction mark"
+    );
+    assert_eq!(
+        target.projection_get(&MARKS, &owner, "x-2").await.unwrap(),
+        Some(json!({ "redacted": false }))
+    );
+    let copied = target.read_stream(&x, 0, 10).await.unwrap().events;
+    assert!(copied[0].is_redacted() && !copied[1].is_redacted());
+    assert_eq!(copied[0].data, redaction_tombstone("erased"));
+}
+
 each_layout!(
+    a_copy_hands_an_inline_projector_a_redacted_event_as_redacted,
     a_store_redacted_with_free_text_by_an_earlier_release_reopens_and_copies,
     a_tree_copied_into_sqlite_holds_every_event_blob_and_receipt_modulo_the_origin_map,
     a_forked_then_merged_tree_linearizes_in_position_order_the_same_way_on_every_checkout,

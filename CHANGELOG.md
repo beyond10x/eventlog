@@ -5,6 +5,57 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Breaking
+
+- SQLite: `RestoredEvent` has the new public field `redacted: Option<String>`; a struct literal
+  adds `redacted: None` to keep restoring live events.
+- Tree: eventlog 0.10.0 and earlier refuse a store holding a tenant directory named
+  `%%<digest>`, which this release writes for a tenant whose escaped name is longer than 255
+  bytes. Upgrade every binary that reads such a store before one writes it.
+- Tree: `MigrationReport` has the new public fields `group_fingerprints_before`,
+  `groups_fingerprinted` and `groups_without_fingerprint`.
+- Tree: eventlog 0.10.0 and earlier refuse a group file in the format `eventlog-tree/group/2`,
+  which this release writes in every new store and in a store `migrate` fenced. Upgrade every
+  binary that reads a store before one writes it.
+
+### Added
+
+- Tree: the group file format `eventlog-tree/group/2` keeps the fingerprint of the request an
+  atomic group answered. A retry of the group after one of its events was redacted or one of its
+  blobs deleted gets its original receipt after a cold reopen, where it got
+  `IdempotencyMismatch` before. A new store declares the format in `store.json`
+  (`"groups": "eventlog-tree/group/2"`); a store 0.10.0 or earlier wrote keeps writing
+  `eventlog-tree/group/1` and reads unchanged.
+- Tree: `migrate(root, MigrationMode::Apply)` fences a store into `eventlog-tree/group/2` and
+  writes the fingerprint into every group whose events and blobs are all still intact.
+  Operators: run it once on each existing tree store, only after every binary that reads the
+  store runs this release. The limit: a group that was redacted, or whose blob was deleted,
+  before the migration cannot get its fingerprint back, and a retry of it after a reopen still
+  answers `IdempotencyMismatch` (`MigrationReport::groups_without_fingerprint` counts them).
+- SQLite: `SqliteEventStore::group_fingerprint` and `restore_group_fingerprint` read and restore
+  the fingerprint of an atomic group's receipt.
+- Tree: `TreeEventStore::reload` rebuilds an open handle from the files, as a reopen does,
+  keeping every position the handle served.
+
+### Changed
+
+- Tree: an append on a handle that saw no write since it was current lists no group file; the
+  writer publishes a token in `.cache/publication` after each group file. History a
+  `git checkout`, `pull` or `merge` added while a handle was open is served only after
+  `TreeEventStore::reload` or a reopen, and a write whose idempotency key or member streams that
+  history touched is refused with `EventLogError::Backend` naming the reopen until then (before,
+  every append listed every group file and picked such history up).
+
+### Fixed
+
+- Tree: `copy` into a target with an inline projector hands a redacted event to the projector
+  as redacted (`RecordedEvent::redacted_at` set, the tombstone as body), and the target stores it
+  redacted.
+- Tree: a tenant whose escaped directory name would exceed 255 bytes (up to the 512-byte field
+  limit) is stored under `tenants/%%<sha256 of the tenant>` with a `tenant.json` naming it,
+  instead of failing with "File name too long (os error 36)". The shared inline projection
+  exercise now runs with a 512-byte tenant on every provider.
+
 ## 0.10.0 — 2026-11-23
 
 ### Added

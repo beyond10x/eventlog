@@ -22,8 +22,7 @@
 //! refuses an expansion whose length or SHA-256 is not the one the manifest recorded.
 
 use crate::layout::{
-    backend, blob_path, canonical, corrupt, read_file, segment, sha256_hex, tenant_dir,
-    write_atomic, write_once,
+    backend, blob_path, canonical, corrupt, read_file, segment, sha256_hex, tenant_dir, write_once,
 };
 use eventlog_core::EventLogError;
 use serde_json::{Map, Value, json};
@@ -700,18 +699,6 @@ pub(crate) fn drop_raw(
         crate::layout::sync_dir(directory)?;
     }
     Ok(())
-}
-
-/// Rewrite `store.json` with `format`, keeping its identity.
-pub(crate) fn set_format(root: &Path, format: &str) -> Result<(), EventLogError> {
-    let path = root.join("store.json");
-    let bytes = fs::read(&path).map_err(backend)?;
-    let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| corrupt("store.json"))?;
-    value
-        .as_object_mut()
-        .ok_or_else(|| corrupt("store.json"))?
-        .insert("format".into(), Value::String(format.to_owned()));
-    write_atomic(&path, &canonical(&value))
 }
 
 #[cfg(test)]

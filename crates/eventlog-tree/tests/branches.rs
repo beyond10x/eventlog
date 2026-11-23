@@ -23,12 +23,13 @@ fn stream(id: &str) -> StreamId {
     StreamId::new(TenantId::new("tenant-a").unwrap(), "item", id).unwrap()
 }
 
-/// Copy every file under `from` into `into`, as a merge of two branches that added different
-/// files does. A file both sides hold must be identical, as Git would leave it.
+/// Copy every history file under `from` into `into`, as a merge of two branches that added
+/// different files does. A file both sides hold must be identical, as Git would leave it. The
+/// writer lock and `.cache/`, which holds its own `.gitignore`, are not history and not merged.
 fn merge_into(from: &Path, into: &Path) {
     for entry in walk(from) {
         let relative = entry.strip_prefix(from).unwrap();
-        if relative == Path::new(".lock") {
+        if relative == Path::new(".lock") || relative.starts_with(".cache") {
             continue;
         }
         let target = into.join(relative);
@@ -176,6 +177,88 @@ async fn a_group_and_its_blobs_reopen_whole(layout: TreeLayout) {
     assert!(
         retry.deduplicated,
         "a group retried after reopening wrote twice"
+    );
+}
+
+/// Review L71: a cold replay rebuilt a group's receipt fingerprint from the bodies and blobs still
+/// present, so after a redaction or a blob deletion the exact retry of a committed group answered
+/// `IdempotencyMismatch`. The group file keeps the fingerprint (`eventlog-tree/group/2`), and the
+/// retry gets the group's receipt with its original result ranges.
+async fn a_group_retried_after_its_content_was_removed_gets_its_receipt_after_a_cold_reopen(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let tenant = TenantId::new("tenant-a").unwrap();
+    let group = |key: &str, ids: [&str; 2]| AppendGroup {
+        tenant: tenant.clone(),
+        appends: ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| StreamAppend {
+                stream: stream(id),
+                expected: Expected::NoStream,
+                events: vec![event("item.received", i64::try_from(index).unwrap() + 1)],
+            })
+            .collect(),
+        meta: meta(key, &json!({ "group": key })),
+    };
+    let with_blob = group("with-blob", ["left", "right"]);
+    let plain = group("plain", ["up", "down"]);
+    let blobs = vec![("blob-1".to_owned(), b"bytes".to_vec())];
+    let guard = || std::sync::Arc::new(eventlog_core::NoGuard);
+    let (first, second) = {
+        let store = TreeEventStore::open_in(root, layout).await.unwrap();
+        let first = store
+            .append_group_guarded_with_blobs(&with_blob, guard(), &blobs)
+            .await
+            .unwrap();
+        let second = store.append_group_guarded(&plain, guard()).await.unwrap();
+        store.redact(&stream("left"), 1, "erased").await.unwrap();
+        store.delete_blob(&tenant, "blob-1").await.unwrap();
+        store.redact(&stream("down"), 1, "erased").await.unwrap();
+        (first, second)
+    };
+    let _ = fs::remove_dir_all(root.join(".cache"));
+
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
+    assert!(store.replayed().await, "control: the reopen replayed");
+    let ranges = |result: &eventlog_core::AppendGroupResult| {
+        result
+            .appends
+            .iter()
+            .map(|append| {
+                (
+                    append.first_version,
+                    append.last_version,
+                    append.events[0].event_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let retried = store
+        .append_group_guarded_with_blobs(&with_blob, guard(), &blobs)
+        .await
+        .expect("the exact retry of a group whose content was removed was refused");
+    assert!(retried.deduplicated, "the retry wrote again");
+    assert_eq!(ranges(&retried), ranges(&first));
+    let retried = store
+        .append_group_guarded(&plain, guard())
+        .await
+        .expect("the exact retry of a group whose event was redacted was refused");
+    assert!(retried.deduplicated, "the retry wrote again");
+    assert_eq!(ranges(&retried), ranges(&second));
+
+    // The fingerprint still tells another request under the same key from the one recorded.
+    let mut changed = plain.clone();
+    changed.appends[0].events = vec![event("item.received", 9)];
+    let refused = store
+        .append_group_guarded(&changed, guard())
+        .await
+        .expect_err("another request under a recorded key was answered");
+    assert!(
+        matches!(&refused, EventLogError::IdempotencyMismatch { key } if key == "plain"),
+        "{refused:?}"
     );
 }
 
@@ -465,6 +548,124 @@ async fn a_second_handle_sees_the_first_handles_commit_before_it_writes(layout: 
             actual: 1
         }
     ));
+}
+
+/// Story `tree-publication-counter-and-reopen-contract`: an append does not list every group file
+/// while no write of this checkout has published since the handle last looked, so history a
+/// checkout, pull or merge added behind an open handle is not taken in by its next write. An append
+/// to a stream that history touched, or under a key it recorded, is refused, naming the reopen, and
+/// writes nothing; `reload` (or a reopen) takes the history in.
+async fn an_append_after_a_merge_behind_the_handle_is_refused_until_a_reload(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let branch = tempfile::tempdir().unwrap();
+    let store = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    store
+        .append(
+            &stream("x"),
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("base", &json!({})),
+        )
+        .await
+        .unwrap();
+    copy_tree(directory.path(), branch.path());
+    {
+        let theirs = TreeEventStore::open_in(branch.path(), layout)
+            .await
+            .unwrap();
+        theirs
+            .append(
+                &stream("x"),
+                Expected::Exact(1),
+                &[event("item.indexed", 2)],
+                &meta("theirs", &json!({})),
+            )
+            .await
+            .unwrap();
+        theirs
+            .append_group_guarded(
+                &AppendGroup {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    appends: vec![StreamAppend {
+                        stream: stream("q"),
+                        expected: Expected::NoStream,
+                        events: vec![event("item.received", 3)],
+                    }],
+                    meta: meta("group", &json!({ "side": "theirs" })),
+                },
+                std::sync::Arc::new(eventlog_core::NoGuard),
+            )
+            .await
+            .unwrap();
+    }
+    merge_into(branch.path(), directory.path());
+    let files = walk(&directory.path().join("tenants"));
+    let refused_as_changed = |error: &EventLogError| {
+        matches!(error, EventLogError::Backend(message)
+            if message.contains("changed outside this handle")
+                && message.contains("reopen")
+                && message.contains("reload"))
+    };
+
+    let error = store
+        .append(
+            &stream("x"),
+            Expected::Exact(1),
+            &[event("item.indexed", 4)],
+            &meta("ours", &json!({})),
+        )
+        .await
+        .expect_err("an append on a stream a merge extended behind the handle was written");
+    assert!(refused_as_changed(&error), "{error:?}");
+    let error = store
+        .append_group_guarded(
+            &AppendGroup {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                appends: vec![StreamAppend {
+                    stream: stream("r"),
+                    expected: Expected::NoStream,
+                    events: vec![event("item.received", 5)],
+                }],
+                meta: meta("group", &json!({ "side": "ours" })),
+            },
+            std::sync::Arc::new(eventlog_core::NoGuard),
+        )
+        .await
+        .expect_err("a group under a key a merge recorded behind the handle was written");
+    assert!(refused_as_changed(&error), "{error:?}");
+    assert_eq!(
+        walk(&directory.path().join("tenants")),
+        files,
+        "a refused append wrote a file"
+    );
+
+    // A stream the merge did not touch cannot fork, and is appended to.
+    store
+        .append(
+            &stream("z"),
+            Expected::NoStream,
+            &[event("item.received", 6)],
+            &meta("untouched", &json!({})),
+        )
+        .await
+        .unwrap();
+
+    store.reload().await.unwrap();
+    assert_eq!(store.stream_version(&stream("x")).await.unwrap(), Some(2));
+    assert_eq!(store.stream_version(&stream("q")).await.unwrap(), Some(1));
+    let appended = store
+        .append(
+            &stream("x"),
+            Expected::Exact(2),
+            &[event("item.indexed", 4)],
+            &meta("ours", &json!({})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(appended.first_version, 3);
+    assert_eq!(store.heads(&stream("x")).await.unwrap().len(), 1);
 }
 
 async fn a_second_handle_adopts_the_tenant_identity_the_first_handle_wrote(layout: TreeLayout) {
@@ -1019,6 +1220,9 @@ async fn a_saved_feed_cursor_skips_nothing_when_the_open_handle_rebuilds(
                 fs::copy(&path, &target).unwrap();
             }
         }
+        // A merge outside the store is taken in by a reload or a reopen, not by the next write:
+        // no write of this checkout published it.
+        store.reload().await.unwrap();
         unseen
     } else {
         let other = TreeEventStore::open_in(directory.path(), layout)
@@ -1307,6 +1511,8 @@ async fn a_cold_replay_hands_an_inline_projector_a_redacted_event_as_redacted(la
 
 each_layout!(
     a_saved_feed_cursor_skips_nothing_after_another_handle_appends,
+    a_group_retried_after_its_content_was_removed_gets_its_receipt_after_a_cold_reopen,
+    an_append_after_a_merge_behind_the_handle_is_refused_until_a_reload,
     a_saved_feed_cursor_skips_nothing_when_another_replay_kept_its_state,
     a_saved_feed_cursor_skips_nothing_after_a_merge,
     a_saved_feed_cursor_skips_nothing_after_a_redaction,

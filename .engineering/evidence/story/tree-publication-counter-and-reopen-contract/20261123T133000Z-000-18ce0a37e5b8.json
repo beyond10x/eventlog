@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T13:30:00Z",
+  "actor": "human:timo",
+  "artifact": "story:tree-publication-counter-and-reopen-contract",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-tree: cargo test -p eventlog-tree 197 passed; tree.append.group_files_listed 64 -> 0; mutation S1 listing and S1 refusal both red (history.rs:949, branches.rs:620)"
+  }
+}

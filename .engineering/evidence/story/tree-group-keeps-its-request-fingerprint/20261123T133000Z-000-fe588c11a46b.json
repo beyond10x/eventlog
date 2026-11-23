@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T13:30:00Z",
+  "actor": "human:timo",
+  "artifact": "story:tree-group-keeps-its-request-fingerprint",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-tree: branches retry-after-cold-reopen and layout 0.10.0 fixture tests green (real 0.10.0 store); mutation S2 replay and backfill red (branches.rs:242, layout.rs:594)"
+  }
+}

@@ -4,7 +4,8 @@
 //! The migration is explicit and never runs on open. It holds the writer lock throughout, reads
 //! and verifies the whole store before it writes, and afterwards reads the whole store again and
 //! compares what it serves — every blob's bytes, every group and event — with what it served
-//! before. Event, group and identity files are never touched, so every digest and parent stays as
+//! before. Event and identity files are never touched, and a group file only gains the request
+//! fingerprint its receipt recorded (`eventlog-tree/group/2`), so every digest and parent stays as
 //! it was.
 //!
 //! Crash order: `store.json` is switched first, because an `eventlog-tree/2` store whose blobs are
@@ -13,10 +14,14 @@
 //! interrupted anywhere leaves a store that opens and serves the same bytes, and running it again
 //! finishes it.
 
-use crate::history::{self, Loaded};
-use crate::layout::{FORMAT, StoreFormat, backend, blob_path, sha256_hex, store_format};
+use crate::history::{self, GroupRecord, Kind, Loaded};
+use crate::layout::{
+    FORMAT, GROUP_FORMAT_V2, GROUPS_KEY, StoreFormat, backend, blob_path, canonical, corrupt,
+    group_path, sha256_hex, store_format, store_manifest, write_atomic,
+};
 use crate::split;
 use eventlog_core::EventLogError;
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,6 +52,17 @@ pub struct MigrationReport {
     pub blobs_split: usize,
     /// Text files this call adds (or would): texts no blob held yet, each once.
     pub texts_added: usize,
+    /// Whether `store.json` declared `eventlog-tree/group/2` before: every group written to the
+    /// store keeps its request fingerprint. A migration declares it.
+    pub group_fingerprints_before: bool,
+    /// Atomic groups whose file this call gives (or would give) the request fingerprint their
+    /// receipt recorded, rewriting it from `eventlog-tree/group/1` to `eventlog-tree/group/2`.
+    pub groups_fingerprinted: usize,
+    /// Atomic groups left in `eventlog-tree/group/1`: an event of theirs was redacted, or a blob of
+    /// theirs deleted, before any migration kept their fingerprint, and the files no longer hold
+    /// the request it was computed from. After a reopen, the exact retry of such a group is
+    /// refused with [`EventLogError::IdempotencyMismatch`].
+    pub groups_without_fingerprint: usize,
     /// Bytes of every history file — `store.json` and everything under `tenants/` — before.
     pub bytes_before: u64,
     /// The same, after (or as it would be).
@@ -64,7 +80,10 @@ impl MigrationReport {
     /// Whether an apply would change anything.
     #[must_use]
     pub fn pending(&self) -> bool {
-        self.blobs_split > 0 || self.from_format != self.to_format
+        self.blobs_split > 0
+            || self.from_format != self.to_format
+            || !self.group_fingerprints_before
+            || self.groups_fingerprinted > 0
     }
 }
 
@@ -74,6 +93,16 @@ impl MigrationReport {
 /// changes nothing. A raw blob in an `eventlog-tree/2` store — one merged from a branch that had
 /// not migrated — is split like any other. An `eventlog-tree/3` store already splits, so it keeps
 /// its format and only has its raw blobs split; no migration changes a store's stream layout.
+///
+/// The migration also fences the store into `eventlog-tree/group/2`: `store.json` declares it, so
+/// every atomic group written from then on keeps the request fingerprint its receipt recorded,
+/// and every atomic group already committed whose content is intact gets that fingerprint
+/// (computed from its files, as a replay computes it). A replay then restores each group's receipt
+/// even after one of its events is redacted or one of its blobs deleted. A group whose content
+/// was removed before the migration cannot be given its fingerprint back
+/// ([`MigrationReport::groups_without_fingerprint`]). Eventlog 0.10.0 and earlier refuse a group
+/// file in `eventlog-tree/group/2` as corrupt: migrate only once every binary that opens the store
+/// reads it. A store created by this release declares it from the start.
 ///
 /// # Errors
 /// Refuses a directory that is not a tree store, and a store the replay cannot verify, before
@@ -148,13 +177,48 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
             }
         }
     }
-    if format == StoreFormat::V1 {
-        let manifest = root.join("store.json");
-        let grown = FORMAT.len() as u64 - StoreFormat::V1.tag().len() as u64;
-        if let Some(size) = sizes.get_mut(&relative(root, &manifest)) {
-            *size += grown;
+    // Every atomic group whose content is intact gets the fingerprint its receipt recorded, which
+    // is the one a replay of it computes today. One whose event was redacted or whose blob was
+    // deleted no longer holds the request its writer made, so its fingerprint is lost for good.
+    let (_, group_fingerprints_before) = store_manifest(root)?;
+    let mut backfill: Vec<(PathBuf, Vec<u8>, GroupRecord)> = Vec::new();
+    let mut groups_without_fingerprint = 0;
+    for history in before.tenants.values() {
+        for committed in &history.groups {
+            if committed.record.kind != Kind::Group || committed.record.fingerprint.is_some() {
+                continue;
+            }
+            let Some(fingerprint) = committed.intact_fingerprint()? else {
+                groups_without_fingerprint += 1;
+                continue;
+            };
+            let mut record = committed.record.clone();
+            record.fingerprint = Some(fingerprint);
+            let path = group_path(root, &record.tenant, &record.key_digest());
+            let bytes = canonical(&record.to_value()?);
+            sizes.insert(relative(root, &path), bytes.len() as u64);
+            backfill.push((path, bytes, record));
         }
     }
+
+    // `store.json` moves to `eventlog-tree/2` from the first layout, and declares group files
+    // that keep their fingerprint: from then on every group written keeps it, and Eventlog 0.10.0
+    // and earlier refuse the store's new group files rather than misread them.
+    let manifest_path = root.join("store.json");
+    let manifest = if format == StoreFormat::V1 || !group_fingerprints_before {
+        let bytes = fs::read(&manifest_path).map_err(backend)?;
+        let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| corrupt("store.json"))?;
+        let map = value.as_object_mut().ok_or_else(|| corrupt("store.json"))?;
+        if format == StoreFormat::V1 {
+            map.insert("format".into(), Value::String(FORMAT.to_owned()));
+        }
+        map.insert(GROUPS_KEY.into(), Value::String(GROUP_FORMAT_V2.to_owned()));
+        let bytes = canonical(&value);
+        sizes.insert(relative(root, &manifest_path), bytes.len() as u64);
+        Some(bytes)
+    } else {
+        None
+    };
     let mut report = MigrationReport {
         from_format: format.tag().to_owned(),
         to_format: if format == StoreFormat::V1 {
@@ -167,6 +231,9 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
         already_split,
         blobs_split: plan.len(),
         texts_added,
+        group_fingerprints_before,
+        groups_fingerprinted: backfill.len(),
+        groups_without_fingerprint,
         bytes_before,
         bytes_after: sizes.values().sum(),
         largest_before,
@@ -177,8 +244,10 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
         return Ok(report);
     }
 
-    if format == StoreFormat::V1 {
-        split::set_format(root, FORMAT)?;
+    // First, as the first layout's switch always was: a store declaring group files that keep
+    // their fingerprint still reads every group file that does not.
+    if let Some(bytes) = &manifest {
+        write_atomic(&manifest_path, bytes)?;
     }
     for planned in &plan {
         let (tenant, digest, bytes) = (&planned.tenant, &planned.digest, &planned.bytes);
@@ -189,13 +258,41 @@ pub fn migrate(root: &Path, mode: MigrationMode) -> Result<MigrationReport, Even
             Step::DropRaw => split::drop_raw(root, tenant, digest, bytes)?,
         }
     }
+    // A group file is rewritten in place, as a redacted event file is: only the format tag and
+    // the fingerprint change, so the group's name, its events and their digests stay as they were.
+    for (path, bytes, _) in &backfill {
+        write_atomic(path, bytes)?;
+    }
 
     let after = history::load(root)?;
     let served_after = served(&after);
     if served_after != served_before {
-        return Err(crate::layout::corrupt(
+        return Err(corrupt(
             "the migrated store does not serve what it served before",
         ));
+    }
+    let kept: BTreeMap<(&str, String), Option<&String>> = after
+        .tenants
+        .values()
+        .flat_map(|history| &history.groups)
+        .map(|committed| {
+            (
+                (
+                    committed.record.tenant.as_str(),
+                    committed.record.key_digest(),
+                ),
+                committed.record.fingerprint.as_ref(),
+            )
+        })
+        .collect();
+    for (_, _, record) in &backfill {
+        if kept.get(&(record.tenant.as_str(), record.key_digest()))
+            != Some(&record.fingerprint.as_ref())
+        {
+            return Err(corrupt(
+                "a migrated group file does not read back with its fingerprint",
+            ));
+        }
     }
     let measured = file_sizes(root)?;
     report.bytes_after = measured.values().sum();

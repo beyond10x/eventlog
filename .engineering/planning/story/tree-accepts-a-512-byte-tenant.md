@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:tree-accepts-a-512-byte-tenant
 kind: story
-status: draft
+status: implemented
 title: A Tree store accepts a valid 512-byte tenant instead of File name too long (os error 36)
 summary: tree_inline_contract hashed and nested fail on a 512-byte tenant directory name
 owner: eventlog
-revision: 1
+relations:
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T13:45:31Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T13:45:31Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T13:45:31Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

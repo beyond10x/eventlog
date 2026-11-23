@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:tree-publication-counter-and-reopen-contract
 kind: story
-status: draft
+status: implemented
 title: A Tree append skips the group listing on an unchanged publication counter, with a reopen contract
 summary: Review L17 = C; one append lists all 64 group files under the writer lock
 owner: eventlog
-revision: 1
+relations:
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T13:45:30Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T13:45:30Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T13:45:30Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 
