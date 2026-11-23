@@ -69,6 +69,49 @@ pub(crate) fn publish_removal(root: &Path) -> Result<String, EventLogError> {
     Ok(token)
 }
 
+fn publication_path(root: &Path) -> PathBuf {
+    root.join(".cache").join("publication")
+}
+
+/// The publication token last published under `root`, `None` when none is.
+///
+/// Every group a handle of this release writes publishes a new one, under the writer lock, after
+/// the group file. A handle whose state was built under the token still published has seen every
+/// group any handle of this checkout wrote, so its next write need not list the group files.
+/// History a checkout, pull or merge brings publishes none: a handle takes it in on a reopen or
+/// [`crate::TreeEventStore::reload`]. The token is not history and not durable; a crash or a
+/// deleted `.cache/` loses it, which only costs the next write a listing.
+///
+/// # Errors
+/// Returns [`EventLogError::Backend`] when the token exists but cannot be read.
+pub(crate) fn publication_token(root: &Path) -> Result<Option<String>, EventLogError> {
+    match fs::read(publication_path(root)) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(backend(error)),
+    }
+}
+
+/// Publish a new publication token after a write, under the writer lock, and return it. When it
+/// cannot be written the token is removed instead, so that every handle's next write lists the
+/// group files, and `None` is returned. Neither is synced: a handle that finds no token, or
+/// another one, lists.
+pub(crate) fn publish_write(root: &Path) -> Option<String> {
+    let token = eventlog_core::new_event_id();
+    let path = publication_path(root);
+    let written = ignored_cache(root).and_then(|()| {
+        let staging = root.join(".cache").join(".publication.tmp");
+        fs::write(&staging, token.as_bytes())?;
+        fs::rename(&staging, &path)
+    });
+    if written.is_ok() {
+        Some(token)
+    } else {
+        let _ = fs::remove_file(&path);
+        None
+    }
+}
+
 /// Create `.cache/` with the `.gitignore` that keeps it out of history.
 fn ignored_cache(root: &Path) -> std::io::Result<()> {
     let cache = root.join(".cache");

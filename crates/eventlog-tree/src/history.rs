@@ -551,6 +551,8 @@ pub(crate) fn group_files(root: &Path) -> Result<BTreeSet<PathBuf>, EventLogErro
     }
     #[cfg(feature = "kpi-counters")]
     crate::kpi::group_files_listed(found.len());
+    #[cfg(test)]
+    GROUP_FILES_LISTED.with(|count| count.set(count.get() + found.len()));
     Ok(found)
 }
 
@@ -833,6 +835,12 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How many group file names [`group_files`] listed on this thread.
+    static GROUP_FILES_LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn between_passes() {
     if let Some(hook) = BETWEEN_PASSES.with(|hook| hook.borrow_mut().take()) {
         hook();
@@ -898,6 +906,69 @@ mod tests {
             assert_eq!(
                 hashed, 2,
                 "an append of two events canonicalized and hashed their envelopes {hashed} times"
+            );
+        });
+    }
+
+    /// Review L17: one append enumerated every earlier group file under the writer lock. On a
+    /// handle that saw no change since its last write, as in the KPI scenario
+    /// `tree.append.group_files_listed` (64 earlier groups, then one append), it lists none; after
+    /// another handle's write it lists them again and takes that write in.
+    #[test]
+    fn an_append_on_a_handle_that_saw_no_change_lists_no_group_file() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let store = TreeEventStore::open(directory.path()).await.unwrap();
+            let one = |key: &str| meta(key, &json!({ "key": key }));
+            for index in 0..64 {
+                store
+                    .append(
+                        &stream("first"),
+                        Expected::Any,
+                        &[event("item.received", index)],
+                        &one(&format!("append-{index}")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let listed = || super::GROUP_FILES_LISTED.with(std::cell::Cell::get);
+            let before = listed();
+            store
+                .append(
+                    &stream("first"),
+                    Expected::Any,
+                    &[event("item.received", 64)],
+                    &one("last"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                listed() - before,
+                0,
+                "an append on a handle that saw no change listed group files"
+            );
+
+            let other = TreeEventStore::open(directory.path()).await.unwrap();
+            append(&other, "y").await;
+            let before = listed();
+            let after_other = store
+                .append(
+                    &stream("y"),
+                    Expected::Exact(2),
+                    &[event("item.closed", 3)],
+                    &one("after-other"),
+                )
+                .await
+                .expect("the handle did not take in another handle's write");
+            assert_eq!(after_other.first_version, 3);
+            assert_eq!(
+                listed() - before,
+                66,
+                "control: after another handle's write the append lists every group file"
             );
         });
     }

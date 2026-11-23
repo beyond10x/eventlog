@@ -34,6 +34,17 @@ under bare-version tags such as `0.1.0`.
   answers `IdempotencyMismatch` (`MigrationReport::groups_without_fingerprint` counts them).
 - SQLite: `SqliteEventStore::group_fingerprint` and `restore_group_fingerprint` read and restore
   the fingerprint of an atomic group's receipt.
+- Tree: `TreeEventStore::reload` rebuilds an open handle from the files, as a reopen does,
+  keeping every position the handle served.
+
+### Changed
+
+- Tree: an append on a handle that saw no write since it was current lists no group file; the
+  writer publishes a token in `.cache/publication` after each group file. History a
+  `git checkout`, `pull` or `merge` added while a handle was open is served only after
+  `TreeEventStore::reload` or a reopen, and a write whose idempotency key or member streams that
+  history touched is refused with `EventLogError::Backend` naming the reopen until then (before,
+  every append listed every group file and picked such history up).
 
 ### Fixed
 

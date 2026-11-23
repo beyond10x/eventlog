@@ -13,6 +13,7 @@
 //! <root>/tenants/<tenant>/texts/<hh>/<sha256 hex>       eventlog-tree/2: one text, stored once
 //! <root>/tenants/%%<sha256 hex>/tenant.json             {tenant}: a tenant too long for a name
 //! <root>/.lock                                          one writer per checkout; not history
+//! <root>/.cache/                                        kept state and tokens; ignored by Git
 //! ```
 //!
 //! `<tenant>` is the tenant id escaped into one file name. A tenant id may be 512 bytes, which
@@ -54,6 +55,14 @@
 //! engine, because another handle or a merge added history or content was removed, every event it
 //! served keeps its position, an erased one leaves a gap, and history new to it is placed above
 //! every position it assigned, so a saved feed cursor never passes an event it has not seen.
+//!
+//! An open handle picks up what another handle of this checkout wrote: each write leaves a token
+//! in `.cache/`, and a write that finds a token other than the one it last saw reads the group
+//! files again. History a `git checkout`, `pull` or `merge` put in the directory leaves no such
+//! token; a handle serves it only after [`TreeEventStore::reload`] or a reopen. Until then a
+//! write whose idempotency key or streams that history touched is refused with
+//! [`EventLogError::Backend`] naming the reopen, never answered from a receipt the handle has not
+//! seen nor appended on a stream forked behind it; a write elsewhere proceeds.
 
 mod copy;
 mod fold;
@@ -82,8 +91,8 @@ use eventlog_core::{
 use eventlog_sqlite::{EventOrigin, EventPositions, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
-    FORMAT, FORMAT_V3, GROUP_FORMAT_V2, GROUPS_KEY, backend, canonical, corrupt, event_path,
-    group_path, identity_path, sha256_hex, tenant_dir, write_atomic, write_once,
+    FORMAT, FORMAT_V3, GROUP_FORMAT_V2, GROUPS_KEY, StoreFormat, backend, canonical, corrupt,
+    event_path, group_path, identity_path, sha256_hex, tenant_dir, write_atomic, write_once,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -144,6 +153,10 @@ struct State {
     /// The privacy token published when this state was built: read before the files were, so a
     /// removal of content that ran while they were read leaves this state stale, never current.
     privacy: Option<String>,
+    /// The publication token published when this state was built or last brought up to date
+    /// under the writer lock (`fold::publication_token`): while it is still the published one, no
+    /// handle of this checkout has written a group this state lacks.
+    publication: Option<String>,
     /// Set while a write is in the engine and not yet in the files, and left set when the caller
     /// stopped awaiting it in between: the engine may then hold what the files never committed,
     /// so the next operation rebuilds from the files before serving anything.
@@ -233,6 +246,34 @@ impl TreeEventStore {
         Ok(torn)
     }
 
+    /// Rebuild this handle's state from the files, under the writer lock: what a reopen serves,
+    /// with every position this handle served kept (see the crate documentation).
+    ///
+    /// History that arrived from outside this checkout's writers while the handle was open (a
+    /// `git pull`, merge or checkout) is served only after this call or a reopen. A write refuses
+    /// a stream or key such history touched until then.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Closed`] for a handle that can no longer serve, and refuses files
+    /// the replay cannot verify, as an open does.
+    pub async fn reload(&self) -> Result<(), EventLogError> {
+        let mut state = self.state.lock().await;
+        if state.poisoned {
+            return Err(EventLogError::Closed);
+        }
+        let _lock = self.writer_lock().await?;
+        let served = state.engine.positions().await?;
+        *state = build(
+            &self.root,
+            state.inline.clone(),
+            state.catch_up.clone(),
+            Locked::Held,
+            Some(served),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// The writer lock, waited for on a blocking worker. Another handle holding it may be
     /// suspended on this very runtime, awaiting its engine; blocking the executor thread in the
     /// wait would keep that handle from ever resuming to release it.
@@ -269,7 +310,7 @@ impl TreeEventStore {
             return Ok(());
         }
         let _lock = self.writer_lock().await?;
-        refresh(&self.root, state).await
+        refresh(&self.root, state, Listing::Always).await.map(drop)
     }
 
     /// Serve `read` from an engine current for the last removal of content, and serve it again
@@ -384,7 +425,7 @@ impl TreeEventStore {
             return Err(EventLogError::Closed);
         }
         let _lock = self.writer_lock().await?;
-        refresh(&self.root, &mut state).await?;
+        let listed = refresh(&self.root, &mut state, Listing::WhenPublished).await?;
         let (format, fingerprinted) = layout::store_manifest(&self.root)?;
 
         // A command already recorded is answered from its receipt, whatever the heads are now: a
@@ -401,6 +442,9 @@ impl TreeEventStore {
             &history::receipt_digest(kind, tenant.as_str(), stream, &meta.idempotency_key),
         );
         let recorded = state.group_files.contains(&receipt);
+        if !listed {
+            refuse_outside_history(&self.root, format, &state, members, &receipt, recorded).await?;
+        }
 
         let mut parents_before = Vec::with_capacity(members.len());
         let mut engine_expected = Vec::with_capacity(members.len());
@@ -609,6 +653,8 @@ impl TreeEventStore {
             }
         };
         state.group_files.insert(path);
+        // Tell this checkout's other handles that a group they lack exists; this state has it.
+        state.publication = fold::publish_write(&self.root);
         for (index, (stream, _)) in members.iter().enumerate() {
             if let Some(last) = group.members[index].events.last() {
                 state.heads.insert(key_of(stream), vec![last.clone()]);
@@ -702,12 +748,24 @@ fn prepare(root: &Path, layout: TreeLayout) -> Result<(), EventLogError> {
 
 /// Rebuild the state when another writer has committed a group, or removed content, since this
 /// one was built. The caller holds the writer lock.
-async fn refresh(root: &Path, state: &mut State) -> Result<(), EventLogError> {
-    if !state.unsettled
-        && fold::privacy_token(root)? == state.privacy
-        && history::group_files(root)? == state.group_files
-    {
-        return Ok(());
+///
+/// With [`Listing::WhenPublished`], the group files are listed only when another handle of this
+/// checkout has published a write since this state was current; returns whether they were.
+async fn refresh(root: &Path, state: &mut State, listing: Listing) -> Result<bool, EventLogError> {
+    if !state.unsettled && fold::privacy_token(root)? == state.privacy {
+        // Read before the listing: a write publishes after its group file, and none runs while
+        // the caller holds the writer lock.
+        let publication = fold::publication_token(root)?;
+        if listing == Listing::WhenPublished
+            && publication.is_some()
+            && publication == state.publication
+        {
+            return Ok(false);
+        }
+        if history::group_files(root)? == state.group_files {
+            state.publication = publication;
+            return Ok(true);
+        }
     }
     let rebuilt = build(
         root,
@@ -718,6 +776,101 @@ async fn refresh(root: &Path, state: &mut State) -> Result<(), EventLogError> {
     )
     .await?;
     *state = rebuilt;
+    Ok(true)
+}
+
+/// When [`refresh`] lists the group files to find groups this state lacks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    /// Only when a write of this checkout was published since the state was current. History a
+    /// checkout, pull or merge added is then not found: a write checks the streams it touches
+    /// for it ([`refuse_outside_history`]).
+    WhenPublished,
+    /// Every time.
+    Always,
+}
+
+/// The refusal of a write that history added from outside this checkout's writers touches.
+fn changed_outside() -> EventLogError {
+    EventLogError::Backend(
+        "the tree store changed outside this handle (a checkout, pull or merge touched what this \
+         write touches): reopen the store or call TreeEventStore::reload, then retry"
+            .into(),
+    )
+}
+
+/// Refuse a write whose receipt or member streams hold history `state` lacks: a group file, or
+/// an event file of a committed group, that a checkout, pull or merge put in the tree since the
+/// state was built. A write that ran over it would answer a receipt it never saw or append on a
+/// stream forked behind its back. Runs when [`refresh`] skipped the listing, before the engine.
+///
+/// The cheap pass compares, for each member stream, the number of event files with the number
+/// of events the engine holds and checks that every head's file exists; only a stream that
+/// differs is read file by file, where an event file whose group file is missing is torn and
+/// ignored, as a replay ignores it.
+async fn refuse_outside_history(
+    root: &Path,
+    format: StoreFormat,
+    state: &State,
+    members: &[(StreamId, Expected)],
+    receipt: &Path,
+    recorded: bool,
+) -> Result<(), EventLogError> {
+    if !recorded && receipt.exists() {
+        return Err(changed_outside());
+    }
+    let mut seen = BTreeSet::new();
+    for (stream, _) in members {
+        let stream_key = key_of(stream);
+        if !seen.insert(stream_key.clone()) {
+            continue;
+        }
+        let (tenant, stream_type, stream_id) = &stream_key;
+        let directory = layout::stream_dir(root, format, tenant, stream_type, stream_id);
+        let files = layout::json_files(&directory)?;
+        let held = state.engine.stream_version(stream).await?.unwrap_or(0);
+        let heads = state.heads.get(&stream_key).map_or(&[][..], Vec::as_slice);
+        let digest_of = |path: &PathBuf| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        };
+        if u64::try_from(files.len()).ok() == Some(held)
+            && heads
+                .iter()
+                .all(|head| directory.join(format!("{head}.json")).exists())
+        {
+            continue;
+        }
+        let known: BTreeSet<&str> = state
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                record.tenant == *tenant
+                    && record.stream_type == *stream_type
+                    && record.stream_id == *stream_id
+            })
+            .filter_map(|(event_id, _)| state.digests.get(event_id).map(String::as_str))
+            .collect();
+        let mut present = BTreeSet::new();
+        for path in &files {
+            let Some(digest) = digest_of(path) else {
+                continue;
+            };
+            if known.contains(digest.as_str()) {
+                present.insert(digest);
+                continue;
+            }
+            let bytes = layout::read_file(path).map_err(backend)?;
+            let value: Value = serde_json::from_slice(&bytes).map_err(backend)?;
+            let (record, _) = EventRecord::from_value(&value)?;
+            if group_path(root, tenant, &record.group).exists() {
+                return Err(changed_outside());
+            }
+        }
+        if known.len() != present.len() {
+            return Err(changed_outside());
+        }
+    }
     Ok(())
 }
 
@@ -749,6 +902,7 @@ async fn build(
     served: Option<EventPositions>,
 ) -> Result<State, EventLogError> {
     let privacy = fold::privacy_token(root)?;
+    let publication = fold::publication_token(root)?;
     let started = fold::now_ns();
     let before = fold::stamps(root);
     // A kept state stands for a fold through exactly these projectors only when each vouches for
@@ -773,10 +927,12 @@ async fn build(
         && let Ok(mut state) = from_kept(root, image, &kept, &inline, &catch_up).await
     {
         state.privacy = privacy;
+        state.publication = publication;
         return Ok(state);
     }
     let mut state = replay_all(root, inline, catch_up, served.as_ref()).await?;
     state.privacy = privacy;
+    state.publication = publication;
     if let (Some(before), Some(key)) = (before, key)
         && fold::settled(&before, started)
         && let Ok(image) = state.engine.image().await
@@ -897,6 +1053,7 @@ async fn from_kept(
         poisoned: false,
         replayed: false,
         privacy: None,
+        publication: None,
         unsettled: false,
     })
 }
@@ -1036,6 +1193,7 @@ async fn replay_all(
         poisoned: false,
         replayed: true,
         privacy: None,
+        publication: None,
         unsettled: false,
     })
 }
@@ -1315,7 +1473,7 @@ impl EventStore for TreeEventStore {
                 return Err(EventLogError::Closed);
             }
             let _lock = self.writer_lock().await?;
-            refresh(&self.root, &mut state).await?;
+            refresh(&self.root, &mut state, Listing::Always).await?;
             state.unsettled = true;
             let removed = async {
                 let mut redacted = state.engine.redact(stream, version, reason).await?;
@@ -1402,7 +1560,7 @@ impl EventStore for TreeEventStore {
             // Another writer's groups for other tenants are taken in first: the erasure below
             // drops only this tenant's from the groups this state has loaded, so a group it never
             // loaded can never count as loaded.
-            refresh(&self.root, &mut state).await?;
+            refresh(&self.root, &mut state, Listing::Always).await?;
             state.unsettled = true;
             let removed = async {
                 state.engine.forget_tenant(tenant).await?;
@@ -1707,7 +1865,7 @@ impl EventStore for TreeEventStore {
             // bytes no writer ever spelled: refuse it before anything is resolved or removed.
             eventlog_core::validate_field("digest", digest)?;
             let _lock = self.writer_lock().await?;
-            refresh(&self.root, &mut state).await?;
+            refresh(&self.root, &mut state, Listing::Always).await?;
             // A split blob takes with it every text no other blob of the tenant names, so a
             // deleted blob's content is gone from the tree and not only its manifest. Every
             // manifest is read before anything is removed: a fault refuses the whole deletion.

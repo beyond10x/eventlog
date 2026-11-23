@@ -12,7 +12,7 @@
 //! redaction replaces `data` and would take the origin with it.
 
 use crate::history::{self, Loaded};
-use crate::{TreeEventStore, refresh, replay, replayable_reason};
+use crate::{Listing, TreeEventStore, refresh, replay, replayable_reason};
 use eventlog_core::{EventLogError, EventStore, MAX_READ_LIMIT, StreamId, TenantId};
 use eventlog_sqlite::SqliteEventStore;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,7 +56,7 @@ pub async fn copy(
         return Err(EventLogError::Closed);
     }
     let _lock = from.writer_lock().await?;
-    refresh(&from.root, &mut state).await?;
+    refresh(&from.root, &mut state, Listing::Always).await?;
     let loaded = history::load(&from.root)?;
     let versions = served_versions(&state.engine, &loaded).await?;
     drop(state);
