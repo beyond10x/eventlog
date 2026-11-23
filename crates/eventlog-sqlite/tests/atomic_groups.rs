@@ -139,3 +139,94 @@ async fn concurrent_groups_preserve_order_without_partial_commits() {
         assert_eq!(events.last().unwrap().version, 8);
     }
 }
+
+/// One observation: a batch read never shows one member of a group another handle committed
+/// without the other, because the batch holds one read transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_many_never_shows_half_a_group_committed_by_another_handle() {
+    use eventlog_core::{
+        AppendGroup, AtomicEventStore, EventStore, Expected, Read, ReadResult, StreamAppend,
+        StreamId, TenantId,
+    };
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.sqlite");
+    let path = path.to_str().unwrap();
+    let writer_store = Arc::new(SqliteEventStore::open(path, "snapshot").await.unwrap());
+    let reader = SqliteEventStore::open(path, "snapshot").await.unwrap();
+    let tenant = TenantId::new("snapshot-tenant").unwrap();
+    let left = StreamId::new(tenant.clone(), "item", "left").unwrap();
+    let right = StreamId::new(tenant.clone(), "item", "right").unwrap();
+    writer_store
+        .put_blob(&tenant, "fixture", b"content")
+        .await
+        .unwrap();
+    let rounds = 80;
+    let writer = {
+        let (store, tenant, left, right) = (
+            Arc::clone(&writer_store),
+            tenant.clone(),
+            left.clone(),
+            right.clone(),
+        );
+        tokio::spawn(async move {
+            for n in 0..rounds {
+                let entry = |stream: &StreamId| StreamAppend {
+                    stream: stream.clone(),
+                    expected: Expected::Exact(n),
+                    events: vec![eventlog_conformance::event("item.changed", 1)],
+                };
+                store
+                    .append_group(&AppendGroup {
+                        tenant: tenant.clone(),
+                        appends: vec![entry(&left), entry(&right)],
+                        meta: eventlog_conformance::meta(
+                            &format!("pair-{n}"),
+                            &serde_json::json!({ "n": n }),
+                        ),
+                    })
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let reads = [
+        Read::Stream {
+            stream: left.clone(),
+            after_version: 0,
+            limit: 1_000,
+        },
+        Read::Blob {
+            tenant: tenant.clone(),
+            digest: "fixture".into(),
+        },
+        Read::Stream {
+            stream: right.clone(),
+            after_version: 0,
+            limit: 1_000,
+        },
+    ];
+    let mut observed = 0;
+    while !writer.is_finished() {
+        let batch = reader.read_many(&reads).await.unwrap();
+        let lengths: Vec<usize> = batch
+            .iter()
+            .filter_map(|answer| match answer {
+                ReadResult::Stream(slice) => Some(slice.events.len()),
+                ReadResult::Blob(bytes) => {
+                    assert_eq!(bytes.as_deref(), Some(&b"content"[..]));
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(lengths[0], lengths[1], "half a group visible: {lengths:?}");
+        observed += 1;
+    }
+    writer.await.unwrap();
+    assert!(observed > 0);
+    let last = reader.read_many(&reads).await.unwrap();
+    assert_eq!(
+        last[0],
+        ReadResult::Stream(reader.read_stream(&left, 0, 1_000).await.unwrap())
+    );
+}

@@ -4,12 +4,15 @@ use crate::layout::{
     EVENT_FORMAT, GROUP_FORMAT, backend, canonical, corrupt, group_path, json_files, sha256_hex,
     subdirectories,
 };
-use eventlog_core::{CommandMeta, EventLogError, Expected, NewEvent, StreamId, TenantId};
+use eventlog_core::{
+    CommandMeta, EventLogError, Expected, NewEvent, StreamId, TenantId, redaction_tombstone,
+};
 use serde_json::{Map, Value, json};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -116,16 +119,33 @@ impl GroupRecord {
     /// The group file's name: a digest of where its receipt lives, so one command identity has
     /// exactly one file and two different ones never share it.
     pub fn key_digest(&self) -> String {
-        let scope = match self.kind {
-            Kind::Append => {
-                let member = &self.members[0];
-                json!(["append", self.tenant, member.stream_type, member.stream_id])
-            }
-            Kind::Group => json!(["group", self.tenant]),
-        };
-        sha256_hex(&canonical(&json!([scope, self.meta.idempotency_key])))
+        let stream = self
+            .members
+            .first()
+            .map(|member| (member.stream_type.as_str(), member.stream_id.as_str()));
+        receipt_digest(self.kind, &self.tenant, stream, &self.meta.idempotency_key)
     }
+}
 
+/// The name of the group file that holds the receipt of a command under `idempotency_key`: an
+/// append's receipt is its stream's (`stream` is its type and id), a group's is its tenant's.
+pub(crate) fn receipt_digest(
+    kind: Kind,
+    tenant: &str,
+    stream: Option<(&str, &str)>,
+    idempotency_key: &str,
+) -> String {
+    let scope = match (kind, stream) {
+        (Kind::Append, Some((stream_type, stream_id))) => {
+            json!(["append", tenant, stream_type, stream_id])
+        }
+        (Kind::Append, None) => json!(["append", tenant]),
+        (Kind::Group, _) => json!(["group", tenant]),
+    };
+    sha256_hex(&canonical(&json!([scope, idempotency_key])))
+}
+
+impl GroupRecord {
     pub fn to_value(&self) -> Result<Value, EventLogError> {
         let meta = &self.meta;
         Ok(json!({
@@ -277,17 +297,28 @@ impl EventRecord {
 
     /// The digest that names the file and that children name as their parent.
     pub fn digest(&self) -> Result<String, EventLogError> {
+        #[cfg(feature = "kpi-counters")]
+        crate::kpi::event_digest();
+        #[cfg(test)]
+        DIGESTS.with(|count| count.set(count.get() + 1));
         Ok(sha256_hex(&canonical(&self.envelope()?)))
     }
 
     pub fn to_value(&self) -> Result<Value, EventLogError> {
+        self.to_value_named(&self.digest()?)
+    }
+
+    /// [`EventRecord::to_value`] for a writer that has just computed this record's `digest` and
+    /// carries it, rather than canonicalizing and hashing the same envelope again. A reader never
+    /// takes this path: [`EventRecord::from_value`] verifies every file it reads.
+    pub fn to_value_named(&self, digest: &str) -> Result<Value, EventLogError> {
         let mut value = self.envelope()?;
         let map = value.as_object_mut().expect("an envelope is an object");
         map.insert("data".into(), self.data.clone());
         if let Some(reason) = &self.redacted {
             map.insert("redacted".into(), json!({ "reason": reason }));
         }
-        map.insert("digest".into(), Value::String(self.digest()?));
+        map.insert("digest".into(), Value::String(digest.to_owned()));
         Ok(value)
     }
 
@@ -345,6 +376,13 @@ impl EventRecord {
             data: field(map, "data")?.clone(),
             redacted,
         };
+        // A redacted record keeps exactly the tombstone of its reason: any other body would be
+        // content the redaction was meant to remove, and the digest does not cover it.
+        if let Some(reason) = &record.redacted
+            && record.data != redaction_tombstone(reason)
+        {
+            return Err(corrupt("a redacted event whose body is not its tombstone"));
+        }
         let stated = text(field(map, "digest")?, "event digest")?.to_owned();
         Ok((record, stated))
     }
@@ -369,7 +407,7 @@ pub(crate) struct Committed {
     /// One list per member, in the member's order.
     pub events: Vec<Vec<EventRecord>>,
     /// The bytes of each blob the group committed that is still present.
-    pub blobs: Vec<(String, Vec<u8>)>,
+    pub blobs: Vec<(String, Arc<[u8]>)>,
 }
 
 /// One tenant's history as the tree holds it.
@@ -378,7 +416,7 @@ pub(crate) struct TenantHistory {
     pub identity: Option<String>,
     pub groups: Vec<Committed>,
     /// Every blob file, whether a group bound it or `put_blob` stored it alone.
-    pub blobs: Vec<(String, Vec<u8>)>,
+    pub blobs: Vec<(String, Arc<[u8]>)>,
 }
 
 /// What an open found.
@@ -413,6 +451,8 @@ pub(crate) fn group_files(root: &Path) -> Result<BTreeSet<PathBuf>, EventLogErro
             found.extend(json_files(&shard)?);
         }
     }
+    #[cfg(feature = "kpi-counters")]
+    crate::kpi::group_files_listed(found.len());
     Ok(found)
 }
 
@@ -450,7 +490,13 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
             ));
         }
         // Every blob, in whichever form it is held.
-        let tenant_blobs = crate::split::tenant_blobs(root, &segment_name)?;
+        // Shared, never copied: every group that names a blob holds the same bytes as the tenant,
+        // so a blob a hundred groups name is held once, not a hundred and one times.
+        let tenant_blobs: BTreeMap<String, Arc<[u8]>> =
+            crate::split::tenant_blobs(root, &segment_name)?
+                .into_iter()
+                .map(|(digest, bytes)| (digest, Arc::from(bytes)))
+                .collect();
         let identity_file = tenant_directory.join("identity.json");
         if identity_file.exists() {
             let value = read_json(&identity_file)?;
@@ -535,9 +581,9 @@ pub(crate) fn load(root: &Path) -> Result<Loaded, EventLogError> {
             let mut blobs = Vec::new();
             for digest in &record.blobs {
                 let held = if record.tenant == segment_name {
-                    tenant_blobs.get(digest).cloned()
+                    tenant_blobs.get(digest).map(Arc::clone)
                 } else {
-                    crate::split::read_blob(root, &record.tenant, digest)?
+                    crate::split::read_blob(root, &record.tenant, digest)?.map(Arc::from)
                 };
                 if let Some(bytes) = held {
                     blobs.push((digest.clone(), bytes));
@@ -683,6 +729,12 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How many times [`EventRecord::digest`] ran on this thread.
+    static DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn between_passes() {
     if let Some(hook) = BETWEEN_PASSES.with(|hook| hook.borrow_mut().take()) {
         hook();
@@ -723,6 +775,33 @@ mod tests {
             root, format, "tenant-a", "item", id,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn an_append_hashes_each_new_event_envelope_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let store = TreeEventStore::open(directory.path()).await.unwrap();
+            let before = super::DIGESTS.with(std::cell::Cell::get);
+            store
+                .append(
+                    &stream("x"),
+                    Expected::NoStream,
+                    &[event("item.received", 1), event("item.indexed", 2)],
+                    &meta("x", &json!({})),
+                )
+                .await
+                .unwrap();
+            let hashed = super::DIGESTS.with(std::cell::Cell::get) - before;
+            assert_eq!(
+                hashed, 2,
+                "an append of two events canonicalized and hashed their envelopes {hashed} times"
+            );
+        });
     }
 
     #[test]
@@ -776,6 +855,74 @@ mod tests {
             .map(|tenant| tenant.groups.len())
             .sum();
         assert_eq!(groups, 2);
+    }
+
+    /// The bytes of blobs a load holds, counting each allocation once however many groups share it.
+    fn retained_blob_bytes(loaded: &super::Loaded) -> usize {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0;
+        for tenant in loaded.tenants.values() {
+            let all = tenant
+                .blobs
+                .iter()
+                .chain(tenant.groups.iter().flat_map(|group| group.blobs.iter()));
+            for (_, bytes) in all {
+                if seen.insert(bytes.as_ptr() as usize) {
+                    total += bytes.len();
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn a_blob_many_groups_name_is_held_once_by_a_load() {
+        const GROUPS: usize = 20;
+        const SIZE: usize = 64 * 1024;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let bytes = vec![7_u8; SIZE];
+        runtime.block_on(async {
+            let store = TreeEventStore::open_in(&root, TreeLayout::Hashed)
+                .await
+                .unwrap();
+            for index in 0..GROUPS {
+                let id = format!("x{index}");
+                let group = eventlog_core::AppendGroup {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    appends: vec![eventlog_core::StreamAppend {
+                        stream: stream(&id),
+                        expected: Expected::NoStream,
+                        events: vec![event("item.received", 1)],
+                    }],
+                    meta: meta(&id, &json!({})),
+                };
+                eventlog_core::AtomicEventStore::append_group_guarded_with_blobs(
+                    &store,
+                    &group,
+                    Arc::new(eventlog_core::NoGuard),
+                    &[("blob-1".to_owned(), bytes.clone())],
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let loaded = load(&root).unwrap();
+
+        let tenant = &loaded.tenants["tenant-a"];
+        let binding = tenant
+            .groups
+            .iter()
+            .filter(|group| group.blobs.iter().any(|(_, held)| **held == *bytes))
+            .count();
+        assert_eq!(binding, GROUPS, "every group keeps its binding to the blob");
+        assert_eq!(
+            retained_blob_bytes(&loaded),
+            SIZE,
+            "the load held the blob more than once ({GROUPS} groups name it)"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ members = [
     "crates/eventlog-conformance",
     "crates/eventlog-file",
     "crates/eventlog-tree",
+    "crates/eventlog-kpi",
 ]
 resolver = "3"
 # `ess generate types` writes the capture crate with its own `[workspace]` table, so it is a path
@@ -18,7 +19,7 @@ license = "Apache-2.0"
 repository = "https://github.com/beyond10x/eventlog"
 homepage = "https://github.com/beyond10x/eventlog"
 rust-version = "1.91"
-version = "0.9.4"
+version = "0.10.0"
 publish = false
 
 [workspace.dependencies]

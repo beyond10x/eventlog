@@ -92,8 +92,9 @@ bash scripts/gate.sh
 
 The compatibility shell entry point delegates argument parsing and selection to the Rust `gate`
 example. In order: `cargo test --workspace --locked`, `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --locked -- -D warnings`.
-Green here is the bar for `main`.
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and the same clippy for
+`eventlog-kpi --features counters`, which compiles the providers' KPI counters.
+Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate).
 
 The required shared Gates check covers common security/privacy rules. Install coordinated local
 hooks with `b10x-gates --repository beyond10x/eventlog install`; they inspect the index, messages
@@ -121,6 +122,42 @@ pipeline's (`gate.sh 2>&1 | tail` reports `tail`'s status, not the gate's).
 Gates enforces forbidden identifiers through a private policy overlay. Exceptions require an exact
 rule, bounded location and content digest in trusted policy. Candidate ignore files and inline
 suppression comments cannot disable organization rules.
+
+## The KPI gate
+
+What the kit costs is part of what must not break. `kpi/kpis.json` defines every KPI (id, what it
+measures, unit, direction, fixture, tolerance) and `kpi/baseline.json` holds the recorded numbers.
+The runner is `crates/eventlog-kpi` (`publish = false`).
+
+- **Counters** are deterministic work counts on small fixtures: bytes read and written
+  (`/proc/self/io`), SQLite VM steps, fold calls, feed map visits, blob-directory entries, Tree
+  group files and digests, snapshot-generation rows, allocation bytes, PostgreSQL round trips
+  (a counting proxy), write transactions (transaction ids) and buffers (`EXPLAIN ANALYZE`).
+  `bash scripts/gate.sh --kpi` compares each with the baseline and fails on a regression beyond
+  its tolerance. This is the gate.
+- **Timings** (latency p50/p95, batch throughput) are never compared with a number from another
+  machine. `eventlog-kpi ab --base <rev> --head <rev>` builds both revisions with the current
+  runner, runs them interleaved for several rounds on the same machine and fails when a median
+  is worse than `ab.max_ratio`. The baseline's timings are the recording machine's, for reading.
+- Counters inside a provider (`eventlog-file`, `eventlog-sqlite`, `eventlog-tree`, module `kpi`)
+  compile only with their non-default `kpi-counters` feature, enabled by the runner's `counters`
+  feature; no product build carries them. A change that rewrites a counted path keeps its
+  counter call in the rewritten code. The PostgreSQL `EXPLAIN` KPIs run a copy of the library's
+  feed and capture-preflight statements (`crates/eventlog-kpi/src/counter.rs`); a change to
+  either statement changes the copy in the same commit.
+- Allocation counts use `stats_alloc` (the workspace forbids the `unsafe` a counting allocator
+  needs), linked only with `counters`.
+- PostgreSQL KPIs run only with `EVENTLOG_TEST_POSTGRES_URL` set and say so when skipped.
+- An improvement beyond tolerance is reported, not ratcheted. Re-record in the same change, on a
+  quiet machine with a disposable PostgreSQL:
+  `cargo run --release --locked -p eventlog-kpi --features counters -- record`. Never edit the
+  baseline by hand and never re-record to absorb a regression.
+- CI: `.github/workflows/kpi.yml` has two jobs. `KPI / KPI counters` runs the counters with a
+  PostgreSQL service on every pull request and push to `main`; it is the one meant to become a
+  required check. `KPI / KPI timing` runs the A/B against the base on a pull request; it is
+  informational (`continue-on-error`) and never a required check. In both, a change of only
+  `.engineering/` or Markdown skips the measuring step and the job passes
+  (`eventlog-kpi ci-scope`).
 
 ## Releases
 
@@ -183,7 +220,10 @@ Keep internal plans, stories, ADRs, decisions, worklogs, security material, and 
 Hosted traffic uses verified TLS, explicit migration/application roles and a declared replica plus
 reserve connection budget. The supported application role is dedicated, has no memberships or
 DDL ownership/creation powers, and has a finite server connection limit within its pool share.
-Schema and projection admission compares actual physical shape and the persisted migration roster.
+It reads and never writes the migration metadata (`schema_version`, `projection_registry`,
+`settlement_floor`): erasure deletes a tenant from every registered projection, so a role that
+could edit the roster could make erasure skip a table, and a role that could raise the floor could
+let a feed cursor pass an append still in flight. Schema and projection admission compares actual physical shape and the persisted migration roster.
 Never broaden that profile silently or treat a checksum alone as schema compatibility.
 
 Registration freezes before traffic. A cancelled/unsettled connection stays quarantined until its
@@ -199,12 +239,28 @@ The committed-XID predicate alone is not a position-contiguity proof: a guard ca
 XID before another append obtains a lower sequence position. The PostgreSQL publication gate
 therefore precedes every other owner lock. Append and redaction share it through commit; tenant
 erasure takes it exclusively to prevent snapshot-generation capture from surviving erasure.
+After it an append takes its claim or group lock, then its stream locks, then every attached inline
+projector's owner/projector/tenant lock ordered by name, all before the guard; admission and
+projection-row locks come later. The projector locks hold to commit so one projection is never
+folded concurrently, across handles too. Keep that order and the two-writer deadlock regression.
 Feed, catch-up and rebuild take it exclusively before a fresh READ COMMITTED query. Preserve the original watermark
 predicate and stop before its first withheld global position in that same statement snapshot:
 unrelated transactions can hold xmin between already committed owner XIDs. A rowwise filter can
 otherwise leave a hole even while no owner writer is active. Keep both reversed-XID/position
 regressions, including the unrelated-xmin case, plus the original late-commit
-mutation case. Sequence CACHE 1 and deterministic column collations are admission requirements.
+mutation case.
+
+A logical restore copies each event's `committed_xid` from the source cluster's clock, and the
+watermark would withhold the restored history and every later event of the owner until this
+cluster's clock passed it. Timo, 2026-11-23 03:56 CET: L61 = A (settlement floor). Positions at or
+below the highest `<prefix>_settlement_floor.settled_through` count as settled; the watermark and
+the first withheld position apply above it, in the same statement snapshot. Only `migrate` writes
+the floor: after its schema transaction commits it looks for a visible event above the floor whose
+`committed_xid` is at or past this snapshot's xmax (no native row can be) and, if one exists,
+records `MAX(global_seq)` under the exclusive publication gate. Hosted `open` refuses an owner with
+such a row, and the floor is migration metadata the application role may only read. The restore
+procedure is "restore, then run migrate". Never rewrite `committed_xid` to settle a restore: the
+only UPDATE on events is redaction. Sequence CACHE 1 and deterministic column collations are admission requirements.
 Mixed protocol generations require a fenced cutover; retaining physical old-reader formats does
 not authorize concurrent old writer/feed binaries.
 

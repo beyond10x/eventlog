@@ -7,13 +7,46 @@
 use crate::PostgresEventStore;
 use eventlog_core::{
     AppendGroup, AtomicBlobEventStore as _, AtomicEventStore as _, BlobAppendGroup, BlobWrite,
-    BoxFuture, EventLogError, EventStore as _, Expected, Guard, NoGuard, ProjectionStore,
-    StreamAppend, StreamId, TenantId,
+    BoxFuture, EventLogError, EventStore as _, Expected, Guard, NoGuard, ProjectionStore, Read,
+    ReadResult, StreamAppend, StreamId, TenantId,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 const READS: usize = 20;
+
+/// Reads of one store prefix to hold between their fetch and their check: (prefix, reached,
+/// resume). Keyed by prefix so concurrent cases in this process never pause each other.
+type FetchPause = (String, Arc<Notify>, Arc<Notify>);
+static FETCH_PAUSES: Mutex<Vec<FetchPause>> = Mutex::new(Vec::new());
+
+/// Pause the next blob read of `prefix` after its rows are fetched and before they are checked.
+fn pause_after_blob_fetch(prefix: &str) -> (Arc<Notify>, Arc<Notify>) {
+    let reached = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    FETCH_PAUSES.lock().unwrap().push((
+        prefix.to_owned(),
+        Arc::clone(&reached),
+        Arc::clone(&resume),
+    ));
+    (reached, resume)
+}
+
+/// Called by the blob read paths between their fetch and their check.
+pub(crate) async fn after_blob_fetch(prefix: &str) {
+    let pause = {
+        let mut pauses = FETCH_PAUSES.lock().unwrap();
+        pauses
+            .iter()
+            .position(|(paused, _, _)| paused == prefix)
+            .map(|index| pauses.remove(index))
+    };
+    if let Some((_, reached, resume)) = pause {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
 
 fn url() -> String {
     std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned real PostgreSQL URL")
@@ -225,6 +258,131 @@ async fn deletion_erasure_and_a_failed_binding_drop_remembered_content() {
     store.forget_tenant(&tenant()).await.unwrap();
     assert_eq!(store.verified.held(), 0, "erasure");
     store.drop_tables().await.unwrap();
+}
+
+/// A blob group reads stored bytes back only for a digest that was already bound: a row its own
+/// insert wrote holds the bytes it was given, and the integrity hash it wrote is the one the
+/// request's fingerprint was built from, which a fresh handle's full check accepts.
+#[tokio::test]
+async fn a_blob_group_reads_back_only_digests_that_were_already_bound() {
+    let prefix = prefix("readback");
+    let store = PostgresEventStore::connect(&url(), &prefix).await.unwrap();
+    store.drop_tables().await.unwrap();
+    let store = PostgresEventStore::connect(&url(), &prefix).await.unwrap();
+    let blob = |digest: &str, bytes: &[u8]| BlobWrite {
+        digest: digest.into(),
+        bytes: bytes.to_vec(),
+    };
+    let read_backs = || {
+        store
+            .blob_read_backs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    store
+        .append_group_with_blobs(&BlobAppendGroup {
+            group: group("fresh", "fresh"),
+            blobs: vec![
+                blob("z", b"last"),
+                blob("a", b"first"),
+                blob("m", b"middle"),
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(read_backs(), 0, "three digests this group bound itself");
+
+    store
+        .append_group_with_blobs(&BlobAppendGroup {
+            group: group("reuses", "reuses"),
+            blobs: vec![blob("m", b"middle"), blob("n", b"new")],
+        })
+        .await
+        .unwrap();
+    assert_eq!(read_backs(), 1, "only the digest an earlier group bound");
+
+    let refused = store
+        .append_group_with_blobs(&BlobAppendGroup {
+            group: group("differs", "differs"),
+            blobs: vec![blob("a", b"other bytes")],
+        })
+        .await
+        .expect_err("a bound digest naming other content");
+    assert_eq!(
+        refused,
+        EventLogError::Invalid("blob digest already names different content".into())
+    );
+
+    let fresh = PostgresEventStore::connect(&url(), &prefix).await.unwrap();
+    for (digest, bytes) in [("a", &b"first"[..]), ("m", b"middle"), ("n", b"new")] {
+        assert_eq!(
+            fresh.get_blob(&tenant(), digest).await.unwrap().as_deref(),
+            Some(bytes),
+            "{digest}: stored bytes and integrity hash pass a full check"
+        );
+    }
+    assert_eq!(fresh.verified.hashed(), 3, "each read was a full check");
+    fresh.shutdown().await.unwrap();
+    store.drop_tables().await.unwrap();
+}
+
+/// Which read path a race case drives.
+#[derive(Clone, Copy)]
+enum BlobRead {
+    Batch,
+    Single,
+}
+
+/// Fetch `d`, let a same-handle deletion settle completely before the fetched row is checked,
+/// then finish the read: it answers with the bytes it fetched and remembers none of them.
+async fn deletion_between_fetch_and_check_leaves_nothing_remembered(path: BlobRead) {
+    let prefix = prefix(match path {
+        BlobRead::Batch => "racebatch",
+        BlobRead::Single => "racesingle",
+    });
+    let store = Arc::new(fresh_handle(&prefix).await);
+    let (reached, resume) = pause_after_blob_fetch(&prefix);
+    let reader = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            match path {
+                BlobRead::Batch => store
+                    .read_many(&[Read::Blob {
+                        tenant: tenant(),
+                        digest: "d".into(),
+                    }])
+                    .await
+                    .map(|mut answers| match answers.pop() {
+                        Some(ReadResult::Blob(bytes)) => bytes,
+                        other => panic!("one blob answer expected: {other:?}"),
+                    }),
+                BlobRead::Single => store.get_blob(&tenant(), "d").await,
+            }
+        })
+    };
+    reached.notified().await;
+    store.delete_blob(&tenant(), "d").await.unwrap();
+    resume.notify_one();
+    assert_eq!(
+        reader.await.unwrap().unwrap(),
+        Some(content()),
+        "the read answers from the snapshot it fetched"
+    );
+    assert_eq!(
+        (store.verified.held(), store.verified.entries()),
+        (0, 0),
+        "bytes deleted through this handle after the fetch must not be remembered"
+    );
+    store.drop_tables().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_batch_read_racing_a_same_handle_deletion_remembers_no_deleted_bytes() {
+    deletion_between_fetch_and_check_leaves_nothing_remembered(BlobRead::Batch).await;
+}
+
+#[tokio::test]
+async fn a_single_read_racing_a_same_handle_deletion_remembers_no_deleted_bytes() {
+    deletion_between_fetch_and_check_leaves_nothing_remembered(BlobRead::Single).await;
 }
 
 #[cfg(test)]

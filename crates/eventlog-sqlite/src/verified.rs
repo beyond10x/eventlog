@@ -27,7 +27,7 @@
 use eventlog_core::{EventLogError, VerifiedContent};
 use rusqlite::Connection;
 
-/// The most content bytes one handle remembers. Past it the memory is cleared, not grown.
+/// The most content bytes one handle remembers. Past it the least recently used entries go first.
 #[cfg(test)]
 pub(crate) const BUDGET: usize = eventlog_core::VERIFIED_CONTENT_BUDGET;
 

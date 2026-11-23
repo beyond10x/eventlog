@@ -1308,12 +1308,13 @@ mod tests {
         );
     }
 
-    /// A reader's view the writer cannot share is dropped by the next transaction rather than kept
-    /// beside the writer's as a second copy. A privacy rewrite is the case where they cannot: the
-    /// capture's view holds the epoch before it, every frame of which differs from the new one, and
-    /// those are the bytes the rewrite removed.
+    /// A privacy rewrite drops the reader's view it replaces, in the write itself: the capture's
+    /// view holds the epoch before it, every frame of which differs from the new one, and those are
+    /// the bytes the rewrite removed. It used to stay until a later transaction dropped it, so an
+    /// idle handle kept the replaced content in memory. A rewrite that published and then failed
+    /// its snapshot cleanup, an error after publication, drops it too, as does an erasure.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_reader_view_from_before_a_privacy_rewrite_is_dropped_by_the_next_transaction() {
+    async fn a_privacy_rewrite_drops_the_reader_view_it_replaces() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let tenant = TenantId::new("reader-dropped-owner").unwrap();
@@ -1339,20 +1340,62 @@ mod tests {
                 .unwrap();
         }
         store.capture_tenant(&tenant, &[], limits()).await.unwrap();
-        store.redact(&stream, 1, "privacy").await.unwrap();
         assert!(
             store.runtime.lock().await.captured.is_some(),
-            "the control: the rewrite itself leaves the reader's view where it was"
+            "the fixture needs the reader's view"
+        );
+        store.redact(&stream, 1, "privacy").await.unwrap();
+        assert!(
+            store.runtime.lock().await.captured.is_none(),
+            "a reader's view of the epoch before a rewrite outlived the rewrite"
         );
         store.read_stream(&stream, 0, 10).await.unwrap();
-        let runtime = store.runtime.lock().await;
         assert!(
-            runtime.verified.is_some(),
-            "the fixture needs the writer's view"
-        );
-        assert!(
-            runtime.captured.is_none(),
+            store.runtime.lock().await.captured.is_none(),
             "a reader's view of the epoch before a rewrite was kept beside the writer's"
+        );
+
+        // A capture refuses a redacted tenant, so each case below captures a tenant of its own.
+        let fresh = |name: &'static str| {
+            let store = &store;
+            async move {
+                let tenant = TenantId::new(name).unwrap();
+                let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+                store.stream_identity(&tenant).await.unwrap();
+                store
+                    .append(
+                        &stream,
+                        Expected::NoStream,
+                        &[eventlog_conformance::event("item.changed", 1)],
+                        &eventlog_conformance::meta(name, &json!({})),
+                    )
+                    .await
+                    .unwrap();
+                store.capture_tenant(&tenant, &[], limits()).await.unwrap();
+                assert!(store.runtime.lock().await.captured.is_some());
+                (tenant, stream)
+            }
+        };
+
+        let (erased, _) = fresh("reader-dropped-erased").await;
+        store.forget_tenant(&erased).await.unwrap();
+        assert!(
+            store.runtime.lock().await.captured.is_none(),
+            "an erasure kept the reader's view of the erased tenant"
+        );
+
+        // Published, then refused by its snapshot cleanup: the outcome is an error, the old bytes
+        // are gone from the file all the same, and from the handle.
+        let (_, stream) = fresh("reader-dropped-uncertain").await;
+        let blocker = root.join(".cache").join("not-a-snapshot");
+        std::fs::create_dir_all(&blocker).unwrap();
+        store
+            .redact(&stream, 1, "privacy")
+            .await
+            .expect_err("the snapshot cleanup refuses a directory in the cache");
+        assert!(
+            store.runtime.lock().await.captured.is_none(),
+            "a rewrite that failed after publishing kept the reader's view"
         );
     }
 

@@ -5,34 +5,65 @@ use std::process::{Command, ExitCode};
 struct Args {
     #[arg(long)]
     production_proof: bool,
+    /// Run only the KPI lane: every counter against `kpi/baseline.json` (AGENTS.md § The KPI gate).
+    #[arg(long, conflicts_with = "production_proof")]
+    kpi: bool,
 }
 fn main() -> ExitCode {
     let args = Args::parse();
-    let tests = if args.production_proof {
-        vec![
+    let steps = if args.kpi {
+        vec![vec![
             "run",
+            "--release",
             "--locked",
             "-p",
-            "eventlog-postgres",
-            "--example",
-            "production-proof",
-        ]
-    } else {
-        vec!["test", "--workspace", "--locked"]
-    };
-    for arguments in [
-        tests,
-        vec!["fmt", "--all", "--check"],
-        vec![
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--locked",
+            "eventlog-kpi",
+            "--features",
+            "counters",
             "--",
-            "-D",
-            "warnings",
-        ],
-    ] {
+            "check",
+        ]]
+    } else {
+        let tests = if args.production_proof {
+            vec![
+                "run",
+                "--locked",
+                "-p",
+                "eventlog-postgres",
+                "--example",
+                "production-proof",
+            ]
+        } else {
+            vec!["test", "--workspace", "--locked"]
+        };
+        vec![
+            tests,
+            vec!["fmt", "--all", "--check"],
+            vec![
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            // The providers' KPI counters compile only with this feature; lint them too.
+            vec![
+                "clippy",
+                "-p",
+                "eventlog-kpi",
+                "--all-targets",
+                "--locked",
+                "--features",
+                "counters",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ]
+    };
+    for arguments in steps {
         println!("gate: cargo {}", arguments.join(" "));
         match Command::new("cargo").args(arguments).status() {
             Ok(status) if status.success() => {}

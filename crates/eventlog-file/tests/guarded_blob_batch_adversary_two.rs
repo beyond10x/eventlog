@@ -195,3 +195,91 @@ async fn file_atomic_receipt_survives_reopen_and_a_torn_tail_after_it_refuses() 
         );
     }
 }
+
+/// Reserves one unit of a tenant counter under a ceiling of two and keeps what each call saw.
+struct Quota {
+    permit: eventlog_core::AdmissionPermit,
+    seen: Arc<std::sync::Mutex<Vec<i64>>>,
+}
+
+impl Guard for Quota {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            let values = store
+                .reserve(
+                    &self.permit,
+                    &[eventlog_core::Reservation {
+                        scope: eventlog_core::AdmissionScope::Tenant {
+                            tenant: tenant(),
+                            key: "quota".into(),
+                        },
+                        delta: 1,
+                        ceiling: 2,
+                    }],
+                )
+                .await?;
+            self.seen.lock().unwrap().extend(values);
+            Ok(())
+        })
+    }
+}
+
+/// A deduplicated guarded retry still runs its admission, but answers with the original receipt
+/// and charges nothing: the reservation it staged is rolled back, as SQLite rolls it back. With a
+/// ceiling of two, one commit and one retry leave room for a second commit, in this handle and
+/// after a reopen.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_deduplicated_guarded_retry_charges_no_reservation() {
+    let directory = tempfile::tempdir().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let store = FileEventStore::open(directory.path()).await.unwrap();
+        let quota = Arc::new(Quota {
+            permit: store.admission_permit(),
+            seen: seen.clone(),
+        });
+        let first = store
+            .append_group_guarded_with_blobs(&group("first"), quota.clone(), &batch(b"one"))
+            .await
+            .unwrap();
+        assert!(!first.deduplicated);
+        let retry = store
+            .append_group_guarded_with_blobs(&group("first"), quota.clone(), &batch(b"one"))
+            .await
+            .unwrap();
+        assert!(retry.deduplicated);
+        assert_eq!(*seen.lock().unwrap(), [1, 2], "the retry ran its admission");
+        let second = store
+            .append_group_guarded_with_blobs(
+                &group("second"),
+                quota,
+                &[("second".to_owned(), b"two".to_vec())],
+            )
+            .await
+            .expect("the retry left the quota where the first commit put it");
+        assert!(!second.deduplicated);
+        assert_eq!(*seen.lock().unwrap(), [1, 2, 2]);
+    }
+    let reopened = FileEventStore::open_existing(directory.path())
+        .await
+        .unwrap();
+    let refused = reopened
+        .append_group_guarded_with_blobs(
+            &group("third"),
+            Arc::new(Quota {
+                permit: reopened.admission_permit(),
+                seen: seen.clone(),
+            }),
+            &[("third".to_owned(), b"three".to_vec())],
+        )
+        .await
+        .expect_err("two commits used the quota; the retry's charge was never journaled");
+    assert!(
+        matches!(&refused, EventLogError::Invalid(reason) if reason.contains("ceiling")),
+        "{refused:?}"
+    );
+    assert_eq!(*seen.lock().unwrap(), [1, 2, 2]);
+}

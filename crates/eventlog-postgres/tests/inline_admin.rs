@@ -1,15 +1,15 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use eventlog_core::{
-    BoxFuture, CaptureError, CaptureLimits, CaptureMaterial, ConsistentTenantCapture,
-    EventLogError, EventStore, Expected, InlineProjectionAdmin, ProjectionStore, Projector,
-    RecordedEvent, StreamId, TenantId,
+    AppendGroup, AtomicEventStore, BoxFuture, CaptureError, CaptureLimits, CaptureMaterial,
+    ConsistentTenantCapture, EventLogError, EventStore, Expected, Guard, InlineProjectionAdmin,
+    ProjectionSpec, ProjectionStore, Projector, RecordedEvent, StreamAppend, StreamId, TenantId,
 };
 use eventlog_postgres::{PoolOptions, PostgresConfig, PostgresEventStore};
 
@@ -327,6 +327,8 @@ async fn restricted_application_role_attaches_existing_shapes_without_ddl() {
         .batch_execute(&format!(
             "GRANT USAGE ON SCHEMA {schema} TO eventlog_test_application; \
              GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA {schema} TO eventlog_test_application; \
+             REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON {schema}.kit_schema_version, {schema}.kit_projection_registry, {schema}.kit_settlement_floor \
+                 FROM eventlog_test_application; \
              GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO eventlog_test_application"
         ))
         .await
@@ -896,4 +898,345 @@ async fn commit_and_unlock_response_loss_are_unknown_and_retire_before_capacity_
         reopened.drop_tables().await.expect("dropped");
         reopened.shutdown().await.expect("closed");
     }
+}
+
+/// One shared summary row, maintained with the ordinary get, compute and upsert.
+const SUMMARY: ProjectionSpec = ProjectionSpec {
+    name: "serial_summary",
+    indexed: &[],
+};
+
+/// Counts every event into one row, and can hold its first call between the read and the write.
+struct SummaryProjector {
+    hold_first: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    in_flight: AtomicUsize,
+    overlapped: AtomicBool,
+}
+
+impl SummaryProjector {
+    fn new(hold_first: bool) -> Self {
+        Self {
+            hold_first: AtomicBool::new(hold_first),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            in_flight: AtomicUsize::new(0),
+            overlapped: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Projector for SummaryProjector {
+    fn name(&self) -> &'static str {
+        "serial_summary"
+    }
+
+    fn projections(&self) -> &'static [ProjectionSpec] {
+        std::slice::from_ref(&SUMMARY)
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a RecordedEvent,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if self.in_flight.fetch_add(1, Ordering::AcqRel) > 0 {
+                self.overlapped.store(true, Ordering::Release);
+            }
+            let counted = store
+                .get(&SUMMARY, &event.tenant, "total")
+                .await?
+                .and_then(|row| row["count"].as_u64())
+                .unwrap_or(0);
+            if self.hold_first.swap(false, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let written = store
+                .upsert(
+                    &SUMMARY,
+                    &event.tenant,
+                    "total",
+                    &serde_json::json!({ "count": counted + 1 }),
+                )
+                .await;
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            written
+        })
+    }
+}
+
+/// A guard that locks the summary row before the append's projector writes it.
+struct LocksSummary(TenantId);
+
+impl Guard for LocksSummary {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn ProjectionStore,
+    ) -> BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            store.get_for_update(&SUMMARY, &self.0, "total").await?;
+            Ok(())
+        })
+    }
+}
+
+/// Two handles of one owner, each driving the same summary projector inline.
+async fn two_handles(
+    prefix: &str,
+    projector: &Arc<SummaryProjector>,
+) -> (Arc<PostgresEventStore>, Arc<PostgresEventStore>) {
+    let first = PostgresEventStore::connect(&url(), prefix)
+        .await
+        .expect("first handle");
+    first
+        .create_projections(projector.clone())
+        .await
+        .expect("summary table");
+    first
+        .attach_inline_existing(projector.clone())
+        .await
+        .expect("first attached");
+    let second = PostgresEventStore::connect(&url(), prefix)
+        .await
+        .expect("second handle");
+    second
+        .attach_inline_existing(projector.clone())
+        .await
+        .expect("second attached");
+    (Arc::new(first), Arc::new(second))
+}
+
+fn one_event_group(tenant: &TenantId, key: &str, streams: &[&str]) -> AppendGroup {
+    AppendGroup {
+        tenant: tenant.clone(),
+        meta: eventlog_conformance::meta(key, &serde_json::json!({})),
+        appends: streams
+            .iter()
+            .map(|id| StreamAppend {
+                stream: StreamId::new(tenant.clone(), "item", *id).expect("stream"),
+                expected: Expected::Any,
+                events: vec![eventlog_conformance::event("item.recorded", 1)],
+            })
+            .collect(),
+    }
+}
+
+async fn summary_count(store: &PostgresEventStore, tenant: &TenantId) -> u64 {
+    store
+        .projection_get(&SUMMARY, tenant, "total")
+        .await
+        .expect("summary read")
+        .and_then(|row| row["count"].as_u64())
+        .unwrap_or(0)
+}
+
+/// An append to one stream holds the inline projector between its read and its write; an append
+/// group to two other streams through a second handle must wait for it to commit instead of
+/// folding the same projection beside it and losing the first write's update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_projector_is_serialized_across_handles_for_distinct_streams() {
+    let prefix = prefix();
+    let tenant = TenantId::new("serial-summary").expect("tenant");
+    let projector = Arc::new(SummaryProjector::new(true));
+    let (first, second) = two_handles(&prefix, &projector).await;
+
+    let single = {
+        let first = Arc::clone(&first);
+        let tenant = tenant.clone();
+        tokio::spawn(async move {
+            first
+                .append(
+                    &StreamId::new(tenant, "item", "one").expect("stream"),
+                    Expected::NoStream,
+                    &[eventlog_conformance::event("item.recorded", 1)],
+                    &eventlog_conformance::meta("single", &serde_json::json!({})),
+                )
+                .await
+        })
+    };
+    projector.entered.notified().await;
+    let mut group = {
+        let second = Arc::clone(&second);
+        let group = one_event_group(&tenant, "group", &["two", "three"]);
+        tokio::spawn(async move { second.append_group(&group).await })
+    };
+    let early = tokio::time::timeout(Duration::from_millis(750), &mut group).await;
+    let finished_beside = early.is_ok();
+    projector.release.notify_one();
+    single.await.expect("single task").expect("single append");
+    match early {
+        Ok(joined) => joined,
+        Err(_) => group.await,
+    }
+    .expect("group task")
+    .expect("group append");
+
+    assert!(
+        !finished_beside,
+        "the group committed while another append held the projector"
+    );
+    assert!(
+        !projector.overlapped.load(Ordering::Acquire),
+        "the projector was called twice concurrently"
+    );
+    assert_eq!(
+        summary_count(&first, &tenant).await,
+        3,
+        "every event of both appends is counted once"
+    );
+    first.drop_tables().await.expect("dropped");
+    first.shutdown().await.expect("first closed");
+    second.shutdown().await.expect("second closed");
+}
+
+/// Many writers on two handles, singles and groups to distinct streams, each guard locking the
+/// summary row its projector then writes: none deadlocks, none loses an update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serialized_inline_projectors_do_not_deadlock_with_guard_row_locks() {
+    let prefix = prefix();
+    let tenant = TenantId::new("serial-guarded").expect("tenant");
+    let projector = Arc::new(SummaryProjector::new(false));
+    let (first, second) = two_handles(&prefix, &projector).await;
+    let guard: Arc<dyn Guard> = Arc::new(LocksSummary(tenant.clone()));
+
+    let mut writers = Vec::new();
+    // Four writers per handle: each holds one of its pool's four connections while it waits.
+    for writer in 0..8_usize {
+        let store = Arc::clone(if writer % 2 == 0 { &first } else { &second });
+        let tenant = tenant.clone();
+        let guard = Arc::clone(&guard);
+        writers.push(tokio::spawn(async move {
+            if writer % 3 == 0 {
+                let key = format!("group-{writer}");
+                let left = format!("left-{writer}");
+                let right = format!("right-{writer}");
+                let group = one_event_group(&tenant, &key, &[&left, &right]);
+                store
+                    .append_group_guarded(&group, guard)
+                    .await
+                    .map(|_| 2_u64)
+            } else {
+                store
+                    .append_guarded(
+                        &StreamId::new(tenant, "item", format!("single-{writer}")).expect("stream"),
+                        Expected::NoStream,
+                        &[eventlog_conformance::event("item.recorded", 1)],
+                        &eventlog_conformance::meta(
+                            &format!("single-{writer}"),
+                            &serde_json::json!({}),
+                        ),
+                        guard,
+                    )
+                    .await
+                    .map(|_| 1_u64)
+            }
+        }));
+    }
+    let mut events = 0;
+    let all = tokio::time::timeout(Duration::from_secs(20), async {
+        for writer in writers {
+            events += writer
+                .await
+                .expect("writer task")
+                .expect("no writer is refused or deadlocked");
+        }
+    })
+    .await;
+    assert!(all.is_ok(), "the writers did not finish within 20 s");
+    assert_eq!(summary_count(&first, &tenant).await, events);
+    assert_eq!(
+        events,
+        3 * 2 + 5,
+        "three groups of two events and five single appends"
+    );
+    first.drop_tables().await.expect("dropped");
+    first.shutdown().await.expect("first closed");
+    second.shutdown().await.expect("second closed");
+}
+
+fn invalid_reason(outcome: Result<impl std::fmt::Debug, EventLogError>) -> String {
+    match outcome {
+        Err(EventLogError::Invalid(reason)) => reason,
+        other => panic!("expected an Invalid refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catch_up_refuses_a_projector_registered_inline_after_its_runner() {
+    let prefix = prefix();
+    let store = Arc::new(
+        PostgresEventStore::connect(&url(), &prefix)
+            .await
+            .expect("store"),
+    );
+    let tenant = TenantId::new("drive-once-inline-late").expect("tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "one").expect("stream");
+    let shared: Arc<dyn EventStore> = store.clone();
+    eventlog_core::CatchUpRunner::new(shared, Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("runner");
+    store
+        .register_inline(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("inline registration before catch-up ran");
+    let body = serde_json::json!({"value": 1});
+    store
+        .append(
+            &stream,
+            Expected::Any,
+            &[eventlog_core::NewEvent::new("item.received", 1, body.clone()).expect("event")],
+            &eventlog_conformance::meta("command-a", &body),
+        )
+        .await
+        .expect("append");
+
+    let reason = invalid_reason(
+        store
+            .run_catch_up(Arc::new(eventlog_conformance::Tally), &tenant, 10)
+            .await,
+    );
+    assert_eq!(reason, "projection tally is already driven inline");
+    let count = store
+        .projection_get(&eventlog_conformance::TALLY, &tenant, "item/one")
+        .await
+        .expect("tally read")
+        .and_then(|row| row["count"].as_u64());
+    assert_eq!(count, Some(1), "event folded twice");
+    store.drop_tables().await.expect("dropped");
+    store.shutdown().await.expect("closed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_registration_refuses_a_projector_catch_up_already_drove() {
+    let prefix = prefix();
+    let store = Arc::new(
+        PostgresEventStore::connect(&url(), &prefix)
+            .await
+            .expect("store"),
+    );
+    let tenant = TenantId::new("drive-once-catch-up-first").expect("tenant");
+    let shared: Arc<dyn EventStore> = store.clone();
+    let runner = eventlog_core::CatchUpRunner::new(shared, Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("runner");
+    runner.drain(&tenant).await.expect("catch-up pass");
+
+    let reason = invalid_reason(
+        store
+            .register_inline(Arc::new(eventlog_conformance::Tally))
+            .await,
+    );
+    assert_eq!(reason, "projection tally is already driven by catch-up");
+    let reason = invalid_reason(
+        store
+            .attach_inline_existing(Arc::new(eventlog_conformance::Tally))
+            .await,
+    );
+    assert_eq!(reason, "projection tally is already driven by catch-up");
+    assert!(!store.is_inline("tally").await);
+    store.drop_tables().await.expect("dropped");
+    store.shutdown().await.expect("closed");
 }

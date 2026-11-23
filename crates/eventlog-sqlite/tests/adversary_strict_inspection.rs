@@ -255,9 +255,15 @@ async fn adversary_sqlite_public_descriptor_bound_keeps_prior_writer_lock() {
     assert_eq!(mode, "registry");
     let directory = tempfile::tempdir().unwrap();
     let tenant = TenantId::new("inspection-tenant").unwrap();
+    // One history, written once and copied: the registry keys a source by device and inode, so
+    // each byte copy is a distinct source, without opening a store and syncing four appends 65
+    // times (37 s of this test before).
+    let originals = tempfile::tempdir().unwrap();
+    let original = originals.path().join("original.sqlite3");
+    fixture(&original).await;
     for index in 0..64 {
         let path = directory.path().join(format!("source-{index}.sqlite3"));
-        fixture(&path).await;
+        fs::copy(&original, &path).unwrap();
         let before = fs::read(&path).unwrap();
         assert_eq!(
             SqliteHistoryInspector::new(&path, "inspection")
@@ -282,7 +288,7 @@ async fn adversary_sqlite_public_descriptor_bound_keeps_prior_writer_lock() {
         3
     );
     let path = directory.path().join("source-65.sqlite3");
-    fixture(&path).await;
+    fs::copy(&original, &path).unwrap();
     let before = inventory(directory.path());
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();

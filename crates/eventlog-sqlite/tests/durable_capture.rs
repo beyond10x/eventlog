@@ -58,7 +58,10 @@ fn limits() -> CaptureLimits {
 }
 
 /// `{"key": k, "value": v}` sets row `k` to `v`, a present JSON null included; `{"key": k,
-/// "remove": true}` deletes it.
+/// "remove": true}` deletes it; `{"key": k, "fill": n}` sets row `k` to a string of `n` bytes.
+///
+/// `fill` keeps a large row's event small. The journal bounds row bytes, never event bytes, and
+/// an event that carried them as well was serialized and captured again at debug-build speed.
 struct Rows;
 
 impl Projector for Rows {
@@ -81,6 +84,11 @@ impl Projector for Rows {
             };
             if event.data.get("remove").is_some() {
                 store.delete(&ROWS, &event.tenant, key).await
+            } else if let Some(length) = event.data["fill"].as_u64() {
+                let filler = "x".repeat(usize::try_from(length).unwrap());
+                store
+                    .upsert(&ROWS, &event.tenant, key, &json!(filler))
+                    .await
             } else {
                 store
                     .upsert(&ROWS, &event.tenant, key, &event.data["value"])
@@ -729,23 +737,29 @@ async fn the_journal_keeps_at_most_sixteen_mebibytes_and_never_an_oversized_entr
         let store = file.open().await;
         durable(&store, &[ROWS]).await
     };
-    let big = |index: usize| {
-        let filler = "x".repeat(usize::try_from(7 * MIB).unwrap());
-        changed(
-            &format!("big-{index}"),
-            &format!("big-{index}"),
-            &json!(filler),
-        )
-    };
+    // The large groups are the neighbour's. The journal and its bounds are one chain for the whole
+    // owner, and a neighbour's entry is a link of the captured tenant's chain, so the pruning and
+    // the oversized group break that chain exactly as the tenant's own would; the captured tenant's
+    // complete captures no longer read 38 MiB of rows. This and `fill` took the test from 25.4 s to
+    // 3.3 s of CPU.
+    let filled =
+        |key: &str, length: u64| group(&neighbour(), key, &[json!({ "key": key, "fill": length })]);
     {
         let store = file.open().await;
         for index in 0..3 {
-            store.append_group(&big(index)).await.unwrap();
+            store
+                .append_group(&filled(&format!("big-{index}"), 7 * MIB))
+                .await
+                .unwrap();
         }
     }
     let (count, bytes) = file.journal();
     assert_eq!(count, 2, "the oldest whole entry went");
     assert!(bytes <= i64::try_from(16 * MIB).unwrap(), "{bytes}");
+    assert!(
+        bytes > i64::try_from(14 * MIB).unwrap(),
+        "each kept entry holds its whole seven-mebibyte row: {bytes}"
+    );
     assert_eq!(file.mark().3, 3, "the newest entry stays");
 
     let (_, recent) = {
@@ -754,9 +768,8 @@ async fn the_journal_keeps_at_most_sixteen_mebibytes_and_never_an_oversized_entr
     };
     {
         let store = file.open().await;
-        let filler = "y".repeat(usize::try_from(17 * MIB).unwrap());
         store
-            .append_group(&changed("oversized", "o", &json!(filler)))
+            .append_group(&filled("oversized", 17 * MIB))
             .await
             .unwrap();
     }
@@ -1257,7 +1270,7 @@ async fn redaction_and_tenant_erasure_leave_no_journal_entry() {
             .redact(
                 &StreamId::new(tenant(), "item", "seed").unwrap(),
                 1,
-                "erasure request",
+                "subject-request",
             )
             .await
             .unwrap();
@@ -1565,7 +1578,7 @@ async fn a_redacted_tenants_group_keeps_the_chain_for_every_other_tenant() {
             .redact(
                 &StreamId::new(tenant(), "item", "seed").unwrap(),
                 1,
-                "erasure request",
+                "subject-request",
             )
             .await
             .unwrap();

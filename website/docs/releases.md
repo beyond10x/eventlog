@@ -6,6 +6,26 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.10.0 — November 23, 2026
+
+This release fixes the findings of the 0.9.4 review and adds a KPI gate. It has breaking changes:
+
+- A redaction reason must be an owner-defined code. Free text is refused with `Invalid`; the Tree
+  store maps reasons stored as free text to `legacy-reason` when it reopens or copies a history.
+- An indexed projection value over 2,048 bytes is refused with
+  `EventLogError::IndexedValueTooLarge` by every provider.
+- The File store reports `EventLogError::Committed { cleanup }` when a commit is published but its
+  cleanup fails.
+- PostgreSQL adds the table `<prefix>_settlement_floor`. After a `pg_restore`, run `migrate`
+  before you open the history.
+- The PostgreSQL application role keeps only `SELECT` on the migration metadata.
+- New `canonical_request_hash` (`c1:` prefix); `request_hash` is unchanged for existing keys.
+- `PostgresConnectionAuthority::cancel` is new and reports `Unsupported` by default.
+- PostgreSQL serializes inline projectors per prefix, name and tenant.
+- Opening a hosted PostgreSQL history takes 152 round trips instead of 1,085.
+
+Read the [0.10.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.10.0).
+
 ## 0.9.4 — November 11, 2026
 
 - SQLite: the bundled SQLite moves to 3.54.1 through `rusqlite` 0.41.0. This fixes

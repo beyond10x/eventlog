@@ -22,8 +22,9 @@ use serde_json::Value;
 use crate::{
     COLUMNS, Inner, SqliteEventStore, backend, begin_immediate,
     durable_capture::{self, Continued},
-    poisoned, projection_index, projection_table, projection_table_body, read_event,
-    sqlite_schema_tokens, sqlite_table_body_tokens, stored_json, to_i64, to_u64,
+    legacy_projection_index_columns, poisoned, projection_index, projection_index_columns,
+    projection_table, projection_table_body, read_event, sqlite_schema_tokens,
+    sqlite_table_body_tokens, stored_json, to_i64, to_u64,
     tracked_capture::{Checkpoint, Scope, Stamp},
 };
 
@@ -478,7 +479,7 @@ fn refuse_malformed_tenant_coordinate(
         .query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM {table}
-                 WHERE typeof(tenant_id)<>'text' AND CAST(tenant_id AS BLOB)=?1)"
+                 WHERE {MALFORMED_TENANT_WHERE} AND {MALFORMED_TENANT_KEY}=?1)"
             ),
             params![tenant.as_str().as_bytes()],
             |row| row.get(0),
@@ -490,6 +491,27 @@ fn refuse_malformed_tenant_coordinate(
     Ok(())
 }
 
+/// The rows the malformed-coordinate probe looks for: a tenant coordinate stored as anything but
+/// TEXT, which the TEXT equality of every ordinary read would skip.
+const MALFORMED_TENANT_WHERE: &str = "typeof(tenant_id)<>'text'";
+
+/// The probe's comparison key: the coordinate's exact bytes.
+const MALFORMED_TENANT_KEY: &str = "CAST(tenant_id AS BLOB)";
+
+/// A partial index holding only malformed coordinates, keyed the way the probe compares them.
+///
+/// Healthy rows are TEXT and never enter it, so it stays empty and costs a write only the predicate.
+/// With it the probe is one index lookup instead of a scan of every tenant's rows. Its expression
+/// and predicate are the probe's own constants, so SQLite matches it to the probe's query. A file
+/// without it (opened by `open_existing` or `from_image`, which create nothing) still runs the
+/// same probe, as a scan.
+pub(crate) fn malformed_tenant_index(table: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {table}_malformed_tenant ON {table} ({MALFORMED_TENANT_KEY}) \
+         WHERE {MALFORMED_TENANT_WHERE};"
+    )
+}
+
 fn read_events(
     connection: &Connection,
     prefix: &str,
@@ -498,18 +520,21 @@ fn read_events(
 ) -> Result<Vec<RecordedEvent>, CaptureError> {
     let mut events = Vec::new();
     let mut after: Option<i64> = None;
+    let mut first = connection
+        .prepare(&events_page_sql(prefix, false))
+        .map_err(operational)?;
+    let mut continued = connection
+        .prepare(&events_page_sql(prefix, true))
+        .map_err(operational)?;
     loop {
         let page = {
-            let mut statement = connection
-                .prepare(&format!(
-                    "SELECT {COLUMNS} FROM {prefix}_events
-                     WHERE tenant_id = ?1 AND (?2 IS NULL OR global_seq > ?2)
-                     ORDER BY global_seq LIMIT ?3"
-                ))
-                .map_err(operational)?;
-            let rows = statement
-                .query_map(params![tenant.as_str(), after, CHUNK], read_event)
-                .map_err(operational)?;
+            let rows = match after {
+                None => first.query_map(params![tenant.as_str(), CHUNK], read_event),
+                Some(after) => {
+                    continued.query_map(params![tenant.as_str(), after, CHUNK], read_event)
+                }
+            }
+            .map_err(operational)?;
             let mut page = Vec::new();
             for row in rows {
                 page.push(
@@ -527,6 +552,27 @@ fn read_events(
             after = Some(to_i64(event.global_seq)?);
             events.push(event);
         }
+    }
+}
+
+/// One page of a tenant's events in sequence order.
+///
+/// A continuation page has a mandatory sequence bound, so SQLite seeks the feed index on the
+/// tenant and the position together. An optional bound (`?2 IS NULL OR global_seq > ?2`) leaves
+/// the position as a filter and makes every page walk the tenant's earlier events again.
+pub(crate) fn events_page_sql(prefix: &str, continued: bool) -> String {
+    if continued {
+        format!(
+            "SELECT {COLUMNS} FROM {prefix}_events
+             WHERE tenant_id = ?1 AND global_seq > ?2
+             ORDER BY global_seq LIMIT ?3"
+        )
+    } else {
+        format!(
+            "SELECT {COLUMNS} FROM {prefix}_events
+             WHERE tenant_id = ?1
+             ORDER BY global_seq LIMIT ?2"
+        )
     }
 }
 
@@ -791,10 +837,13 @@ fn admit_indexes(
         if *partial {
             return Err(refuse());
         }
-        let (expected, expected_unique) = match origin.as_str() {
+        let (expected, expected_unique): (Vec<Vec<String>>, bool) = match origin.as_str() {
             "pk" => {
                 primary += 1;
-                ([String::from("tenant_id"), String::from("row_key")], true)
+                (
+                    vec![vec![String::from("tenant_id"), String::from("row_key")]],
+                    true,
+                )
             }
             "c" => {
                 // A foreign catalog name is already a shape mismatch. Classify it before the name
@@ -803,8 +852,13 @@ fn admit_indexes(
                 let position = (0..specification.indexed.len())
                     .find(|position| &projection_index(table, *position) == name)
                     .ok_or_else(refuse)?;
+                // A read-only capture does not upgrade an index; registration does. Until then
+                // the earlier (tenant_id, idx_N) columns are the same declared shape.
                 (
-                    [String::from("tenant_id"), format!("idx_{position}")],
+                    vec![
+                        projection_index_columns(position).to_vec(),
+                        legacy_projection_index_columns(position).to_vec(),
+                    ],
                     false,
                 )
             }
@@ -820,7 +874,7 @@ fn admit_indexes(
         {
             return Err(refuse());
         }
-        if *unique != expected_unique || columns != expected {
+        if *unique != expected_unique || !expected.contains(&columns) {
             return Err(refuse());
         }
     }

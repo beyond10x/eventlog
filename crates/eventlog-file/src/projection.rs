@@ -1,7 +1,7 @@
 use crate::{Transaction, state::Op};
 use eventlog_core::{
     AdmissionPermit, AdmissionScope, BoxFuture, EventLogError, ProjectionSpec, ProjectionStore,
-    Reservation, TenantId, bounded_limit, indexed_value, ordered_reservations,
+    Reservation, TenantId, bounded_limit, indexed_values, ordered_reservations,
 };
 use serde_json::Value;
 
@@ -109,6 +109,7 @@ impl ProjectionStore for View<'_> {
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
             self.validate(spec, tenant)?;
+            indexed_values(spec, body)?;
             self.tx.record(Op::Row {
                 tenant: tenant.clone(),
                 name: spec.name.into(),
@@ -184,19 +185,29 @@ impl ProjectionStore for View<'_> {
                     "field was not declared indexed".into(),
                 ));
             }
-            Ok(self
-                .tx
-                .state
-                .rows
-                .iter()
-                .filter(|((t, n, _), body)| {
-                    t == tenant.as_str()
-                        && n == spec.name
-                        && indexed_value(body, field).as_deref() == Some(value)
-                })
+            // Through the row index, so a lookup costs the rows it returns: a value no row holds
+            // visits none, however many rows the projection has.
+            let state = &self.tx.state;
+            let mut visited = 0_u64;
+            let found = state
+                .row_index
+                .keys(tenant.as_str(), spec.name, field, value)
+                .inspect(|_| visited += 1)
                 .take(bounded_limit(limit))
-                .map(|(_, body)| body.clone())
-                .collect())
+                .filter_map(|key| {
+                    state
+                        .rows
+                        .get(&(tenant.as_str().into(), spec.name.into(), key.into()))
+                        .cloned()
+                })
+                .collect();
+            #[cfg(test)]
+            crate::cost::charge(&self.tx.root, |cost| {
+                cost.projection_rows_visited += visited;
+            });
+            #[cfg(not(test))]
+            let _ = visited;
+            Ok(found)
         })
     }
 }

@@ -42,11 +42,16 @@
 //!
 //! What this store does not promise, in [`Capabilities::BRANCHABLE`]: positions are valid only
 //! while the store is open, claims are refused, and snapshots, catch-up cursors and admission
-//! counters live only in memory.
+//! counters live only in memory. While a handle is open its positions hold: when it rebuilds its
+//! engine, because another handle or a merge added history or content was removed, every event it
+//! served keeps its position, an erased one leaves a gap, and history new to it is placed above
+//! every position it assigned, so a saved feed cursor never passes an event it has not seen.
 
 mod copy;
 mod fold;
 mod history;
+#[cfg(feature = "kpi-counters")]
+pub mod kpi;
 mod layout;
 mod migrate;
 mod split;
@@ -62,11 +67,11 @@ use eventlog_core::{
     BlobAppendGroup, BlobWrite, BoxFuture, BranchableEventStore, Capabilities, CaptureError,
     CaptureLimits, CatchUpProgress, Claim, ClaimedCommand, CommandMeta, ConsistentTenantCapture,
     EventLogError, EventStore, Expected, FeedPage, Guard, HeadSetDigest, InlineProjectionAdmin,
-    InlineRebuildResult, NewEvent, NoGuard, ProjectionPage, ProjectionSpec, Projector,
-    RecordedEvent, Snapshot, SnapshotGeneration, StreamAppend, StreamId, StreamSlice,
+    InlineRebuildResult, NewEvent, NoGuard, ProjectionPage, ProjectionSpec, Projector, Read,
+    ReadResult, RecordedEvent, Snapshot, SnapshotGeneration, StreamAppend, StreamId, StreamSlice,
     TenantCapture, TenantId, redaction_tombstone,
 };
-use eventlog_sqlite::{EventOrigin, RestoredEvent, SqliteEventStore};
+use eventlog_sqlite::{EventOrigin, EventPositions, RestoredEvent, SqliteEventStore};
 use history::{Committed, EventRecord, GroupRecord, Kind, Member};
 use layout::{
     FORMAT, FORMAT_V3, backend, canonical, corrupt, event_path, group_path, identity_path,
@@ -87,6 +92,24 @@ fn key_of(stream: &StreamId) -> StreamKey {
         stream.stream_type().to_owned(),
         stream.stream_id().to_owned(),
     )
+}
+
+/// The reason a replay or a [`copy`] redacts with when the file holds one this release refuses.
+///
+/// Releases up to 0.9.4 accepted free text as a redaction reason, and an event file keeps the
+/// reason it was redacted with. A replay redacts again through
+/// [`EventStore::redact`], which now takes only an owner-defined code, so such a reason is
+/// replaced by this code rather than refusing to open or copy the store. The event file keeps
+/// its bytes; what the store serves, and what a copy holds, is this code.
+pub const LEGACY_REDACTION_REASON: &str = "legacy-reason";
+
+/// `reason` when [`EventStore::redact`] accepts it, otherwise [`LEGACY_REDACTION_REASON`].
+fn replayable_reason(reason: &str) -> &str {
+    if eventlog_core::validate_redaction_reason(reason).is_ok() {
+        reason
+    } else {
+        LEGACY_REDACTION_REASON
+    }
 }
 
 /// What the store knows beyond what the engine holds.
@@ -110,6 +133,13 @@ struct State {
     poisoned: bool,
     /// Whether this state was replayed from the files rather than read back from `.cache/`.
     replayed: bool,
+    /// The privacy token published when this state was built: read before the files were, so a
+    /// removal of content that ran while they were read leaves this state stale, never current.
+    privacy: Option<String>,
+    /// Set while a write is in the engine and not yet in the files, and left set when the caller
+    /// stopped awaiting it in between: the engine may then hold what the files never committed,
+    /// so the next operation rebuilds from the files before serving anything.
+    unsettled: bool,
 }
 
 /// An [`EventStore`] over a directory that version control can merge.
@@ -187,7 +217,7 @@ impl TreeEventStore {
     /// Refuses a store the replay cannot verify, and reports a file that cannot be removed.
     pub async fn repair(&self) -> Result<Vec<PathBuf>, EventLogError> {
         let _state = self.state.lock().await;
-        let _lock = self.writer_lock()?;
+        let _lock = self.writer_lock().await?;
         let torn = history::load(&self.root)?.torn;
         for path in &torn {
             fs::remove_file(path).map_err(backend)?;
@@ -195,32 +225,97 @@ impl TreeEventStore {
         Ok(torn)
     }
 
-    fn writer_lock(&self) -> Result<fs::File, EventLogError> {
-        writer_lock(&self.root)
+    /// The writer lock, waited for on a blocking worker. Another handle holding it may be
+    /// suspended on this very runtime, awaiting its engine; blocking the executor thread in the
+    /// wait would keep that handle from ever resuming to release it.
+    async fn writer_lock(&self) -> Result<fs::File, EventLogError> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || writer_lock(&root))
+            .await
+            .map_err(|_| {
+                EventLogError::Backend("the writer lock's blocking worker panicked".into())
+            })?
     }
 
+    /// The engine, rebuilt first when another handle has removed content since it was built.
     async fn engine(&self) -> Result<Arc<SqliteEventStore>, EventLogError> {
-        let state = self.state.lock().await;
+        Ok(self.engine_at().await?.0)
+    }
+
+    /// The engine and the privacy token it is current for.
+    async fn engine_at(&self) -> Result<(Arc<SqliteEventStore>, Option<String>), EventLogError> {
+        let mut state = self.state.lock().await;
+        self.current(&mut state).await?;
+        Ok((Arc::clone(&state.engine), state.privacy.clone()))
+    }
+
+    /// Bring `state` up to the last removal of content any handle published: a redaction, an
+    /// erasure or a blob deletion another handle made is in the files and not in this engine. The
+    /// rebuild runs under the writer lock, so no removal is half done while it reads the files. A
+    /// write this handle's caller abandoned between the engine and the files is rebuilt away too.
+    async fn current(&self, state: &mut State) -> Result<(), EventLogError> {
         if state.poisoned {
             return Err(EventLogError::Closed);
         }
-        Ok(Arc::clone(&state.engine))
+        if !state.unsettled && fold::privacy_token(&self.root)? == state.privacy {
+            return Ok(());
+        }
+        let _lock = self.writer_lock().await?;
+        refresh(&self.root, state).await
     }
 
-    /// Fill in each event's digest and parents from the files.
-    async fn decorate(&self, events: &mut [RecordedEvent]) {
-        let state = self.state.lock().await;
-        for event in events {
-            if let Some(record) = state.records.get(&event.event_id) {
-                event.digest = state.digests.get(&event.event_id).cloned();
-                event.parents.clone_from(&record.parents);
+    /// Serve `read` from an engine current for the last removal of content, and serve it again
+    /// from a rebuilt one when a removal was published while it ran: what a read returns after a
+    /// redaction or an erasure has returned never holds what it removed.
+    async fn read<T, F, Fut>(&self, read: F) -> Result<T, EventLogError>
+    where
+        F: Fn(Arc<SqliteEventStore>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, EventLogError>>,
+    {
+        loop {
+            let (engine, privacy) = self.engine_at().await?;
+            let value = read(engine).await?;
+            if fold::privacy_token(&self.root)? == privacy {
+                return Ok(value);
             }
         }
     }
 
+    /// After a removal of content, still under the writer lock: delete every kept state and
+    /// publish a new privacy token, whatever the removal did, since one that failed half way has
+    /// still changed the files and every other handle must rebuild from them. This handle stays
+    /// marked unsettled after a failed removal, so it rebuilds from the files too.
+    fn published<T>(
+        &self,
+        state: &mut State,
+        removed: Result<T, EventLogError>,
+    ) -> Result<T, EventLogError> {
+        if removed.is_ok() {
+            state.unsettled = false;
+        }
+        match fold::publish_removal(&self.root) {
+            Ok(token) => {
+                state.privacy = Some(token);
+                removed
+            }
+            Err(error) => {
+                // Other handles cannot be told, so this one stops serving rather than pretend
+                // the removal is complete.
+                state.poisoned = true;
+                removed.and(Err(error))
+            }
+        }
+    }
+
+    /// Fill in each event's digest and parents from the files.
+    async fn decorate(&self, events: &mut [RecordedEvent]) {
+        decorate_from(&*self.state.lock().await, events);
+    }
+
     /// Open the store at `root` with `inline` projectors registered before its history is
     /// replayed, so the replay runs once. [`TreeEventStore::open`] followed by
-    /// [`InlineProjectionAdmin::attach_inline_existing`] replays twice.
+    /// [`EventStore::create_projections`] and [`InlineProjectionAdmin::attach_inline_existing`],
+    /// which attaches only what the handle admitted, replays twice.
     ///
     /// # Errors
     /// As [`TreeEventStore::open`], and whatever a projector refuses during the replay.
@@ -243,7 +338,7 @@ impl TreeEventStore {
     ) -> Result<Self, EventLogError> {
         let root = root.as_ref().to_owned();
         prepare(&root, layout)?;
-        let state = build(&root, inline, Vec::new()).await?;
+        let state = build(&root, inline, Vec::new(), Locked::NotHeld, None).await?;
         Ok(Self {
             root,
             state: Mutex::new(state),
@@ -253,7 +348,8 @@ impl TreeEventStore {
     /// Append through the engine and, when it wrote, commit the same facts to the files.
     ///
     /// `members` names each stream and what its caller expected; `call` receives what the engine
-    /// is to expect instead, which differs only for a merge.
+    /// is to expect instead, which differs only for a merge, and whether the files already hold
+    /// this command's receipt.
     async fn commit<'a, F>(
         &'a self,
         kind: Kind,
@@ -267,6 +363,7 @@ impl TreeEventStore {
         F: FnOnce(
             Arc<SqliteEventStore>,
             Vec<Expected>,
+            bool,
         ) -> BoxFuture<'a, Result<(Vec<AppendResult>, bool), EventLogError>>,
     {
         if meta.claim.is_some() {
@@ -278,8 +375,23 @@ impl TreeEventStore {
         if state.poisoned {
             return Err(EventLogError::Closed);
         }
-        let _lock = self.writer_lock()?;
+        let _lock = self.writer_lock().await?;
         refresh(&self.root, &mut state).await?;
+
+        // A command already recorded is answered from its receipt, whatever the heads are now: a
+        // merge that committed has left one head where it found several, and a retry of it must
+        // still return what it wrote. The engine checks the request against its receipt, with
+        // each merge expectation passed as the `Any` it was written with; the merge's own head
+        // set is checked against the parents its first event recorded, below.
+        let stream = members
+            .first()
+            .map(|(stream, _)| (stream.stream_type(), stream.stream_id()));
+        let receipt = group_path(
+            &self.root,
+            tenant.as_str(),
+            &history::receipt_digest(kind, tenant.as_str(), stream, &meta.idempotency_key),
+        );
+        let recorded = state.group_files.contains(&receipt);
 
         let mut parents_before = Vec::with_capacity(members.len());
         let mut engine_expected = Vec::with_capacity(members.len());
@@ -290,6 +402,8 @@ impl TreeEventStore {
                 .cloned()
                 .unwrap_or_default();
             let passed = match expected {
+                Expected::Merge(_) if recorded => Expected::Any,
+                other if recorded => *other,
                 Expected::Merge(digest) if heads.len() > 1 => {
                     if *digest != HeadSetDigest::of(&heads) {
                         return Err(EventLogError::Forked {
@@ -317,8 +431,22 @@ impl TreeEventStore {
         }
 
         let engine = Arc::clone(&state.engine);
-        let (mut results, deduplicated) = call(engine, engine_expected.clone()).await?;
+        // From here until the files hold what the engine wrote, the engine may be ahead of them.
+        // A caller that stops awaiting leaves the engine's worker to finish without this future;
+        // the mark it leaves makes the next operation rebuild from the files instead of serving
+        // a write that was never committed.
+        state.unsettled = true;
+        let (mut results, deduplicated) =
+            match call(engine, engine_expected.clone(), recorded).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // The engine refused inside its own transaction and holds nothing new.
+                    state.unsettled = false;
+                    return Err(error);
+                }
+            };
         if deduplicated {
+            state.unsettled = false;
             for result in &mut results {
                 for event in &mut result.events {
                     if let Some(record) = state.records.get(&event.event_id) {
@@ -327,7 +455,28 @@ impl TreeEventStore {
                     }
                 }
             }
+            // A merge's head set is part of its request: the receipt answers only the merge over
+            // the heads it actually joined.
+            for ((_, expected), result) in members.iter().zip(&results) {
+                if let Expected::Merge(digest) = expected {
+                    let joined = result.events.first().map(|event| &event.parents);
+                    if !joined.is_some_and(|parents| {
+                        parents.len() > 1 && HeadSetDigest::of(parents) == *digest
+                    }) {
+                        return Err(EventLogError::IdempotencyMismatch {
+                            key: meta.idempotency_key.clone(),
+                        });
+                    }
+                }
+            }
             return Ok((results, true));
+        }
+        if recorded {
+            // The receipt exists but the engine wrote anew: it no longer matches the files.
+            state.poisoned = true;
+            return Err(corrupt(
+                "a recorded command the engine did not answer from its receipt",
+            ));
         }
 
         let recorded_at = results
@@ -394,8 +543,8 @@ impl TreeEventStore {
                 event.digest = Some(digest.clone());
                 event.parents.clone_from(&parents);
                 group.members[index].events.push(digest.clone());
-                parents = vec![digest];
-                written.push(record);
+                parents = vec![digest.clone()];
+                written.push((record, digest));
                 offset += 1;
             }
             running.insert(key_of(stream), parents);
@@ -407,16 +556,16 @@ impl TreeEventStore {
             for (digest, bytes) in blobs {
                 split::write_blob(&self.root, tenant.as_str(), digest, bytes, splits)?;
             }
-            for record in &written {
+            for (record, digest) in &written {
                 let path = event_path(
                     &self.root,
                     format,
                     &record.tenant,
                     &record.stream_type,
                     &record.stream_id,
-                    &record.digest()?,
+                    digest,
                 );
-                write_once(&path, &canonical(&record.to_value()?))?;
+                write_once(&path, &canonical(&record.to_value_named(digest)?))?;
             }
             // Written last: until this file exists the events above are torn, never served.
             let path = group_path(&self.root, tenant.as_str(), &key);
@@ -436,13 +585,22 @@ impl TreeEventStore {
                 state.heads.insert(key_of(stream), vec![last.clone()]);
             }
         }
-        for record in written {
-            state
-                .digests
-                .insert(record.event_id.clone(), record.digest()?);
+        for (record, digest) in written {
+            state.digests.insert(record.event_id.clone(), digest);
             state.records.insert(record.event_id.clone(), record);
         }
+        state.unsettled = false;
         Ok((results, false))
+    }
+}
+
+/// Fill in each event's digest and parents from the files, as `state` knows them.
+fn decorate_from(state: &State, events: &mut [RecordedEvent]) {
+    for event in events {
+        if let Some(record) = state.records.get(&event.event_id) {
+            event.digest = state.digests.get(&event.event_id).cloned();
+            event.parents.clone_from(&record.parents);
+        }
     }
 }
 
@@ -456,6 +614,18 @@ fn writer_lock(root: &Path) -> Result<fs::File, EventLogError> {
         .map_err(backend)?;
     file.lock().map_err(backend)?;
     Ok(file)
+}
+
+/// The writer lock when no one holds it right now, without waiting; `None` otherwise.
+fn try_writer_lock(root: &Path) -> Option<fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".lock"))
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 /// Refuse a directory that holds another kind of store, and create `store.json` in one that
@@ -494,48 +664,101 @@ fn prepare(root: &Path, layout: TreeLayout) -> Result<(), EventLogError> {
     Ok(())
 }
 
-/// Rebuild the state when another writer has committed a group since this one was built.
+/// Rebuild the state when another writer has committed a group, or removed content, since this
+/// one was built. The caller holds the writer lock.
 async fn refresh(root: &Path, state: &mut State) -> Result<(), EventLogError> {
-    if history::group_files(root)? == state.group_files {
+    if !state.unsettled
+        && fold::privacy_token(root)? == state.privacy
+        && history::group_files(root)? == state.group_files
+    {
         return Ok(());
     }
-    let rebuilt = build(root, state.inline.clone(), state.catch_up.clone()).await?;
+    let rebuilt = build(
+        root,
+        state.inline.clone(),
+        state.catch_up.clone(),
+        Locked::Held,
+        Some(state.engine.positions().await?),
+    )
+    .await?;
     *state = rebuilt;
     Ok(())
+}
+
+/// Whether the caller of [`build`] holds the writer lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Locked {
+    Held,
+    NotHeld,
 }
 
 /// The state of the files under `root`: the one kept for exactly these files when there is one,
 /// otherwise a replay, which is then kept if no file changed while it ran and none is too new to
 /// trust by its stamp.
+///
+/// A state is kept only under the writer lock, and only while the privacy token it was built under
+/// is still the published one: a removal of content deletes every kept state under that lock, so
+/// a replay that read the files before the removal can never put its image back afterwards.
+///
+/// `served` holds where every event stood in the engine an open handle is replacing. Positions are
+/// valid for as long as the handle is open, and a reader may have saved any of them, so a rebuild
+/// replays from the files with each of those events at its old position, and places every event
+/// new to the handle above the highest position it ever assigned. A kept state was folded by
+/// another replay, in that replay's order, so a rebuild never loads one.
 async fn build(
     root: &Path,
     inline: Vec<Arc<dyn Projector>>,
     catch_up: Vec<Arc<dyn Projector>>,
+    locked: Locked,
+    served: Option<EventPositions>,
 ) -> Result<State, EventLogError> {
+    let privacy = fold::privacy_token(root)?;
     let started = fold::now_ns();
     let before = fold::stamps(root);
-    let names = |projectors: &[Arc<dyn Projector>]| -> Vec<&'static str> {
+    // A kept state stands for a fold through exactly these projectors only when each vouches for
+    // its output with a fingerprint; without one, every open folds through it again.
+    let fingerprints = |projectors: &[Arc<dyn Projector>]| -> Option<Vec<(&'static str, String)>> {
         projectors
             .iter()
-            .map(|projector| projector.name())
+            .map(|projector| Some((projector.name(), projector.fingerprint()?)))
             .collect()
     };
-    let key = before
-        .as_ref()
-        .map(|stamps| fold::key(stamps, &names(&inline), &names(&catch_up)));
-    if let Some(key) = &key
+    let key = match (
+        before.as_ref(),
+        fingerprints(&inline),
+        fingerprints(&catch_up),
+    ) {
+        (Some(stamps), Some(inline), Some(catch_up)) => Some(fold::key(stamps, &inline, &catch_up)),
+        _ => None,
+    };
+    if served.is_none()
+        && let Some(key) = &key
         && let Some((image, kept)) = fold::load(root, key)
-        && let Ok(state) = from_kept(root, image, &kept, &inline, &catch_up).await
+        && let Ok(mut state) = from_kept(root, image, &kept, &inline, &catch_up).await
     {
+        state.privacy = privacy;
         return Ok(state);
     }
-    let state = replay_all(root, inline, catch_up).await?;
+    let mut state = replay_all(root, inline, catch_up, served.as_ref()).await?;
+    state.privacy = privacy;
     if let (Some(before), Some(key)) = (before, key)
         && fold::settled(&before, started)
-        && fold::stamps(root).as_ref() == Some(&before)
         && let Ok(image) = state.engine.image().await
     {
-        fold::keep(root, &key, &image, kept_state(root, &state));
+        // Without the lock already held, only a lock free right now is taken: keeping a state
+        // saves a later replay, and is never worth waiting for.
+        let _lock = match locked {
+            Locked::Held => None,
+            Locked::NotHeld => match try_writer_lock(root) {
+                Some(lock) => Some(lock),
+                None => return Ok(state),
+            },
+        };
+        if fold::stamps(root).as_ref() == Some(&before)
+            && fold::privacy_token(root).ok().as_ref() == Some(&state.privacy)
+        {
+            fold::keep(root, &key, &image, kept_state(root, &state));
+        }
     }
     Ok(state)
 }
@@ -637,28 +860,46 @@ async fn from_kept(
         catch_up: catch_up.to_vec(),
         poisoned: false,
         replayed: false,
+        privacy: None,
+        unsettled: false,
     })
 }
 
-/// Replay the files under `root` into a fresh engine.
+/// Replay the files under `root` into a fresh engine, keeping the positions in `served` (see
+/// [`build`]).
 async fn replay_all(
     root: &Path,
     inline: Vec<Arc<dyn Projector>>,
     catch_up: Vec<Arc<dyn Projector>>,
+    served: Option<&EventPositions>,
 ) -> Result<State, EventLogError> {
     let loaded = history::load(root)?;
+    // An inline projector is handed each event as the replay appends it, and a redacted event is
+    // appended with its tombstone body and marked redacted only after every group is in: the
+    // projector would take a redacted event for a live one. With any redaction in the history,
+    // the inline projectors are therefore driven afterwards, from the restored events.
+    let redacted = loaded
+        .tenants
+        .values()
+        .flat_map(|tenant| &tenant.groups)
+        .flat_map(|committed| committed.events.iter().flatten())
+        .any(|record| record.redacted.is_some());
+    let deferred = redacted && !inline.is_empty();
     let engine = Arc::new(SqliteEventStore::in_memory("tree").await?);
     for projector in &catch_up {
         engine.create_projections(Arc::clone(projector)).await?;
     }
-    for projector in &inline {
-        engine.register_inline(Arc::clone(projector)).await?;
+    if !deferred {
+        for projector in &inline {
+            engine.register_inline(Arc::clone(projector)).await?;
+        }
     }
     let mut heads: BTreeMap<StreamKey, BTreeSet<String>> = BTreeMap::new();
     let mut records = BTreeMap::new();
     let mut digests = BTreeMap::new();
     let mut identities = BTreeSet::new();
     let mut redactions = Vec::new();
+    let mut order = Vec::new();
     for (tenant_name, tenant_history) in &loaded.tenants {
         let tenant = TenantId::new(tenant_name.clone())?;
         if let Some(identity) = &tenant_history.identity {
@@ -669,30 +910,79 @@ async fn replay_all(
             engine.put_blob(&tenant, digest, bytes).await?;
         }
         for committed in &tenant_history.groups {
-            let versions = replay(&engine, &tenant, committed, None).await?;
-            for (record, version) in committed.events.iter().flatten().zip(versions) {
-                let key = (
-                    record.tenant.clone(),
-                    record.stream_type.clone(),
-                    record.stream_id.clone(),
-                );
-                let entry = heads.entry(key).or_default();
-                for parent in &record.parents {
-                    entry.remove(parent);
-                }
-                let digest = record.digest()?;
-                entry.insert(digest.clone());
-                if let Some(reason) = &record.redacted {
-                    redactions.push((record.stream()?, version, reason.clone()));
-                }
-                digests.insert(record.event_id.clone(), digest);
-                records.insert(record.event_id.clone(), record.clone());
+            order.push((tenant.clone(), committed));
+        }
+    }
+    // Tenant by tenant, each in causal order, unless the handle has served positions. Then every
+    // group it served goes first, in the order it held them, which was causal when they were
+    // appended, and each event keeps its position; the groups new to it follow in causal order,
+    // above the highest position it assigned. A stream's versions then still rise with positions.
+    let mut next = served.map_or(0, |served| served.high_water);
+    if let Some(served) = served {
+        let first = |committed: &Committed| {
+            committed
+                .events
+                .iter()
+                .flatten()
+                .filter_map(|record| served.by_event.get(&record.event_id).copied())
+                .min()
+        };
+        // Stable, so the new groups keep their causal order behind the served ones.
+        order.sort_by_key(|(_, committed)| first(committed).map_or((1, 0), |at| (0, at)));
+    }
+    for (tenant, committed) in order {
+        let positions = served.map(|served| {
+            committed
+                .events
+                .iter()
+                .flatten()
+                .map(|record| {
+                    served
+                        .by_event
+                        .get(&record.event_id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            next += 1;
+                            next
+                        })
+                })
+                .collect()
+        });
+        let versions = replay(&engine, &tenant, committed, None, positions).await?;
+        for (record, version) in committed.events.iter().flatten().zip(versions) {
+            let key = (
+                record.tenant.clone(),
+                record.stream_type.clone(),
+                record.stream_id.clone(),
+            );
+            let entry = heads.entry(key).or_default();
+            for parent in &record.parents {
+                entry.remove(parent);
             }
+            let digest = record.digest()?;
+            entry.insert(digest.clone());
+            if let Some(reason) = &record.redacted {
+                redactions.push((record.stream()?, version, reason.clone()));
+            }
+            digests.insert(record.event_id.clone(), digest);
+            records.insert(record.event_id.clone(), record.clone());
         }
     }
     for (stream, version, reason) in redactions {
-        engine.redact(&stream, version, &reason).await?;
+        engine
+            .redact(&stream, version, replayable_reason(&reason))
+            .await?;
     }
+    if served.is_some() {
+        // An append after the rebuild lands above every position the handle ever assigned, also
+        // one an event since erased held.
+        engine.reserve_positions_through(next).await?;
+    }
+    let engine = if deferred {
+        drive_inline_from_restored(&engine, &loaded, &inline, &catch_up).await?
+    } else {
+        engine
+    };
     // A parent is always replayed before its child, so removing parents as their children arrive
     // leaves exactly the events no other event follows.
     Ok(State {
@@ -709,7 +999,38 @@ async fn replay_all(
         catch_up,
         poisoned: false,
         replayed: true,
+        privacy: None,
+        unsettled: false,
     })
+}
+
+/// An engine holding everything `replayed` holds, with `inline` registered and each of their
+/// projections folded from the restored events, redaction marks included, tenant by tenant.
+///
+/// Registration closes once an engine has appended, so the replayed engine is carried over through
+/// its image, as a kept state is ([`from_kept`]).
+async fn drive_inline_from_restored(
+    replayed: &SqliteEventStore,
+    loaded: &history::Loaded,
+    inline: &[Arc<dyn Projector>],
+    catch_up: &[Arc<dyn Projector>],
+) -> Result<Arc<SqliteEventStore>, EventLogError> {
+    let engine = Arc::new(SqliteEventStore::from_image("tree", replayed.image().await?).await?);
+    for projector in catch_up {
+        engine.create_projections(Arc::clone(projector)).await?;
+    }
+    for projector in inline {
+        engine.register_inline(Arc::clone(projector)).await?;
+    }
+    for tenant in loaded.tenants.keys() {
+        let tenant = TenantId::new(tenant.clone())?;
+        for projector in inline {
+            engine
+                .rebuild_inline_projection(projector.name(), &tenant)
+                .await?;
+        }
+    }
+    Ok(engine)
 }
 
 /// Append one committed group to the engine as its writer did, keeping its identities and
@@ -717,11 +1038,14 @@ async fn replay_all(
 ///
 /// `origins` holds the tree's version of each event, by event id, when the engine is a copy's
 /// target rather than the tree's own; each event then records where it stood in the tree.
+/// `positions` holds the global position each event takes, in the group's order, when a rebuild
+/// keeps the positions a handle served.
 async fn replay(
     engine: &SqliteEventStore,
     tenant: &TenantId,
     committed: &Committed,
     origins: Option<&BTreeMap<String, u64>>,
+    positions: Option<Vec<u64>>,
 ) -> Result<Vec<u64>, EventLogError> {
     let restored = committed
         .events
@@ -745,7 +1069,10 @@ async fn replay(
             })
         })
         .collect::<Result<Vec<_>, EventLogError>>()?;
-    engine.restore_events(restored)?;
+    match positions {
+        None => engine.restore_events(restored)?,
+        Some(positions) => engine.restore_events_at(restored, positions)?,
+    }
     let mut appends = Vec::with_capacity(committed.events.len());
     for (member, records) in committed.record.members.iter().zip(&committed.events) {
         appends.push(StreamAppend {
@@ -799,15 +1126,16 @@ async fn replay(
 }
 
 /// The engine commits blob-bearing groups through its blob entry point, whose request fingerprint
-/// covers the bytes; a replay goes through the same one so a retry still matches.
-fn blob_group(group: AppendGroup, blobs: &[(String, Vec<u8>)]) -> BlobAppendGroup {
+/// covers the bytes; a replay goes through the same one so a retry still matches. The copy it
+/// makes lives only for this one group's append.
+fn blob_group(group: AppendGroup, blobs: &[(String, impl AsRef<[u8]>)]) -> BlobAppendGroup {
     BlobAppendGroup {
         group,
         blobs: blobs
             .iter()
             .map(|(digest, bytes)| BlobWrite {
                 digest: digest.clone(),
-                bytes: bytes.clone(),
+                bytes: bytes.as_ref().to_vec(),
             })
             .collect(),
     }
@@ -846,8 +1174,7 @@ impl EventStore for TreeEventStore {
         idempotency_key: &'a str,
         request_hash: &'a str,
     ) -> BoxFuture<'a, Result<Option<AppendResult>, EventLogError>> {
-        Box::pin(async move {
-            let engine = self.engine().await?;
+        Box::pin(self.read(move |engine| async move {
             let mut found = engine
                 .recorded_command(stream, idempotency_key, request_hash)
                 .await?;
@@ -855,7 +1182,7 @@ impl EventStore for TreeEventStore {
                 self.decorate(&mut result.events).await;
             }
             Ok(found)
-        })
+        }))
     }
 
     fn read_stream<'a>(
@@ -864,19 +1191,18 @@ impl EventStore for TreeEventStore {
         after_version: u64,
         limit: usize,
     ) -> BoxFuture<'a, Result<StreamSlice, EventLogError>> {
-        Box::pin(async move {
-            let engine = self.engine().await?;
+        Box::pin(self.read(move |engine| async move {
             let mut slice = engine.read_stream(stream, after_version, limit).await?;
             self.decorate(&mut slice.events).await;
             Ok(slice)
-        })
+        }))
     }
 
     fn stream_version<'a>(
         &'a self,
         stream: &'a StreamId,
     ) -> BoxFuture<'a, Result<Option<u64>, EventLogError>> {
-        Box::pin(async move { self.engine().await?.stream_version(stream).await })
+        Box::pin(self.read(move |engine| async move { engine.stream_version(stream).await }))
     }
 
     fn read_feed<'a>(
@@ -885,11 +1211,50 @@ impl EventStore for TreeEventStore {
         after_position: u64,
         limit: usize,
     ) -> BoxFuture<'a, Result<FeedPage, EventLogError>> {
-        Box::pin(async move {
-            let engine = self.engine().await?;
+        Box::pin(self.read(move |engine| async move {
             let mut page = engine.read_feed(tenant, after_position, limit).await?;
             self.decorate(&mut page.events).await;
             Ok(page)
+        }))
+    }
+
+    fn read_many<'a>(
+        &'a self,
+        reads: &'a [Read],
+    ) -> BoxFuture<'a, Result<Vec<ReadResult>, EventLogError>> {
+        Box::pin(async move {
+            // One observation for the whole batch: the state stays locked from the first read to
+            // the last, so no commit through this handle lands between two of them, and every
+            // event's digest and parents come from the state that served its body.
+            loop {
+                let mut state = self.state.lock().await;
+                self.current(&mut state).await?;
+                let mut results = Vec::with_capacity(reads.len());
+                for read in reads {
+                    results.push(match read {
+                        Read::Stream {
+                            stream,
+                            after_version,
+                            limit,
+                        } => {
+                            let mut slice = state
+                                .engine
+                                .read_stream(stream, *after_version, *limit)
+                                .await?;
+                            decorate_from(&state, &mut slice.events);
+                            ReadResult::Stream(slice)
+                        }
+                        Read::Blob { tenant, digest } => {
+                            ReadResult::Blob(state.engine.get_blob(tenant, digest).await?)
+                        }
+                    });
+                }
+                // As `TreeEventStore::read`: a removal another handle published meanwhile is
+                // served again from a rebuilt state.
+                if fold::privacy_token(&self.root)? == state.privacy {
+                    return Ok(results);
+                }
+            }
         })
     }
 
@@ -900,41 +1265,47 @@ impl EventStore for TreeEventStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
         Box::pin(async move {
+            eventlog_core::validate_redaction_reason(reason)?;
             let mut state = self.state.lock().await;
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
-            let _lock = self.writer_lock()?;
+            let _lock = self.writer_lock().await?;
             refresh(&self.root, &mut state).await?;
-            let mut redacted = state.engine.redact(stream, version, reason).await?;
-            let Some(record) = state.records.get_mut(&redacted.event_id) else {
-                state.poisoned = true;
-                return Err(corrupt("a redacted event with no file"));
-            };
-            // The body goes; the digest stays, because it covers the body only through
-            // `data_digest`, so the chain through this event holds.
-            record.data = redaction_tombstone(reason);
-            record.redacted = Some(reason.to_owned());
-            let record = record.clone();
-            let written = record.digest().and_then(|digest| {
-                let format = layout::store_format(&self.root)?;
-                let path = event_path(
-                    &self.root,
-                    format,
-                    &record.tenant,
-                    &record.stream_type,
-                    &record.stream_id,
-                    &digest,
-                );
-                write_atomic(&path, &canonical(&record.to_value()?))
-            });
-            if let Err(error) = written {
-                state.poisoned = true;
-                return Err(error);
+            state.unsettled = true;
+            let removed = async {
+                let mut redacted = state.engine.redact(stream, version, reason).await?;
+                let Some(record) = state.records.get_mut(&redacted.event_id) else {
+                    state.poisoned = true;
+                    return Err(corrupt("a redacted event with no file"));
+                };
+                // The body goes; the digest stays, because it covers the body only through
+                // `data_digest`, so the chain through this event holds.
+                record.data = redaction_tombstone(reason);
+                record.redacted = Some(reason.to_owned());
+                let record = record.clone();
+                let written = record.digest().and_then(|digest| {
+                    let format = layout::store_format(&self.root)?;
+                    let path = event_path(
+                        &self.root,
+                        format,
+                        &record.tenant,
+                        &record.stream_type,
+                        &record.stream_id,
+                        &digest,
+                    );
+                    write_atomic(&path, &canonical(&record.to_value()?))
+                });
+                if let Err(error) = written {
+                    state.poisoned = true;
+                    return Err(error);
+                }
+                redacted.digest = record.digest().ok();
+                redacted.parents.clone_from(&record.parents);
+                Ok(redacted)
             }
-            redacted.digest = record.digest().ok();
-            redacted.parents.clone_from(&record.parents);
-            Ok(redacted)
+            .await;
+            self.published(&mut state, removed)
         })
     }
 
@@ -971,7 +1342,7 @@ impl EventStore for TreeEventStore {
         &'a self,
         stream: &'a StreamId,
     ) -> BoxFuture<'a, Result<Option<Snapshot>, EventLogError>> {
-        Box::pin(async move { self.engine().await?.load_snapshot(stream).await })
+        Box::pin(self.read(move |engine| async move { engine.load_snapshot(stream).await }))
     }
 
     fn forget_tenant<'a>(
@@ -983,27 +1354,39 @@ impl EventStore for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
-            let _lock = self.writer_lock()?;
-            state.engine.forget_tenant(tenant).await?;
-            // Erasure is the one removal a log admits, besides redaction; it takes the tenant's
-            // whole directory, so nothing of it is left to merge back.
-            let directory = tenant_dir(&self.root, tenant.as_str());
-            if let Err(error) = fs::remove_dir_all(&directory)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                state.poisoned = true;
-                return Err(backend(error));
+            let _lock = self.writer_lock().await?;
+            // Another writer's groups for other tenants are taken in first: the erasure below
+            // drops only this tenant's from the groups this state has loaded, so a group it never
+            // loaded can never count as loaded.
+            refresh(&self.root, &mut state).await?;
+            state.unsettled = true;
+            let removed = async {
+                state.engine.forget_tenant(tenant).await?;
+                // Erasure is the one removal a log admits, besides redaction; it takes the
+                // tenant's whole directory, so nothing of it is left to merge back. Every state
+                // kept under `.cache/` is deleted with it, by `published` below.
+                let directory = tenant_dir(&self.root, tenant.as_str());
+                if let Err(error) = fs::remove_dir_all(&directory)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    state.poisoned = true;
+                    return Err(backend(error));
+                }
+                let name = tenant.as_str().to_owned();
+                state.heads.retain(|(owner, _, _), _| owner != &name);
+                state.records.retain(|_, record| record.tenant != name);
+                let State {
+                    records, digests, ..
+                } = &mut *state;
+                digests.retain(|id, _| records.contains_key(id));
+                state.identities.remove(&name);
+                state
+                    .group_files
+                    .retain(|path| !path.starts_with(&directory));
+                Ok(())
             }
-            let name = tenant.as_str().to_owned();
-            state.heads.retain(|(owner, _, _), _| owner != &name);
-            state.records.retain(|_, record| record.tenant != name);
-            let State {
-                records, digests, ..
-            } = &mut *state;
-            digests.retain(|id, _| records.contains_key(id));
-            state.identities.remove(&name);
-            state.group_files = history::group_files(&self.root)?;
-            Ok(())
+            .await;
+            self.published(&mut state, removed)
         })
     }
 
@@ -1026,7 +1409,7 @@ impl EventStore for TreeEventStore {
                     &members,
                     meta,
                     &[],
-                    move |engine, passed| {
+                    move |engine, passed, _| {
                         Box::pin(async move {
                             let result = engine
                                 .append_guarded(stream, passed[0], events, meta, guard)
@@ -1072,7 +1455,15 @@ impl EventStore for TreeEventStore {
                 Err(EventLogError::Invalid(_)) if !state.records.is_empty() => {
                     let mut inline = state.inline.clone();
                     inline.push(projector);
-                    *state = build(&self.root, inline, state.catch_up.clone()).await?;
+                    let served = state.engine.positions().await?;
+                    *state = build(
+                        &self.root,
+                        inline,
+                        state.catch_up.clone(),
+                        Locked::NotHeld,
+                        Some(served),
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1120,12 +1511,9 @@ impl EventStore for TreeEventStore {
         tenant: &'a TenantId,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Value>, EventLogError>> {
-        Box::pin(async move {
-            self.engine()
-                .await?
-                .projection_get(projection, tenant, key)
-                .await
-        })
+        Box::pin(self.read(move |engine| async move {
+            engine.projection_get(projection, tenant, key).await
+        }))
     }
 
     fn projection_find<'a>(
@@ -1136,12 +1524,11 @@ impl EventStore for TreeEventStore {
         value: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Value>, EventLogError>> {
-        Box::pin(async move {
-            self.engine()
-                .await?
+        Box::pin(self.read(move |engine| async move {
+            engine
                 .projection_find(projection, tenant, field, value, limit)
                 .await
-        })
+        }))
     }
 
     fn projection_list<'a>(
@@ -1151,12 +1538,11 @@ impl EventStore for TreeEventStore {
         after_key: Option<&'a str>,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<(String, Value)>, EventLogError>> {
-        Box::pin(async move {
-            self.engine()
-                .await?
+        Box::pin(self.read(move |engine| async move {
+            engine
                 .projection_list(projection, tenant, after_key, limit)
                 .await
-        })
+        }))
     }
 
     fn projection_page<'a>(
@@ -1167,12 +1553,11 @@ impl EventStore for TreeEventStore {
         cursor: Option<&'a str>,
         limit: usize,
     ) -> BoxFuture<'a, Result<ProjectionPage, EventLogError>> {
-        Box::pin(async move {
-            self.engine()
-                .await?
+        Box::pin(self.read(move |engine| async move {
+            engine
                 .projection_page(projection, tenant, prefix, cursor, limit)
                 .await
-        })
+        }))
     }
 
     fn stream_identity<'a>(
@@ -1181,31 +1566,44 @@ impl EventStore for TreeEventStore {
     ) -> BoxFuture<'a, Result<String, EventLogError>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
-            if state.poisoned {
-                return Err(EventLogError::Closed);
+            // An identity another handle's erasure removed must not be handed out again.
+            self.current(&mut state).await?;
+            if state.identities.contains(tenant.as_str()) {
+                return state.engine.stream_identity(tenant).await;
             }
-            let identity = state.engine.stream_identity(tenant).await?;
-            if !state.identities.contains(tenant.as_str()) {
-                let _lock = self.writer_lock()?;
-                let path = identity_path(&self.root, tenant.as_str());
-                // Another writer may have named this tenant first; the replay after a merge would
-                // then refuse two identities, so the first one on disk wins here too.
-                if let Ok(bytes) = fs::read(&path) {
+            // Under the writer lock, before the engine makes one up: another handle may have named
+            // this tenant since this one opened, and the first identity on disk is the tenant's
+            // (the replay after a merge would refuse two).
+            let _lock = self.writer_lock().await?;
+            let path = identity_path(&self.root, tenant.as_str());
+            let identity = match fs::read(&path) {
+                Ok(bytes) => {
                     let value: Value =
                         serde_json::from_slice(&bytes).map_err(|_| corrupt("tenant identity"))?;
                     let stored = value
                         .get("stream_identity")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| corrupt("tenant identity"))?;
-                    if stored != identity {
-                        state.poisoned = true;
-                        return Err(corrupt("another writer named this tenant's identity"));
+                        .ok_or_else(|| corrupt("tenant identity"))?
+                        .to_owned();
+                    // Refused only when this handle's engine already holds another identity.
+                    match state.engine.restore_stream_identity(tenant, &stored).await {
+                        Ok(()) => {}
+                        Err(EventLogError::Invalid(_)) => {
+                            state.poisoned = true;
+                            return Err(corrupt("another writer named this tenant's identity"));
+                        }
+                        Err(other) => return Err(other),
                     }
-                } else {
-                    write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
+                    stored
                 }
-                state.identities.insert(tenant.as_str().to_owned());
-            }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let identity = state.engine.stream_identity(tenant).await?;
+                    write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
+                    identity
+                }
+                Err(error) => return Err(backend(error)),
+            };
+            state.identities.insert(tenant.as_str().to_owned());
             Ok(identity)
         })
     }
@@ -1221,8 +1619,13 @@ impl EventStore for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
-            let _lock = self.writer_lock()?;
-            state.engine.put_blob(tenant, digest, bytes).await?;
+            let _lock = self.writer_lock().await?;
+            // As in `commit`: a caller that stops awaiting leaves the engine ahead of the files.
+            state.unsettled = true;
+            if let Err(error) = state.engine.put_blob(tenant, digest, bytes).await {
+                state.unsettled = false;
+                return Err(error);
+            }
             let written = layout::store_format(&self.root).and_then(|format| {
                 split::write_blob(&self.root, tenant.as_str(), digest, bytes, format.splits())
             });
@@ -1230,6 +1633,7 @@ impl EventStore for TreeEventStore {
                 state.poisoned = true;
                 return Err(error);
             }
+            state.unsettled = false;
             Ok(())
         })
     }
@@ -1239,7 +1643,7 @@ impl EventStore for TreeEventStore {
         tenant: &'a TenantId,
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
-        Box::pin(async move { self.engine().await?.get_blob(tenant, digest).await })
+        Box::pin(self.read(move |engine| async move { engine.get_blob(tenant, digest).await }))
     }
 
     fn delete_blob<'a>(
@@ -1252,15 +1656,26 @@ impl EventStore for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
-            let _lock = self.writer_lock()?;
-            state.engine.delete_blob(tenant, digest).await?;
+            // A key `put_blob` refuses names no blob, and its file name would be derived from
+            // bytes no writer ever spelled: refuse it before anything is resolved or removed.
+            eventlog_core::validate_field("digest", digest)?;
+            let _lock = self.writer_lock().await?;
+            refresh(&self.root, &mut state).await?;
             // A split blob takes with it every text no other blob of the tenant names, so a
-            // deleted blob's content is gone from the tree and not only its manifest.
-            if let Err(error) = split::delete_blob(&self.root, tenant.as_str(), digest) {
-                state.poisoned = true;
-                return Err(error);
+            // deleted blob's content is gone from the tree and not only its manifest. Every
+            // manifest is read before anything is removed: a fault refuses the whole deletion.
+            let deletion = split::plan_delete(&self.root, tenant.as_str(), digest)?;
+            state.unsettled = true;
+            let removed = async {
+                state.engine.delete_blob(tenant, digest).await?;
+                if let Err(error) = deletion.apply() {
+                    state.poisoned = true;
+                    return Err(error);
+                }
+                Ok(())
             }
-            Ok(())
+            .await;
+            self.published(&mut state, removed)
         })
     }
 }
@@ -1305,7 +1720,7 @@ impl TreeEventStore {
                     &members,
                     &group.meta,
                     blobs,
-                    move |engine, passed| {
+                    move |engine, passed, recorded| {
                         Box::pin(async move {
                             let mut rewritten = group.clone();
                             for (append, expected) in rewritten.appends.iter_mut().zip(passed) {
@@ -1313,6 +1728,14 @@ impl TreeEventStore {
                             }
                             let result = if blobs.is_empty() {
                                 engine.append_group_guarded(&rewritten, admission).await?
+                            } else if recorded {
+                                // A retry carrying a batch is admitted again before its receipt
+                                // answers it, as `AtomicEventStore` promises: the blob entry point
+                                // the commit went through answers from its receipt without asking
+                                // the guard. The receipt it recorded is matched all the same.
+                                engine
+                                    .append_group_guarded_with_blobs(&rewritten, admission, blobs)
+                                    .await?
                             } else {
                                 engine
                                     .append_group_with_blobs_guarded(
@@ -1361,10 +1784,15 @@ impl ConsistentTenantCapture for TreeEventStore {
         limits: CaptureLimits,
     ) -> BoxFuture<'a, Result<TenantCapture, CaptureError>> {
         Box::pin(async move {
-            let engine = self.engine().await.map_err(CaptureError::from)?;
-            let mut capture = engine.capture_tenant(tenant, projections, limits).await?;
-            self.decorate(&mut capture.events).await;
-            Ok(capture)
+            // As `TreeEventStore::read`, with the capture's own error type.
+            loop {
+                let (engine, privacy) = self.engine_at().await.map_err(CaptureError::from)?;
+                let mut capture = engine.capture_tenant(tenant, projections, limits).await?;
+                if fold::privacy_token(&self.root).map_err(CaptureError::from)? == privacy {
+                    self.decorate(&mut capture.events).await;
+                    return Ok(capture);
+                }
+            }
         })
     }
 }
@@ -1379,13 +1807,33 @@ impl InlineProjectionAdmin for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
+            // Attachment is to projections admitted already; registering the projector for the
+            // replay below would create its tables, so a misspelled or never admitted projection
+            // would report success. The files keep no projection structure: what this handle
+            // admitted is what `create_projections` admitted on it. An engine holding exactly those
+            // admissions judges the attachment by the rules SQLite attaches by.
+            let admitted = SqliteEventStore::in_memory("tree").await?;
+            for admission in &state.catch_up {
+                admitted.create_projections(Arc::clone(admission)).await?;
+            }
+            admitted
+                .attach_inline_existing(Arc::clone(&projector))
+                .await?;
             // The engine freezes inline registration once it has served, and the replay that
             // loaded this history already has. So the engine is rebuilt from the files with the
             // projector registered before the replay, which is what attaching to existing history
             // means: every row it would have written is written.
             let mut inline = state.inline.clone();
             inline.push(projector);
-            *state = build(&self.root, inline, state.catch_up.clone()).await?;
+            let served = state.engine.positions().await?;
+            *state = build(
+                &self.root,
+                inline,
+                state.catch_up.clone(),
+                Locked::NotHeld,
+                Some(served),
+            )
+            .await?;
             Ok(())
         })
     }

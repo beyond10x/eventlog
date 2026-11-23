@@ -5,6 +5,271 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.10.0 — 2026-11-23
+
+### Added
+
+- KPI gate: `kpi/kpis.json` defines deterministic work counters and timings per provider,
+  `kpi/baseline.json` records them, and the `eventlog-kpi` runner checks the counters
+  (`bash scripts/gate.sh --kpi`) and A/B-compares timings between two revisions. The providers'
+  counters exist only behind the non-default `kpi-counters` feature; no public API changes.
+  CI runs them as two jobs: `KPI / KPI counters` (meant to become a required check) and
+  `KPI / KPI timing` (the A/B on pull requests, informational only).
+- Core: `Projector::fingerprint`, an optional digest of a projector's configuration and version.
+  The default, `None`, changes nothing except the tree store's kept state (below).
+- SQLite: `SqliteEventStore::restore_events_at` queues restored events with the global position
+  each takes, `positions` reads every event's position and the highest one ever assigned
+  (`EventPositions`), and `reserve_positions_through` keeps later appends above a position.
+- Core: `EventLogError::Committed { cleanup }`, returned when a commit is published and its
+  outcome known but the cleanup after it failed. The command is not to be retried as failed.
+- PostgreSQL implements `AtomicEventStore::append_group_guarded_with_blobs`: admission, the
+  batch's blob bindings, the members and the receipt commit in one transaction, so a refused
+  guard binds no blob and a batch costs one commit instead of one per blob. The sorted digests are
+  recorded in the new table `<prefix>_group_batches`; retries follow the shared contract of File
+  and SQLite. This is a new schema edition: run `PostgresEventStore::migrate` with the migration
+  role before opening with the application role (hosted `open` refuses the previous edition), and
+  grant the application role `SELECT, INSERT, UPDATE, DELETE` on the new table.
+- PostgreSQL: the same edition adds the index `<prefix>_events_publication` on
+  `(committed_xid, global_seq)`. A feed, catch-up or rebuild page finds the first position still
+  in flight with an index range scan instead of reading every event of the owner. `migrate`
+  builds it inside its transaction, so the events table is locked against writes while it builds.
+- PostgreSQL: the same edition adds the index `<prefix>_scope_counters_bytes` on the byte order of
+  the admission counter coordinates. Tenant erasure removes the tenant's counters with an index
+  range scan instead of reading every counter while it holds the exclusive publication lock.
+- PostgreSQL: the same edition adds the table `<prefix>_settlement_floor`, written only by
+  `migrate` (see Fixed). Grant the application role `SELECT` on it, nothing more.
+- `eventlog_core::MAX_INDEXED_VALUE_BYTES` (2,048) and `indexed_values`: every provider refuses a
+  projection row whose indexed field value is longer, before writing, with the new
+  `EventLogError::IndexedValueTooLarge { field, bytes, limit }`. On PostgreSQL such a value could
+  exceed the B-tree entry limit and abort the append with a backend error; SQLite and the file
+  provider accepted it. A projector that indexes longer values must index a shorter key instead.
+- PostgreSQL: `PostgresConnectionAuthority::cancel` sends the server-side cancel request for a
+  caller-owned session. The pool calls it when it retires an unsettled lease. The default
+  reports `Unsupported`, so existing authorities compile unchanged; with it, a retired query on a
+  server without disconnect polling (PostgreSQL 13, or a platform without
+  `client_connection_check_interval`) can keep running and holding locks after the pool returned
+  its permit, until it finishes or reaches its statement or lock timeout.
+
+### Changed
+
+- Every provider's `redact` takes the reason as an owner-defined code, such as
+  `subject-request`, and refuses free text with `EventLogError::Invalid` before it writes
+  anything. The tombstone keeps the reason after the body is gone, so a name or an address in an
+  explanation was read back by everyone who read the redacted event. A code takes the grammar of
+  an identity (`validate_identity`): printable ASCII, no space, no `@`; the new
+  `validate_redaction_reason` checks it, and the kit defines no codes. Stricter input on a public
+  API: a minor release. A tree store an earlier release redacted with free text still opens and
+  copies: the replay and `eventlog_tree::copy` redact with the fixed code
+  `eventlog_tree::LEGACY_REDACTION_REASON` (`legacy-reason`), and the event file keeps its bytes.
+  Consumers whose test fixtures pass free-text reasons and fail on this release: conductor tests
+  (`erased on request`), entity-runtime `crates/entity-eventlog/tests/providers.rs`, ekr-store
+  tests, service-sdk `service-eventlog` and the `service-host` persistence fixtures. Shared
+  exercise case `a_free_text_redaction_reason_is_refused_before_writing`.
+- PostgreSQL: schema admission (`open`, `migrate`, projection validation) reads each catalog
+  property for all of a check's relations in one query: hosted `open` makes about 14 round trips
+  for its schema and privilege checks instead of about 190. Every admission requirement and every
+  refusal message is unchanged.
+- PostgreSQL: `AtomicBlobEventStore` hashes each blob once (the fingerprint's SHA-256 is the
+  integrity column), binds from the caller's bytes without copying the request, and reads a
+  stored blob back only when its digest was already bound.
+- PostgreSQL: a guard's scope reservation takes one statement per phase (advisory locks in sorted
+  order, the counter read, the counter write) instead of three per scope: 64 scopes cost the same
+  round trips as one. A scope whose value does not change is not written, so a zero-delta check
+  creates no counter row and writes no WAL; the locks and ceiling checks are unchanged.
+- PostgreSQL: consistent tenant capture sizes each page of its event, blob and projection-row
+  reads from the remaining payload allowance and the largest item that read has admitted, from
+  one row up to 1,000. The first page of each read holds one row, so a first body over the
+  allowance is refused after one row arrived instead of after a full page (a 1,000-row page of
+  8 KB bodies was 8.2 MB on the wire).
+- PostgreSQL: `read_stream` and the stream reads of `read_many` still read one row past the page
+  to decide `end_of_stream`, but no longer output, detoast or decode that row's event body; the
+  next page reads it once.
+- Verified blob content: a full memory drops its least recently used entries until a new content
+  fits, instead of clearing every entry. Deletion and erasure through the handle still clear it.
+- PostgreSQL: capture preflight takes the blob count, byte total and invalid-length count from one
+  aggregate, scanning the tenant's blob bindings once instead of three times.
+
+### Fixed
+
+- Tree: a redaction, tenant erasure or blob deletion through one handle is no longer served by
+  another open handle of the same store; reads check a privacy token published under the writer
+  lock and rebuild from the files, and a read that overlaps a removal is served again.
+- Tree: a removal of content deletes every kept state under `.cache/state/`, and a state is kept
+  only under the writer lock while no removal has been published since its replay began.
+- Tree: a kept state is reused only when every registered projector returns an unchanged
+  fingerprint; a projector without one is folded again on each open.
+- Tree: a write waits for the writer lock on a blocking worker, so two handles contending on one
+  single-thread runtime no longer deadlock.
+- Tree: a write whose caller stopped awaiting it between the engine and the files is rebuilt away
+  on the next operation instead of being served or answered as deduplicated.
+- Tree: a retry of a committed merge returns its receipt; the same key over other heads is an
+  idempotency mismatch.
+- Tree: erasing a tenant no longer counts another writer's unseen group for another tenant as
+  loaded.
+- Tree: `read_many` serves the whole batch from one observation, so it never shows half of an
+  atomic group.
+- Tree: an append hashes each event's envelope once instead of four times.
+- Tree: a guarded group retried with its blobs is admitted again before its receipt answers it,
+  as `AtomicEventStore::append_group_guarded_with_blobs` promises; a guard that refuses now
+  refuses the retry.
+- Tree: an open requests file metadata once per history file instead of twice, and not at all
+  for a directory.
+- Tree: `attach_inline_existing` refuses a projection that `create_projections` did not admit on
+  the handle, or admitted with another shape, instead of creating it and reporting success.
+- Tree: an open handle that rebuilds its engine (after another handle's commit, a merge, a
+  redaction, an erasure or an inline attachment) keeps every served event's global position and
+  places history new to it above the highest position it assigned, so a saved feed cursor no
+  longer skips events. A rebuild no longer loads a kept state, which another replay ordered.
+- Repository: a command the store answers as already recorded is answered from the stream it was
+  recorded on. A tenant-wide claim retried under a freshly minted id used to fold the original
+  stream's events into the retry id's aggregate and could cache that state under the retry id;
+  the outcome now carries the recorded stream's state, nothing is cached for the retry id, and a
+  claim recorded on a stream of another aggregate type is refused with `IdempotencyMismatch`.
+  The same holds on one stream: a duplicate answered after other writers moved the stream past
+  the revision this call loaded no longer skips their events.
+- Repository: `load` is read-only. It no longer captures a snapshot generation, which wrote a
+  durable generation row for every absent stream read on SQLite and PostgreSQL. It still starts
+  from a cache only when the provider's provenance check accepts it; `handle` captures a
+  generation only when its policy can write a snapshot, and `snapshot_now` always does.
+- Repository: automatic snapshots count the events since the cache a command started from, and
+  write at the committed revision. A command of several events used to step over the exact
+  multiple and skip the snapshot, so a stream of two-event commands could be folded from zero on
+  every command. The generation check is unchanged.
+- SQLite and PostgreSQL: within one snapshot generation the cached revision never moves back. A
+  delayed checked save of an older fold used to replace a newer cache and move the replay point
+  back; it now leaves the newer cache and returns `true`. A cache from an earlier generation is
+  still replaced at any revision. Shared exercise `run_snapshot_revision_is_monotonic`.
+- SQLite: the populated legacy blob migration walks its `(tenant_id, digest)` cursor with one
+  row-value range on the primary key instead of an expanded `OR` that rescanned the tenant's
+  earlier digests on every row. Transaction, byte-count and integrity checks are unchanged.
+- File: a deduplicated guarded retry of a blob-bearing group still runs its admission, but no
+  longer commits what that admission staged. A counter reservation made by the retry used to be
+  journaled with zero new events, so each retry charged the quota again; it is now rolled back,
+  as SQLite rolls it back, and the original receipt is returned.
+- File: forgetting a tenant the history does not hold no longer rewrites the journal or advances
+  its epoch, so other open handles keep working; leftover snapshot and object disposal still runs.
+- File: a redaction or tenant erasure drops the handle's capture view of the replaced history at
+  once, including when the rewrite fails after publishing, instead of keeping it in memory until a
+  later call.
+- File: `rebuild_projection` refuses, before clearing a row, a projector whose name or table an
+  attached inline projector owns ("rebuild requires a catch-up projection") unless it is that
+  attached instance itself; it used to replace inline rows with any supplied projector's results.
+  `run_catch_up` refuses a differently named projector over an inline table as well.
+- File: a delayed `save_snapshot_checked` of an older fold no longer replaces a newer cached
+  snapshot of the same generation; it returns true and keeps the newer one, so the replay point
+  never moves back. A cache of an earlier generation is still replaced at any revision.
+- File: a commit whose object or snapshot cleanup fails after publication returns
+  `EventLogError::Committed` instead of `UnknownCommit` (atomic content) or a plain backend error
+  (other writes, redaction, tenant erasure). The next commit that changes bindings, or a reopen,
+  retries the cleanup.
+- PostgreSQL: a redaction or tenant erasure whose deadline fires after `COMMIT` was sent returns
+  `UnknownCommit` instead of `Deadline`, as append does; the change may have been applied.
+- PostgreSQL: a projection whose `<table>_idx_<n>` index name would exceed 63 bytes gets one
+  index per declared field under a shortened name with a digest of the table name. Before,
+  PostgreSQL truncated every such name to the same identifier, only the first field was indexed,
+  `migrate` succeeded and `open` refused the table. `migrate` now creates the indexes missing by
+  definition, whatever their stored names, and compares the table's whole shape before it
+  commits, as `open` does.
+- PostgreSQL: a positive pool timeout under a whole millisecond is sent to the session rounded up
+  (500 µs becomes 1 ms). Before, it was truncated to 0, which PostgreSQL reads as no statement,
+  lock or idle-transaction limit.
+- PostgreSQL: an owner restored from a logical backup delivers its feed again after `migrate`.
+  Restored events keep the source cluster's transaction ids; one id ahead of this cluster's clock
+  withheld the restored history and every later event of the owner, in every tenant, from feed,
+  catch-up and rebuild until the clock passed it. `migrate` now finds a visible event whose
+  transaction id this cluster has not handed out yet and records the highest position as settled
+  in `<prefix>_settlement_floor`, under the exclusive publication gate; positions at or below the
+  floor count as settled and the watermark applies above it. Hosted `open` refuses such an owner
+  until then with `Invalid("PostgreSQL events carry another cluster's transaction ids (a restored
+  history); run migrate with the migration role before opening")`. The restore procedure is:
+  restore, then run `migrate`.
+- PostgreSQL: dropping an operation that holds an unsettled pool lease on a thread outside any
+  Tokio runtime no longer panics in the lease destructor. Retirement is spawned on the runtime
+  the lease was acquired on, not on the dropping thread's ambient runtime.
+- PostgreSQL: a grouped append, with or without blobs, starts its transaction deadline at its
+  public entry. The wait for inline registration to freeze, which an inline rebuild can hold
+  while it replays, is now spent from the same budget instead of being followed by a fresh full
+  timeout, as on the single-append path.
+- PostgreSQL: `recorded_command` reads a command receipt and its events in one read-only
+  REPEATABLE READ snapshot, so a tenant erasure that commits between the two reads no longer
+  returns a receipt with no events or with events of recreated stream coordinates. A receipt
+  whose interval lacks an event is refused as a backend error instead of returned short.
+- SQLite and PostgreSQL: a projector is driven inline or by catch-up, never both. A catch-up
+  runner created before the same projector was registered inline used to fold every event a
+  second time. `run_catch_up` now refuses an inline projector, as the file provider already did,
+  and inline registration or attachment refuses a projector catch-up has already driven on that
+  handle.
+- PostgreSQL: an inline projector is no longer folded by two appends at once. Appends to distinct
+  streams, through one handle or several, each took only the shared publication gate and their own
+  stream lock, so a projector that reads, computes and upserts a shared row could lose an update.
+  Every append and append group now takes each attached inline projector's owner/projector/tenant
+  lock, ordered by name, after its stream locks and before its guard, and holds it to commit.
+  Writes of one tenant therefore serialize from that point while an inline projector is attached.
+- PostgreSQL: a blob read whose fetch and check are separated by a commit or a statement notes the
+  verified-content generation before it fetches, so a same-handle deletion that settles in between
+  no longer leaves the deleted bytes in the handle's memory. `eventlog-core` adds
+  `VerifiedContent::generation`, `VerifiedContent::check_stored_since` and `ContentGeneration`;
+  `check_stored` is unchanged.
+- PostgreSQL and SQLite: inline rebuild no longer holds the tenant's whole decoded history in one
+  vector. It validates every page first and then folds page by page, both in the same snapshot,
+  so no callback still runs on corrupt history and the shadow-table publication stays atomic.
+  `eventlog-core` adds `CapturedOrder`, the page-at-a-time form of `validate_captured_order`.
+- PostgreSQL: an idempotency mismatch from `recorded_command` rolls back and keeps its pooled
+  connection instead of retiring it as an unsettled lease.
+
+### Security
+
+- PostgreSQL: hosted `open` requires only `SELECT` on the migration metadata
+  (`<prefix>_schema_version`, `<prefix>_projection_registry`, `<prefix>_settlement_floor`) and
+  refuses an application role that can `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` them. Erasure
+  deletes a tenant from every registered projection, so a role that could edit the roster could
+  make erasure skip a table; a role that could raise the settlement floor could let a feed cursor
+  pass an append still in flight. Existing deployments that granted DML on all tables must revoke
+  it on these three tables after `migrate`: `REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON
+  <prefix>_schema_version, <prefix>_projection_registry, <prefix>_settlement_floor FROM
+  <application role>`.
+- PostgreSQL: a hosted pool holds every physical session it opens after `open` to the database,
+  role and schema that admission saw, and to the hosted role rules (no DDL powers, a finite
+  connection limit within the replica share). A caller-owned authority that reconnects as another
+  principal is refused with `Invalid("pooled PostgreSQL session is not the admitted hosted
+  principal")` and the session is retired unserved. Before, only the first session was checked.
+
+### Performance
+
+- File: `read_feed` and catch-up start at the requested position instead of walking the store
+  from its first event. Paging 128 events in pages of 8 visits 143 events instead of 1,103, and an
+  idle catch-up poll visits none.
+- File: an idle `run_catch_up` poll whose cursor is already current commits nothing. Twenty idle
+  polls used to add twenty journal frames (369 to 7,901 bytes); a projector without a cursor still
+  records its first one.
+- File: opening a store reads, chains and replays its journal once instead of twice, under the
+  writer lock of that open; recovery, snapshot and object disposal and object hashing are unchanged.
+- File: a commit that binds or unbinds no blob no longer lists and synchronizes the blob directory.
+  Objects a crash leaves behind are disposed of by the next commit that changes bindings and by the
+  complete opener.
+- File: a blob batch finds digests it already binds through an index instead of scanning the batch,
+  so 1,024 distinct digests no longer cost 523,776 comparisons. A repeated digest with different
+  bytes still refuses the group.
+- File: `projection_find` reads an in-memory index by tenant, projection, field, value and row
+  key instead of every row of the projection, so a lookup of a value no row holds visits no row
+  (it used to evaluate the field of every row: 512 for 512 rows). The journal format is unchanged.
+- File: deciding which cached snapshots are live builds one set of generations instead of scanning
+  every generation per snapshot, so opening a store with 64 live snapshots no longer makes 2,080
+  comparisons.
+- File: `projection_list` seeks to the first key past its cursor instead of walking the rows from
+  the first key, so a page visits the rows it returns and at most one more (paging 512 rows by 32
+  used to evaluate 4,864).
+- File: an inline registration resumes the handle's verified view instead of opening and replaying
+  the whole journal, and keeps that view for the next call (four registrations on a 128-frame store
+  used to visit 518 extra frames).
+
+### Documentation
+
+- Repository: idempotency covers only a command that wrote events, now stated on
+  `Aggregate::decide`, `Outcome` and `EventStore::recorded_command`. A command that decided
+  nothing leaves no record under its key, so a retry with the same key is decided again against
+  the current state and may write. Behaviour is unchanged; a repository test pins it.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security

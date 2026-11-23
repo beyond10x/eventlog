@@ -336,13 +336,16 @@ impl DeferredTenantCapture {
     ///
     /// # Errors
     /// Whatever [`DeferredBlob::bytes`] returns for the first binding that cannot be read.
+    ///
+    /// Content the value already holds moves into the result; only a deferred binding is read.
     pub fn load(self) -> Result<TenantCapture, CaptureError> {
         let mut blobs = Vec::with_capacity(self.blobs.len());
-        for blob in &self.blobs {
-            blobs.push(CapturedBlob {
-                digest: blob.digest.clone(),
-                bytes: blob.bytes()?,
-            });
+        for DeferredBlob { digest, source } in self.blobs {
+            let bytes = match source {
+                DeferredSource::Held(bytes) => bytes,
+                DeferredSource::Read(source) => source.read(&digest)?,
+            };
+            blobs.push(CapturedBlob { digest, bytes });
         }
         Ok(TenantCapture {
             tenant: self.tenant,
@@ -592,7 +595,7 @@ pub fn validate_capture_request(
     let mut names = BTreeSet::new();
     for specification in projections {
         specification
-            .validate()
+            .validate_identifiers()
             .map_err(|_| refuse(CaptureRequestRefusal::InvalidProjectionSpecification))?;
         if !names.insert(specification.name) {
             return Err(refuse(CaptureRequestRefusal::DuplicateProjection));
@@ -732,9 +735,31 @@ impl CaptureBudget {
 }
 
 /// The compact UTF-8 length of one stored body. Object key order does not change it.
+///
+/// The same serializer as `to_vec` writes into a counter, so the length is exact and no second
+/// copy of the body is built only to be measured.
 fn compact_len(value: &Value, material: CaptureMaterial) -> Result<u64, CaptureError> {
-    let encoded = serde_json::to_vec(value).map_err(|_| CaptureError::Corrupt { material })?;
-    u64::try_from(encoded.len()).map_err(|_| CaptureError::Corrupt { material })
+    let mut counter = ByteCount(0);
+    serde_json::to_writer(&mut counter, value).map_err(|_| CaptureError::Corrupt { material })?;
+    Ok(counter.0)
+}
+
+/// A writer that keeps only how many bytes it was given.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let len = u64::try_from(bytes.len()).map_err(|_| std::io::ErrorKind::InvalidData)?;
+        self.0 = self
+            .0
+            .checked_add(len)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Check one stored event's constructor-level envelope invariants.
@@ -793,26 +818,61 @@ pub fn validate_captured_order(
     tenant: &TenantId,
     events: &[RecordedEvent],
 ) -> Result<(), CaptureError> {
-    let corrupt = || CaptureError::Corrupt {
-        material: CaptureMaterial::Event,
-    };
-    let mut position = 0_u64;
-    let mut heads: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    let mut order = CapturedOrder::default();
     for event in events {
+        order.observe(tenant, event)?;
+    }
+    Ok(())
+}
+
+/// [`validate_captured_order`] one event at a time, for a reader that pages through history.
+///
+/// Feeding every event of a history to [`CapturedOrder::observe`] in order accepts and refuses
+/// exactly what [`validate_captured_order`] does over the whole slice, while the caller keeps only
+/// one page. What it retains is the last position and one head per stream seen, not the events.
+#[derive(Debug, Default)]
+pub struct CapturedOrder {
+    position: u64,
+    /// Highest version seen, by stream type and then stream id.
+    heads: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+impl CapturedOrder {
+    /// Check the next event of the history after every event observed so far.
+    ///
+    /// # Errors
+    /// Returns [`CaptureError::Corrupt`] for a position that does not rise past the previous one, a
+    /// version that is not one past its stream's previous version, or an event that fails
+    /// [`validate_captured_event`].
+    pub fn observe(
+        &mut self,
+        tenant: &TenantId,
+        event: &RecordedEvent,
+    ) -> Result<(), CaptureError> {
+        let corrupt = || CaptureError::Corrupt {
+            material: CaptureMaterial::Event,
+        };
         validate_captured_event(tenant, event)?;
-        if event.global_seq <= position {
+        if event.global_seq <= self.position {
             return Err(corrupt());
         }
-        position = event.global_seq;
-        let head = heads
-            .entry((event.stream_type.as_str(), event.stream_id.as_str()))
-            .or_insert(0);
+        let streams = match self.heads.get_mut(event.stream_type.as_str()) {
+            Some(streams) => streams,
+            None => self.heads.entry(event.stream_type.clone()).or_default(),
+        };
+        let head = streams.get(event.stream_id.as_str()).copied().unwrap_or(0);
         if head.checked_add(1) != Some(event.version) {
             return Err(corrupt());
         }
-        *head = event.version;
+        match streams.get_mut(event.stream_id.as_str()) {
+            Some(stored) => *stored = event.version,
+            None => {
+                streams.insert(event.stream_id.clone(), event.version);
+            }
+        }
+        self.position = event.global_seq;
+        Ok(())
     }
-    Ok(())
 }
 
 /// [`validate_captured_order`] for a store whose streams can fork.
@@ -1082,6 +1142,65 @@ mod tests {
         }
     }
 
+    /// Observing a history one event at a time accepts and refuses what the whole-slice check
+    /// does, including a version gap or a repeated position that straddles two pages.
+    #[test]
+    fn captured_order_observed_event_by_event_matches_the_whole_history_check() {
+        let tenant = TenantId::new("tenant-1").unwrap();
+        let histories: [(&str, Vec<RecordedEvent>); 5] = [
+            (
+                "interleaved streams",
+                vec![
+                    recorded(1, 1, "one"),
+                    recorded(3, 1, "two"),
+                    recorded(4, 2, "one"),
+                    recorded(9, 2, "two"),
+                ],
+            ),
+            (
+                "version gap",
+                vec![
+                    recorded(1, 1, "one"),
+                    recorded(2, 1, "two"),
+                    recorded(3, 3, "one"),
+                ],
+            ),
+            (
+                "repeated version",
+                vec![recorded(1, 1, "one"), recorded(2, 1, "one")],
+            ),
+            (
+                "repeated position",
+                vec![recorded(1, 1, "one"), recorded(1, 1, "two")],
+            ),
+            ("first version is not one", vec![recorded(1, 2, "one")]),
+        ];
+        for (case, history) in histories {
+            let mut order = CapturedOrder::default();
+            let mut observed = Ok(());
+            for event in &history {
+                observed = order.observe(&tenant, event);
+                if observed.is_err() {
+                    break;
+                }
+            }
+            assert_eq!(
+                observed,
+                validate_captured_order(&tenant, &history),
+                "{case}: incremental and whole-history checks disagree"
+            );
+        }
+        let mut order = CapturedOrder::default();
+        order.observe(&tenant, &recorded(1, 1, "one")).unwrap();
+        assert_eq!(
+            order.observe(&tenant, &recorded(2, 3, "one")),
+            Err(CaptureError::Corrupt {
+                material: CaptureMaterial::Event
+            }),
+            "a gap after an earlier page is refused as corrupt history"
+        );
+    }
+
     #[test]
     fn a_branchable_capture_admits_a_fork_and_its_merge() {
         let tenant = TenantId::new("tenant-1").unwrap();
@@ -1160,6 +1279,92 @@ mod tests {
             validate_captured_branchable_order(&tenant, &history).is_err(),
             "a parent on another stream was accepted"
         );
+    }
+
+    #[test]
+    fn loading_moves_held_content_and_reads_only_deferred_bindings() {
+        #[derive(Debug)]
+        struct Reader(std::sync::atomic::AtomicUsize);
+        impl BoundBlobs for Reader {
+            fn read(&self, digest: &str) -> Result<Vec<u8>, CaptureError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match digest {
+                    "deferred" => Ok(b"read later".to_vec()),
+                    _ => Err(CaptureError::Corrupt {
+                        material: CaptureMaterial::Blob,
+                    }),
+                }
+            }
+        }
+        let held = vec![7_u8; 4096];
+        let held_buffer = held.as_ptr();
+        let reader = Arc::new(Reader(std::sync::atomic::AtomicUsize::new(0)));
+        let capture = |blobs| DeferredTenantCapture {
+            tenant: TenantId::new("tenant-1").unwrap(),
+            stream_identity: "identity".into(),
+            events: Vec::new(),
+            blobs,
+            projections: Vec::new(),
+        };
+        let loaded = capture(vec![
+            DeferredBlob::held("held".into(), held),
+            DeferredBlob::deferred("deferred".into(), reader.clone()),
+        ])
+        .load()
+        .unwrap();
+        assert_eq!(loaded.blobs[0].digest, "held");
+        assert_eq!(loaded.blobs[0].bytes, vec![7_u8; 4096]);
+        assert_eq!(
+            loaded.blobs[0].bytes.as_ptr(),
+            held_buffer,
+            "held content was copied instead of moved into the result"
+        );
+        assert_eq!(loaded.blobs[1].digest, "deferred");
+        assert_eq!(loaded.blobs[1].bytes, b"read later");
+        assert_eq!(reader.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let refused = capture(vec![
+            DeferredBlob::held("held".into(), vec![1]),
+            DeferredBlob::deferred("gone".into(), reader.clone()),
+        ])
+        .load();
+        assert_eq!(
+            refused.err(),
+            Some(CaptureError::Corrupt {
+                material: CaptureMaterial::Blob
+            })
+        );
+    }
+
+    #[test]
+    fn payload_length_is_the_exact_compact_encoding_of_escapes_numbers_and_non_ascii() {
+        let bodies = [
+            json!({}),
+            json!({"value": 1}),
+            json!({"zeta":1,"alpha":"quote \" slash \\ tab \t nl \n ctl \u{1} del \u{7f}"}),
+            json!({"name":"Grüße, 世界 😀","nested":{"y":[1,-2,3.5,1e300,0.1],"x":null}}),
+            json!({"max":u64::MAX,"min":i64::MIN,"list":[[],{},true,false]}),
+            json!({"long":"b".repeat(70_000)}),
+        ];
+        for body in bodies {
+            let encoded = serde_json::to_vec(&body).unwrap().len() as u64;
+            assert_eq!(
+                compact_len(&body, CaptureMaterial::Projection).unwrap(),
+                encoded,
+                "counted length differs from the encoding of {body}"
+            );
+        }
+        let exact = json!({"long":"b".repeat(70_000)});
+        let bytes = serde_json::to_vec(&exact).unwrap().len() as u64;
+        let mut budget = CaptureBudget::new(CaptureLimits {
+            max_events: 0,
+            max_blobs: 0,
+            max_projection_rows: 2,
+            max_payload_bytes: bytes * 2,
+        });
+        budget.admit_projection_row(&exact).unwrap();
+        budget.admit_projection_row(&exact).unwrap();
+        assert_eq!(budget.usage().payload_bytes, bytes * 2);
     }
 
     #[test]
