@@ -339,40 +339,31 @@ pub fn indexed_value(body: &Value, field: &str) -> Option<String> {
     }
 }
 
-/// The longest indexed value, in UTF-8 bytes, a projection row may carry.
+/// The bound 0.10.0 put on an indexed value, in UTF-8 bytes. No provider applies it any more.
 ///
-/// PostgreSQL keeps the whole value in a `(tenant_id, idx_N)` B-tree, whose entries must fit in
-/// about a third of a page (2,704 bytes at the default 8 KiB): a 512-byte tenant, this many
-/// incompressible bytes and the entry's headers still fit. Every provider refuses a longer value
-/// before writing, so a projector behaves the same on each.
+/// PostgreSQL kept the whole value in a `(tenant_id, idx_N)` B-tree, whose entries must fit in
+/// about a third of a page, so 0.10.0 refused a longer value on every provider. PostgreSQL now
+/// indexes a fixed-size digest of the value and compares each candidate with the value itself;
+/// SQLite and the file provider index the value as they always did.
+#[deprecated(note = "no provider bounds an indexed value; nothing refuses a longer one")]
 pub const MAX_INDEXED_VALUE_BYTES: usize = 2048;
 
 /// Every declared field's value for one row, in declaration order, as the backend stores it.
 ///
+/// A value of any length is indexed.
+///
 /// # Errors
-/// Returns [`EventLogError::IndexedValueTooLarge`] for a value over
-/// [`MAX_INDEXED_VALUE_BYTES`].
+/// None. The `Result` is kept so callers written against 0.10.0, which refused a value over
+/// 2,048 bytes here, compile unchanged.
 pub fn indexed_values(
     projection: &ProjectionSpec,
     body: &Value,
 ) -> Result<Vec<Option<String>>, EventLogError> {
-    projection
+    Ok(projection
         .indexed
         .iter()
-        .map(|field| {
-            let value = indexed_value(body, field);
-            match &value {
-                Some(text) if text.len() > MAX_INDEXED_VALUE_BYTES => {
-                    Err(EventLogError::IndexedValueTooLarge {
-                        field,
-                        bytes: text.len(),
-                        limit: MAX_INDEXED_VALUE_BYTES,
-                    })
-                }
-                _ => Ok(value),
-            }
-        })
-        .collect()
+        .map(|field| indexed_value(body, field))
+        .collect())
 }
 
 #[cfg(test)]
@@ -380,26 +371,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_indexed_value_one_byte_over_the_bound_is_refused_by_name() {
+    fn an_indexed_value_of_any_length_is_kept_whole() {
         const SPEC: ProjectionSpec = ProjectionSpec {
-            name: "bound",
+            name: "large",
             indexed: &["small", "large"],
         };
-        let at = "é".repeat(MAX_INDEXED_VALUE_BYTES / 2);
+        let large = format!("{}x", "é".repeat(4_000));
         assert_eq!(
-            indexed_values(&SPEC, &serde_json::json!({"small": 1, "large": at})),
-            Ok(vec![Some("1".into()), Some(at)])
-        );
-        assert_eq!(
-            indexed_values(
-                &SPEC,
-                &serde_json::json!({"large": format!("{}x", "é".repeat(MAX_INDEXED_VALUE_BYTES / 2))})
-            ),
-            Err(EventLogError::IndexedValueTooLarge {
-                field: "large",
-                bytes: MAX_INDEXED_VALUE_BYTES + 1,
-                limit: MAX_INDEXED_VALUE_BYTES,
-            })
+            indexed_values(&SPEC, &serde_json::json!({"small": 1, "large": large})),
+            Ok(vec![Some("1".into()), Some(large)]),
+            "8,001 bytes, over the 0.10.0 bound of 2,048, are indexed whole"
         );
     }
 

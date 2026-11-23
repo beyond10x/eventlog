@@ -915,12 +915,12 @@ async fn the_inline_projection_exercise_passes_on_postgresql() {
     eventlog_conformance::run_inline_projections(&store).await;
 }
 
-/// PostgreSQL keeps a whole indexed value in a B-tree entry of about a third of a page. A row
-/// whose indexed value is far over the portable bound is refused by name before any SQL, rather
-/// than by the index aborting the append's transaction; a value at the bound under a tenant of
-/// the longest accepted length fits the entry and is found by its value.
+/// PostgreSQL kept a whole indexed value in a B-tree entry of about a third of a page, so a long
+/// value under a long tenant aborted the append that wrote it (review L78). The index keys on a
+/// fixed-size digest of the value now: 8,000 incompressible bytes under a tenant of the longest
+/// accepted length are written with their event and found by their value.
 #[tokio::test]
-async fn an_oversized_indexed_value_is_refused_before_postgresql_aborts_the_append() {
+async fn an_8000_byte_indexed_value_under_the_longest_tenant_is_indexed_and_found() {
     struct WritesKind(TenantId, String);
     impl eventlog_core::Guard for WritesKind {
         fn check<'a>(
@@ -932,25 +932,25 @@ async fn an_oversized_indexed_value_is_refused_before_postgresql_aborts_the_appe
                     .upsert(
                         &eventlog_conformance::TALLY,
                         &self.0,
-                        "oversized",
+                        "large",
                         &serde_json::json!({ "kind": self.1 }),
                     )
                     .await
             })
         }
     }
-    let Some(store) = store("idx_bound").await else {
+    let Some(store) = store("idx_large").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
     };
-    drop_projection_tables(&store, &["idx_bound_p_tally"]).await;
+    drop_projection_tables(&store, &["idx_large_p_tally"]).await;
     store
         .register_inline(Arc::new(eventlog_conformance::Tally))
         .await
         .expect("registered");
     let tenant = TenantId::new(format!(
-        "idx-bound-{}",
-        "b".repeat(eventlog_core::MAX_FIELD_LEN - "idx-bound-".len())
+        "idx-large-{}",
+        "b".repeat(eventlog_core::MAX_FIELD_LEN - "idx-large-".len())
     ))
     .unwrap();
     let mut state: u64 = 0x2545_f491_4f6c_dd1d;
@@ -981,26 +981,19 @@ async fn an_oversized_indexed_value_is_refused_before_postgresql_aborts_the_appe
         }
     };
     assert_eq!(
-        append("oversized", noise.clone()).await,
-        (
-            Err(EventLogError::IndexedValueTooLarge {
-                field: "kind",
-                bytes: 8_000,
-                limit: eventlog_core::MAX_INDEXED_VALUE_BYTES,
-            }),
-            None
-        )
-    );
-    let at_bound = noise[..eventlog_core::MAX_INDEXED_VALUE_BYTES].to_owned();
-    assert_eq!(
-        append("at-bound", at_bound.clone()).await,
-        (Ok(()), Some(1))
+        append("large", noise.clone()).await,
+        (Ok(()), Some(1)),
+        "an 8,000-byte indexed value under the longest tenant is written with its event"
     );
     let found = store
-        .projection_find(&eventlog_conformance::TALLY, &tenant, "kind", &at_bound, 10)
+        .projection_find(&eventlog_conformance::TALLY, &tenant, "kind", &noise, 10)
         .await
         .unwrap();
-    assert_eq!(found.len(), 1, "the row at the bound is found by its value");
+    assert_eq!(
+        found,
+        [serde_json::json!({ "kind": noise })],
+        "the row is found by its value"
+    );
 }
 
 async fn drop_projection_tables(store: &PostgresEventStore, tables: &[&str]) {

@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:pg-indexed-values-through-a-fixed-size-digest
 kind: story
-status: draft
+status: implemented
 title: PostgreSQL indexes a fixed-size digest of indexed values, verifies candidates, migrates fenced
 summary: Review L78 = B; 0.10.0 only refuses indexed values over 2,048 bytes
 owner: eventlog
-revision: 1
+relations:
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T17:45:56Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T17:45:56Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T17:45:57Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

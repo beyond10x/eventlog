@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T18:00:00Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-projection-pages-walk-a-bytewise-index",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-pg-schema: ICU und EXPLAIN Index Scan on _key_c without Sort; mixed-case desk/1 Desk/2 desk/3 all returned; previous edition refused; nextest 983 run 981 passed (2 unrelated); 3 mutants red"
+  }
+}

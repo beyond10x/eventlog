@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T18:00:00Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-indexed-values-through-a-fixed-size-digest",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-pg-schema: 8,000-byte value under a 512-byte tenant indexed and found on all providers; md5-prefix twins told apart; migrated store answers the same; 5 mutants red; KPI counters 0 regressed"
+  }
+}

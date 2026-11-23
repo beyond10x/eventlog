@@ -1578,12 +1578,13 @@ pub async fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
         "the guard's projection write was rolled back with its refused append"
     );
     assert_eq!(row["last"], json!("item.extracted"));
-    run_indexed_value_bound(store).await;
+    run_large_indexed_value(store).await;
 }
 
-/// A guard that writes one tally row whose indexed `kind` is the given text.
+/// A guard that writes one tally row, under `key`, whose indexed `kind` is the given text.
 struct WritesIndexedKind {
     tenant: TenantId,
+    key: &'static str,
     kind: String,
 }
 
@@ -1597,8 +1598,8 @@ impl eventlog_core::Guard for WritesIndexedKind {
                 .upsert(
                     &TALLY,
                     &self.tenant,
-                    "bound/row",
-                    &json!({"stream": "bound", "kind": self.kind, "count": 0, "last": "bound"}),
+                    self.key,
+                    &json!({"stream": self.key, "kind": self.kind, "count": 0, "last": "large"}),
                 )
                 .await
         })
@@ -1618,72 +1619,56 @@ fn incompressible(length: usize) -> String {
         .collect()
 }
 
-/// Every provider indexes a value of [`eventlog_core::MAX_INDEXED_VALUE_BYTES`] incompressible
-/// bytes and refuses one byte more with a typed error before writing anything, under a tenant of
-/// the longest accepted length, [`eventlog_core::MAX_FIELD_LEN`] bytes, half of them bytes a file
+/// Every provider indexes, and finds by equality, a value of 8,000 incompressible bytes, and
+/// tells it apart from a value that differs from it only in its last byte, under a tenant of the
+/// longest accepted length, [`eventlog_core::MAX_FIELD_LEN`] bytes, half of them bytes a file
 /// name must escape: every provider stores and reads such a tenant.
-async fn run_indexed_value_bound(store: &std::sync::Arc<dyn EventStore>) {
-    let limit = eventlog_core::MAX_INDEXED_VALUE_BYTES;
-    let mut name = String::from("tenant-bound-");
+///
+/// PostgreSQL kept the whole value in a B-tree entry of about a third of a page, so a long value
+/// aborted the append that wrote it (review L78), and 0.10.0 refused a value over 2,048 bytes on
+/// every provider. PostgreSQL now keys the index on a fixed-size digest of the value and compares
+/// each candidate with the value itself.
+async fn run_large_indexed_value(store: &std::sync::Arc<dyn EventStore>) {
+    let mut name = String::from("tenant-large-");
     while name.len() < eventlog_core::MAX_FIELD_LEN {
         name.push(if name.len() % 2 == 0 { '/' } else { 'b' });
     }
     let tenant = TenantId::new(name).expect("a tenant of the longest accepted length");
-    let stream = StreamId::new(tenant.clone(), "item", "bound").expect("valid stream");
-    let guard = |kind: String| {
-        std::sync::Arc::new(WritesIndexedKind {
-            tenant: tenant.clone(),
-            kind,
-        }) as std::sync::Arc<dyn eventlog_core::Guard>
-    };
-    let refused = store
-        .append_guarded(
-            &stream,
-            Expected::NoStream,
-            &[event("item.received", 1)],
-            &meta("bound-over", &json!({})),
-            guard(incompressible(limit + 1)),
-        )
-        .await;
-    assert_eq!(
-        refused.map(|_| ()),
-        Err(EventLogError::IndexedValueTooLarge {
-            field: "kind",
-            bytes: limit + 1,
-            limit,
-        }),
-        "an indexed value over the portable bound is refused by name"
-    );
-    assert_eq!(
-        store.stream_version(&stream).await.expect("readable"),
-        None,
-        "a refused indexed value wrote no event"
-    );
-    assert_eq!(
+    let kind = incompressible(8_000);
+    let mut twin = kind.clone();
+    let last = twin.pop().expect("not empty");
+    twin.push(if last == '!' { '#' } else { '!' });
+    let rows = [("large-row", &kind), ("large-twin", &twin)];
+    for (key, value) in rows {
+        let stream = StreamId::new(tenant.clone(), "item", key).expect("valid stream");
         store
-            .projection_get(&TALLY, &tenant, "bound/row")
+            .append_guarded(
+                &stream,
+                Expected::NoStream,
+                &[event("item.received", 1)],
+                &meta(key, &json!({})),
+                std::sync::Arc::new(WritesIndexedKind {
+                    tenant: tenant.clone(),
+                    key,
+                    kind: value.clone(),
+                }),
+            )
             .await
-            .expect("readable"),
-        None,
-        "a refused indexed value wrote no row"
-    );
-    let kind = incompressible(limit);
-    store
-        .append_guarded(
-            &stream,
-            Expected::NoStream,
-            &[event("item.received", 1)],
-            &meta("bound-at", &json!({})),
-            guard(kind.clone()),
-        )
-        .await
-        .expect("a value at the bound is indexed");
-    let found = store
-        .projection_find(&TALLY, &tenant, "kind", &kind, 10)
-        .await
-        .expect("readable");
-    assert_eq!(found.len(), 1, "the row at the bound is found by its value");
-    assert_eq!(found[0]["kind"], json!(kind));
+            .expect("an 8,000-byte indexed value is written");
+    }
+    for (key, value) in rows {
+        let found = store
+            .projection_find(&TALLY, &tenant, "kind", value, 10)
+            .await
+            .expect("readable");
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly the row holding the value is found: {key}"
+        );
+        assert_eq!(found[0]["stream"], json!(key));
+        assert_eq!(found[0]["kind"], json!(value));
+    }
 }
 
 /// One stored event body, exactly as some past version of the code wrote it.

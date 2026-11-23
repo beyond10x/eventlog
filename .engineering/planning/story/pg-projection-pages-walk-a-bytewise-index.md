@@ -2,11 +2,17 @@
 format: aep.planning-md/3
 id: story:pg-projection-pages-walk-a-bytewise-index
 kind: story
-status: draft
+status: implemented
 title: PostgreSQL projection pages walk a (tenant_id, row_key COLLATE "C") index, admitted and cut over fenced
 summary: Review L22 follow-up; 0.10.0 sorts each page on a non-C database
 owner: eventlog
-revision: 1
+relations:
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T17:45:56Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T17:45:56Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T17:45:56Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

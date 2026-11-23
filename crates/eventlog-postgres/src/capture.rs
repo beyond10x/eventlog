@@ -605,13 +605,8 @@ pub(crate) async fn admit_projection(
     }
     observed.sort();
     let mut wanted = vec![(true, "btree (tenant_id, row_key)".to_owned(), true, true)];
-    for position in 0..specification.indexed.len() {
-        wanted.push((
-            false,
-            format!("btree (tenant_id, idx_{position})"),
-            true,
-            true,
-        ));
+    for (_, columns) in schema::projection_indexes(&table, specification.indexed.len()) {
+        wanted.push((false, columns, true, true));
     }
     wanted.sort();
     if observed != wanted {
