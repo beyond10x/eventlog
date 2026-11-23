@@ -7,6 +7,12 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- PostgreSQL: an inline projector is no longer folded by two appends at once. Appends to distinct
+  streams, through one handle or several, each took only the shared publication gate and their own
+  stream lock, so a projector that reads, computes and upserts a shared row could lose an update.
+  Every append and append group now takes each attached inline projector's owner/projector/tenant
+  lock, ordered by name, after its stream locks and before its guard, and holds it to commit.
+  Writes of one tenant therefore serialize from that point while an inline projector is attached.
 - PostgreSQL: a blob read whose fetch and check are separated by a commit or a statement notes the
   verified-content generation before it fetches, so a same-handle deletion that settles in between
   no longer leaves the deleted bytes in the handle's memory. `eventlog-core` adds
