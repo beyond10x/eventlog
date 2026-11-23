@@ -2572,9 +2572,7 @@ impl Inner {
                 guard.execute(&format!("INSERT INTO {prefix}_projection_registry(projection_name,indexed_fields) VALUES(?1,?2) ON CONFLICT(projection_name) DO NOTHING"),params![spec.name,&indexed]).map_err(backend)?;
                 let recorded:String=guard.query_row(&format!("SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"),params![spec.name],|row|row.get(0)).map_err(backend)?;
                 if recorded != indexed {
-                    return Err(EventLogError::Invalid(
-                        "projection registration shape changed".into(),
-                    ));
+                    return Err(changed_registration(prefix, spec.name, &recorded));
                 }
             }
             Ok(())
@@ -3405,6 +3403,30 @@ fn projection_table_body(indexed: usize) -> String {
 /// The one name a declared field's index is created and recognised under.
 fn projection_index(table: &str, position: usize) -> String {
     format!("{table}_idx_{position}")
+}
+
+/// The refusal of a registration whose declaration differs from the persisted one.
+///
+/// Releases up to 0.9.4 admitted a declaration that repeats an indexed field, which capture
+/// cannot read. Its persisted declaration can no longer be registered, and the corrected one
+/// differs from it, so the refusal names the projection's table and the way out: the table is
+/// derived from the log and is dropped and rebuilt, never edited in place.
+fn changed_registration(prefix: &str, name: &str, recorded: &str) -> EventLogError {
+    let repeats = serde_json::from_str::<Vec<String>>(recorded).is_ok_and(|fields| {
+        fields
+            .iter()
+            .enumerate()
+            .any(|(position, field)| fields[..position].contains(field))
+    });
+    if repeats {
+        return EventLogError::Invalid(format!(
+            "projection {name} is persisted with indexed fields {recorded}, which repeat a field \
+             capture cannot read; drop table {} and its {prefix}_projection_registry row, then \
+             register the corrected declaration and rebuild the projection",
+            projection_table(prefix, name)
+        ));
+    }
+    EventLogError::Invalid("projection registration shape changed".into())
 }
 
 /// Refuse a reader whose declared field order differs from the projection's registration.

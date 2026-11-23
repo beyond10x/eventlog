@@ -592,7 +592,7 @@ pub fn validate_capture_request(
     let mut names = BTreeSet::new();
     for specification in projections {
         specification
-            .validate()
+            .validate_identifiers()
             .map_err(|_| refuse(CaptureRequestRefusal::InvalidProjectionSpecification))?;
         if !names.insert(specification.name) {
             return Err(refuse(CaptureRequestRefusal::DuplicateProjection));
