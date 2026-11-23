@@ -5,6 +5,22 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Changed
+
+- Every provider's `redact` takes the reason as an owner-defined code, such as
+  `subject-request`, and refuses free text with `EventLogError::Invalid` before it writes
+  anything. The tombstone keeps the reason after the body is gone, so a name or an address in an
+  explanation was read back by everyone who read the redacted event. A code takes the grammar of
+  an identity (`validate_identity`): printable ASCII, no space, no `@`; the new
+  `validate_redaction_reason` checks it, and the kit defines no codes. Stricter input on a public
+  API: a minor release. A tree store an earlier release redacted with free text still opens and
+  copies: the replay and `eventlog_tree::copy` redact with the fixed code
+  `eventlog_tree::LEGACY_REDACTION_REASON` (`legacy-reason`), and the event file keeps its bytes.
+  Consumers whose test fixtures pass free-text reasons and fail on this release: conductor tests
+  (`erased on request`), entity-runtime `crates/entity-eventlog/tests/providers.rs`, ekr-store
+  tests, service-sdk `service-eventlog` and the `service-host` persistence fixtures. Shared
+  exercise case `a_free_text_redaction_reason_is_refused_before_writing`.
+
 ### Fixed
 
 - Repository: a command the store answers as already recorded is answered from the stream it was

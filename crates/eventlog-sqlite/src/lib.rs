@@ -1979,7 +1979,7 @@ impl Inner {
         version: u64,
         reason: &str,
     ) -> Result<RecordedEvent, EventLogError> {
-        validate_field("redaction reason", reason)?;
+        eventlog_core::validate_redaction_reason(reason)?;
         let prefix = self.prefix.clone();
         let mut guard = self.connection.lock().map_err(poisoned)?;
         let transaction = guard

@@ -180,6 +180,7 @@ pub async fn run(store: &dyn EventStore) {
     bytes_live_outside_the_log_and_can_be_erased_alone(store, &tenant).await;
     run_blob_binding_race(store, store).await;
     a_stream_identity_is_stable(store, &tenant, &other).await;
+    a_free_text_redaction_reason_is_refused_before_writing(store, &stream).await;
     redaction_keeps_the_place_and_drops_the_snapshot(store, &stream).await;
     forgetting_a_tenant_leaves_nothing(store, &other, &twin).await;
 }
@@ -1052,6 +1053,50 @@ pub async fn run_snapshot_revision_is_monotonic(store: &dyn EventStore) {
     );
 }
 
+/// A redaction reason is an owner-defined code. The tombstone keeps it after the body is gone,
+/// so free text, where a name or an address arrives, is refused before anything is written: the
+/// body, the snapshot and the snapshot generation stay as they were.
+async fn a_free_text_redaction_reason_is_refused_before_writing(
+    store: &dyn EventStore,
+    stream: &StreamId,
+) {
+    let events = store.read_stream(stream, 0, 100).await.expect("readable");
+    let snapshot = store.load_snapshot(stream).await.expect("readable");
+    let generation = store.snapshot_generation(stream).await.expect("readable");
+    assert!(
+        snapshot.is_some() && generation.is_some(),
+        "control: the stream holds a snapshot a redaction would drop"
+    );
+    let target = events.events[1].version;
+    for free_text in ["the person asked", "jane@example.org", "Jane Doe"] {
+        let refused = store.redact(stream, target, free_text).await;
+        let Err(EventLogError::Invalid(message)) = refused else {
+            panic!(
+                "a redaction with the free-text reason {free_text:?} was not refused: {refused:?}"
+            );
+        };
+        assert!(
+            message.contains("redaction reason"),
+            "{free_text:?} was refused for another reason: {message}"
+        );
+    }
+    assert_eq!(
+        store.read_stream(stream, 0, 100).await.expect("readable"),
+        events,
+        "a refused redaction changed the stream"
+    );
+    assert_eq!(
+        store.load_snapshot(stream).await.expect("readable"),
+        snapshot,
+        "a refused redaction dropped the snapshot"
+    );
+    assert_eq!(
+        store.snapshot_generation(stream).await.expect("readable"),
+        generation,
+        "a refused redaction moved the snapshot generation"
+    );
+}
+
 async fn redaction_keeps_the_place_and_drops_the_snapshot(
     store: &dyn EventStore,
     stream: &StreamId,
@@ -1061,14 +1106,14 @@ async fn redaction_keeps_the_place_and_drops_the_snapshot(
     assert!(!target.is_redacted());
 
     let redacted = store
-        .redact(stream, target.version, "the person asked")
+        .redact(stream, target.version, "subject-request")
         .await
         .expect("redactable");
     assert_eq!(redacted.event_id, target.event_id, "the fact keeps its id");
     assert_eq!(redacted.version, target.version, "and its place");
     assert!(redacted.is_redacted());
     assert_eq!(redacted.data["redacted"], json!(true));
-    assert_eq!(redacted.data["reason"], json!("the person asked"));
+    assert_eq!(redacted.data["reason"], json!("subject-request"));
 
     assert!(
         store
@@ -1087,7 +1132,7 @@ async fn redaction_keeps_the_place_and_drops_the_snapshot(
     );
 
     let error = store
-        .redact(stream, 9_999, "no such version")
+        .redact(stream, 9_999, "subject-request")
         .await
         .expect_err("there is nothing there to redact");
     assert_eq!(error, EventLogError::NotFound);

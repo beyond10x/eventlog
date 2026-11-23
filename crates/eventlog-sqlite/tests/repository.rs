@@ -384,7 +384,7 @@ async fn an_aggregate_stays_foldable_after_an_erasure() {
         .expect("handled");
     let stream = StreamId::new(tenant.clone(), "counter", "c-1").expect("valid stream");
     store
-        .redact(&stream, 1, "the person asked")
+        .redact(&stream, 1, "subject-request")
         .await
         .expect("redactable");
 

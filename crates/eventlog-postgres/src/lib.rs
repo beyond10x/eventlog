@@ -729,7 +729,7 @@ impl EventStore for PostgresEventStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
         self.bounded(async move {
-            validate_field("redaction reason", reason)?;
+            eventlog_core::validate_redaction_reason(reason)?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();

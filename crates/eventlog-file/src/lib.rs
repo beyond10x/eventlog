@@ -1711,9 +1711,13 @@ impl EventStore for FileEventStore {
         version: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<RecordedEvent, EventLogError>> {
+        // Refused before the transaction opens, so a free-text reason takes no lock and
+        // writes no journal.
+        if let Err(error) = eventlog_core::validate_redaction_reason(reason) {
+            return Box::pin(std::future::ready(Err(error)));
+        }
         let (stream, reason) = (stream.clone(), reason.to_owned());
         Box::pin(self.transaction(move |tx| Box::pin(async move {
-            validate_field("redaction reason", &reason)?;
             let mut event = tx.state.events.of_stream(&stream, version..=version).next().cloned().ok_or(EventLogError::NotFound)?;
             event.data = redaction_tombstone(&reason); event.redacted_at = Some(OffsetDateTime::now_utc());
             for transaction in &mut tx.journal.transactions {
@@ -2573,7 +2577,7 @@ mod stamped_resume_cost {
         store.put_blob(&tenant, "blob-1", b"bytes").await.unwrap();
         store.read_stream(&stream(), 0, 10).await.unwrap();
         let refused = store
-            .redact(&stream(), 7, "no such version")
+            .redact(&stream(), 7, "subject-request")
             .await
             .expect_err("a redaction of an absent event refuses");
         assert!(matches!(refused, EventLogError::NotFound));
