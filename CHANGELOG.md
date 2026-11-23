@@ -7,6 +7,9 @@ under bare-version tags such as `0.1.0`.
 
 ### Fixed
 
+- PostgreSQL: dropping an operation that holds an unsettled pool lease on a thread outside any
+  Tokio runtime no longer panics in the lease destructor. Retirement is spawned on the runtime
+  the lease was acquired on, not on the dropping thread's ambient runtime.
 - PostgreSQL: a grouped append, with or without blobs, starts its transaction deadline at its
   public entry. The wait for inline registration to freeze, which an inline rebuild can hold
   while it replays, is now spent from the same budget instead of being followed by a fresh full

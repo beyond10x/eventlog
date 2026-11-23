@@ -540,6 +540,7 @@ impl Pool {
             client: state.idle.pop(),
             reusable: false,
             connection_permit: Some(permit),
+            runtime: tokio::runtime::Handle::current(),
         }
     }
     async fn connect(&self) -> Result<Connection, EventLogError> {
@@ -666,6 +667,7 @@ impl Pool {
                 client: Some(connection),
                 reusable: true,
                 connection_permit: None,
+                runtime: tokio::runtime::Handle::current(),
             });
         }
         tokio::time::timeout(self.options.shutdown_timeout, async {
@@ -702,6 +704,11 @@ pub(crate) struct Lease {
     client: Option<Connection>,
     reusable: bool,
     connection_permit: Option<OwnedSemaphorePermit>,
+    /// The runtime the lease was acquired on. Retirement is spawned there, so a lease whose
+    /// operation future is dropped on a thread outside any Tokio runtime does not panic in this
+    /// destructor. Once that runtime has shut down, the retirement future is dropped unrun,
+    /// which releases its occupancy like any unfinished retirement.
+    runtime: tokio::runtime::Handle,
 }
 impl Lease {
     pub(crate) fn quarantine(&mut self) {
@@ -782,7 +789,7 @@ impl Drop for Lease {
             pool: Arc::clone(&self.pool),
             permit: self.connection_permit.take(),
         };
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             if let Some(cancelled) = cancelled {
                 // Finished or timed out; a dropped sender means the attempt could not start.
                 let _ = cancelled.await;
@@ -1673,6 +1680,49 @@ mod tests {
         );
         drop(pool);
         drop(caller);
+    }
+
+    /// An unsettled lease dropped on a thread outside any Tokio runtime, as a `Send` operation
+    /// future cancelled there drops it, retires on the runtime that acquired it instead of
+    /// panicking in its destructor, and its capacity returns.
+    #[test]
+    fn an_unsettled_lease_dropped_outside_tokio_retires_on_its_own_runtime() {
+        let Some(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(std::env::var_os("EVENTLOG_REQUIRE_POSTGRES").is_none());
+            eprintln!("skipped: off-runtime lease drop needs EVENTLOG_TEST_POSTGRES_URL");
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = Pool::new(
+            PostgresConfig::isolated(&url, "pool").unwrap(),
+            PoolOptions {
+                max_connections: 1,
+                ..PoolOptions::default()
+            },
+        )
+        .unwrap();
+        let lease = runtime.block_on(pool.acquire()).unwrap();
+        let dropped = std::thread::spawn(move || drop(lease)).join();
+        assert!(
+            dropped.is_ok(),
+            "dropping an unsettled lease outside Tokio panicked"
+        );
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pool.status().checked_out != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retirement ran on the lease's runtime and returned its capacity");
+            let mut again = pool.acquire().await.unwrap();
+            again.settled();
+            drop(again);
+            pool.shutdown().await.unwrap();
+        });
     }
 
     /// A backend whose client socket is gone aborts a running query even when no cancel request
