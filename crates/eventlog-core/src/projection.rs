@@ -163,6 +163,16 @@ pub trait Projector: Send + Sync {
         event: &'a RecordedEvent,
         store: &'a mut dyn ProjectionStore,
     ) -> BoxFuture<'a, Result<(), EventLogError>>;
+
+    /// A digest of everything besides [`Projector::name`] that decides what [`Projector::apply`]
+    /// writes: the projector's configuration, and its version where its code can change under
+    /// one name. A store that keeps a folded read model across opens (the tree store's kept
+    /// state) reuses it only while every registered projector returns one and it is unchanged.
+    /// `None`, the default, means the projector cannot vouch for its output, and the history is
+    /// folded through it again.
+    fn fingerprint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A check run inside the append transaction, against inline read models.

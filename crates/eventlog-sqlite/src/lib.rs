@@ -63,8 +63,10 @@ struct Inner {
     admission_permit: eventlog_core::AdmissionPermit,
     registration: Mutex<bool>,
     /// Identities and instants the next appended events take instead of minting their own, in
-    /// order. Empty except while [`SqliteEventStore::restore_events`] replays history.
-    restored: Mutex<std::collections::VecDeque<RestoredEvent>>,
+    /// order, each with the global position it takes when one was given. Empty except while
+    /// [`SqliteEventStore::restore_events`] or [`SqliteEventStore::restore_events_at`] replays
+    /// history.
+    restored: Mutex<std::collections::VecDeque<(RestoredEvent, Option<u64>)>>,
     /// Blob rows this handle has already validated; see [`verified`].
     verified: verified::VerifiedBlobs,
     tracked: tracked_capture::TrackedCapture,
@@ -90,6 +92,16 @@ pub struct EventOrigin {
     pub version: u64,
     pub digest: String,
     pub parents: Vec<String>,
+}
+
+/// Where each event stands in a store's global order, as [`SqliteEventStore::positions`] reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventPositions {
+    /// Each event's global position, by event id.
+    pub by_event: BTreeMap<String, u64>,
+    /// The highest position the store has assigned, held now or by an event since erased.
+    pub high_water: u64,
 }
 
 /// Each copied event's origin, by `(stream_type, stream_id, version)` in the linear store.
@@ -166,8 +178,108 @@ impl SqliteEventStore {
                 "restored identities from an earlier replay were never used".into(),
             ));
         }
-        queue.extend(events);
+        queue.extend(events.into_iter().map(|event| (event, None)));
         Ok(())
+    }
+
+    /// [`SqliteEventStore::restore_events`], with the global position each event takes.
+    ///
+    /// For a provider that rebuilds its in-memory store while it is open: an event a reader was
+    /// already served keeps the position the reader may have saved, so a feed cursor never falls
+    /// behind an event it has not seen. Positions need not follow replay order and may leave gaps;
+    /// a position this store already holds refuses the append that takes it.
+    ///
+    /// # Errors
+    /// As [`SqliteEventStore::restore_events`], and [`EventLogError::Invalid`] when `positions`
+    /// does not hold one position, above zero, for each event.
+    pub fn restore_events_at(
+        &self,
+        events: Vec<RestoredEvent>,
+        positions: Vec<u64>,
+    ) -> Result<(), EventLogError> {
+        if positions.len() != events.len() || positions.contains(&0) {
+            return Err(EventLogError::Invalid(
+                "each restored event takes one position above zero".into(),
+            ));
+        }
+        let mut queue = self.inner.restored.lock().map_err(poisoned)?;
+        if !queue.is_empty() {
+            return Err(EventLogError::Invalid(
+                "restored identities from an earlier replay were never used".into(),
+            ));
+        }
+        queue.extend(events.into_iter().zip(positions.into_iter().map(Some)));
+        Ok(())
+    }
+
+    /// Every event's global position, by event id, and the highest position this store has ever
+    /// assigned, which an event since erased may have held.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the events cannot be read.
+    pub async fn positions(&self) -> Result<EventPositions, EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || {
+            let prefix = &inner.prefix;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let mut statement = connection
+                .prepare(&format!("SELECT event_id, global_seq FROM {prefix}_events"))
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(backend)?;
+            let mut positions = EventPositions::default();
+            for row in rows {
+                let (event_id, position) = row.map_err(backend)?;
+                let position = to_u64(position)?;
+                positions.high_water = positions.high_water.max(position);
+                positions.by_event.insert(event_id, position);
+            }
+            let assigned: Option<i64> = connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                    params![format!("{prefix}_events")],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if let Some(assigned) = assigned {
+                positions.high_water = positions.high_water.max(to_u64(assigned)?);
+            }
+            Ok(positions)
+        })
+        .await
+    }
+
+    /// Make every global position this store assigns from now on greater than `position`.
+    ///
+    /// # Errors
+    /// Returns [`EventLogError::Backend`] when the position cannot be recorded.
+    pub async fn reserve_positions_through(&self, position: u64) -> Result<(), EventLogError> {
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || {
+            let name = format!("{}_events", inner.prefix);
+            let position = to_i64(position)?;
+            let connection = inner.connection.lock().map_err(poisoned)?;
+            let updated = connection
+                .execute(
+                    "UPDATE sqlite_sequence SET seq = max(seq, ?2) WHERE name = ?1",
+                    params![name, position],
+                )
+                .map_err(backend)?;
+            if updated == 0 {
+                connection
+                    .execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                        params![name, position],
+                    )
+                    .map_err(backend)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// How many queued restored identities no append has taken yet.
@@ -1627,21 +1739,28 @@ impl Inner {
         let mut written = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
             let version = head + 1 + offset as u64;
-            let (event_id, now, origin) = match self.restored.lock().map_err(poisoned)?.pop_front()
-            {
-                Some(restored) => (restored.event_id, restored.recorded_at, restored.origin),
-                None => (new_event_id(), minted, None),
-            };
+            let (event_id, now, origin, position) =
+                match self.restored.lock().map_err(poisoned)?.pop_front() {
+                    Some((restored, position)) => (
+                        restored.event_id,
+                        restored.recorded_at,
+                        restored.origin,
+                        position.map(to_i64).transpose()?,
+                    ),
+                    None => (new_event_id(), minted, None, None),
+                };
             let recorded_at = format_time(now)?;
+            // A restored position is taken as given; otherwise `?17` is NULL and the store
+            // assigns the next one.
             connection
                 .execute(
                     &format!(
                         "INSERT INTO {prefix}_events (
                              tenant_id, stream_type, stream_id, version, event_id, event_name,
                              event_schema_version, occurred_at, recorded_at, subject, actor,
-                             request_id, trace_id, causation_id, causation_depth, data)
+                             request_id, trace_id, causation_id, causation_depth, data, global_seq)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16)"
+                                 ?15, ?16, ?17)"
                     ),
                     params![
                         stream.tenant().as_str(),
@@ -1660,6 +1779,7 @@ impl Inner {
                         meta.causation_id,
                         i64::from(meta.causation_depth),
                         event.data.to_string(),
+                        position,
                     ],
                 )
                 .map_err(backend)?;

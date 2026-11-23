@@ -13,6 +13,43 @@ under bare-version tags such as `0.1.0`.
   counters exist only behind the non-default `kpi-counters` feature; no public API changes.
   CI runs them as two jobs: `KPI / KPI counters` (meant to become a required check) and
   `KPI / KPI timing` (the A/B on pull requests, informational only).
+- Core: `Projector::fingerprint`, an optional digest of a projector's configuration and version.
+  The default, `None`, changes nothing except the tree store's kept state (below).
+- SQLite: `SqliteEventStore::restore_events_at` queues restored events with the global position
+  each takes, `positions` reads every event's position and the highest one ever assigned
+  (`EventPositions`), and `reserve_positions_through` keeps later appends above a position.
+
+### Fixed
+
+- Tree: a redaction, tenant erasure or blob deletion through one handle is no longer served by
+  another open handle of the same store; reads check a privacy token published under the writer
+  lock and rebuild from the files, and a read that overlaps a removal is served again.
+- Tree: a removal of content deletes every kept state under `.cache/state/`, and a state is kept
+  only under the writer lock while no removal has been published since its replay began.
+- Tree: a kept state is reused only when every registered projector returns an unchanged
+  fingerprint; a projector without one is folded again on each open.
+- Tree: a write waits for the writer lock on a blocking worker, so two handles contending on one
+  single-thread runtime no longer deadlock.
+- Tree: a write whose caller stopped awaiting it between the engine and the files is rebuilt away
+  on the next operation instead of being served or answered as deduplicated.
+- Tree: a retry of a committed merge returns its receipt; the same key over other heads is an
+  idempotency mismatch.
+- Tree: erasing a tenant no longer counts another writer's unseen group for another tenant as
+  loaded.
+- Tree: `read_many` serves the whole batch from one observation, so it never shows half of an
+  atomic group.
+- Tree: an append hashes each event's envelope once instead of four times.
+- Tree: a guarded group retried with its blobs is admitted again before its receipt answers it,
+  as `AtomicEventStore::append_group_guarded_with_blobs` promises; a guard that refuses now
+  refuses the retry.
+- Tree: an open requests file metadata once per history file instead of twice, and not at all
+  for a directory.
+- Tree: `attach_inline_existing` refuses a projection that `create_projections` did not admit on
+  the handle, or admitted with another shape, instead of creating it and reporting success.
+- Tree: an open handle that rebuilds its engine (after another handle's commit, a merge, a
+  redaction, an erasure or an inline attachment) keeps every served event's global position and
+  places history new to it above the highest position it assigned, so a saved feed cursor no
+  longer skips events. A rebuild no longer loads a kept state, which another replay ordered.
 
 ## 0.9.4 — 2026-11-11
 
