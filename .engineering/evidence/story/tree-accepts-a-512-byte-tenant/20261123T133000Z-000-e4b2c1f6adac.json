@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T13:30:00Z",
+  "actor": "human:timo",
+  "artifact": "story:tree-accepts-a-512-byte-tenant",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e1-tree: tree_inline_contract hashed and nested green with a 512-byte tenant; postgres runtime_context 2 passed; mutation S3 red"
+  }
+}
