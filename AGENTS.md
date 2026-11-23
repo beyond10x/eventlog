@@ -92,9 +92,13 @@ bash scripts/gate.sh
 
 The compatibility shell entry point delegates argument parsing and selection to the Rust `gate`
 example. In order: `cargo nextest run --workspace --locked`, `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --locked -- -D warnings`, and the same clippy for
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, the same clippy for the slow
+lane's `batch_timing` target (a `test = false` target is outside `--all-targets`), and for
 `eventlog-kpi --features counters`, which compiles the providers' KPI counters.
-Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate).
+Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate). `--slow` runs
+the slow lane alone: the wall-clock budgets written for a release build (`eventlog-postgres`
+`batch_timing`, declared `test = false` so no debug step selects it), in a release build, times
+printed. The KPI counters CI job runs it.
 
 The test step needs `cargo-nextest` 0.9.143 or later. `.config/nextest.toml` ends any test that
 runs 60 s, and the gate then prints the run's ten slowest tests from nextest's JUnit report

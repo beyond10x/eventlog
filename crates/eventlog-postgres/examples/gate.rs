@@ -1,72 +1,33 @@
 //! Repository gate, with shell retained only as a compatibility entry point.
+#[path = "gate/lanes.rs"]
+mod lanes;
 use clap::Parser;
+use lanes::Lane;
 use std::process::{Command, ExitCode};
 use std::time::SystemTime;
 #[derive(Parser)]
 struct Args {
-    #[arg(long)]
+    #[arg(long, conflicts_with = "slow")]
     production_proof: bool,
     /// Run only the KPI lane: every counter against `kpi/baseline.json` (AGENTS.md § The KPI gate).
-    #[arg(long, conflicts_with = "production_proof")]
+    #[arg(long, conflicts_with_all = ["production_proof", "slow"])]
     kpi: bool,
+    /// Run only the slow lane: the wall-clock budgets written for a release build, in one.
+    #[arg(long)]
+    slow: bool,
 }
 fn main() -> ExitCode {
     let args = Args::parse();
-    let steps = if args.kpi {
-        vec![vec![
-            "run",
-            "--release",
-            "--locked",
-            "-p",
-            "eventlog-kpi",
-            "--features",
-            "counters",
-            "--",
-            "check",
-        ]]
+    let lane = if args.kpi {
+        Lane::Kpi
+    } else if args.slow {
+        Lane::Slow
+    } else if args.production_proof {
+        Lane::ProductionProof
     } else {
-        let tests = if args.production_proof {
-            vec![
-                "run",
-                "--locked",
-                "-p",
-                "eventlog-postgres",
-                "--example",
-                "production-proof",
-            ]
-        } else {
-            // `.config/nextest.toml` ends a test at 60 s and the run at 120 s (the folder's test
-            // budget); the step then names its slowest tests.
-            vec!["nextest", "run", "--workspace", "--locked"]
-        };
-        vec![
-            tests,
-            vec!["fmt", "--all", "--check"],
-            vec![
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--locked",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            // The providers' KPI counters compile only with this feature; lint them too.
-            vec![
-                "clippy",
-                "-p",
-                "eventlog-kpi",
-                "--all-targets",
-                "--locked",
-                "--features",
-                "counters",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ]
+        Lane::Default
     };
-    for arguments in steps {
+    for arguments in lanes::steps(lane) {
         println!("gate: cargo {}", arguments.join(" "));
         let started = SystemTime::now();
         let status = Command::new("cargo").args(&arguments).status();

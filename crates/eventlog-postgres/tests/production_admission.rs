@@ -455,6 +455,85 @@ fn missing_or_malformed_package_execution_context_refuses_artifact_selection() {
     assert!(select_artifacts(&duplicate, &artifacts).is_err());
 }
 
+#[path = "../examples/gate/lanes.rs"]
+mod lanes;
+
+/// The keys of the `[[test]]` table named `target` in a manifest, one `key = value` per entry with
+/// the spaces taken out, or `None` when the manifest declares no such table.
+fn test_table(manifest: &str, target: &str) -> Option<Vec<String>> {
+    manifest.split("\n[").find_map(|table| {
+        let mut lines = table.lines();
+        if lines.next()?.trim() != "[test]]" {
+            return None;
+        }
+        let keys: Vec<String> = lines
+            .map(|line| line.split_whitespace().collect::<String>())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        keys.contains(&format!("name=\"{target}\"")).then_some(keys)
+    })
+}
+
+/// A wall-clock budget written for a release build fails in a debug build on a loaded host
+/// ("over budget: 10,000 reads: 1.43 s"), so no debug test step may select it: its target is
+/// `test = false`, which both `cargo nextest run --workspace` and `cargo test --workspace` (the
+/// production proof's build) leave out, and only the slow lane names it, in a release build.
+#[test]
+fn a_release_wall_clock_budget_runs_only_in_the_release_slow_lane() {
+    let manifest = include_str!("../Cargo.toml");
+    for (package, target) in lanes::RELEASE_TIMING {
+        assert_eq!(
+            package, "eventlog-postgres",
+            "a target of another crate: {target}"
+        );
+        let table = test_table(manifest, target)
+            .unwrap_or_else(|| panic!("no [[test]] table names {target}"));
+        assert!(
+            table.contains(&"test=false".to_owned()),
+            "{target} is selected by every debug test step: {table:?}"
+        );
+        assert!(
+            table.contains(&format!("path=\"tests/{target}.rs\"")),
+            "{target}: {table:?}"
+        );
+    }
+    for lane in [
+        lanes::Lane::Default,
+        lanes::Lane::ProductionProof,
+        lanes::Lane::Kpi,
+    ] {
+        let steps = lanes::steps(lane);
+        for (package, target) in lanes::RELEASE_TIMING {
+            assert!(
+                steps
+                    .iter()
+                    .all(|step| step[0] == "clippy"
+                        || !step.windows(2).any(|w| w == ["--test", target])),
+                "only the slow lane runs {target}: {lane:?} {steps:?}"
+            );
+            assert!(
+                lane == lanes::Lane::Kpi
+                    || steps.iter().any(|step| step[0] == "clippy"
+                        && step.windows(2).any(|w| w == ["-p", package])
+                        && step.windows(2).any(|w| w == ["--test", target])),
+                "{lane:?} lints {target}, which --all-targets leaves out: {steps:?}"
+            );
+        }
+    }
+    assert!(lanes::steps(lanes::Lane::Default)[0].starts_with(&["nextest", "run", "--workspace"]));
+    let slow = lanes::steps(lanes::Lane::Slow);
+    assert_eq!(slow.len(), lanes::RELEASE_TIMING.len());
+    for ((package, target), step) in lanes::RELEASE_TIMING.iter().zip(&slow) {
+        assert!(step.starts_with(&["test", "--release"]), "{step:?}");
+        assert!(step.windows(2).any(|w| w == ["-p", package]), "{step:?}");
+        assert!(step.windows(2).any(|w| w == ["--test", target]), "{step:?}");
+        assert!(
+            step.ends_with(&["--", "--nocapture"]),
+            "the slow lane prints its times: {step:?}"
+        );
+    }
+}
+
 /// The value of `key = <value>` on the first line of `text` that starts with `key`, spaces and
 /// quotes taken out.
 fn setting<'a>(text: &'a str, key: &str) -> Option<&'a str> {

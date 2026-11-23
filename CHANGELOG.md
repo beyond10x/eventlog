@@ -69,6 +69,10 @@ under bare-version tags such as `0.1.0`.
   times faster. PostgreSQL conformance cases that neither read the feed, catch up, rebuild nor
   use the shared application role run beside other tests; the rest still run alone. The test
   step does not fit its 120 s budget yet.
+- Gate: `bash scripts/gate.sh --slow` runs the slow lane, the PostgreSQL `batch_timing` budgets
+  (10,000 reads under one second, groups of up to 20,000 events), in a release build and prints
+  their times. The debug test step no longer runs `batch_timing` (`test = false`); the gate still
+  lints it. The KPI counters CI job runs the slow lane.
 
 ### Deprecated
 
