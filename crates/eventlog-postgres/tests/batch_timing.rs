@@ -1,10 +1,14 @@
 //! The consumer's measured cases on PostgreSQL: 10,000 single-row reads through `read_many`, and
 //! append groups of 1,000, 5,000 and 20,000 events.
 //!
-//! The bounds are the story's, for a release build (`cargo test --release -p eventlog-postgres
-//! --test batch_timing -- --nocapture`): the reads under one second, and every group committed
-//! inside the default store-operation deadline, which the store enforces itself and refuses a
-//! group past. One test, so the cases never share the fixture with each other.
+//! The bounds are the story's, for a release build: the reads under one second, and every group
+//! committed inside the default store-operation deadline, which the store enforces itself and
+//! refuses a group past. One test, so the cases never share the fixture with each other.
+//!
+//! A debug build misses the one-second bound on a loaded host, so the target is `test = false`:
+//! no debug test step selects it. The slow lane runs it in a release build and prints its times
+//! (`bash scripts/gate.sh --slow`, which runs `cargo test --release --locked -p eventlog-postgres
+//! --test batch_timing -- --nocapture`).
 //!
 //! The 20,000 events go to 4,000 streams, five each. A group takes one transaction-scoped
 //! advisory lock per distinct stream, and each lock is a slot in PostgreSQL's shared lock table:

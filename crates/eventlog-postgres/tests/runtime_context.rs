@@ -15,7 +15,9 @@ use tokio_postgres::NoTls;
 
 /// The watermark couples feed visibility across every connection in the instance
 /// (`pg_snapshot_xmin` is cluster-wide), so a test holding a transaction open while another
-/// asserts on its feed is a race by design. One at a time, deterministically.
+/// asserts on its feed is a race by design. One at a time, deterministically. Under nextest, where
+/// each case is a process of its own, `.config/nextest.toml` runs every case here alone among the
+/// PostgreSQL tests instead (`tests/production_admission.rs` checks it).
 static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn url() -> Option<String> {

@@ -92,17 +92,31 @@ bash scripts/gate.sh
 
 The compatibility shell entry point delegates argument parsing and selection to the Rust `gate`
 example. In order: `cargo nextest run --workspace --locked`, `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --locked -- -D warnings`, and the same clippy for
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, the same clippy for the slow
+lane's `batch_timing` target (a `test = false` target is outside `--all-targets`), and for
 `eventlog-kpi --features counters`, which compiles the providers' KPI counters.
-Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate).
+Green here is the bar for `main`. `--kpi` runs the KPI lane alone (§ The KPI gate). `--slow` runs
+the slow lane alone: the wall-clock budgets written for a release build (`eventlog-postgres`
+`batch_timing`, declared `test = false` so no debug step selects it), in a release build, times
+printed. The KPI counters CI job runs it.
 
 The test step needs `cargo-nextest` 0.9.143 or later. `.config/nextest.toml` ends any test that
 runs 60 s, and the gate then prints the run's ten slowest tests from nextest's JUnit report
-(`target/nextest/default/junit.xml`). Nextest runs every test in a process of its own, so a
-`static` lock in a test binary orders nothing: the PostgreSQL `conformance` and `runtime_context`
-binaries, which serialize through one, run each test with every other test stopped (the
-watermark couples feed latency across the instance; see above). A binary added with such a lock
-is added to that filter.
+(`target/nextest/default/junit.xml`). The folder's budget for the whole step is 120 s; the step
+does not fit it yet on this host (story `test-step-fits-120-s`), so the run-wide limit is not set.
+Test builds carry no debug information and are optimized (`.cargo/config.toml`: `opt-level = 1`
+for the workspace, `2` for dependencies): unoptimized hashing made the two in-memory
+`remembered_content` tests run 12 to 18 s, optimized they run 1 to 2 s. Most of the step's time
+is file and database I/O, which the build profile does not change.
+
+Nextest runs every test in a process of its own, so a `static` lock in a test binary orders
+nothing there. The PostgreSQL `conformance` binary takes its `INSTANCE` lock for writing in a case
+that reads the feed, catches up, rebuilds or uses the shared application role, and for reading
+in every other case; `.config/nextest.toml` runs exactly the writing cases, and every
+`runtime_context` case, after every other test and each with no test beside it (the watermark
+couples feed latency across the instance, across databases too; see above). The reading cases
+run beside the rest. `tests/production_admission.rs` fails when the configuration and the source
+disagree. A new case that needs the instance to itself takes the lock for writing.
 
 The required shared Gates check covers common security/privacy rules. Install coordinated local
 hooks with `b10x-gates --repository beyond10x/eventlog install`; they inspect the index, messages

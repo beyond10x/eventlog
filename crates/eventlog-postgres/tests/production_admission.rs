@@ -40,7 +40,7 @@ fn a_passing_sqlite_peer_cannot_mask_the_missing_postgres_target() {
 #[path = "../examples/production-proof/required.rs"]
 mod required;
 use admission::{assess, select_artifacts};
-use std::fmt::Write as _;
+use std::{collections::BTreeSet, fmt::Write as _};
 #[test]
 fn a_passing_postgres_peer_cannot_mask_the_missing_sqlite_target() {
     assert_eq!(
@@ -453,4 +453,211 @@ fn missing_or_malformed_package_execution_context_refuses_artifact_selection() {
     })
     .to_string();
     assert!(select_artifacts(&duplicate, &artifacts).is_err());
+}
+
+#[path = "../examples/gate/lanes.rs"]
+mod lanes;
+
+/// The keys of the `[[test]]` table named `target` in a manifest, one `key = value` per entry with
+/// the spaces taken out, or `None` when the manifest declares no such table.
+fn test_table(manifest: &str, target: &str) -> Option<Vec<String>> {
+    manifest.split("\n[").find_map(|table| {
+        let mut lines = table.lines();
+        if lines.next()?.trim() != "[test]]" {
+            return None;
+        }
+        let keys: Vec<String> = lines
+            .map(|line| line.split_whitespace().collect::<String>())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        keys.contains(&format!("name=\"{target}\"")).then_some(keys)
+    })
+}
+
+/// A wall-clock budget written for a release build fails in a debug build on a loaded host
+/// ("over budget: 10,000 reads: 1.43 s"), so no debug test step may select it: its target is
+/// `test = false`, which both `cargo nextest run --workspace` and `cargo test --workspace` (the
+/// production proof's build) leave out, and only the slow lane names it, in a release build.
+#[test]
+fn a_release_wall_clock_budget_runs_only_in_the_release_slow_lane() {
+    let manifest = include_str!("../Cargo.toml");
+    for (package, target) in lanes::RELEASE_TIMING {
+        assert_eq!(
+            package, "eventlog-postgres",
+            "a target of another crate: {target}"
+        );
+        let table = test_table(manifest, target)
+            .unwrap_or_else(|| panic!("no [[test]] table names {target}"));
+        assert!(
+            table.contains(&"test=false".to_owned()),
+            "{target} is selected by every debug test step: {table:?}"
+        );
+        assert!(
+            table.contains(&format!("path=\"tests/{target}.rs\"")),
+            "{target}: {table:?}"
+        );
+    }
+    for lane in [
+        lanes::Lane::Default,
+        lanes::Lane::ProductionProof,
+        lanes::Lane::Kpi,
+    ] {
+        let steps = lanes::steps(lane);
+        for (package, target) in lanes::RELEASE_TIMING {
+            assert!(
+                steps
+                    .iter()
+                    .all(|step| step[0] == "clippy"
+                        || !step.windows(2).any(|w| w == ["--test", target])),
+                "only the slow lane runs {target}: {lane:?} {steps:?}"
+            );
+            assert!(
+                lane == lanes::Lane::Kpi
+                    || steps.iter().any(|step| step[0] == "clippy"
+                        && step.windows(2).any(|w| w == ["-p", package])
+                        && step.windows(2).any(|w| w == ["--test", target])),
+                "{lane:?} lints {target}, which --all-targets leaves out: {steps:?}"
+            );
+        }
+    }
+    assert!(lanes::steps(lanes::Lane::Default)[0].starts_with(&["nextest", "run", "--workspace"]));
+    let slow = lanes::steps(lanes::Lane::Slow);
+    assert_eq!(slow.len(), lanes::RELEASE_TIMING.len());
+    for ((package, target), step) in lanes::RELEASE_TIMING.iter().zip(&slow) {
+        assert!(step.starts_with(&["test", "--release"]), "{step:?}");
+        assert!(step.windows(2).any(|w| w == ["-p", package]), "{step:?}");
+        assert!(step.windows(2).any(|w| w == ["--test", target]), "{step:?}");
+        assert!(
+            step.ends_with(&["--", "--nocapture"]),
+            "the slow lane prints its times: {step:?}"
+        );
+    }
+}
+
+/// The value of `key = <value>` on the first line of `text` that starts with `key`, spaces and
+/// quotes taken out.
+fn setting<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(key)?.trim().strip_prefix('='))
+        .map(|value| value.trim().trim_matches('"'))
+}
+
+/// Every test of a Rust source file: its name, whether it is async, and the lines of its body
+/// that take a lock (`.lock()`, `.read()` or `.write()` on a `static`).
+fn cases(source: &str) -> Vec<(String, bool, Vec<String>)> {
+    let mut cases = Vec::new();
+    let mut attribute = None;
+    let mut open: Option<(String, bool, Vec<String>)> = None;
+    for line in source.lines() {
+        if let Some((name, asynchronous, locks)) = open.as_mut() {
+            if line == "}" {
+                cases.push((std::mem::take(name), *asynchronous, std::mem::take(locks)));
+                open = None;
+            } else if [".lock().await", ".read().await", ".write().await"]
+                .iter()
+                .any(|lock| line.contains(lock))
+            {
+                locks.push(line.trim().to_owned());
+            }
+        } else if line.starts_with("#[tokio::test") {
+            attribute = Some(true);
+        } else if line == "#[test]" {
+            attribute = Some(false);
+        } else if let Some(asynchronous) = attribute.filter(|_| !line.starts_with("#[")) {
+            let name = line
+                .trim_start_matches("async ")
+                .strip_prefix("fn ")
+                .and_then(|rest| rest.split('(').next())
+                .expect("a test attribute precedes its fn");
+            open = Some((name.to_owned(), asynchronous, Vec::new()));
+            attribute = None;
+        }
+    }
+    cases
+}
+
+/// The test step's budget is the folder's (`~/beyond10x/AGENTS.md` § Tests stay fast): nextest
+/// kills a test at 60 s, and the step is to end within 120 s. The PostgreSQL cases that need the
+/// instance to themselves run alone, and only those: every case run alone holds the whole step.
+/// A case of `tests/conformance.rs` needs it exactly when it takes the file's `INSTANCE` lock for
+/// writing, which orders it under `cargo test`; under nextest each case is a process, and only
+/// the configuration orders it.
+#[test]
+fn an_optimized_test_build_and_nextest_runs_alone_exactly_the_cases_that_lock_for_writing() {
+    let config = include_str!("../../../.config/nextest.toml");
+    let profile = config
+        .split("[profile.default]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n[").next())
+        .expect("a default profile");
+    // `~/.cargo/config.toml` sets line-table debug info and a configuration file wins over the
+    // manifest, so the test build's profile lives in the repository's configuration file.
+    // Unoptimized, the CPU-bound cases (hashing above all) ran up to 15 times longer.
+    let build = include_str!("../../../.cargo/config.toml");
+    let dev = build
+        .split("[profile.dev]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n[").next())
+        .expect("a dev profile");
+    assert_eq!(setting(dev, "debug"), Some("false"), "{build}");
+    assert_eq!(setting(dev, "opt-level"), Some("1"), "{build}");
+    let dependencies = build
+        .split("[profile.dev.package.\"*\"]")
+        .nth(1)
+        .expect("a profile for every dependency");
+    assert_eq!(setting(dependencies, "opt-level"), Some("2"), "{build}");
+    assert_eq!(
+        setting(profile, "slow-timeout"),
+        Some(r#"{ period = "60s", terminate-after = 1, grace-period = "5s" }"#),
+        "{profile}"
+    );
+
+    let alone = config
+        .split("[[profile.default.overrides]]")
+        .find(|block| block.contains("binary_id(eventlog-postgres::conformance)"))
+        .expect("the override that runs conformance cases alone");
+    assert_eq!(
+        setting(alone, "threads-required"),
+        Some("num-test-threads"),
+        "a case runs with no other test beside it only when it takes every thread: {alone}"
+    );
+    assert!(
+        alone.contains("binary_id(eventlog-postgres::runtime_context)\n"),
+        "every case of runtime_context runs alone: {alone}"
+    );
+    let named: BTreeSet<&str> = alone
+        .split("test(=")
+        .skip(1)
+        .map(|rest| rest.split(')').next().unwrap())
+        .collect();
+
+    let conformance = cases(include_str!("conformance.rs"));
+    assert!(conformance.len() > 50, "{conformance:?}");
+    for (name, asynchronous, locks) in &conformance {
+        assert!(
+            !asynchronous
+                || locks.as_slice() == ["let _instance = INSTANCE.read().await;"]
+                || locks.as_slice() == ["let _instance = INSTANCE.write().await;"],
+            "{name} takes INSTANCE once, for reading or for writing: {locks:?}"
+        );
+    }
+    let writers: BTreeSet<&str> = conformance
+        .iter()
+        .filter(|(_, _, locks)| locks.iter().any(|lock| lock.contains("INSTANCE.write()")))
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        named, writers,
+        "nextest runs alone exactly the conformance cases that take INSTANCE for writing"
+    );
+    let runtime = cases(include_str!("runtime_context.rs"));
+    assert!(
+        !runtime.is_empty()
+            && runtime
+                .iter()
+                .all(|(_, _, locks)| locks.as_slice()
+                    == ["let _exclusive = EXCLUSIVE.lock().await;"]),
+        "every case of runtime_context takes its lock: {runtime:?}"
+    );
 }

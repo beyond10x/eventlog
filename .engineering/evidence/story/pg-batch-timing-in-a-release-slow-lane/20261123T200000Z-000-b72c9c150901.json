@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-23T20:00:00Z",
+  "actor": "human:timo",
+  "artifact": "story:pg-batch-timing-in-a-release-slow-lane",
+  "kind": "story",
+  "revision": 1,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "e2-budget: gate.sh --slow exit 0, read_many 10,000 reads 150 ms (1 s budget); production_admission a_release_wall_clock_budget_runs_only_in_the_release_slow_lane red when test = false is dropped"
+  }
+}

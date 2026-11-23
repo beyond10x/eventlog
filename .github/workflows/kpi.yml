@@ -80,6 +80,9 @@ jobs:
       - name: Counters against kpi/baseline.json
         if: steps.scope.outputs.run == 'true'
         run: bash scripts/gate.sh --kpi
+      - name: Slow lane, the release-build wall-clock budgets
+        if: steps.scope.outputs.run == 'true'
+        run: bash scripts/gate.sh --slow
 
   timing:
     name: KPI timing

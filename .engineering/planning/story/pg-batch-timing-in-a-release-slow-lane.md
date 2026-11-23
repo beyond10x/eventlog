@@ -2,10 +2,16 @@
 format: aep.planning-md/3
 id: story:pg-batch-timing-in-a-release-slow-lane
 kind: story
-status: draft
+status: implemented
 title: The batch_timing wall-clock budget runs in a release slow lane, not the debug step
 summary: 1 s budget for a release build failed at 1.43 s and 1.32 s in the debug nextest step
-revision: 1
+relations:
+- serves: vision:O2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T19:44:58Z", actor: "human:timo", revision: 2, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-23T19:44:58Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-23T19:44:58Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

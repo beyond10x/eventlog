@@ -32,5 +32,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-
 tokio-postgres.workspace = true
 serde_json.workspace = true
 
+[[test]]
+name = "batch_timing"
+path = "tests/batch_timing.rs"
+test = false
+
 [lints]
 workspace = true
