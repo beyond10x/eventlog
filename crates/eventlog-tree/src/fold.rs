@@ -3,9 +3,12 @@
 //! Opening a tree replays every file into an in-memory engine, and the engine and every projector
 //! over it hash what they are given. On a store nobody has changed that work is the same each
 //! time, so the result is kept under `.cache/state/`, named by a digest of every history file's
-//! stamp (`dev`, `ino`, length, `mtime`, `ctime`) together with the projectors registered and the
-//! running executable. An open whose files all carry the same stamps loads it, and opens no event
-//! file at all.
+//! stamp (`dev`, `ino`, length, `mtime`, `ctime`) together with the projectors registered, each
+//! with its fingerprint, and the running executable. An open whose files all carry the same stamps
+//! loads it, and opens no event file at all. No state is kept or loaded while any registered
+//! projector has no fingerprint ([`eventlog_core::Projector::fingerprint`]): a projector whose
+//! configuration changed under one name and one executable would otherwise be served the rows its
+//! earlier configuration wrote.
 //!
 //! What a stamp detects is set out in the file provider's design (Part B § B3): any write,
 //! truncation or rename moves `ctime` or `ino`, and userspace cannot set `ctime`. A file whose
@@ -14,14 +17,68 @@
 //! after that window replays once and keeps it.
 //!
 //! `.cache/` holds its own `.gitignore`, so a cache is never committed, and `verify` never reads it.
+//!
+//! A removal of content (a redaction, a tenant's erasure, a blob's deletion) changes a file in
+//! place or removes it, which a kept state and another handle's engine both predate. So each such
+//! removal, under the writer lock, deletes every kept state and publishes a new privacy token in
+//! `.cache/privacy`. A state records the token it was built under; a handle whose token is no
+//! longer the published one rebuilds before it serves, and a state is kept only while the token
+//! it was built under is still the published one.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use eventlog_core::EventLogError;
 use serde_json::{Value, json};
 
-use crate::layout::{canonical, sha256_hex};
+use crate::layout::{backend, canonical, sha256_hex, write_atomic};
+
+fn privacy_path(root: &Path) -> PathBuf {
+    root.join(".cache").join("privacy")
+}
+
+/// The privacy token last published under `root`, `None` when none ever was.
+///
+/// # Errors
+/// Returns [`EventLogError::Backend`] when the token exists but cannot be read: a handle that
+/// cannot tell whether it is current must not serve.
+pub(crate) fn privacy_token(root: &Path) -> Result<Option<String>, EventLogError> {
+    match fs::read(privacy_path(root)) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(backend(error)),
+    }
+}
+
+/// Delete every kept state and publish a new privacy token, which it returns. Called under the
+/// writer lock by every operation that removes content.
+///
+/// # Errors
+/// Returns [`EventLogError::Backend`] when a kept state cannot be removed or the token cannot be
+/// written: the removal is then not complete, and the caller must say so.
+pub(crate) fn publish_removal(root: &Path) -> Result<String, EventLogError> {
+    match fs::remove_dir_all(root.join(".cache").join("state")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(backend(error)),
+    }
+    ignored_cache(root).map_err(backend)?;
+    let token = eventlog_core::new_event_id();
+    write_atomic(&privacy_path(root), token.as_bytes())?;
+    Ok(token)
+}
+
+/// Create `.cache/` with the `.gitignore` that keeps it out of history.
+fn ignored_cache(root: &Path) -> std::io::Result<()> {
+    let cache = root.join(".cache");
+    fs::create_dir_all(&cache)?;
+    let ignore = cache.join(".gitignore");
+    if !ignore.exists() {
+        fs::write(&ignore, b"*\n")?;
+    }
+    Ok(())
+}
 
 /// Only a history file whose `ctime` is this far behind the open is trusted by its stamp.
 pub(crate) const UNTRUSTED_NS: i128 = 2_000_000_000;
@@ -94,10 +151,15 @@ pub(crate) fn now_ns() -> i128 {
     time::OffsetDateTime::now_utc().unix_timestamp_nanos()
 }
 
-/// The name a state is kept under: every stamp, every projector, and the program that folded it.
-pub(crate) fn key(stamps: &Stamps, inline: &[&str], catch_up: &[&str]) -> String {
-    // A projector has no version of its own, so the executable stands in for its code: a rebuilt
-    // program replays once rather than trusting a projection an older one wrote.
+/// The name a state is kept under: every stamp, every projector with its fingerprint, and the
+/// program that folded it.
+pub(crate) fn key(
+    stamps: &Stamps,
+    inline: &[(&str, String)],
+    catch_up: &[(&str, String)],
+) -> String {
+    // The executable also stands in for a projector's code: a rebuilt program replays once rather
+    // than trusting a projection an older one wrote, whatever fingerprint it reports.
     let program = std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -139,15 +201,11 @@ pub(crate) fn load(root: &Path, key: &str) -> Option<(Vec<u8>, Value)> {
 }
 
 /// Keep `image` and `state` under `key`, replacing whatever was kept before. A failure keeps
-/// nothing, which only costs the next open a replay.
+/// nothing, which only costs the next open a replay. The caller holds the writer lock, so no
+/// removal of content runs while a state is written.
 pub(crate) fn keep(root: &Path, key: &str, image: &[u8], mut state: Value) {
-    let cache = root.join(".cache");
-    let directory = cache.join("state");
-    if fs::create_dir_all(&directory).is_err() {
-        return;
-    }
-    let ignore = cache.join(".gitignore");
-    if !ignore.exists() && fs::write(&ignore, b"*\n").is_err() {
+    let directory = root.join(".cache").join("state");
+    if ignored_cache(root).is_err() || fs::create_dir_all(&directory).is_err() {
         return;
     }
     if let Some(map) = state.as_object_mut() {

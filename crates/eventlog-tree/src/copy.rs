@@ -52,7 +52,7 @@ pub async fn copy(
     if state.poisoned {
         return Err(EventLogError::Closed);
     }
-    let _lock = from.writer_lock()?;
+    let _lock = from.writer_lock().await?;
     refresh(&from.root, &mut state).await?;
     let loaded = history::load(&from.root)?;
     let versions = served_versions(&state.engine, &loaded).await?;

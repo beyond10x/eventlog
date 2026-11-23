@@ -5,6 +5,32 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- Core: `Projector::fingerprint`, an optional digest of a projector's configuration and version.
+  The default, `None`, changes nothing except the tree store's kept state (below).
+
+### Fixed
+
+- Tree: a redaction, tenant erasure or blob deletion through one handle is no longer served by
+  another open handle of the same store; reads check a privacy token published under the writer
+  lock and rebuild from the files, and a read that overlaps a removal is served again.
+- Tree: a removal of content deletes every kept state under `.cache/state/`, and a state is kept
+  only under the writer lock while no removal has been published since its replay began.
+- Tree: a kept state is reused only when every registered projector returns an unchanged
+  fingerprint; a projector without one is folded again on each open.
+- Tree: a write waits for the writer lock on a blocking worker, so two handles contending on one
+  single-thread runtime no longer deadlock.
+- Tree: a write whose caller stopped awaiting it between the engine and the files is rebuilt away
+  on the next operation instead of being served or answered as deduplicated.
+- Tree: a retry of a committed merge returns its receipt; the same key over other heads is an
+  idempotency mismatch.
+- Tree: erasing a tenant no longer counts another writer's unseen group for another tenant as
+  loaded.
+- Tree: `read_many` serves the whole batch from one observation, so it never shows half of an
+  atomic group.
+- Tree: an append hashes each event's envelope once instead of four times.
+
 ## 0.9.4 — 2026-11-11
 
 ### Security

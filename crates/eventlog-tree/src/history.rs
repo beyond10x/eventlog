@@ -116,16 +116,33 @@ impl GroupRecord {
     /// The group file's name: a digest of where its receipt lives, so one command identity has
     /// exactly one file and two different ones never share it.
     pub fn key_digest(&self) -> String {
-        let scope = match self.kind {
-            Kind::Append => {
-                let member = &self.members[0];
-                json!(["append", self.tenant, member.stream_type, member.stream_id])
-            }
-            Kind::Group => json!(["group", self.tenant]),
-        };
-        sha256_hex(&canonical(&json!([scope, self.meta.idempotency_key])))
+        let stream = self
+            .members
+            .first()
+            .map(|member| (member.stream_type.as_str(), member.stream_id.as_str()));
+        receipt_digest(self.kind, &self.tenant, stream, &self.meta.idempotency_key)
     }
+}
 
+/// The name of the group file that holds the receipt of a command under `idempotency_key`: an
+/// append's receipt is its stream's (`stream` is its type and id), a group's is its tenant's.
+pub(crate) fn receipt_digest(
+    kind: Kind,
+    tenant: &str,
+    stream: Option<(&str, &str)>,
+    idempotency_key: &str,
+) -> String {
+    let scope = match (kind, stream) {
+        (Kind::Append, Some((stream_type, stream_id))) => {
+            json!(["append", tenant, stream_type, stream_id])
+        }
+        (Kind::Append, None) => json!(["append", tenant]),
+        (Kind::Group, _) => json!(["group", tenant]),
+    };
+    sha256_hex(&canonical(&json!([scope, idempotency_key])))
+}
+
+impl GroupRecord {
     pub fn to_value(&self) -> Result<Value, EventLogError> {
         let meta = &self.meta;
         Ok(json!({
@@ -277,17 +294,26 @@ impl EventRecord {
 
     /// The digest that names the file and that children name as their parent.
     pub fn digest(&self) -> Result<String, EventLogError> {
+        #[cfg(test)]
+        DIGESTS.with(|count| count.set(count.get() + 1));
         Ok(sha256_hex(&canonical(&self.envelope()?)))
     }
 
     pub fn to_value(&self) -> Result<Value, EventLogError> {
+        self.to_value_named(&self.digest()?)
+    }
+
+    /// [`EventRecord::to_value`] for a writer that has just computed this record's `digest` and
+    /// carries it, rather than canonicalizing and hashing the same envelope again. A reader never
+    /// takes this path: [`EventRecord::from_value`] verifies every file it reads.
+    pub fn to_value_named(&self, digest: &str) -> Result<Value, EventLogError> {
         let mut value = self.envelope()?;
         let map = value.as_object_mut().expect("an envelope is an object");
         map.insert("data".into(), self.data.clone());
         if let Some(reason) = &self.redacted {
             map.insert("redacted".into(), json!({ "reason": reason }));
         }
-        map.insert("digest".into(), Value::String(self.digest()?));
+        map.insert("digest".into(), Value::String(digest.to_owned()));
         Ok(value)
     }
 
@@ -683,6 +709,12 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How many times [`EventRecord::digest`] ran on this thread.
+    static DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn between_passes() {
     if let Some(hook) = BETWEEN_PASSES.with(|hook| hook.borrow_mut().take()) {
         hook();
@@ -723,6 +755,33 @@ mod tests {
             root, format, "tenant-a", "item", id,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn an_append_hashes_each_new_event_envelope_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let store = TreeEventStore::open(directory.path()).await.unwrap();
+            let before = super::DIGESTS.with(std::cell::Cell::get);
+            store
+                .append(
+                    &stream("x"),
+                    Expected::NoStream,
+                    &[event("item.received", 1), event("item.indexed", 2)],
+                    &meta("x", &json!({})),
+                )
+                .await
+                .unwrap();
+            let hashed = super::DIGESTS.with(std::cell::Cell::get) - before;
+            assert_eq!(
+                hashed, 2,
+                "an append of two events canonicalized and hashed their envelopes {hashed} times"
+            );
+        });
     }
 
     #[test]
