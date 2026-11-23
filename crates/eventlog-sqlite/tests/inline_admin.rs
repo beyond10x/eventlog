@@ -582,3 +582,86 @@ async fn cancelled_rebuild_caller_leaves_one_continuing_worker_and_whole_publica
         .await
         .expect("later rebuild proceeds");
 }
+
+fn invalid_reason(outcome: Result<impl std::fmt::Debug, EventLogError>) -> String {
+    match outcome {
+        Err(EventLogError::Invalid(reason)) => reason,
+        other => panic!("expected an Invalid refusal, got {other:?}"),
+    }
+}
+
+async fn tally_count(store: &SqliteEventStore, tenant: &TenantId) -> u64 {
+    store
+        .projection_get(&eventlog_conformance::TALLY, tenant, "item/one")
+        .await
+        .expect("tally read")
+        .and_then(|row| row["count"].as_u64())
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn catch_up_refuses_a_projector_registered_inline_after_its_runner() {
+    let store: Arc<SqliteEventStore> = Arc::new(
+        SqliteEventStore::in_memory("drive_once_inline_late")
+            .await
+            .expect("store"),
+    );
+    let tenant = TenantId::new("tenant").expect("tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "one").expect("stream");
+    let shared: Arc<dyn EventStore> = store.clone();
+    eventlog_core::CatchUpRunner::new(shared, Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("runner");
+    store
+        .register_inline(Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("inline registration before catch-up ran");
+    let body = json!({"value": 1});
+    let event = NewEvent::new("item.received", 1, body.clone()).expect("event");
+    store
+        .append(
+            &stream,
+            Expected::Any,
+            &[event],
+            &eventlog_conformance::meta("command-a", &body),
+        )
+        .await
+        .expect("append");
+
+    let reason = invalid_reason(
+        store
+            .run_catch_up(Arc::new(eventlog_conformance::Tally), &tenant, 10)
+            .await,
+    );
+    assert_eq!(reason, "projection tally is already driven inline");
+    assert_eq!(tally_count(&store, &tenant).await, 1, "event folded twice");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_registration_refuses_a_projector_catch_up_already_drove() {
+    let store: Arc<SqliteEventStore> = Arc::new(
+        SqliteEventStore::in_memory("drive_once_catch_up_first")
+            .await
+            .expect("store"),
+    );
+    let tenant = TenantId::new("tenant").expect("tenant");
+    let shared: Arc<dyn EventStore> = store.clone();
+    let runner = eventlog_core::CatchUpRunner::new(shared, Arc::new(eventlog_conformance::Tally))
+        .await
+        .expect("runner");
+    runner.drain(&tenant).await.expect("catch-up pass");
+
+    let reason = invalid_reason(
+        store
+            .register_inline(Arc::new(eventlog_conformance::Tally))
+            .await,
+    );
+    assert_eq!(reason, "projection tally is already driven by catch-up");
+    let reason = invalid_reason(
+        store
+            .attach_inline_existing(Arc::new(eventlog_conformance::Tally))
+            .await,
+    );
+    assert_eq!(reason, "projection tally is already driven by catch-up");
+    assert!(!store.is_inline("tally").await);
+}

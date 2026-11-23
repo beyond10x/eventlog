@@ -33,8 +33,14 @@ use serde_json::Value;
 use time::OffsetDateTime;
 mod atomic_group;
 mod capture;
+#[cfg(test)]
+mod capture_pages;
 mod inline_admin;
 mod pool;
+#[cfg(test)]
+mod receipt_snapshot;
+#[cfg(test)]
+mod registration_deadline;
 mod schema;
 #[cfg(test)]
 mod verify_content_once;
@@ -79,6 +85,9 @@ pub struct PostgresEventStore {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    /// Projectors this handle has driven by catch-up. Locked after `inline`, so one projector is
+    /// driven inline or by catch-up, never both, whichever is registered first.
+    catch_up: Mutex<BTreeSet<String>>,
     /// Blob content this handle has verified or hashed at write time; see
     /// [`eventlog_core::VerifiedContent`].
     verified: VerifiedContent,
@@ -261,6 +270,7 @@ impl PostgresEventStore {
             admission_permit: eventlog_core::AdmissionPermit::default(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            catch_up: Mutex::new(BTreeSet::new()),
             verified: VerifiedContent::default(),
             #[cfg(test)]
             blob_read_backs: std::sync::atomic::AtomicUsize::new(0),
@@ -310,6 +320,31 @@ impl PostgresEventStore {
             outcome
         })
     }
+    /// Called with `inline` held, so no catch-up pass can claim the projector meanwhile.
+    fn refuse_catch_up_driven(&self, name: &str) -> Result<(), EventLogError> {
+        if self.catch_up.lock().map_err(poisoned)?.contains(name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven by catch-up"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that catch-up drives this projector, unless it is driven inline.
+    fn claim_catch_up(&self, name: &str) -> Result<(), EventLogError> {
+        let projectors = self.inline.lock().map_err(poisoned)?;
+        if projectors.iter().any(|projector| projector.name() == name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven inline"
+            )));
+        }
+        self.catch_up
+            .lock()
+            .map_err(poisoned)?
+            .insert(name.to_owned());
+        Ok(())
+    }
+
     fn bounded<'a, T: Send + 'a>(
         &'a self,
         future: impl std::future::Future<Output = Result<T, EventLogError>> + Send + 'a,
@@ -491,7 +526,16 @@ impl EventStore for PostgresEventStore {
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
-            let transaction = client.transaction().await.map_err(backend)?;
+            // The receipt and its events are one observation. Under READ COMMITTED a tenant
+            // erasure committing between the two statements paired a receipt with no events, or
+            // with events of recreated stream coordinates.
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await
+                .map_err(backend)?;
             let recorded = transaction
                 .query_opt(
                     &format!(
@@ -517,14 +561,25 @@ impl EventStore for PostgresEventStore {
             let first_version: i64 = row.get(1);
             let last_version: i64 = row.get(2);
             if stored_hash != request_hash {
+                // A known answer, not an interrupted operation: end the read and keep the
+                // connection rather than retiring a healthy one through the quarantine.
+                transaction.rollback().await.map_err(backend)?;
+                client.settled();
                 return Err(EventLogError::IdempotencyMismatch {
                     key: idempotency_key.to_owned(),
                 });
             }
+            #[cfg(test)]
+            receipt_snapshot::after_receipt(&self.prefix).await;
             let events =
                 select_versions(&transaction, &prefix, stream, first_version, last_version).await?;
             transaction.rollback().await.map_err(backend)?;
             client.settled();
+            if !is_complete_interval(&events, first_version, last_version) {
+                return Err(EventLogError::Backend(
+                    "recorded command interval is incomplete".into(),
+                ));
+            }
             Ok(Some(AppendResult {
                 first_version: to_u64(first_version)?,
                 last_version: to_u64(last_version)?,
@@ -546,18 +601,13 @@ impl EventStore for PostgresEventStore {
             let mut client = self.pool.acquire().await?;
             let rows = client
                 .query(
-                    &format!(
-                        "SELECT {COLUMNS} FROM {prefix}_events
-                         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3
-                           AND version > $4
-                         ORDER BY version LIMIT $5"
-                    ),
+                    &stream_page_sql(prefix),
                     &[
                         &stream.tenant().as_str(),
                         &stream.stream_type(),
                         &stream.stream_id(),
                         &to_i64(after_version)?,
-                        &to_i64(limit as u64 + 1)?,
+                        &to_i64(limit as u64)?,
                     ],
                 )
                 .await
@@ -601,7 +651,7 @@ impl EventStore for PostgresEventStore {
                                     stream,
                                     after,
                                     through: i64::MAX,
-                                    fetch: to_i64(limit as u64 + 1)?,
+                                    fetch: to_i64(limit as u64)?,
                                 },
                             ));
                         }
@@ -619,6 +669,9 @@ impl EventStore for PostgresEventStore {
                     None => Ok(Vec::new()),
                 };
             }
+            // Noted before the snapshot exists: a same-handle deletion that settles while the
+            // rows are fetched or the transaction commits must keep them out of the memory.
+            let noted = self.verified.generation()?;
             let mut client = paced(Some(one.deadline), self.pool.acquire()).await?;
             let transaction = paced(Some(one.deadline), async {
                 client
@@ -643,6 +696,8 @@ impl EventStore for PostgresEventStore {
             })
             .await?;
             client.settled();
+            #[cfg(test)]
+            verify_content_once::after_blob_fetch(&self.prefix).await;
 
             let mut answers: Vec<Option<Result<ReadResult, EventLogError>>> =
                 (0..reads.len()).map(|_| None).collect();
@@ -653,7 +708,8 @@ impl EventStore for PostgresEventStore {
             for ((index, _, _), row) in blobs.iter().zip(blob_rows) {
                 answers[*index] = Some(
                     row.map(|row| {
-                        self.verified.check_stored(
+                        self.verified.check_stored_since(
+                            noted,
                             row.get(0),
                             row.get(1),
                             row.get(2),
@@ -1191,6 +1247,7 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
         self.bounded(async move {
             let prefix = &self.prefix;
+            let noted = self.verified.generation()?;
             let mut client = self.pool.acquire().await?;
             let row = client
                 .query_opt(
@@ -1203,8 +1260,11 @@ impl EventStore for PostgresEventStore {
                 .await
                 .map_err(backend)?;
             client.settled();
+            #[cfg(test)]
+            verify_content_once::after_blob_fetch(&self.prefix).await;
             row.map(|row| {
-                self.verified.check_stored(
+                self.verified.check_stored_since(
+                    noted,
                     row.get(0),
                     row.get(1),
                     row.get(2),
@@ -1294,6 +1354,8 @@ impl EventStore for PostgresEventStore {
                 }
             }
             self.create_projections(Arc::clone(&projector)).await?;
+            let mut projectors = self.inline.lock().map_err(poisoned)?;
+            self.refuse_catch_up_driven(projector.name())?;
             let mut names = self.inline_names.lock().map_err(poisoned)?;
             for spec in projector.projections() {
                 if !names.insert(spec.name.to_owned()) {
@@ -1304,7 +1366,7 @@ impl EventStore for PostgresEventStore {
                 }
             }
             drop(names);
-            self.inline.lock().map_err(poisoned)?.push(projector);
+            projectors.push(projector);
             Ok(())
         })
     }
@@ -1323,6 +1385,7 @@ impl EventStore for PostgresEventStore {
     ) -> BoxFuture<'a, Result<CatchUpProgress, EventLogError>> {
         self.bounded(async move {
             let batch = bounded_limit(batch);
+            self.claim_catch_up(projector.name())?;
             let prefix = self.prefix.clone();
             let mut client = self.pool.acquire().await?;
             client.quarantine();
@@ -1589,6 +1652,7 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, EventLogError>> {
         Box::pin(async move {
             validate_field("digest", digest)?;
+            let noted = self.verified.generation()?;
             let row = self
                 .client
                 .query_opt(
@@ -1603,7 +1667,8 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
                 .map_err(backend)?;
             let result = row
                 .map(|row| {
-                    self.verified.check_stored(
+                    self.verified.check_stored_since(
+                        noted,
                         row.get(0),
                         row.get(1),
                         row.get(2),
@@ -1896,6 +1961,23 @@ fn forget_counters(prefix: &str) -> String {
     )
 }
 
+/// Whether `events` are exactly the versions `first ..= last`, in order: a receipt's interval
+/// that a read returns short is refused rather than handed back as a complete answer.
+fn is_complete_interval(events: &[RecordedEvent], first: i64, last: i64) -> bool {
+    let (Ok(first), Ok(last)) = (u64::try_from(first), u64::try_from(last)) else {
+        return false;
+    };
+    // An empty interval is written as `last = first - 1`.
+    let Some(expected) = (last + 1).checked_sub(first) else {
+        return false;
+    };
+    events.len() as u64 == expected
+        && events
+            .iter()
+            .zip(first..)
+            .all(|(event, version)| event.version == version)
+}
+
 async fn select_versions<C: GenericClient>(
     client: &C,
     prefix: &str,
@@ -1924,24 +2006,180 @@ async fn select_versions<C: GenericClient>(
     rows.iter().map(read_event).collect()
 }
 
-/// The page `read_stream` returns from up to `limit + 1` rows read past `after_version`.
+/// The columns of a stream page `p` read with one row past the page: [`COLUMNS`] in their order,
+/// with `data` withheld (NULL) on the row past `fetch`, then whether the row is that lookahead.
+///
+/// The lookahead row comes from the same index scan as the page, so it costs no extra probe, but
+/// its body is never output: a stored body is not detoasted, sent or decoded for it, and is read
+/// once, when the next page asks for it.
+fn stream_page_columns(fetch: &str) -> String {
+    let leading = COLUMNS
+        .strip_suffix(", data")
+        .unwrap_or(COLUMNS)
+        .split(", ")
+        .map(|column| format!("p.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{leading}, CASE WHEN p.n <= {fetch} THEN p.data END AS data, p.n > {fetch} AS lookahead"
+    )
+}
+
+/// `read_stream`'s statement: at most `$5` events past version `$4`, plus the lookahead row
+/// [`stream_page_columns`] describes, in one observation.
+fn stream_page_sql(prefix: &str) -> String {
+    let columns = stream_page_columns("$5::int8");
+    format!(
+        "SELECT {columns}
+         FROM (SELECT {COLUMNS}, row_number() OVER (ORDER BY version) AS n FROM {prefix}_events
+               WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3 AND version > $4
+               ORDER BY version LIMIT $5::int8 + 1) AS p
+         ORDER BY p.version"
+    )
+}
+
+/// The page `read_stream` returns from up to `limit` rows read past `after_version`, plus at
+/// most one lookahead row ([`stream_page_columns`]) that only decides `end_of_stream` and is
+/// not decoded.
 fn stream_slice(
     rows: &[Row],
     after_version: u64,
     limit: usize,
 ) -> Result<StreamSlice, EventLogError> {
-    let mut events = rows
+    let lookahead = |row: &Row| {
+        row.try_get::<_, bool>(COLUMN_COUNT)
+            .map_err(|_| EventLogError::Backend("stream page lookahead is missing".into()))
+    };
+    let (page, more) = match rows.split_last() {
+        Some((last, page)) if lookahead(last)? => (page, true),
+        _ => (rows, false),
+    };
+    if page.len() > limit {
+        return Err(EventLogError::Backend(
+            "a stream page returned more rows than it asked for".into(),
+        ));
+    }
+    let events = page
         .iter()
         .map(read_event)
         .collect::<Result<Vec<_>, EventLogError>>()?;
-    let end_of_stream = events.len() <= limit;
-    events.truncate(limit);
+    let end_of_stream = !more;
     let next_version = events.last().map_or(after_version, |event| event.version);
     Ok(StreamSlice {
         events,
         next_version,
         end_of_stream,
     })
+}
+
+#[cfg(test)]
+mod stream_page_tests {
+    use super::*;
+
+    /// The rows of a page that carry an event body; a lookahead row carries none.
+    fn bodies(rows: &[Row]) -> usize {
+        rows.iter()
+            .filter(|row| row.get::<_, Option<Value>>(COLUMN_COUNT - 1).is_some())
+            .count()
+    }
+
+    #[test]
+    fn the_body_is_the_last_of_the_event_columns() {
+        assert!(COLUMNS.ends_with(", data"));
+        assert_eq!(COLUMNS.split(", ").count(), COLUMN_COUNT);
+    }
+
+    /// Page through a three-event stream one event at a time, through the single read's
+    /// statement and through the batched windows: every page selects the body of exactly the event
+    /// it returns, and only its body-less lookahead row says whether the stream continues.
+    #[tokio::test]
+    async fn a_stream_page_selects_only_the_bodies_it_returns() {
+        let Ok(url) = std::env::var("EVENTLOG_TEST_POSTGRES_URL") else {
+            panic!("stream page proof requires EVENTLOG_TEST_POSTGRES_URL");
+        };
+        let prefix = "stream_page_lookahead";
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        store.drop_tables().await.unwrap();
+        let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+        let stream = StreamId::new(TenantId::new("paged").unwrap(), "item", "one").unwrap();
+        let events: Vec<NewEvent> = (1..=3)
+            .map(|value| {
+                NewEvent::new("item.recorded", 1, serde_json::json!({ "value": value })).unwrap()
+            })
+            .collect();
+        let meta = CommandMeta {
+            idempotency_key: "seed".into(),
+            request_hash: eventlog_core::request_hash(&serde_json::json!({})).unwrap(),
+            subject: "person-1".into(),
+            actor: "service-1".into(),
+            request_id: "request-seed".into(),
+            trace_id: "trace-seed".into(),
+            causation_id: None,
+            causation_depth: 0,
+            occurred_at: OffsetDateTime::UNIX_EPOCH,
+            claim: None,
+        };
+        store
+            .append(&stream, Expected::NoStream, &events, &meta)
+            .await
+            .unwrap();
+        let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let mut seen = Vec::new();
+        for after in 0..3_i64 {
+            let rows = sql
+                .query(
+                    &stream_page_sql(prefix),
+                    &[
+                        &stream.tenant().as_str(),
+                        &stream.stream_type(),
+                        &stream.stream_id(),
+                        &after,
+                        &1_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bodies(&rows),
+                1,
+                "page after {after} selected the next event's body"
+            );
+            let windowed = select_windows(
+                &sql,
+                prefix,
+                &[&Window {
+                    stream: &stream,
+                    after,
+                    through: i64::MAX,
+                    fetch: 1,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                bodies(&windowed[0]),
+                1,
+                "window after {after} selected the next event's body"
+            );
+            for page in [&rows[..], &windowed[0][..]] {
+                let slice = stream_slice(page, u64::try_from(after).unwrap(), 1).unwrap();
+                assert_eq!(slice.events.len(), 1);
+                assert_eq!(slice.end_of_stream, after == 2, "page after {after}");
+                seen.push(slice.next_version);
+            }
+        }
+        assert_eq!(seen, [1, 1, 2, 2, 3, 3]);
+        let past = store.read_stream(&stream, 3, 1).await.unwrap();
+        assert!(past.events.is_empty() && past.end_of_stream);
+        store.drop_tables().await.unwrap();
+    }
 }
 
 /// One stream's versions in `(after, through]`, at most `fetch` of them, in version order.
@@ -1955,8 +2193,10 @@ struct Window<'a> {
 /// Every window's rows, in request order, [`STATEMENT_BATCH`] windows per statement.
 ///
 /// Each window is the statement [`select_versions`] and `read_stream` issue for one stream, run
-/// as a lateral subquery per array element; the element's ordinal is appended after
-/// [`COLUMNS`], so [`read_event`] reads the rows unchanged.
+/// as a lateral subquery per array element. Each window also returns the lookahead row of
+/// [`stream_page_columns`] when a version past its `fetch` rows exists up to `through`; after
+/// [`COLUMNS`] each row carries that flag and then the element's ordinal, so [`read_event`]
+/// reads the page rows unchanged. A window whose `fetch` covers its whole range never has one.
 ///
 /// With a `pace`, each statement runs under that pace times the windows it carries; without
 /// one, under whatever already bounds the caller's transaction.
@@ -1970,6 +2210,7 @@ async fn select_windows<C: GenericClient>(
     if windows.is_empty() {
         return Ok(answers);
     }
+    let columns = stream_page_columns("r.r_fetch");
     let statement = paced(pace.map(|one| one.deadline), async {
         client
             .prepare(&format!(
@@ -1977,10 +2218,13 @@ async fn select_windows<C: GenericClient>(
                                           $5::int8[], $6::int8[])
                  WITH ORDINALITY AS r(r_tenant, r_type, r_id, r_after, r_through, r_fetch, ord)
              CROSS JOIN LATERAL (
-                 SELECT {COLUMNS} FROM {prefix}_events
-                 WHERE tenant_id = r.r_tenant AND stream_type = r.r_type AND stream_id = r.r_id
-                   AND version > r.r_after AND version <= r.r_through
-                 ORDER BY version LIMIT r.r_fetch) AS e
+                 SELECT {columns}
+                 FROM (SELECT {COLUMNS}, row_number() OVER (ORDER BY version) AS n
+                       FROM {prefix}_events
+                       WHERE tenant_id = r.r_tenant AND stream_type = r.r_type
+                         AND stream_id = r.r_id
+                         AND version > r.r_after AND version <= r.r_through
+                       ORDER BY version LIMIT r.r_fetch + 1) AS p) AS e
              ORDER BY r.ord, e.version"
             ))
             .await
@@ -2009,7 +2253,7 @@ async fn select_windows<C: GenericClient>(
         })
         .await?;
         for row in rows {
-            let index = batch * STATEMENT_BATCH + ordinal(row.get(COLUMN_COUNT))?;
+            let index = batch * STATEMENT_BATCH + ordinal(row.get(COLUMN_COUNT + 1))?;
             answers
                 .get_mut(index)
                 .ok_or_else(|| EventLogError::Backend("batched read out of range".into()))?

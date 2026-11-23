@@ -239,6 +239,10 @@ The committed-XID predicate alone is not a position-contiguity proof: a guard ca
 XID before another append obtains a lower sequence position. The PostgreSQL publication gate
 therefore precedes every other owner lock. Append and redaction share it through commit; tenant
 erasure takes it exclusively to prevent snapshot-generation capture from surviving erasure.
+After it an append takes its claim or group lock, then its stream locks, then every attached inline
+projector's owner/projector/tenant lock ordered by name, all before the guard; admission and
+projection-row locks come later. The projector locks hold to commit so one projection is never
+folded concurrently, across handles too. Keep that order and the two-writer deadlock regression.
 Feed, catch-up and rebuild take it exclusively before a fresh READ COMMITTED query. Preserve the original watermark
 predicate and stop before its first withheld global position in that same statement snapshot:
 unrelated transactions can hold xmin between already committed owner XIDs. A rowwise filter can

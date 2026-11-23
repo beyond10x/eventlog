@@ -16,7 +16,7 @@ mod inspection;
 pub use admission::{AdmissionPermit, AdmissionScope, Reservation, ordered_reservations};
 mod blob_integrity;
 mod verified_content;
-pub use verified_content::{VERIFIED_CONTENT_BUDGET, VerifiedContent};
+pub use verified_content::{ContentGeneration, VERIFIED_CONTENT_BUDGET, VerifiedContent};
 mod capture;
 mod inline_admin;
 pub use inspection::{HistoryInspection, InspectHistory, InspectionError, InspectionLimits};
@@ -24,12 +24,12 @@ mod projection;
 
 pub use capture::{
     BoundBlobs, CaptureBudget, CaptureCheckpoint, CaptureError, CaptureLimits, CaptureMaterial,
-    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedProjection,
-    CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture, DeferredBlob,
-    DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal, TenantCapture,
-    TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs, order_rows,
-    validate_capture_request, validate_captured_branchable_order, validate_captured_digest,
-    validate_captured_event, validate_captured_order,
+    CaptureRequestRefusal, CaptureResource, CaptureUsage, CapturedBlob, CapturedOrder,
+    CapturedProjection, CapturedProjectionDelta, CapturedRowChange, ConsistentTenantCapture,
+    DeferredBlob, DeferredTenantCapture, DurableCaptureCheckpoint, ProjectionCaptureRefusal,
+    TenantCapture, TenantCaptureDelta, TenantCaptureUpdate, order_blobs, order_deferred_blobs,
+    order_rows, validate_capture_request, validate_captured_branchable_order,
+    validate_captured_digest, validate_captured_event, validate_captured_order,
 };
 pub use inline_admin::{InlineProjectionAdmin, InlineRebuildResult};
 
@@ -1159,7 +1159,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// Drive this projector inside every append transaction from now on.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered.
+    /// Returns [`EventLogError::Invalid`] when a projection of that name is already registered,
+    /// or when catch-up on this handle has already driven the projector.
     fn register_inline(
         &self,
         projector: Arc<dyn Projector>,
@@ -1171,7 +1172,8 @@ pub trait EventStore: Send + Sync + 'static {
     /// Apply one batch of a catch-up projection under its own lock.
     ///
     /// # Errors
-    /// Returns [`EventLogError::Backend`] when the store is unavailable.
+    /// Returns [`EventLogError::Backend`] when the store is unavailable, and
+    /// [`EventLogError::Invalid`] when the projector is driven inline.
     fn run_catch_up<'a>(
         &'a self,
         projector: Arc<dyn Projector>,

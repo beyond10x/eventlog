@@ -16,7 +16,8 @@
 //!
 //! **What is remembered, and for how long.** Entries come only from content the handle read and
 //! verified, or wrote and hashed itself. They are bounded by [`VERIFIED_CONTENT_BUDGET`] bytes;
-//! past it the memory is cleared, not grown. A provider calls [`VerifiedContent::forget`] when its
+//! past it the least recently used entries are dropped until a new one fits, so one new content
+//! does not evict everything else. A provider calls [`VerifiedContent::forget`] when its
 //! handle deletes a blob, erases a tenant, or returns an error from a write that bound blobs, so
 //! content of a write that returned an error is not kept and a deletion or erasure through the
 //! handle leaves none of its bytes here. A callback that **panics** after a batch was bound
@@ -30,16 +31,19 @@
 //! memory, and is remembered only if no [`VerifiedContent::forget`] happened in between. So a read
 //! through the same handle that raced a deletion or erasure — and saw the row before the commit —
 //! cannot put the erased bytes back once the post-commit forget has run, and reads that miss hash
-//! in parallel rather than one at a time.
+//! in parallel rather than one at a time. A read that fetches, awaits (a statement, a commit) and
+//! only then checks notes the generation before its fetch ([`VerifiedContent::generation`],
+//! [`VerifiedContent::check_stored_since`]): a deletion that settles entirely inside that interval
+//! would otherwise bump the generation before the check looked it up.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
 use crate::{EventLogError, validate_legacy_blob_count, validate_stored_blob};
 
-/// The most content bytes one handle remembers. Past it the memory is cleared, not grown.
+/// The most content bytes one handle remembers. Past it the least recently used entries go first.
 pub const VERIFIED_CONTENT_BUDGET: usize = 32 << 20;
 
 /// What one handle has verified. One per handle; never shared between handles.
@@ -50,8 +54,12 @@ pub struct VerifiedContent {
 
 #[derive(Default)]
 struct State {
-    /// Verified content by its SHA-256, exactly as it was verified.
-    by_hash: HashMap<String, Arc<[u8]>>,
+    /// Verified content by its SHA-256, exactly as it was verified, with its last use.
+    by_hash: HashMap<String, Entry>,
+    /// Every entry's hash by its last use, oldest first: the eviction order.
+    by_use: BTreeMap<u64, String>,
+    /// The next use stamp; only grows.
+    clock: u64,
     /// The sum of the lengths in `by_hash`.
     held: usize,
     /// Full checks this memory could not answer and therefore ran.
@@ -61,24 +69,73 @@ struct State {
     generation: u64,
 }
 
+struct Entry {
+    bytes: Arc<[u8]>,
+    used: u64,
+}
+
 impl State {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// The content under `integrity_sha256`, marked as used now.
+    fn touch(&mut self, integrity_sha256: &str) -> Option<Arc<[u8]>> {
+        let used = self.tick();
+        let entry = self.by_hash.get_mut(integrity_sha256)?;
+        let previous = std::mem::replace(&mut entry.used, used);
+        let bytes = Arc::clone(&entry.bytes);
+        if let Some(hash) = self.by_use.remove(&previous) {
+            self.by_use.insert(used, hash);
+        }
+        Some(bytes)
+    }
+
     fn insert(&mut self, integrity_sha256: &str, bytes: &[u8]) {
         if bytes.len() > VERIFIED_CONTENT_BUDGET || self.by_hash.contains_key(integrity_sha256) {
             return;
         }
-        if self.held + bytes.len() > VERIFIED_CONTENT_BUDGET {
-            self.by_hash.clear();
-            self.held = 0;
+        // Drop the least recently used entries until the new one fits, not everything.
+        while self.held + bytes.len() > VERIFIED_CONTENT_BUDGET {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            if let Some(evicted) = self.by_hash.remove(&oldest) {
+                self.held -= evicted.bytes.len();
+            }
         }
+        let used = self.tick();
         self.held += bytes.len();
-        self.by_hash
-            .insert(integrity_sha256.to_owned(), Arc::from(bytes));
+        self.by_use.insert(used, integrity_sha256.to_owned());
+        self.by_hash.insert(
+            integrity_sha256.to_owned(),
+            Entry {
+                bytes: Arc::from(bytes),
+                used,
+            },
+        );
+    }
+
+    fn clear(&mut self) {
+        self.by_hash.clear();
+        self.by_use.clear();
+        self.held = 0;
     }
 }
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> EventLogError {
     EventLogError::Backend("the store lock was poisoned by a panic".to_owned())
 }
+
+/// The memory's generation, noted by a read **before** it fetches anything from storage.
+///
+/// A read whose fetch and check are separated by awaits — a statement, a commit — notes this
+/// first and hands it to [`VerifiedContent::check_stored_since`]. Content is then remembered only
+/// if no [`VerifiedContent::forget`] happened since the fetch began, so a same-handle deletion
+/// that finished between the fetch and the check cannot leave the deleted bytes remembered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentGeneration(u64);
 
 /// What one lookup saw: the remembered content under the hash, if any, and the generation.
 struct Lookup {
@@ -97,9 +154,9 @@ impl Lookup {
 
 impl VerifiedContent {
     fn look_up(&self, integrity_sha256: Option<&str>) -> Result<Lookup, EventLogError> {
-        let state = self.state.lock().map_err(poisoned)?;
+        let mut state = self.state.lock().map_err(poisoned)?;
         Ok(Lookup {
-            remembered: integrity_sha256.and_then(|hash| state.by_hash.get(hash).cloned()),
+            remembered: integrity_sha256.and_then(|hash| state.touch(hash)),
             generation: state.generation,
         })
     }
@@ -134,7 +191,53 @@ impl VerifiedContent {
         integrity_sha256: Option<String>,
         integrity_v1: i64,
     ) -> Result<Vec<u8>, EventLogError> {
-        let lookup = self.look_up(integrity_sha256.as_deref())?;
+        self.check_stored_from(None, bytes, byte_count, integrity_sha256, integrity_v1)
+    }
+
+    /// The memory's generation now. Note it before fetching a row whose check comes later.
+    ///
+    /// # Errors
+    /// [`EventLogError::Backend`] when the memory's lock was poisoned.
+    pub fn generation(&self) -> Result<ContentGeneration, EventLogError> {
+        Ok(ContentGeneration(
+            self.state.lock().map_err(poisoned)?.generation,
+        ))
+    }
+
+    /// [`Self::check_stored`] for a row fetched after `since` was noted: the row is remembered
+    /// only if no [`Self::forget`] happened since then, not merely since this check began.
+    ///
+    /// # Errors
+    /// [`EventLogError::Backend`] for corrupt persisted metadata or bytes.
+    pub fn check_stored_since(
+        &self,
+        since: ContentGeneration,
+        bytes: Vec<u8>,
+        byte_count: i64,
+        integrity_sha256: Option<String>,
+        integrity_v1: i64,
+    ) -> Result<Vec<u8>, EventLogError> {
+        self.check_stored_from(
+            Some(since),
+            bytes,
+            byte_count,
+            integrity_sha256,
+            integrity_v1,
+        )
+    }
+
+    fn check_stored_from(
+        &self,
+        since: Option<ContentGeneration>,
+        bytes: Vec<u8>,
+        byte_count: i64,
+        integrity_sha256: Option<String>,
+        integrity_v1: i64,
+    ) -> Result<Vec<u8>, EventLogError> {
+        let mut lookup = self.look_up(integrity_sha256.as_deref())?;
+        if let Some(ContentGeneration(noted)) = since {
+            lookup.generation = noted;
+        }
         if integrity_v1 == 1 && lookup.hit(&bytes) {
             validate_legacy_blob_count(&bytes, byte_count)?;
             return Ok(bytes);
@@ -190,8 +293,7 @@ impl VerifiedContent {
     /// to remember any check that began before this call.
     pub fn forget(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.by_hash.clear();
-            state.held = 0;
+            state.clear();
             state.generation += 1;
         }
     }
@@ -314,6 +416,89 @@ mod tests {
         );
         assert_eq!((verified.held(), verified.entries()), (0, 0));
         assert_eq!(verified.hashed(), 1);
+    }
+
+    /// A row fetched before a `forget` and checked after it is returned but not remembered when
+    /// the read noted the generation before its fetch; an unnoted check would remember it.
+    #[test]
+    fn a_row_fetched_before_a_forget_is_not_remembered_by_a_later_check() {
+        let verified = VerifiedContent::default();
+        let bytes = b"fetched".to_vec();
+        let hash = blob_integrity_sha256(&bytes);
+        let noted = verified.generation().unwrap();
+        verified.forget();
+        verified.forget();
+        assert_eq!(
+            verified
+                .check_stored_since(noted, bytes.clone(), 7, Some(hash.clone()), 1)
+                .unwrap(),
+            bytes,
+            "the read still answers with the bytes it fetched"
+        );
+        assert_eq!((verified.held(), verified.entries()), (0, 0));
+        let current = verified.generation().unwrap();
+        verified
+            .check_stored_since(current, bytes.clone(), 7, Some(hash), 1)
+            .unwrap();
+        assert_eq!(
+            verified.entries(),
+            1,
+            "a fetch after the forget is remembered"
+        );
+    }
+
+    /// A full memory makes room for one new content by dropping the least recently used entry,
+    /// not everything: the contents still in use are answered without another full check, and a
+    /// `forget` still drops them all.
+    #[test]
+    fn one_new_content_evicts_only_the_least_recently_used_entry() {
+        const MIB: usize = 1 << 20;
+        let verified = VerifiedContent::default();
+        let blobs: Vec<(String, Vec<u8>)> = (0..=VERIFIED_CONTENT_BUDGET / MIB)
+            .map(|index| {
+                (
+                    format!("hash-{index}"),
+                    vec![u8::try_from(index).unwrap(); MIB],
+                )
+            })
+            .collect();
+        let (cold, active) = blobs.split_last().unwrap();
+        // The full check is not what this case measures; counting it is.
+        let full = |_: &[u8]| true;
+        for (hash, bytes) in active {
+            assert!(verified.check_recorded(bytes, hash, full).unwrap());
+        }
+        assert_eq!(verified.held(), VERIFIED_CONTENT_BUDGET);
+        for (hash, bytes) in &active[1..] {
+            assert!(verified.check_recorded(bytes, hash, full).unwrap());
+        }
+        let filled = verified.hashed();
+        assert!(verified.check_recorded(&cold.1, &cold.0, full).unwrap());
+        assert_eq!(
+            verified.entries(),
+            active.len(),
+            "exactly one entry made room"
+        );
+        for (hash, bytes) in &active[1..] {
+            assert!(verified.check_recorded(bytes, hash, full).unwrap());
+        }
+        assert_eq!(
+            verified.hashed(),
+            filled + 1,
+            "only the new content was checked in full; the recently used ones stayed"
+        );
+        assert!(
+            verified
+                .check_recorded(&active[0].1, &active[0].0, full)
+                .unwrap()
+        );
+        assert_eq!(
+            verified.hashed(),
+            filled + 2,
+            "the least recently used entry was the one dropped"
+        );
+        verified.forget();
+        assert_eq!((verified.held(), verified.entries()), (0, 0));
     }
 
     #[test]

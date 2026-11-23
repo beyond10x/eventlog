@@ -99,6 +99,10 @@ complete journal, and a driver may materialize one row before its decoded size i
 preflights counts and stored blob lengths inside the snapshot, then decodes incrementally and
 checks the exact accumulating payload size before retaining each item. It must not load every
 blob through an unbounded `query` and only then test the cap. A malformed length is corruption.
+PostgreSQL sizes each page of a read from the remaining payload allowance: as many rows as it
+could admit at the largest item size seen so far in that read, at least one and at most 1,000.
+The first page of each read holds one row, so a first body over the allowance is refused after
+one row arrived. Rows larger than any seen before can still make one page exceed the allowance.
 Implementations may refuse a proven exceeded cap early; when several caps are exceeded, no
 cross-provider precedence is promised. Every reported limit must actually have been exceeded.
 The same rules apply on repeated captures; there is no hidden remembered quota or partial cursor.

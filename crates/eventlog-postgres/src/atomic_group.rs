@@ -263,6 +263,66 @@ async fn lock_streams(
     set_statement_timeout(transaction, statement_timeout).await
 }
 
+/// The coordinate of one projector's lock for one tenant: the very lock catch-up, catch-up
+/// rebuild and inline rebuild take (`[prefix, "projector", name, tenant]`).
+fn projector_lock_identity(
+    prefix: &str,
+    name: &str,
+    tenant: &eventlog_core::TenantId,
+) -> Result<String, EventLogError> {
+    serde_json::to_string(&[prefix, "projector", name, tenant.as_str()])
+        .map_err(|_| EventLogError::Invalid("invalid lock coordinates".into()))
+}
+
+/// Take every inline projector's lock for `tenant`, ordered by name, in one statement, held to
+/// the end of the transaction.
+///
+/// [`Projector::apply`] promises that one projection is never folded concurrently. Appends to
+/// distinct streams share the publication gate and hold different stream locks, so without this
+/// two of them — through one handle or several — would run one projector side by side, and a
+/// get/compute/upsert of a shared row would lose an update. The lock lasts until commit because
+/// a later call must also see the earlier call's writes.
+///
+/// Order: after the publication gate, the claim or group lock and every stream lock, and before
+/// the guard and the first projector callback, whose admission and projection-row locks come
+/// after it. Every writer takes the locks in that order and by name, so a write driving several
+/// projectors cannot deadlock against another. A projector is folded by every append of its
+/// owner, so writes of one tenant serialize from here to commit while an inline projector is
+/// attached; other tenants are not affected.
+async fn lock_projectors(
+    transaction: &tokio_postgres::Transaction<'_>,
+    prefix: &str,
+    projectors: &[Arc<dyn Projector>],
+    tenant: &eventlog_core::TenantId,
+) -> Result<(), EventLogError> {
+    if projectors.is_empty() {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = projectors
+        .iter()
+        .map(|projector| projector.name())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let identities = names
+        .iter()
+        .map(|name| projector_lock_identity(prefix, name, tenant))
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = ADVISORY_KEY.replace("$1", "r.identity");
+    transaction
+        .execute(
+            &format!(
+                "SELECT pg_advisory_xact_lock({key})
+                 FROM (SELECT identity FROM unnest($1::text[]) WITH ORDINALITY AS u(identity, ord)
+                       ORDER BY ord) AS r"
+            ),
+            &[&identities],
+        )
+        .await
+        .map_err(backend)?;
+    Ok(())
+}
+
 /// Every stream's current head, 0 for a stream not yet written, [`STATEMENT_BATCH`] per statement.
 async fn stream_heads<'s>(
     transaction: &tokio_postgres::Transaction<'_>,
@@ -415,6 +475,8 @@ impl PostgresEventStore {
         };
         check_expected(expected, head)?;
 
+        let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
+        lock_projectors(transaction, &prefix, &projectors, stream.tenant()).await?;
         {
             let mut projections = PostgresProjections {
                 client: transaction,
@@ -466,7 +528,6 @@ impl PostgresEventStore {
             )
             .await
             .map_err(backend)?;
-        let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
         for projector in &projectors {
             let mut projections = PostgresProjections {
                 client: transaction,
@@ -707,6 +768,8 @@ impl PostgresEventStore {
             self.pool.options.statement_timeout,
         )
         .await?;
+        let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
+        lock_projectors(transaction, prefix, &projectors, &group.tenant).await?;
         match blobs {
             GroupBlobs::Bound(blobs) => {
                 self.bind_blobs(transaction, &group.tenant, blobs).await?;
@@ -758,7 +821,6 @@ impl PostgresEventStore {
         if !planned.is_empty() {
             checkpoint("group-event-1");
         }
-        let projectors: Vec<Arc<dyn Projector>> = self.inline.lock().map_err(poisoned)?.clone();
         let mut appends = Vec::with_capacity(members.len());
         let mut ranges = Vec::with_capacity(members.len());
         #[cfg(test)]
@@ -901,17 +963,21 @@ impl PostgresEventStore {
     ///
     /// A deduplicated answer to a batch-bearing guarded retry rolls back rather than commits: it
     /// wrote nothing, and its re-run admission may have staged reservations it must not keep.
+    ///
+    /// `deadline` is taken at the public entry: one budget, from which the wait for registration
+    /// to freeze (an inline rebuild holds it while it replays) is spent too, as on the
+    /// single-append path.
     async fn run_group(
         &self,
         group: &AppendGroup,
         fingerprint: &str,
         blobs: GroupBlobs<'_>,
         admission: Arc<dyn Guard>,
+        deadline: tokio::time::Instant,
     ) -> Result<AppendGroupResult, EventLogError> {
-        self.freeze().await;
         let commit_started = std::sync::atomic::AtomicBool::new(false);
-        let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
         let outcome = tokio::time::timeout_at(deadline, async {
+            self.freeze().await;
             let mut client = self.pool.acquire().await?;
             client.quarantine();
             let transaction = client.transaction().await.map_err(backend)?;
@@ -974,9 +1040,18 @@ impl AtomicEventStore for PostgresEventStore {
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(async move {
+            // One budget from the public entry: the wait for registration to freeze (an inline
+            // rebuild holds it while it replays) is spent from it, as on the single-append path.
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
             let fingerprint = group.fingerprint()?;
-            self.run_group(group, &fingerprint, GroupBlobs::Bound(&[]), admission)
-                .await
+            self.run_group(
+                group,
+                &fingerprint,
+                GroupBlobs::Bound(&[]),
+                admission,
+                deadline,
+            )
+            .await
         })
     }
 
@@ -998,6 +1073,9 @@ impl AtomicEventStore for PostgresEventStore {
             return self.append_group_guarded(group, admission);
         }
         Box::pin(async move {
+            // One budget from the public entry, registration wait included; see
+            // `run_group`.
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
             let fingerprint = group.fingerprint()?;
             // Equal repetitions of a digest collapse to one binding; other bytes under it refuse.
             let mut unique: BTreeMap<&str, &[u8]> = BTreeMap::new();
@@ -1024,6 +1102,7 @@ impl AtomicEventStore for PostgresEventStore {
                     blob_fingerprint: &blob_fingerprint,
                 },
                 admission,
+                deadline,
             )
             .await
         })
@@ -1037,6 +1116,9 @@ impl AtomicBlobEventStore for PostgresEventStore {
         admission: Arc<dyn Guard>,
     ) -> BoxFuture<'a, Result<AppendGroupResult, EventLogError>> {
         Box::pin(async move {
+            // One budget from the public entry, registration wait included; see
+            // `run_group`.
+            let deadline = tokio::time::Instant::now() + self.pool.options.transaction_timeout;
             // One SHA-256 per content serves the fingerprint and the integrity column alike, and
             // the blobs are bound from the caller's own bytes.
             let (fingerprint, hashes) = request.fingerprint_and_hashes()?;
@@ -1052,6 +1134,7 @@ impl AtomicBlobEventStore for PostgresEventStore {
                 &fingerprint,
                 GroupBlobs::Bound(&blobs),
                 admission,
+                deadline,
             )
             .await
         })

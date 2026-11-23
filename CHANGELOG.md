@@ -41,6 +41,12 @@ under bare-version tags such as `0.1.0`.
   `EventLogError::IndexedValueTooLarge { field, bytes, limit }`. On PostgreSQL such a value could
   exceed the B-tree entry limit and abort the append with a backend error; SQLite and the file
   provider accepted it. A projector that indexes longer values must index a shorter key instead.
+- PostgreSQL: `PostgresConnectionAuthority::cancel` sends the server-side cancel request for a
+  caller-owned session. The pool calls it when it retires an unsettled lease. The default
+  reports `Unsupported`, so existing authorities compile unchanged; with it, a retired query on a
+  server without disconnect polling (PostgreSQL 13, or a platform without
+  `client_connection_check_interval`) can keep running and holding locks after the pool returned
+  its permit, until it finishes or reaches its statement or lock timeout.
 
 ### Changed
 
@@ -68,6 +74,18 @@ under bare-version tags such as `0.1.0`.
   order, the counter read, the counter write) instead of three per scope: 64 scopes cost the same
   round trips as one. A scope whose value does not change is not written, so a zero-delta check
   creates no counter row and writes no WAL; the locks and ceiling checks are unchanged.
+- PostgreSQL: consistent tenant capture sizes each page of its event, blob and projection-row
+  reads from the remaining payload allowance and the largest item that read has admitted, from
+  one row up to 1,000. The first page of each read holds one row, so a first body over the
+  allowance is refused after one row arrived instead of after a full page (a 1,000-row page of
+  8 KB bodies was 8.2 MB on the wire).
+- PostgreSQL: `read_stream` and the stream reads of `read_many` still read one row past the page
+  to decide `end_of_stream`, but no longer output, detoast or decode that row's event body; the
+  next page reads it once.
+- Verified blob content: a full memory drops its least recently used entries until a new content
+  fits, instead of clearing every entry. Deletion and erasure through the handle still clear it.
+- PostgreSQL: capture preflight takes the blob count, byte total and invalid-length count from one
+  aggregate, scanning the tenant's blob bindings once instead of three times.
 
 ### Fixed
 
@@ -163,6 +181,39 @@ under bare-version tags such as `0.1.0`.
   until then with `Invalid("PostgreSQL events carry another cluster's transaction ids (a restored
   history); run migrate with the migration role before opening")`. The restore procedure is:
   restore, then run `migrate`.
+- PostgreSQL: dropping an operation that holds an unsettled pool lease on a thread outside any
+  Tokio runtime no longer panics in the lease destructor. Retirement is spawned on the runtime
+  the lease was acquired on, not on the dropping thread's ambient runtime.
+- PostgreSQL: a grouped append, with or without blobs, starts its transaction deadline at its
+  public entry. The wait for inline registration to freeze, which an inline rebuild can hold
+  while it replays, is now spent from the same budget instead of being followed by a fresh full
+  timeout, as on the single-append path.
+- PostgreSQL: `recorded_command` reads a command receipt and its events in one read-only
+  REPEATABLE READ snapshot, so a tenant erasure that commits between the two reads no longer
+  returns a receipt with no events or with events of recreated stream coordinates. A receipt
+  whose interval lacks an event is refused as a backend error instead of returned short.
+- SQLite and PostgreSQL: a projector is driven inline or by catch-up, never both. A catch-up
+  runner created before the same projector was registered inline used to fold every event a
+  second time. `run_catch_up` now refuses an inline projector, as the file provider already did,
+  and inline registration or attachment refuses a projector catch-up has already driven on that
+  handle.
+- PostgreSQL: an inline projector is no longer folded by two appends at once. Appends to distinct
+  streams, through one handle or several, each took only the shared publication gate and their own
+  stream lock, so a projector that reads, computes and upserts a shared row could lose an update.
+  Every append and append group now takes each attached inline projector's owner/projector/tenant
+  lock, ordered by name, after its stream locks and before its guard, and holds it to commit.
+  Writes of one tenant therefore serialize from that point while an inline projector is attached.
+- PostgreSQL: a blob read whose fetch and check are separated by a commit or a statement notes the
+  verified-content generation before it fetches, so a same-handle deletion that settles in between
+  no longer leaves the deleted bytes in the handle's memory. `eventlog-core` adds
+  `VerifiedContent::generation`, `VerifiedContent::check_stored_since` and `ContentGeneration`;
+  `check_stored` is unchanged.
+- PostgreSQL and SQLite: inline rebuild no longer holds the tenant's whole decoded history in one
+  vector. It validates every page first and then folds page by page, both in the same snapshot,
+  so no callback still runs on corrupt history and the shadow-table publication stays atomic.
+  `eventlog-core` adds `CapturedOrder`, the page-at-a-time form of `validate_captured_order`.
+- PostgreSQL: an idempotency mismatch from `recorded_command` rolls back and keeps its pooled
+  connection instead of retiring it as an unsettled lease.
 
 ### Security
 

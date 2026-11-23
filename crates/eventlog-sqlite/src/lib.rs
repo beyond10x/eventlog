@@ -61,6 +61,9 @@ struct Inner {
     prefix: String,
     inline: Mutex<Vec<Arc<dyn Projector>>>,
     inline_names: Mutex<BTreeSet<String>>,
+    /// Projectors this handle has driven by catch-up. Locked after `inline`, so one projector is
+    /// driven inline or by catch-up, never both, whichever is registered first.
+    catch_up: Mutex<BTreeSet<String>>,
     admission_permit: eventlog_core::AdmissionPermit,
     registration: Mutex<bool>,
     /// Identities and instants the next appended events take instead of minting their own, in
@@ -477,6 +480,7 @@ impl Inner {
             prefix: prefix.to_owned(),
             inline: Mutex::new(Vec::new()),
             inline_names: Mutex::new(BTreeSet::new()),
+            catch_up: Mutex::new(BTreeSet::new()),
             admission_permit: eventlog_core::AdmissionPermit::default(),
             registration: Mutex::new(false),
             restored: Mutex::new(std::collections::VecDeque::new()),
@@ -2812,6 +2816,8 @@ impl Inner {
             }
         }
         self.create_projections(projector.as_ref())?;
+        let mut projectors = self.inline.lock().map_err(poisoned)?;
+        self.refuse_catch_up_driven(projector.name())?;
         let mut names = self.inline_names.lock().map_err(poisoned)?;
         for spec in projector.projections() {
             if !names.insert(spec.name.to_owned()) {
@@ -2821,7 +2827,33 @@ impl Inner {
                 )));
             }
         }
-        self.inline.lock().map_err(poisoned)?.push(projector);
+        drop(names);
+        projectors.push(projector);
+        Ok(())
+    }
+
+    /// Called with `inline` held, so no catch-up pass can claim the projector meanwhile.
+    fn refuse_catch_up_driven(&self, name: &str) -> Result<(), EventLogError> {
+        if self.catch_up.lock().map_err(poisoned)?.contains(name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven by catch-up"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that catch-up drives this projector, unless it is driven inline.
+    fn claim_catch_up(&self, name: &str) -> Result<(), EventLogError> {
+        let projectors = self.inline.lock().map_err(poisoned)?;
+        if projectors.iter().any(|projector| projector.name() == name) {
+            return Err(EventLogError::Invalid(format!(
+                "projection {name} is already driven inline"
+            )));
+        }
+        self.catch_up
+            .lock()
+            .map_err(poisoned)?
+            .insert(name.to_owned());
         Ok(())
     }
 
@@ -2838,6 +2870,7 @@ impl Inner {
         batch: usize,
     ) -> Result<CatchUpProgress, EventLogError> {
         let batch = bounded_limit(batch);
+        self.claim_catch_up(projector.name())?;
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
