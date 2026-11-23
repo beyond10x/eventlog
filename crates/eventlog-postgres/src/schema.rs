@@ -27,6 +27,7 @@ const ATOMIC_GROUP_CHECKSUM: &str =
     "9d31a95af97bbdb3f675197383851f73758e1459166837171ef367c46530aa1f";
 const BLOB_INTEGRITY_CHECKSUM: &str =
     "3d101321a8cc49dbca39a7d2305fb82dafe0550789fc87612f95dd232359ad0d";
+const BATCH_CHECKSUM: &str = "f5989b20d7de8babbd77d3427015b92a70f5f6275982f740616476873d09a7fa";
 
 fn legacy_base_ddl(prefix: &str) -> String {
     format!(
@@ -194,7 +195,7 @@ fn counter_index(prefix: &str) -> String {
 }
 
 /// Every table of the current edition, in admission order.
-fn every_table() -> Vec<&'static str> {
+pub(crate) fn every_table() -> Vec<&'static str> {
     BASE.iter()
         .chain(ADDED)
         .chain(SNAPSHOT_ADDED)
@@ -205,21 +206,36 @@ fn every_table() -> Vec<&'static str> {
         .collect()
 }
 
+/// The DDL of the owner tables, without the projection tables' shape.
+fn owner_ddl() -> String {
+    format!(
+        "{}{}{}{}{}{}{}{}",
+        base_ddl("owner"),
+        additions("owner"),
+        snapshot_additions("owner"),
+        group_additions("owner"),
+        batch_additions("owner"),
+        floor_additions("owner"),
+        watermark_index("owner"),
+        counter_index("owner")
+    )
+}
+
+/// The current edition: the owner tables and the indexes of a projection table. A change to
+/// either is a new checksum, which every earlier binary refuses at `open` and `migrate`: the
+/// cutover to a new projection shape is fenced by the ledger, not only by the per-table shape
+/// check a binary meets when it registers a projection.
 fn checksum() -> String {
     format!(
         "{:x}",
-        Sha256::digest(format!(
-            "{}{}{}{}{}{}{}{}",
-            base_ddl("owner"),
-            additions("owner"),
-            snapshot_additions("owner"),
-            group_additions("owner"),
-            batch_additions("owner"),
-            floor_additions("owner"),
-            watermark_index("owner"),
-            counter_index("owner")
-        ))
+        Sha256::digest(format!("{}{}", owner_ddl(), projection_edition()))
     )
+}
+
+/// The batch edition, released in 0.10.0: the current owner tables, projection tables indexed
+/// only by `(tenant_id, idx_N)`.
+fn batch_checksum() -> String {
+    BATCH_CHECKSUM.into()
 }
 
 /// The edition with blob integrity columns and atomic groups, before the batch record.
@@ -489,6 +505,16 @@ async fn version(
     prefix: &str,
     expected_checksum: &str,
 ) -> Result<(), EventLogError> {
+    version_among(transaction, prefix, &[expected_checksum]).await?;
+    Ok(())
+}
+
+/// Which of `accepted` the ledger records; any other ledger is refused.
+async fn version_among(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    accepted: &[&str],
+) -> Result<usize, EventLogError> {
     let rows = transaction
         .query(
             &format!("SELECT version,checksum FROM {prefix}_schema_version"),
@@ -496,15 +522,14 @@ async fn version(
         )
         .await
         .map_err(backend)?;
-    if rows.len() != 1
-        || rows[0].get::<_, i64>(0) != 1
-        || rows[0].get::<_, String>(1) != expected_checksum
-    {
-        return Err(EventLogError::Invalid(
-            "unknown PostgreSQL schema version/checksum".into(),
-        ));
-    }
-    Ok(())
+    let recorded = match rows.as_slice() {
+        [row] if row.get::<_, i64>(0) == 1 => row.get::<_, String>(1),
+        _ => String::new(),
+    };
+    accepted
+        .iter()
+        .position(|checksum| *checksum == recorded)
+        .ok_or_else(|| EventLogError::Invalid("unknown PostgreSQL schema version/checksum".into()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -693,6 +718,7 @@ pub(crate) async fn migrate_with_blob_migration(
     } else {
         Some(blob_shape(&transaction, prefix).await?)
     };
+    let mut batch_edition = false;
     if prior_blob_shape == Some(PostgresBlobShape::Current) {
         if !ledger || !generations || !groups {
             return Err(EventLogError::Invalid(
@@ -704,7 +730,10 @@ pub(crate) async fn migrate_with_blob_migration(
         compare(&transaction, prefix, GROUP_ADDED).await?;
         if batches {
             compare(&transaction, prefix, BATCH_ADDED).await?;
-            version(&transaction, prefix, &checksum()).await?;
+            // The 0.10.0 edition differs from the current one only in its projection tables'
+            // indexes, which `upgrade_registered_projections` moves below.
+            batch_edition =
+                version_among(&transaction, prefix, &[&checksum(), &batch_checksum()]).await? == 1;
         } else {
             version(&transaction, prefix, &blob_integrity_checksum()).await?;
         }
@@ -838,13 +867,16 @@ pub(crate) async fn migrate_with_blob_migration(
             .await
             .map_err(backend)?;
     } else if prior_blob_shape == Some(PostgresBlobShape::Legacy)
-        || (prior_blob_shape == Some(PostgresBlobShape::Current) && !batches)
+        || (prior_blob_shape == Some(PostgresBlobShape::Current) && (!batches || batch_edition))
     {
-        let prior_checksum = if prior_blob_shape == Some(PostgresBlobShape::Current) {
+        let prior_checksum = if batch_edition {
+            batch_checksum()
+        } else if prior_blob_shape == Some(PostgresBlobShape::Current) {
             blob_integrity_checksum()
         } else {
             prior_checksum
         };
+        upgrade_registered_projections(&transaction, prefix).await?;
         transaction
             .execute(
                 &format!(
@@ -964,12 +996,17 @@ pub(crate) fn projection_columns(spec: &ProjectionSpec) -> Vec<(String, &'static
 /// the position away, so every field of a long table would share one name and `IF NOT EXISTS`
 /// would create only the first index.
 pub(crate) fn projection_index(table: &str, position: usize) -> String {
-    let plain = format!("{table}_idx_{position}");
+    bounded_index_name(table, &format!("idx_{position}"))
+}
+
+/// `{table}_{role}`, or, past 63 bytes, as much of the table name as fits beside a digest of it.
+fn bounded_index_name(table: &str, role: &str) -> String {
+    let plain = format!("{table}_{role}");
     if plain.len() <= 63 {
         return plain;
     }
     let digest = format!("{:x}", Sha256::digest(table.as_bytes()));
-    let suffix = format!("_{}_idx_{position}", &digest[..8]);
+    let suffix = format!("_{}_{role}", &digest[..8]);
     let kept = table
         .char_indices()
         .map(|(at, _)| at)
@@ -977,6 +1014,40 @@ pub(crate) fn projection_index(table: &str, position: usize) -> String {
         .last()
         .unwrap_or(0);
     format!("{}{suffix}", &table[..kept])
+}
+
+/// Every secondary index of a projection table with `fields` indexed fields: its name and its
+/// columns, written exactly as `pg_get_indexdef` prints the part after `USING`.
+///
+/// One list: `migrate` creates these, projection admission compares a stored table against a
+/// temporary one built from them, read-only capture admission compares the catalog against the
+/// same strings, and the ledger checksum covers them, so none of the four can change alone.
+///
+/// - `(tenant_id, row_key COLLATE "C")` walks a page in byte order (`projection_page_sql`). The
+///   primary key orders keys under the database collation, which on a non-C database is not
+///   the order the shared pager reads; without this index each page sorted the tenant's rows.
+/// - `(tenant_id, idx_N)` finds a row by a declared field's value.
+pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, String)> {
+    let mut indexes = vec![(
+        bounded_index_name(table, "key_c"),
+        "btree (tenant_id, row_key COLLATE \"C\")".to_owned(),
+    )];
+    for position in 0..fields {
+        indexes.push((
+            projection_index(table, position),
+            format!("btree (tenant_id, idx_{position})"),
+        ));
+    }
+    indexes
+}
+
+/// The projection shape the ledger checksum covers: the index columns of a one-field table.
+fn projection_edition() -> String {
+    projection_indexes("owner_p_projection", 1)
+        .into_iter()
+        .map(|(_, columns)| columns)
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 pub(crate) async fn create_projection(
@@ -1005,9 +1076,24 @@ pub(crate) async fn create_projection(
         ))
         .await
         .map_err(backend)?;
-    // An index is missing when no index of the table has its definition, whatever its name: an
-    // existing table may hold one created under an older, truncated name, and creating it again
-    // would leave two where the admitted shape has one.
+    install_projection_indexes(transaction, &table, spec.indexed.len()).await?;
+    // Migration admits existing projection tables too: the stored table must have exactly the
+    // shape a fresh one would, and IF NOT EXISTS alone does not refuse hidden behavior that can
+    // discard projection writes before registration.
+    compare_projection(transaction, prefix, &table, spec.indexed.len()).await
+}
+
+/// Create every index of `projection_indexes` the stored table lacks.
+///
+/// An index is missing when no index of the table has its definition, whatever its name: an
+/// existing table may hold one created under an older, truncated name, and creating it again
+/// would leave two where the admitted shape has one. Each is built inside the migration
+/// transaction, which holds the table against writes until it commits.
+async fn install_projection_indexes(
+    transaction: &Transaction<'_>,
+    table: &str,
+    fields: usize,
+) -> Result<(), EventLogError> {
     let installed: Vec<String> = transaction
         .query(
             "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid=to_regclass($1)",
@@ -1018,22 +1104,59 @@ pub(crate) async fn create_projection(
         .iter()
         .map(|row| row.get(0))
         .collect();
-    let missing = super::joined(spec.indexed.len(), |position| {
-        let definition = format!(" USING btree (tenant_id, idx_{position})");
-        if installed.iter().any(|index| index.ends_with(&definition)) {
-            String::new()
-        } else {
-            let index = projection_index(&table, position);
-            format!("CREATE INDEX {index} ON {table} (tenant_id, idx_{position});")
-        }
-    });
+    let missing = projection_indexes(table, fields)
+        .into_iter()
+        .filter(|(_, columns)| {
+            let definition = format!(" USING {columns}");
+            !installed.iter().any(|stored| stored.ends_with(&definition))
+        })
+        .map(|(index, columns)| format!("CREATE INDEX {index} ON {table} USING {columns};"))
+        .collect::<Vec<_>>()
+        .concat();
     if !missing.is_empty() {
         transaction.batch_execute(&missing).await.map_err(backend)?;
     }
-    // Migration admits existing projection tables too: the stored table must have exactly the
-    // shape a fresh one would, and IF NOT EXISTS alone does not refuse hidden behavior that can
-    // discard projection writes before registration.
-    compare_projection(transaction, prefix, spec).await
+    Ok(())
+}
+
+/// Move every registered projection table to the current edition's indexes.
+///
+/// Runs when `migrate` rewrites the ledger from an earlier edition: the new checksum admits only
+/// projection tables of the new shape, and a table `migrate` was not given this time is still
+/// registered and still read. A registered table that does not exist yet is created by its own
+/// registration, in the current shape.
+async fn upgrade_registered_projections(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+) -> Result<(), EventLogError> {
+    let registered = transaction
+        .query(
+            &format!(
+                "SELECT projection_name, indexed_fields FROM {prefix}_projection_registry
+                 ORDER BY projection_name"
+            ),
+            &[],
+        )
+        .await
+        .map_err(backend)?;
+    for row in registered {
+        let name: String = row.get(0);
+        let fields: serde_json::Value = row.get(1);
+        // The name is spliced into DDL: it must be what a declaration could have registered.
+        eventlog_core::validate_identifier("registered projection name", &name)?;
+        let Some(fields) = fields.as_array() else {
+            return Err(EventLogError::Invalid(format!(
+                "projection registry holds no field list for {name}"
+            )));
+        };
+        let table = super::projection_table(prefix, &name);
+        if !exists(transaction, &table).await? {
+            continue;
+        }
+        install_projection_indexes(transaction, &table, fields.len()).await?;
+        compare_projection(transaction, prefix, &table, fields.len()).await?;
+    }
+    Ok(())
 }
 
 /// Refuse a stored projection table whose physical shape differs from the declared one, compared
@@ -1042,20 +1165,22 @@ pub(crate) async fn create_projection(
 async fn compare_projection(
     transaction: &Transaction<'_>,
     prefix: &str,
-    spec: &ProjectionSpec,
+    table: &str,
+    fields: usize,
 ) -> Result<(), EventLogError> {
-    let table = super::projection_table(prefix, spec.name);
-    let columns = super::joined(spec.indexed.len(), |position| {
-        format!(", idx_{position} TEXT")
-    });
-    let indexes = super::joined(spec.indexed.len(), |position| {
-        format!("CREATE INDEX ON eventlog_expected_projection (tenant_id,idx_{position});")
-    });
+    let columns = super::joined(fields, |position| format!(", idx_{position} TEXT"));
+    let indexes = projection_indexes("eventlog_expected_projection", fields)
+        .into_iter()
+        .map(|(_, columns)| {
+            format!("CREATE INDEX ON eventlog_expected_projection USING {columns};")
+        })
+        .collect::<Vec<_>>()
+        .concat();
     transaction.batch_execute(&format!("CREATE TEMP TABLE eventlog_expected_projection (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
     let answered = shapes(
         transaction,
         &[
-            (table.clone(), prefix),
+            (table.to_owned(), prefix),
             (
                 "eventlog_expected_projection".to_owned(),
                 "eventlog_expected",
@@ -1112,7 +1237,7 @@ pub(crate) async fn validate_projection(
             "declared projection lacks required application DML permissions".into(),
         ));
     }
-    compare_projection(&transaction, prefix, spec).await?;
+    compare_projection(&transaction, prefix, &table, spec.indexed.len()).await?;
     transaction.commit().await.map_err(backend)
 }
 
@@ -1138,9 +1263,10 @@ async fn downgrade_blob_fixture(client: &Client, prefix: &str) {
 #[cfg(test)]
 mod blob_integrity_tests {
     use super::{
-        ATOMIC_GROUP_CHECKSUM, BLOB_INTEGRITY_CHECKSUM, LEGACY_CHECKSUM, SNAPSHOT_CHECKSUM,
-        additions, atomic_group_checksum, base_ddl, blob_integrity_checksum, checksum,
-        group_additions, legacy_checksum, snapshot_additions, snapshot_checksum,
+        ATOMIC_GROUP_CHECKSUM, BATCH_CHECKSUM, BLOB_INTEGRITY_CHECKSUM, LEGACY_CHECKSUM,
+        SNAPSHOT_CHECKSUM, additions, atomic_group_checksum, base_ddl, batch_checksum,
+        blob_integrity_checksum, checksum, group_additions, legacy_checksum, owner_ddl,
+        snapshot_additions, snapshot_checksum,
     };
     use sha2::{Digest, Sha256};
 
@@ -1164,6 +1290,10 @@ mod blob_integrity_tests {
         assert_eq!(blob_integrity, BLOB_INTEGRITY_CHECKSUM);
         assert_ne!(checksum(), ATOMIC_GROUP_CHECKSUM);
         assert_ne!(checksum(), BLOB_INTEGRITY_CHECKSUM);
+        // The batch edition (0.10.0) is the current owner DDL without the projection edition.
+        assert_eq!(batch_checksum(), BATCH_CHECKSUM);
+        assert_eq!(format!("{:x}", Sha256::digest(owner_ddl())), BATCH_CHECKSUM);
+        assert_ne!(checksum(), BATCH_CHECKSUM);
     }
 }
 
@@ -1536,7 +1666,10 @@ mod projection_index_tests {
         assert_eq!(projection_index(short, 3), "owner_p_items_idx_3");
         let table = crate::projection_table(PREFIX, LONG.name);
         assert_eq!(table.len(), 58, "the fixture is the long case");
-        let names: Vec<String> = (0..8).map(|at| projection_index(&table, at)).collect();
+        let names: Vec<String> = projection_indexes(&table, 8)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         for name in &names {
             assert!(
                 name.len() <= 63,
@@ -1546,8 +1679,8 @@ mod projection_index_tests {
         let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
         assert_eq!(
             distinct.len(),
-            8,
-            "every field has its own index name: {names:?}"
+            9,
+            "every index, the page index and each field's, has its own name: {names:?}"
         );
     }
 
@@ -1588,7 +1721,11 @@ mod projection_index_tests {
 
         migrate(&mut sql, PREFIX, &[LONG]).await.unwrap();
         let fresh = secondary_indexes(&sql, &table).await;
-        assert_eq!(fresh.len(), 2, "one index per declared field: {fresh:?}");
+        assert_eq!(
+            fresh.len(),
+            3,
+            "one index per declared field and the page index: {fresh:?}"
+        );
         validate_projection(&mut sql, PREFIX, &LONG).await.unwrap();
 
         // The state an older release left: every field's name truncated to one identifier, so
@@ -1624,8 +1761,8 @@ mod projection_index_tests {
         let repaired = secondary_indexes(&sql, &table).await;
         assert_eq!(
             repaired.len(),
-            2,
-            "migration adds the missing index: {repaired:?}"
+            3,
+            "migration adds the missing indexes: {repaired:?}"
         );
         assert!(
             repaired

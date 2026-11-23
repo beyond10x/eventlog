@@ -7,6 +7,8 @@ under bare-version tags such as `0.1.0`.
 
 ### Breaking
 
+- PostgreSQL: a new schema edition (projection indexes, see Changed). Eventlog 0.10.0 refuses a
+  schema this release's `migrate` wrote; stop every 0.10.0 binary of the owner before running it.
 - SQLite: `RestoredEvent` has the new public field `redacted: Option<String>`; a struct literal
   adds `redacted: None` to keep restoring live events.
 - Tree: eventlog 0.10.0 and earlier refuse a store holding a tenant directory named
@@ -45,6 +47,15 @@ under bare-version tags such as `0.1.0`.
   `TreeEventStore::reload` or a reopen, and a write whose idempotency key or member streams that
   history touched is refused with `EventLogError::Backend` naming the reopen until then (before,
   every append listed every group file and picked such history up).
+- PostgreSQL: every projection table gains the index `<table>_key_c` on
+  `(tenant_id, row_key COLLATE "C")`. On a database that is not C-collated (ICU `und`, glibc
+  `en_US`) a projection page walks it in byte order instead of sorting the tenant's rows for each
+  page. This is a new schema edition. Operators: stop every 0.10.0 binary of the owner, run
+  `PostgresEventStore::migrate` with the migration role, then start this release. `migrate`
+  builds the index on every registered projection table inside its transaction (writes to that
+  table wait until it commits). After it, 0.10.0's `open` and `migrate` refuse the schema with
+  "unknown PostgreSQL schema version/checksum", and this release's `open` refuses a schema that
+  was not migrated. No new grants.
 
 ### Fixed
 

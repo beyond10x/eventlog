@@ -38,6 +38,8 @@ mod capture_pages;
 mod inline_admin;
 mod pool;
 #[cfg(test)]
+mod projection_indexes;
+#[cfg(test)]
 mod receipt_snapshot;
 #[cfg(test)]
 mod registration_deadline;
@@ -1084,17 +1086,9 @@ impl EventStore for PostgresEventStore {
             // contiguous run of keys and a cursor as "after these bytes". Under the database
             // collation (ICU `und`, glibc `en_US`) `Desk/2` sorts between `desk/1` and `desk/3`,
             // and the pager stopped at it, silently dropping `desk/3`.
-            // No cursor is the first page, which starts at the empty key itself: `> ''` would
-            // skip a row keyed by the empty string. A supplied cursor, even an empty one, is
-            // exclusive.
-            let bound = if after_key.is_some() { ">" } else { ">=" };
             let rows = client
                 .query(
-                    &format!(
-                        "SELECT row_key, body FROM {table}
-                         WHERE tenant_id = $1 AND row_key COLLATE \"C\" {bound} $2
-                         ORDER BY row_key COLLATE \"C\" LIMIT $3"
-                    ),
+                    &projection_page_sql(&table, after_key.is_some()),
                     &[
                         &tenant.as_str(),
                         &after_key.unwrap_or(""),
@@ -1955,6 +1949,21 @@ fn joined(count: usize, render: impl Fn(usize) -> String) -> String {
 
 fn projection_table(prefix: &str, name: &str) -> String {
     format!("{prefix}_p_{name}")
+}
+
+/// One page of a projection's rows in byte order: `$1` the tenant, `$2` the lower key, `$3` the
+/// limit. Every projection table has a `(tenant_id, row_key COLLATE "C")` index that answers it
+/// in order, so on a database that is not C-collated the page is walked, not sorted.
+///
+/// No cursor is the first page, which starts at the empty key itself: `> ''` would skip a row
+/// keyed by the empty string. A supplied cursor, even an empty one, is exclusive.
+fn projection_page_sql(table: &str, after_cursor: bool) -> String {
+    let bound = if after_cursor { ">" } else { ">=" };
+    format!(
+        "SELECT row_key, body FROM {table}
+         WHERE tenant_id = $1 AND row_key COLLATE \"C\" {bound} $2
+         ORDER BY row_key COLLATE \"C\" LIMIT $3"
+    )
 }
 
 /// The byte range holding every admission counter of `tenant`: its coordinates are
