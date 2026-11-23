@@ -78,7 +78,7 @@ async fn behind_held_registration<T: Send + 'static>(
 }
 
 fn assert_deadline_includes_wait<T: std::fmt::Debug>(
-    outcome: Result<T, EventLogError>,
+    outcome: &Result<T, EventLogError>,
     elapsed: Duration,
 ) {
     assert!(
@@ -101,7 +101,7 @@ async fn a_grouped_append_spends_its_deadline_on_the_registration_wait() {
             .await
     })
     .await;
-    assert_deadline_includes_wait(outcome, elapsed);
+    assert_deadline_includes_wait(&outcome, elapsed);
     store.drop_tables().await.unwrap();
     store.shutdown().await.unwrap();
 }
@@ -123,7 +123,7 @@ async fn a_grouped_blob_append_spends_its_deadline_on_the_registration_wait() {
             .await
     })
     .await;
-    assert_deadline_includes_wait(outcome, elapsed);
+    assert_deadline_includes_wait(&outcome, elapsed);
     store.drop_tables().await.unwrap();
     store.shutdown().await.unwrap();
 }
