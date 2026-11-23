@@ -1931,12 +1931,25 @@ impl EventStore for FileEventStore {
             Box::pin(async move {
                 // Erased content is not kept in this handle's memory.
                 tx.content.forget();
-                for transaction in &mut tx.journal.transactions {
+                let mut erased = false;
+                let mut rewritten = Vec::with_capacity(tx.journal.transactions.len());
+                for transaction in &tx.journal.transactions {
                     let mut ops: Vec<Op> =
                         serde_json::from_value(transaction.clone()).map_err(backend)?;
+                    let before = ops.len();
                     ops.retain(|op| op.tenant() != Some(&tenant));
-                    *transaction = serde_json::to_value(ops).map_err(backend)?;
+                    erased |= ops.len() != before;
+                    rewritten.push(serde_json::to_value(ops).map_err(backend)?);
                 }
+                if !erased {
+                    // The history holds nothing of this tenant's: no rewrite, so the epoch every
+                    // other handle observed stays. What an interrupted earlier erasure may have
+                    // left outside the journal — a snapshot of a retired generation, an object no
+                    // binding names — is still disposed of.
+                    tx.clear_snapshots()?;
+                    return tx.clean_blobs();
+                }
+                tx.journal.transactions = rewritten;
                 tx.state = State::replay(&tx.journal.transactions)?;
                 tx.privacy = true;
                 Ok(())
@@ -3734,5 +3747,74 @@ mod steady_state_cost {
                 "a live snapshot was removed"
             );
         }
+    }
+
+    /// Forgetting a tenant the history does not hold leaves the journal and its epoch as they
+    /// were: it used to rewrite the journal and advance the epoch under every other handle. What
+    /// an interrupted erasure left outside the journal is still disposed of.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_an_absent_tenant_keeps_the_journal_and_its_epoch() {
+        let kept = tenant("kept");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = FileEventStore::open(root).await.unwrap();
+        store
+            .append_group(&streams(&kept, "item", 2))
+            .await
+            .unwrap();
+        store.put_blob(&kept, "kept", b"bytes").await.unwrap();
+        let other = FileEventStore::open(root).await.unwrap();
+        let journal = fs::read(root.join("events.jsonl")).unwrap();
+        let manifest = fs::read(root.join("manifest.json")).unwrap();
+        let orphan_object = root.join("blobs").join(new_event_id());
+        fs::write(&orphan_object, b"left behind").unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        let orphan_snapshot = root.join(".cache").join("retired");
+        fs::write(
+            &orphan_snapshot,
+            serde_json::to_vec(&(
+                new_event_id(),
+                Snapshot {
+                    version: 1,
+                    state_schema_version: 1,
+                    state: json!({}),
+                    recorded_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        store.forget_tenant(&tenant("absent")).await.unwrap();
+        assert!(
+            fs::read(root.join("manifest.json")).unwrap() == manifest,
+            "the manifest moved: the epoch advanced for nothing"
+        );
+        assert!(
+            fs::read(root.join("events.jsonl")).unwrap() == journal,
+            "the journal was rewritten"
+        );
+        assert!(!orphan_object.exists(), "an unbound object survived");
+        assert!(!orphan_snapshot.exists(), "a retired snapshot survived");
+        assert_eq!(
+            other.get_blob(&kept, "kept").await.unwrap().as_deref(),
+            Some(&b"bytes"[..])
+        );
+
+        store.forget_tenant(&kept).await.unwrap();
+        assert!(
+            fs::read(root.join("manifest.json")).unwrap() != manifest,
+            "a tenant that is present is still erased through a rewrite"
+        );
+        assert_eq!(store.get_blob(&kept, "kept").await.unwrap(), None);
+        // The control: the epoch a real erasure mints is what the other handle runs into.
+        let diverged = other
+            .get_blob(&kept, "kept")
+            .await
+            .expect_err("the other handle observed the epoch before the erasure");
+        assert!(
+            matches!(&diverged, EventLogError::Backend(reason) if reason.contains("diverged")),
+            "{diverged:?}"
+        );
     }
 }

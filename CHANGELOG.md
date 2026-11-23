@@ -11,6 +11,8 @@ under bare-version tags such as `0.1.0`.
   longer commits what that admission staged. A counter reservation made by the retry used to be
   journaled with zero new events, so each retry charged the quota again; it is now rolled back,
   as SQLite rolls it back, and the original receipt is returned.
+- File: forgetting a tenant the history does not hold no longer rewrites the journal or advances
+  its epoch, so other open handles keep working; leftover snapshot and object disposal still runs.
 
 ### Performance
 
