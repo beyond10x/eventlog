@@ -14,8 +14,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A pull request of planning or prose only (scripts/ci-paths.sh) builds no KPI runner. The Scope
+  # steps below narrow further: no Markdown file moves a counter.
+  classify:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Planning, prose, site or code
+        id: paths
+        run: sh scripts/ci-paths.sh pull-request
+
   counters:
     name: KPI counters
+    needs: classify
+    if: ${{ !cancelled() && needs.classify.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -64,7 +83,8 @@ jobs:
 
   timing:
     name: KPI timing
-    if: github.event_name == 'pull_request'
+    needs: classify
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.classify.outputs.code != 'false' }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
