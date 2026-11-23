@@ -2645,22 +2645,39 @@ fn watermarked_source(prefix: &str) -> String {
 
 /// The first position above the settlement floor whose transaction id comes from another
 /// cluster, if any.
+///
+/// One simple-protocol query: it takes no parameters, and a prepared statement would cost a
+/// prepare round trip plus a `Close` that the driver sends when the statement drops, after
+/// `open` returned, so it lands on the caller's next operation (the KPI
+/// `postgres.append.round_trips` counted it in the first append).
 async fn first_foreign<C: GenericClient>(
     client: &C,
     prefix: &str,
 ) -> Result<Option<i64>, EventLogError> {
-    client
-        .query_one(
-            &format!(
-                "SELECT MIN(global_seq) FROM {prefix}_events \
-                 WHERE {FOREIGN} AND global_seq > \
-                 (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)"
-            ),
-            &[],
-        )
+    let messages = client
+        .simple_query(&format!(
+            "SELECT MIN(global_seq) FROM {prefix}_events \
+             WHERE {FOREIGN} AND global_seq > \
+             (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)"
+        ))
         .await
-        .map(|row| row.get(0))
-        .map_err(backend)
+        .map_err(backend)?;
+    let Some(row) = messages.iter().find_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+        _ => None,
+    }) else {
+        return Err(EventLogError::Backend(
+            "PostgreSQL settlement-floor check returned no row".into(),
+        ));
+    };
+    row.try_get(0)
+        .map_err(backend)?
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                EventLogError::Backend("PostgreSQL settlement-floor check is not a position".into())
+            })
+        })
+        .transpose()
 }
 
 /// After a logical restore every event carries the source cluster's transaction id, and the
