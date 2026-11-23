@@ -20,6 +20,27 @@ under bare-version tags such as `0.1.0`.
   (`EventPositions`), and `reserve_positions_through` keeps later appends above a position.
 - Core: `EventLogError::Committed { cleanup }`, returned when a commit is published and its
   outcome known but the cleanup after it failed. The command is not to be retried as failed.
+- PostgreSQL implements `AtomicEventStore::append_group_guarded_with_blobs`: admission, the
+  batch's blob bindings, the members and the receipt commit in one transaction, so a refused
+  guard binds no blob and a batch costs one commit instead of one per blob. The sorted digests are
+  recorded in the new table `<prefix>_group_batches`; retries follow the shared contract of File
+  and SQLite. This is a new schema edition: run `PostgresEventStore::migrate` with the migration
+  role before opening with the application role (hosted `open` refuses the previous edition), and
+  grant the application role `SELECT, INSERT, UPDATE, DELETE` on the new table.
+- PostgreSQL: the same edition adds the index `<prefix>_events_publication` on
+  `(committed_xid, global_seq)`. A feed, catch-up or rebuild page finds the first position still
+  in flight with an index range scan instead of reading every event of the owner. `migrate`
+  builds it inside its transaction, so the events table is locked against writes while it builds.
+- PostgreSQL: the same edition adds the index `<prefix>_scope_counters_bytes` on the byte order of
+  the admission counter coordinates. Tenant erasure removes the tenant's counters with an index
+  range scan instead of reading every counter while it holds the exclusive publication lock.
+- PostgreSQL: the same edition adds the table `<prefix>_settlement_floor`, written only by
+  `migrate` (see Fixed). Grant the application role `SELECT` on it, nothing more.
+- `eventlog_core::MAX_INDEXED_VALUE_BYTES` (2,048) and `indexed_values`: every provider refuses a
+  projection row whose indexed field value is longer, before writing, with the new
+  `EventLogError::IndexedValueTooLarge { field, bytes, limit }`. On PostgreSQL such a value could
+  exceed the B-tree entry limit and abort the append with a backend error; SQLite and the file
+  provider accepted it. A projector that indexes longer values must index a shorter key instead.
 
 ### Changed
 
@@ -36,6 +57,17 @@ under bare-version tags such as `0.1.0`.
   (`erased on request`), entity-runtime `crates/entity-eventlog/tests/providers.rs`, ekr-store
   tests, service-sdk `service-eventlog` and the `service-host` persistence fixtures. Shared
   exercise case `a_free_text_redaction_reason_is_refused_before_writing`.
+- PostgreSQL: schema admission (`open`, `migrate`, projection validation) reads each catalog
+  property for all of a check's relations in one query: hosted `open` makes about 14 round trips
+  for its schema and privilege checks instead of about 190. Every admission requirement and every
+  refusal message is unchanged.
+- PostgreSQL: `AtomicBlobEventStore` hashes each blob once (the fingerprint's SHA-256 is the
+  integrity column), binds from the caller's bytes without copying the request, and reads a
+  stored blob back only when its digest was already bound.
+- PostgreSQL: a guard's scope reservation takes one statement per phase (advisory locks in sorted
+  order, the counter read, the counter write) instead of three per scope: 64 scopes cost the same
+  round trips as one. A scope whose value does not change is not written, so a zero-delta check
+  creates no counter row and writes no WAL; the locks and ceiling checks are unchanged.
 
 ### Fixed
 
@@ -110,6 +142,44 @@ under bare-version tags such as `0.1.0`.
   `EventLogError::Committed` instead of `UnknownCommit` (atomic content) or a plain backend error
   (other writes, redaction, tenant erasure). The next commit that changes bindings, or a reopen,
   retries the cleanup.
+- PostgreSQL: a redaction or tenant erasure whose deadline fires after `COMMIT` was sent returns
+  `UnknownCommit` instead of `Deadline`, as append does; the change may have been applied.
+- PostgreSQL: a projection whose `<table>_idx_<n>` index name would exceed 63 bytes gets one
+  index per declared field under a shortened name with a digest of the table name. Before,
+  PostgreSQL truncated every such name to the same identifier, only the first field was indexed,
+  `migrate` succeeded and `open` refused the table. `migrate` now creates the indexes missing by
+  definition, whatever their stored names, and compares the table's whole shape before it
+  commits, as `open` does.
+- PostgreSQL: a positive pool timeout under a whole millisecond is sent to the session rounded up
+  (500 µs becomes 1 ms). Before, it was truncated to 0, which PostgreSQL reads as no statement,
+  lock or idle-transaction limit.
+- PostgreSQL: an owner restored from a logical backup delivers its feed again after `migrate`.
+  Restored events keep the source cluster's transaction ids; one id ahead of this cluster's clock
+  withheld the restored history and every later event of the owner, in every tenant, from feed,
+  catch-up and rebuild until the clock passed it. `migrate` now finds a visible event whose
+  transaction id this cluster has not handed out yet and records the highest position as settled
+  in `<prefix>_settlement_floor`, under the exclusive publication gate; positions at or below the
+  floor count as settled and the watermark applies above it. Hosted `open` refuses such an owner
+  until then with `Invalid("PostgreSQL events carry another cluster's transaction ids (a restored
+  history); run migrate with the migration role before opening")`. The restore procedure is:
+  restore, then run `migrate`.
+
+### Security
+
+- PostgreSQL: hosted `open` requires only `SELECT` on the migration metadata
+  (`<prefix>_schema_version`, `<prefix>_projection_registry`, `<prefix>_settlement_floor`) and
+  refuses an application role that can `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` them. Erasure
+  deletes a tenant from every registered projection, so a role that could edit the roster could
+  make erasure skip a table; a role that could raise the settlement floor could let a feed cursor
+  pass an append still in flight. Existing deployments that granted DML on all tables must revoke
+  it on these three tables after `migrate`: `REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON
+  <prefix>_schema_version, <prefix>_projection_registry, <prefix>_settlement_floor FROM
+  <application role>`.
+- PostgreSQL: a hosted pool holds every physical session it opens after `open` to the database,
+  role and schema that admission saw, and to the hosted role rules (no DDL powers, a finite
+  connection limit within the replica share). A caller-owned authority that reconnects as another
+  principal is refused with `Invalid("pooled PostgreSQL session is not the admitted hosted
+  principal")` and the session is retired unserved. Before, only the first session was checked.
 
 ### Performance
 

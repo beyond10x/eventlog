@@ -1,7 +1,7 @@
 use crate::{Transaction, state::Op};
 use eventlog_core::{
     AdmissionPermit, AdmissionScope, BoxFuture, EventLogError, ProjectionSpec, ProjectionStore,
-    Reservation, TenantId, bounded_limit, ordered_reservations,
+    Reservation, TenantId, bounded_limit, indexed_values, ordered_reservations,
 };
 use serde_json::Value;
 
@@ -109,6 +109,7 @@ impl ProjectionStore for View<'_> {
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
             self.validate(spec, tenant)?;
+            indexed_values(spec, body)?;
             self.tx.record(Op::Row {
                 tenant: tenant.clone(),
                 name: spec.name.into(),

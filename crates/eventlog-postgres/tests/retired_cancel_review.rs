@@ -69,6 +69,7 @@ async fn fresh(observer: &tokio_postgres::Client, prefix: &str) {
     for suffix in [
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",
@@ -79,6 +80,7 @@ async fn fresh(observer: &tokio_postgres::Client, prefix: &str) {
         "scope_counters",
         "schema_version",
         "projection_registry",
+        "settlement_floor",
         "p_tally",
     ] {
         observer

@@ -227,5 +227,70 @@ async fn deletion_erasure_and_a_failed_binding_drop_remembered_content() {
     store.drop_tables().await.unwrap();
 }
 
+/// A blob group reads stored bytes back only for a digest that was already bound: a row its own
+/// insert wrote holds the bytes it was given, and the integrity hash it wrote is the one the
+/// request's fingerprint was built from, which a fresh handle's full check accepts.
+#[tokio::test]
+async fn a_blob_group_reads_back_only_digests_that_were_already_bound() {
+    let prefix = prefix("readback");
+    let store = PostgresEventStore::connect(&url(), &prefix).await.unwrap();
+    store.drop_tables().await.unwrap();
+    let store = PostgresEventStore::connect(&url(), &prefix).await.unwrap();
+    let blob = |digest: &str, bytes: &[u8]| BlobWrite {
+        digest: digest.into(),
+        bytes: bytes.to_vec(),
+    };
+    let read_backs = || {
+        store
+            .blob_read_backs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    store
+        .append_group_with_blobs(&BlobAppendGroup {
+            group: group("fresh", "fresh"),
+            blobs: vec![
+                blob("z", b"last"),
+                blob("a", b"first"),
+                blob("m", b"middle"),
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(read_backs(), 0, "three digests this group bound itself");
+
+    store
+        .append_group_with_blobs(&BlobAppendGroup {
+            group: group("reuses", "reuses"),
+            blobs: vec![blob("m", b"middle"), blob("n", b"new")],
+        })
+        .await
+        .unwrap();
+    assert_eq!(read_backs(), 1, "only the digest an earlier group bound");
+
+    let refused = store
+        .append_group_with_blobs(&BlobAppendGroup {
+            group: group("differs", "differs"),
+            blobs: vec![blob("a", b"other bytes")],
+        })
+        .await
+        .expect_err("a bound digest naming other content");
+    assert_eq!(
+        refused,
+        EventLogError::Invalid("blob digest already names different content".into())
+    );
+
+    let fresh = PostgresEventStore::connect(&url(), &prefix).await.unwrap();
+    for (digest, bytes) in [("a", &b"first"[..]), ("m", b"middle"), ("n", b"new")] {
+        assert_eq!(
+            fresh.get_blob(&tenant(), digest).await.unwrap().as_deref(),
+            Some(bytes),
+            "{digest}: stored bytes and integrity hash pass a full check"
+        );
+    }
+    assert_eq!(fresh.verified.hashed(), 3, "each read was a full check");
+    fresh.shutdown().await.unwrap();
+    store.drop_tables().await.unwrap();
+}
+
 #[cfg(test)]
 mod adversary;

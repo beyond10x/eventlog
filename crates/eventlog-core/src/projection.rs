@@ -316,3 +316,68 @@ pub fn indexed_value(body: &Value, field: &str) -> Option<String> {
         Some(other) => Some(other.to_string()),
     }
 }
+
+/// The longest indexed value, in UTF-8 bytes, a projection row may carry.
+///
+/// PostgreSQL keeps the whole value in a `(tenant_id, idx_N)` B-tree, whose entries must fit in
+/// about a third of a page (2,704 bytes at the default 8 KiB): a 512-byte tenant, this many
+/// incompressible bytes and the entry's headers still fit. Every provider refuses a longer value
+/// before writing, so a projector behaves the same on each.
+pub const MAX_INDEXED_VALUE_BYTES: usize = 2048;
+
+/// Every declared field's value for one row, in declaration order, as the backend stores it.
+///
+/// # Errors
+/// Returns [`EventLogError::IndexedValueTooLarge`] for a value over
+/// [`MAX_INDEXED_VALUE_BYTES`].
+pub fn indexed_values(
+    projection: &ProjectionSpec,
+    body: &Value,
+) -> Result<Vec<Option<String>>, EventLogError> {
+    projection
+        .indexed
+        .iter()
+        .map(|field| {
+            let value = indexed_value(body, field);
+            match &value {
+                Some(text) if text.len() > MAX_INDEXED_VALUE_BYTES => {
+                    Err(EventLogError::IndexedValueTooLarge {
+                        field,
+                        bytes: text.len(),
+                        limit: MAX_INDEXED_VALUE_BYTES,
+                    })
+                }
+                _ => Ok(value),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_indexed_value_one_byte_over_the_bound_is_refused_by_name() {
+        const SPEC: ProjectionSpec = ProjectionSpec {
+            name: "bound",
+            indexed: &["small", "large"],
+        };
+        let at = "é".repeat(MAX_INDEXED_VALUE_BYTES / 2);
+        assert_eq!(
+            indexed_values(&SPEC, &serde_json::json!({"small": 1, "large": at})),
+            Ok(vec![Some("1".into()), Some(at)])
+        );
+        assert_eq!(
+            indexed_values(
+                &SPEC,
+                &serde_json::json!({"large": format!("{}x", "é".repeat(MAX_INDEXED_VALUE_BYTES / 2))})
+            ),
+            Err(EventLogError::IndexedValueTooLarge {
+                field: "large",
+                bytes: MAX_INDEXED_VALUE_BYTES + 1,
+                limit: MAX_INDEXED_VALUE_BYTES,
+            })
+        );
+    }
+}

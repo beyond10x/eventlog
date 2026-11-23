@@ -36,7 +36,7 @@ use eventlog_core::{
     CommandMeta, EventLogError, EventStore, Expected, FeedPage, Guard, LegacyBlobMigration,
     MAX_READ_LIMIT, NewEvent, NoGuard, ProjectionSpec, ProjectionStore, Projector, RecordedEvent,
     Snapshot, SnapshotGeneration, StreamId, StreamSlice, TenantId, blob_integrity_sha256,
-    bounded_limit, indexed_value, new_event_id, redaction_tombstone, validate_append,
+    bounded_limit, indexed_values, new_event_id, redaction_tombstone, validate_append,
     validate_field, validate_legacy_blob_count, validate_stored_blob,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, TransactionBehavior, params};
@@ -3281,6 +3281,7 @@ impl SqliteProjections<'_> {
             ));
         }
         projection.validate()?;
+        let indexed = indexed_values(projection, body)?;
         let before = self.tracked_before(projection, tenant, key);
         let table = projection_table(self.projection_prefix, projection.name);
         let columns: String = joined(projection.indexed.len(), |position| {
@@ -3299,8 +3300,8 @@ impl SqliteProjections<'_> {
             Box::new(key.to_owned()),
             Box::new(text.clone()),
         ];
-        for field in projection.indexed {
-            values.push(Box::new(indexed_value(body, field)));
+        for value in indexed {
+            values.push(Box::new(value));
         }
         let statement = format!(
             "INSERT INTO {table} (tenant_id, row_key, body{columns})

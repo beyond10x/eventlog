@@ -1578,6 +1578,107 @@ pub async fn run_inline_projections(store: &std::sync::Arc<dyn EventStore>) {
         "the guard's projection write was rolled back with its refused append"
     );
     assert_eq!(row["last"], json!("item.extracted"));
+    run_indexed_value_bound(store).await;
+}
+
+/// A guard that writes one tally row whose indexed `kind` is the given text.
+struct WritesIndexedKind {
+    tenant: TenantId,
+    kind: String,
+}
+
+impl eventlog_core::Guard for WritesIndexedKind {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            store
+                .upsert(
+                    &TALLY,
+                    &self.tenant,
+                    "bound/row",
+                    &json!({"stream": "bound", "kind": self.kind, "count": 0, "last": "bound"}),
+                )
+                .await
+        })
+    }
+}
+
+/// `length` printable ASCII bytes with no repetition a compressor could use.
+fn incompressible(length: usize) -> String {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'!' + u8::try_from(state % 94).expect("below 94"))
+        })
+        .collect()
+}
+
+/// Every provider indexes a value of [`eventlog_core::MAX_INDEXED_VALUE_BYTES`] incompressible
+/// bytes and refuses one byte more with a typed error before writing anything. (PostgreSQL's
+/// own test also indexes it under a tenant of the longest accepted length.)
+async fn run_indexed_value_bound(store: &std::sync::Arc<dyn EventStore>) {
+    let limit = eventlog_core::MAX_INDEXED_VALUE_BYTES;
+    let tenant = TenantId::new("tenant-bound").expect("valid tenant");
+    let stream = StreamId::new(tenant.clone(), "item", "bound").expect("valid stream");
+    let guard = |kind: String| {
+        std::sync::Arc::new(WritesIndexedKind {
+            tenant: tenant.clone(),
+            kind,
+        }) as std::sync::Arc<dyn eventlog_core::Guard>
+    };
+    let refused = store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("bound-over", &json!({})),
+            guard(incompressible(limit + 1)),
+        )
+        .await;
+    assert_eq!(
+        refused.map(|_| ()),
+        Err(EventLogError::IndexedValueTooLarge {
+            field: "kind",
+            bytes: limit + 1,
+            limit,
+        }),
+        "an indexed value over the portable bound is refused by name"
+    );
+    assert_eq!(
+        store.stream_version(&stream).await.expect("readable"),
+        None,
+        "a refused indexed value wrote no event"
+    );
+    assert_eq!(
+        store
+            .projection_get(&TALLY, &tenant, "bound/row")
+            .await
+            .expect("readable"),
+        None,
+        "a refused indexed value wrote no row"
+    );
+    let kind = incompressible(limit);
+    store
+        .append_guarded(
+            &stream,
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("bound-at", &json!({})),
+            guard(kind.clone()),
+        )
+        .await
+        .expect("a value at the bound is indexed");
+    let found = store
+        .projection_find(&TALLY, &tenant, "kind", &kind, 10)
+        .await
+        .expect("readable");
+    assert_eq!(found.len(), 1, "the row at the bound is found by its value");
+    assert_eq!(found[0]["kind"], json!(kind));
 }
 
 /// One stored event body, exactly as some past version of the code wrote it.

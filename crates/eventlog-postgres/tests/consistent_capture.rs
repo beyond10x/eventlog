@@ -312,6 +312,7 @@ async fn capture_observes_an_erasure_that_completed_during_its_lock_wait() {
     for table in [
         "events",
         "append_groups",
+        "group_batches",
         "commands",
         "claims",
         "identity",

@@ -23,7 +23,8 @@ The authority declares `PostgresTransportAssurance::Isolated` or `Verified`. Thi
 host assertion, matching the trust boundary of accepting a caller-created client. `Verified` means
 the authority authenticates the server and rejects plaintext/insecure verification; the provider
 still performs its existing database-role, schema, finite role-connection-limit and replica-budget
-admission. `Isolated` is accepted only by the existing local/migration constructors and remains
+admission, and holds every later physical session to the database, role and schema that admission
+saw. `Isolated` is accepted only by the existing local/migration constructors and remains
 ineligible for hosted `open`.
 
 `PostgresConfig::caller_owned(schema, prefix, authority)` validates the schema/prefix and stores
@@ -39,7 +40,10 @@ The existing pool remains the sole owner of bounds and lifecycle:
    duration;
 3. after establishment the pool immediately spawns and owns the returned driver;
 4. the existing session `search_path`, read-only, statement, lock and transaction timeouts are set
-   before a lease is returned;
+   before a lease is returned (whole milliseconds, a fraction rounded up, so a positive timeout
+   never becomes PostgreSQL's 0 = none); on a hosted pool the new session must also be the
+   admitted database, role and schema and pass the hosted role rules (no DDL powers, finite
+   connection limit within the replica share), or it is refused and retired unserved;
 5. a cancelled or unsettled lease quarantines its client and capacity permit until its driver has
    stopped; and
 6. bounded shutdown closes admission and waits for every idle or checked-out driver retirement.

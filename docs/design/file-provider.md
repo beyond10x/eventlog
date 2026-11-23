@@ -372,7 +372,7 @@ before a byte of the batch is written, so a refused guard publishes neither the 
 
 **A provider that cannot make that guarantee refuses instead of weakening it.** The port's default
 implementation writes nothing, commits nothing and refuses with `eventlog_core::UNAVAILABLE`; this
-provider and SQLite override it. An earlier default wrote each blob on its own path first and then ran
+provider, SQLite and PostgreSQL override it. An earlier default wrote each blob on its own path first and then ran
 admission, which meant a refused guard had already published the whole batch on the two SQL
 providers — and a caller holding a trait object cannot tell which provider it has, so the method
 would have meant one thing here and the opposite there. A blob row is a binding, not scratch:
