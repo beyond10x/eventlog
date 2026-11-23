@@ -347,6 +347,245 @@ async fn capture_observes_an_erasure_that_completed_during_its_lock_wait() {
     store.shutdown().await.expect("closed");
 }
 
+/// A store whose capture may wait on the fixture's table lock for a while.
+async fn patient_store(prefix: &str) -> Arc<PostgresEventStore> {
+    let store = Arc::new(
+        PostgresEventStore::connect_local(
+            &url(),
+            prefix,
+            PoolOptions {
+                lock_timeout: Duration::from_secs(20),
+                transaction_timeout: Duration::from_secs(40),
+                ..PoolOptions::default()
+            },
+        )
+        .await
+        .expect("connected"),
+    );
+    store
+        .create_projections(Arc::new(Assignment))
+        .await
+        .expect("declared projection");
+    store
+}
+
+/// Wait until some session waits for a lock on `table`: a capture that requested
+/// [`ASSIGNMENT`] reached its preflight count, which runs after its snapshot was fixed.
+async fn until_waiting_on(session: &tokio_postgres::Transaction<'_>, table: &str) {
+    for _ in 0..400 {
+        let waiting: bool = session
+            .query_one(
+                "SELECT EXISTS(SELECT FROM pg_locks WHERE relation = to_regclass($1) AND NOT granted)",
+                &[&table],
+            )
+            .await
+            .expect("lock view")
+            .get(0);
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no capture ever waited on {table}");
+}
+
+/// Review P11: a capture releases the publication gate once its snapshot is fixed, and checks the
+/// tenant's privacy state again after the read.
+///
+/// The capture is held inside its read by a table lock on the projection it requested. Meanwhile
+/// another tenant of the same owner prefix appends and this tenant's event is redacted; both
+/// commit before the capture ends, which neither could while the capture held the gate through
+/// its read. The capture's snapshot still holds the body from before the redaction, and the
+/// capture refuses rather than return it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_past_its_snapshot_admits_other_writers_and_refuses_a_redaction_meanwhile() {
+    let prefix = prefix("released");
+    let store = patient_store(&prefix).await;
+    let table = format!("{prefix}_p_capture_assignment");
+    let owner = TenantId::new("pg-capture-held").expect("valid tenant");
+    let neighbour = TenantId::new("pg-capture-neighbour").expect("valid tenant");
+    store
+        .stream_identity(&owner)
+        .await
+        .expect("provisioned identity");
+    let stream = StreamId::new(owner.clone(), "item", "one").expect("valid stream");
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[appended("before", 1)],
+            &eventlog_conformance::meta("before", &json!({})),
+        )
+        .await
+        .expect("appended");
+    let control = store
+        .capture_tenant(&owner, &[ASSIGNMENT], limits())
+        .await
+        .expect("the control: the tenant is observable before anything changes");
+    assert_eq!(control.events[0].data["key"], json!("before"));
+
+    let mut holder = sql().await;
+    let hold = holder.transaction().await.expect("fixture transaction");
+    hold.batch_execute(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+        .await
+        .expect("held the projection table");
+    let capturing = tokio::spawn({
+        let store = store.clone();
+        let owner = owner.clone();
+        async move { store.capture_tenant(&owner, &[ASSIGNMENT], limits()).await }
+    });
+    until_waiting_on(&hold, &table).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.append(
+            &StreamId::new(neighbour, "item", "other").expect("valid stream"),
+            Expected::NoStream,
+            &[appended("neighbour", 2)],
+            &eventlog_conformance::meta("neighbour", &json!({})),
+        ),
+    )
+    .await
+    .expect("another tenant's append waited for the capture read: the gate was still held")
+    .expect("another tenant's append committed");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.redact(&stream, 1, "subject-request"),
+    )
+    .await
+    .expect("the redaction waited for the capture read: the gate was still held")
+    .expect("redaction committed");
+    assert!(
+        !capturing.is_finished(),
+        "the fixture only means something while the capture is still reading"
+    );
+
+    hold.rollback()
+        .await
+        .expect("released the projection table");
+    let outcome = tokio::time::timeout(Duration::from_secs(30), capturing)
+        .await
+        .expect("capture finished")
+        .expect("capture task");
+    assert_eq!(
+        outcome.map(|capture| capture.events[0].data.clone()),
+        Err(CaptureError::RedactedHistory),
+        "a redaction committed during the read must not be served from the earlier snapshot"
+    );
+    recovered(&store).await;
+    store.drop_tables().await.expect("dropped");
+    holder
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("dropped projection");
+    store.shutdown().await.expect("closed");
+}
+
+/// The other half of the privacy check: a tenant erased and provisioned again while a capture
+/// reads is a different tenant, and the capture of the erased one is refused.
+///
+/// The fixture holds the capture inside its read, then, as a compliant erasure does, takes the
+/// publication gate exclusively, deletes the tenant everywhere and provisions a new identity, all
+/// in the transaction that holds the capture. The capture's snapshot still holds the erased
+/// history and its identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_refuses_a_tenant_erased_and_reprovisioned_during_its_read() {
+    let prefix = prefix("reerased");
+    let store = patient_store(&prefix).await;
+    let table = format!("{prefix}_p_capture_assignment");
+    let name = "pg-capture-reerased";
+    let tenant = TenantId::new(name).expect("valid tenant");
+    store
+        .stream_identity(&tenant)
+        .await
+        .expect("provisioned identity");
+    store
+        .append(
+            &StreamId::new(tenant.clone(), "item", "one").expect("valid stream"),
+            Expected::NoStream,
+            &[appended("erased", 1)],
+            &eventlog_conformance::meta("erased", &json!({})),
+        )
+        .await
+        .expect("appended");
+    store
+        .capture_tenant(&tenant, &[ASSIGNMENT], limits())
+        .await
+        .expect("the control: the tenant is observable before the erasure");
+
+    let mut holder = sql().await;
+    let key = publication_key(&holder, &prefix).await;
+    let hold = holder.transaction().await.expect("fixture transaction");
+    hold.batch_execute(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+        .await
+        .expect("held the projection table");
+    let capturing = tokio::spawn({
+        let store = store.clone();
+        let tenant = tenant.clone();
+        async move { store.capture_tenant(&tenant, &[ASSIGNMENT], limits()).await }
+    });
+    until_waiting_on(&hold, &table).await;
+    // Tried, not awaited: waiting here for a gate the capture held would be a deadlock, and the
+    // server would end it by failing the capture.
+    let gate: bool = hold
+        .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&key])
+        .await
+        .expect("tried the publication gate")
+        .get(0);
+    assert!(
+        gate,
+        "an erasure would wait for the capture read: the gate was still held"
+    );
+    for suffix in [
+        "events",
+        "append_groups",
+        "group_batches",
+        "commands",
+        "claims",
+        "identity",
+        "snapshots",
+        "snapshot_generations",
+        "projection_cursors",
+        "blobs",
+        "p_capture_assignment",
+    ] {
+        hold.execute(
+            &format!("DELETE FROM {prefix}_{suffix} WHERE tenant_id = $1"),
+            &[&name],
+        )
+        .await
+        .expect("erased");
+    }
+    hold.execute(
+        &format!("INSERT INTO {prefix}_identity (tenant_id, stream_identity) VALUES ($1, $2)"),
+        &[&name, &"reprovisioned"],
+    )
+    .await
+    .expect("provisioned again");
+    assert!(
+        !capturing.is_finished(),
+        "the fixture only means something while the capture is still reading"
+    );
+    hold.commit().await.expect("erasure committed");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), capturing)
+        .await
+        .expect("capture finished")
+        .expect("capture task");
+    assert_eq!(
+        outcome.map(|capture| capture.stream_identity),
+        Err(CaptureError::TenantIdentityMissing),
+        "the identity this capture read was erased during the read"
+    );
+    recovered(&store).await;
+    store.drop_tables().await.expect("dropped");
+    holder
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("dropped projection");
+    store.shutdown().await.expect("closed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancellation_and_deadline_retire_the_lease_and_recover_capacity() {
     let prefix = prefix("cancel");

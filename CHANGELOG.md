@@ -64,6 +64,12 @@ under bare-version tags such as `0.1.0`.
   written and found where the value index aborted the append. Same schema edition and the same
   operator steps as the entry above: `migrate` drops each registered projection table's
   `(tenant_id, idx_N)` index and builds the digest index under the same name.
+- PostgreSQL: a consistent tenant capture holds the owner's publication gate only while its
+  snapshot is fixed, not through its read, so appends, redactions and erasures under the owner
+  prefix, other tenants' included, no longer wait for a capture read (review P11). A capture
+  whose tenant was erased or had an event redacted during its read is refused with
+  `CaptureError::TenantIdentityMissing` or `CaptureError::RedactedHistory`, as a capture started
+  after that change is, instead of returning the earlier snapshot. No operator step.
 - Gate: test builds carry no debug information and are optimized (`.cargo/config.toml`:
   `opt-level = 1` for the workspace, `2` for dependencies); the CPU-bound tests run up to 15
   times faster. PostgreSQL conformance cases that neither read the feed, catch up, rebuild nor
