@@ -1992,40 +1992,66 @@ impl EventStore for FileEventStore {
             }) {
                 return Err(EventLogError::Invalid("duplicate inline projection".into()));
             }
+            // Entered as every transaction enters: from this handle's verified view when the file
+            // still extends it, folding only frames it gained since, and through the complete
+            // opener (which refuses a diverged history) otherwise. Each registration used to open
+            // and replay the whole journal again, and retire the view for the next call.
             let path = self.root.clone();
-            let journal = blocking(move || Journal::open(&path)).await?;
-            if let Some(observed) = &runtime.observed
-                && !journal.extends(observed)?
-            {
-                return Err(backend(
-                    "file history diverged from this handle's observed history",
-                ));
-            }
-            let mut tx = Transaction {
-                state: State::replay(&journal.transactions)?,
-                journal,
-                pending: Vec::new(),
-                inline: runtime.inline.clone(),
-                root: self.root.clone(),
-                privacy: false,
-                permit: self.permit.clone(),
-                content: Arc::clone(&self.content),
-                written: Vec::new(),
-                staged_blobs: Vec::new(),
-                atomic_content: false,
-                binds: false,
-                undo: None,
-            };
-            tx.register(projector.as_ref())?;
-            let manifest = blocking(move || {
-                if !tx.pending.is_empty() {
-                    tx.journal
-                        .append(serde_json::to_value(tx.pending).map_err(backend)?)?;
-                }
-                Ok(tx.journal.manifest.clone())
+            let observed = runtime.observed.clone();
+            let verified = runtime
+                .verified
+                .take()
+                .filter(|verified| Some(&verified.manifest) == observed.as_ref());
+            let reader = capture::reader_bytes(runtime.captured.as_ref());
+            let (inline, permit, content) = (
+                runtime.inline.clone(),
+                self.permit.clone(),
+                Arc::clone(&self.content),
+            );
+            let mut tx = blocking(move || {
+                enter(
+                    &path,
+                    observed.as_ref(),
+                    verified,
+                    reader.as_ref(),
+                    inline,
+                    permit,
+                    content,
+                )
             })
             .await?;
-            runtime.observed = Some(manifest);
+            capture::keep_reader_once(&mut runtime.captured, &tx.journal);
+            if let Err(refusal) = tx.register(projector.as_ref()) {
+                if tx.pending.is_empty() {
+                    let state = tx.state;
+                    let (manifest, transactions, content) = tx.journal.into_parts();
+                    runtime.observed = Some(manifest.clone());
+                    runtime.verified = Some(Verified {
+                        manifest,
+                        transactions,
+                        state,
+                        content,
+                    });
+                }
+                return Err(refusal);
+            }
+            let (manifest, transactions, state, content) = blocking(move || {
+                if !tx.pending.is_empty() {
+                    tx.journal
+                        .append(serde_json::to_value(&tx.pending).map_err(backend)?)?;
+                }
+                let state = tx.state;
+                let (manifest, transactions, content) = tx.journal.into_parts();
+                Ok((manifest, transactions, state, content))
+            })
+            .await?;
+            runtime.observed = Some(manifest.clone());
+            runtime.verified = Some(Verified {
+                manifest,
+                transactions,
+                state,
+                content,
+            });
             runtime.inline.push(projector);
             Ok(())
         })
@@ -3900,5 +3926,89 @@ mod steady_state_cost {
             crate::cost::of(root).projection_rows_visited - start <= (rows + calls) as u64,
             "the pages together visited more rows than they returned and one per call"
         );
+    }
+
+    static OWN_TABLES: [ProjectionSpec; 4] = [
+        ProjectionSpec {
+            name: "own_0",
+            indexed: &[],
+        },
+        ProjectionSpec {
+            name: "own_1",
+            indexed: &[],
+        },
+        ProjectionSpec {
+            name: "own_2",
+            indexed: &[],
+        },
+        ProjectionSpec {
+            name: "own_3",
+            indexed: &[],
+        },
+    ];
+
+    /// An inline projector over one table of its own that applies nothing.
+    struct Own(usize);
+
+    impl Projector for Own {
+        fn name(&self) -> &'static str {
+            OWN_TABLES[self.0].name
+        }
+        fn projections(&self) -> &'static [ProjectionSpec] {
+            std::slice::from_ref(&OWN_TABLES[self.0])
+        }
+        fn apply<'a>(
+            &'a self,
+            _: &'a RecordedEvent,
+            _: &'a mut dyn eventlog_core::ProjectionStore,
+        ) -> BoxFuture<'a, Result<(), EventLogError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// An inline registration resumes the handle's verified view: four registrations on an opened
+    /// store chain no committed frame again, and the call after them resumes too. Each used to open
+    /// and replay the whole journal (518 extra frame visits for four on a 128-frame store) and
+    /// retire the view, so the next call replayed it once more. The registrations are committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_registrations_resume_the_verified_view() {
+        let owner = tenant("registrations");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        {
+            let store = FileEventStore::open(root).await.unwrap();
+            for round in 0..8 {
+                store
+                    .append_group(&streams(&owner, &format!("r{round}"), 2))
+                    .await
+                    .unwrap();
+            }
+        }
+        let store = FileEventStore::open(root).await.unwrap();
+        let before = crate::cost::of(root).frames_chained;
+        for index in 0..OWN_TABLES.len() {
+            store.register_inline(Arc::new(Own(index))).await.unwrap();
+        }
+        assert_eq!(
+            crate::cost::of(root).frames_chained - before,
+            0,
+            "a registration chained committed frames again"
+        );
+        let stream = StreamId::new(owner.clone(), "r0", "s0000").unwrap();
+        assert_eq!(store.read_stream(&stream, 0, 10).await.unwrap().events.len(), 1);
+        assert_eq!(
+            crate::cost::of(root).frames_chained - before,
+            0,
+            "the call after the registrations did not resume the view"
+        );
+        drop(store);
+        let reopened = FileEventStore::open(root).await.unwrap();
+        let registered = reopened
+            .transaction(|tx| Box::pin(async move { Ok(tx.state.projections.clone()) }))
+            .await
+            .unwrap();
+        for spec in &OWN_TABLES {
+            assert_eq!(registered.get(spec.name), Some(&Vec::new()), "{}", spec.name);
+        }
     }
 }

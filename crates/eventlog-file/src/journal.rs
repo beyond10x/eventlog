@@ -756,6 +756,9 @@ fn atomic_json(root: &Path, name: &str, value: &impl Serialize) -> Result<(), Ev
 }
 
 impl Journal {
+    /// Open a journal, creating a missing store in the single-file layout. Test fixtures only:
+    /// every store entry point enters through `crate::enter` or opens with an explicit layout.
+    #[cfg(test)]
     pub fn open(root: &Path) -> Result<Self, EventLogError> {
         Self::open_with_creation(root, Some(FileLayout::Single))
     }

@@ -42,6 +42,9 @@ under bare-version tags such as `0.1.0`.
 - File: `projection_list` seeks to the first key past its cursor instead of walking the rows from
   the first key, so a page visits the rows it returns and at most one more (paging 512 rows by 32
   used to evaluate 4,864).
+- File: an inline registration resumes the handle's verified view instead of opening and replaying
+  the whole journal, and keeps that view for the next call (four registrations on a 128-frame store
+  used to visit 518 extra frames).
 
 ## 0.9.4 — 2026-11-11
 
