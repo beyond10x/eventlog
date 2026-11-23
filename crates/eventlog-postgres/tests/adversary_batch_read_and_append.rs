@@ -8,7 +8,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -260,10 +260,10 @@ async fn a_batch_of_reads_that_each_miss_the_deadline_is_refused_with_the_deadli
     );
 }
 
-/// A guard that announces it holds the append's stream lock, then keeps it for `hold`.
+/// A guard that announces it holds the append's stream lock, then keeps it until `released`.
 struct Holding {
     entered: Arc<AtomicUsize>,
-    hold: Duration,
+    released: Arc<AtomicBool>,
 }
 
 impl Guard for Holding {
@@ -273,17 +273,42 @@ impl Guard for Holding {
     ) -> BoxFuture<'a, Result<(), EventLogError>> {
         Box::pin(async move {
             self.entered.fetch_add(1, Ordering::AcqRel);
-            tokio::time::sleep(self.hold).await;
+            while !self.released.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             Ok(())
         })
     }
 }
 
+/// How long the test keeps each held stream from the group, one stream after the other.
+const HOLD: Duration = Duration::from_secs(1);
+
+/// The group's limit on any single lock wait.
+const LOCK_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+/// The group's statement timeout, below the four holds together.
+const STATEMENT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The group's store-operation deadline.
+const GROUP_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long the test waits for a step it set up (holders locked, group waiting) before it fails.
+const STEP_BOUND: Duration = Duration::from_secs(15);
+
+const _: () = assert!(HOLD.as_millis() < LOCK_TIMEOUT.as_millis());
+const _: () = assert!(STATEMENT_TIMEOUT.as_millis() < 4 * HOLD.as_millis());
+
 /// A group waits for each of its stream locks as it did with one statement per lock: every wait
-/// below `lock_timeout`, the whole group inside `transaction_timeout`. Four concurrent single
-/// appends hold four of its streams for 0.4, 0.8, 1.2 and 1.6 s. One statement per lock waits at
-/// most 0.4 s per statement; one statement for all of them waits 1.6 s, past the 1 s statement
-/// timeout.
+/// below `lock_timeout`, the whole group inside `transaction_timeout`.
+///
+/// Four single appends hold four of the group's streams. Once the group's session is seen
+/// waiting for an advisory lock, the test lets the holders go one per [`HOLD`], in the group's
+/// lock order. The group's lock statement was already running then and cannot end before the
+/// last release, so it runs at least 4 s on any machine, past the 3 s statement timeout, while
+/// each of its waits is about 1 s against the 2.5 s lock timeout. A store that holds the lock
+/// statement to the statement timeout refuses the group every time; so does a lock timeout
+/// shorter than one hold, because the first wait alone is at least one hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_group_behind_several_short_lock_holders_commits_inside_its_deadline() {
     let name = prefix("lockwait");
@@ -293,24 +318,27 @@ async fn a_group_behind_several_short_lock_holders_commits_inside_its_deadline()
             &name,
             PoolOptions {
                 max_connections: 8,
+                transaction_timeout: Duration::from_secs(30),
                 ..PoolOptions::default()
             },
         )
         .await
         .unwrap(),
     );
-    let grouped = PostgresEventStore::connect_local(
-        &url(),
-        &name,
-        PoolOptions {
-            statement_timeout: Duration::from_secs(1),
-            lock_timeout: Duration::from_millis(900),
-            transaction_timeout: Duration::from_secs(8),
-            ..PoolOptions::default()
-        },
-    )
-    .await
-    .unwrap();
+    let grouped = Arc::new(
+        PostgresEventStore::connect_local(
+            &format!("{}?application_name={name}", url()),
+            &name,
+            PoolOptions {
+                statement_timeout: STATEMENT_TIMEOUT,
+                lock_timeout: LOCK_TIMEOUT,
+                transaction_timeout: GROUP_DEADLINE,
+                ..PoolOptions::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
     let t = tenant("adv-lockwait");
     let streams: Vec<StreamId> = (0..4)
         .map(|n| stream(&t, "item", &format!("held-{n}")))
@@ -328,13 +356,17 @@ async fn a_group_behind_several_short_lock_holders_commits_inside_its_deadline()
     }
 
     let entered = Arc::new(AtomicUsize::new(0));
+    let released: Vec<Arc<AtomicBool>> = streams
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
     let mut running = Vec::new();
     for (n, held) in streams.iter().enumerate() {
         let store = Arc::clone(&holders);
         let held = held.clone();
         let guard = Arc::new(Holding {
             entered: Arc::clone(&entered),
-            hold: Duration::from_millis(400) * u32::try_from(n + 1).unwrap(),
+            released: Arc::clone(&released[n]),
         });
         running.push(tokio::spawn(async move {
             store
@@ -351,8 +383,10 @@ async fn a_group_behind_several_short_lock_holders_commits_inside_its_deadline()
     let waiting = Instant::now();
     while entered.load(Ordering::Acquire) < streams.len() {
         assert!(
-            waiting.elapsed() < Duration::from_secs(5),
-            "holders never took their locks"
+            waiting.elapsed() < STEP_BOUND,
+            "holders took {} of {} locks within {STEP_BOUND:?}",
+            entered.load(Ordering::Acquire),
+            streams.len()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -369,19 +403,59 @@ async fn a_group_behind_several_short_lock_holders_commits_inside_its_deadline()
             .collect(),
         meta: meta("behind-holders", &serde_json::json!({ "group": 1 })),
     };
-    let started = Instant::now();
-    let outcome = grouped.append_group(&group).await;
-    let elapsed = started.elapsed();
+    let appending = {
+        let grouped = Arc::clone(&grouped);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = grouped.append_group(&group).await;
+            (outcome, started.elapsed())
+        })
+    };
+    let sql = sql().await;
+    let looking = Instant::now();
+    loop {
+        let blocked: i64 = sql
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1
+                   AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if blocked > 0 || appending.is_finished() {
+            break;
+        }
+        assert!(
+            looking.elapsed() < STEP_BOUND,
+            "the group never waited for a held stream within {STEP_BOUND:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The group's lock order is its streams' order, held-0 to held-3.
+    for release in &released {
+        tokio::time::sleep(HOLD).await;
+        release.store(true, Ordering::Release);
+    }
+    let (outcome, elapsed) = appending.await.unwrap();
+    eprintln!("timing: the group behind four holders took {elapsed:?}");
     for holder in running {
         holder.await.unwrap().expect("each holder commits");
     }
     let written = outcome.unwrap_or_else(|error| {
         panic!(
-            "the group was refused after {elapsed:?} with {error:?}; no single lock wait reached \
-             the 900 ms lock timeout and the group had an 8 s deadline"
+            "the group was refused after {elapsed:?} with {error:?}; each stream was held about \
+             {HOLD:?} against the {LOCK_TIMEOUT:?} lock timeout, inside a {GROUP_DEADLINE:?} \
+             deadline"
         )
     });
     assert_eq!(written.appends.len(), 4);
+    assert!(
+        elapsed >= HOLD * 4,
+        "the group took {elapsed:?}, under the {:?} the holders kept it waiting, so its lock \
+         statement never outlasted the {STATEMENT_TIMEOUT:?} statement timeout and proves nothing",
+        HOLD * 4
+    );
     for held in &streams {
         assert_eq!(holders.stream_version(held).await.unwrap(), Some(3));
     }
