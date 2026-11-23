@@ -9,12 +9,19 @@ under bare-version tags such as `0.1.0`.
 
 - SQLite: `RestoredEvent` has the new public field `redacted: Option<String>`; a struct literal
   adds `redacted: None` to keep restoring live events.
+- Tree: eventlog 0.10.0 and earlier refuse a store holding a tenant directory named
+  `%%<digest>`, which this release writes for a tenant whose escaped name is longer than 255
+  bytes. Upgrade every binary that reads such a store before one writes it.
 
 ### Fixed
 
 - Tree: `copy` into a target with an inline projector hands a redacted event to the projector
   as redacted (`RecordedEvent::redacted_at` set, the tombstone as body), and the target stores it
   redacted.
+- Tree: a tenant whose escaped directory name would exceed 255 bytes (up to the 512-byte field
+  limit) is stored under `tenants/%%<sha256 of the tenant>` with a `tenant.json` naming it,
+  instead of failing with "File name too long (os error 36)". The shared inline projection
+  exercise now runs with a 512-byte tenant on every provider.
 
 ## 0.10.0 — 2026-11-23
 

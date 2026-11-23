@@ -6,11 +6,16 @@
 //! stream type or id can grow (`docs/design/tree-layout-path-length-v0.1.md`).
 
 use eventlog_conformance::{event, meta};
-use eventlog_core::{EventLogError, EventStore, Expected, StreamId, TenantId};
-use eventlog_tree::{MigrationMode, TreeEventStore, TreeLayout, migrate, verify};
+use eventlog_core::{
+    AppendGroup, AtomicEventStore, EventLogError, EventStore, Expected, NoGuard, StreamAppend,
+    StreamId, TenantId,
+};
+use eventlog_sqlite::SqliteEventStore;
+use eventlog_tree::{MigrationMode, TreeEventStore, TreeLayout, copy, migrate, verify};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn tenant() -> TenantId {
     TenantId::new("tenant-a").unwrap()
@@ -253,4 +258,149 @@ async fn a_directory_of_nested_files_without_store_json_is_never_declared_hashed
     assert_serves_the_fixture(&store).await;
     drop(store);
     assert_eq!(format(root), "eventlog-tree/2");
+}
+
+/// A tenant id of `MAX_FIELD_LEN` (512) bytes, every other byte one a file name escapes: its
+/// escaped segment, 1,024 bytes, is past every file system's 255-byte name limit.
+fn longest_tenant() -> TenantId {
+    let mut name = String::from("t");
+    while name.len() < eventlog_core::MAX_FIELD_LEN {
+        name.push(if name.len() % 2 == 0 { 't' } else { '/' });
+    }
+    TenantId::new(name).unwrap()
+}
+
+/// A tenant directory the store names for `tenant`: one segment under `tenants/`, and never
+/// longer than 255 bytes.
+fn tenant_directories(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.join("tenants"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Story `tree-accepts-a-512-byte-tenant`: a Tree store accepts every tenant id the core accepts.
+/// A tenant of the longest accepted length writes every kind of file, reopens cold, verifies,
+/// migrates, copies and is erased, in both layouts; a tenant whose escaped segment fits a file
+/// name keeps the directory name every release wrote for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_of_the_longest_accepted_length_is_stored_and_reopens() {
+    for layout in [TreeLayout::Nested, TreeLayout::Hashed] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let long = longest_tenant();
+        // 85 bytes that escape to 255, the longest name the file system takes.
+        let fits = TenantId::new("/".repeat(85)).unwrap();
+        let on = |tenant: &TenantId, id: &str| StreamId::new(tenant.clone(), "item", id).unwrap();
+        let store = TreeEventStore::open_in(root, layout).await.unwrap();
+        let identity = store
+            .stream_identity(&long)
+            .await
+            .expect("a 512-byte tenant is named");
+        let appended = store
+            .append(
+                &on(&long, "x"),
+                Expected::NoStream,
+                &[event("item.received", 1), event("item.indexed", 2)],
+                &meta("one", &json!({})),
+            )
+            .await
+            .expect("a 512-byte tenant's event is written");
+        let group = AppendGroup {
+            tenant: long.clone(),
+            appends: vec![StreamAppend {
+                stream: on(&long, "y"),
+                expected: Expected::NoStream,
+                events: vec![event("item.received", 3)],
+            }],
+            meta: meta("group", &json!({})),
+        };
+        store
+            .append_group_guarded_with_blobs(
+                &group,
+                Arc::new(NoGuard),
+                &[("blob-1".to_owned(), b"bytes".to_vec())],
+            )
+            .await
+            .expect("a 512-byte tenant's group and blob are written");
+        store
+            .append(
+                &on(&fits, "x"),
+                Expected::NoStream,
+                &[event("item.received", 4)],
+                &meta("fits", &json!({})),
+            )
+            .await
+            .unwrap();
+        drop(store);
+        let names = tenant_directories(root);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.iter().all(|name| name.len() <= 255),
+            "a tenant directory name past the file-name limit: {names:?}"
+        );
+        assert!(
+            names.contains(&"%2F".repeat(85)),
+            "a tenant whose segment fits lost the directory name 0.10.0 wrote: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(root.join(".cache"));
+        let reopened = TreeEventStore::open_in(root, layout).await.unwrap();
+        assert!(reopened.replayed().await, "control: the reopen replayed");
+        let read = reopened
+            .read_stream(&on(&long, "x"), 0, 10)
+            .await
+            .unwrap()
+            .events;
+        let ids =
+            |events: &[eventlog_core::RecordedEvent]| -> Vec<(String, u64, serde_json::Value)> {
+                events
+                    .iter()
+                    .map(|event| (event.event_id.clone(), event.version, event.data.clone()))
+                    .collect()
+            };
+        assert_eq!(
+            ids(&read),
+            ids(&appended.events),
+            "the 512-byte tenant's events reread"
+        );
+        assert_eq!(read[0].tenant, long);
+        assert_eq!(
+            reopened.stream_version(&on(&long, "y")).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            reopened.get_blob(&long, "blob-1").await.unwrap(),
+            Some(b"bytes".to_vec())
+        );
+        assert_eq!(reopened.stream_identity(&long).await.unwrap(), identity);
+        assert_eq!(
+            reopened.stream_version(&on(&fits, "x")).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(verify(root, None), Vec::new());
+        let report = migrate(root, MigrationMode::DryRun).unwrap();
+        assert!(!report.pending(), "{report:?}");
+
+        let target = SqliteEventStore::in_memory("copy").await.unwrap();
+        let copied = copy(&reopened, &target).await.unwrap();
+        assert_eq!((copied.tenants, copied.events), (2, 4));
+        assert_eq!(
+            target
+                .read_stream(&on(&long, "x"), 0, 10)
+                .await
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+
+        reopened.forget_tenant(&long).await.unwrap();
+        assert_eq!(tenant_directories(root), vec!["%2F".repeat(85)]);
+        drop(reopened);
+        let erased = TreeEventStore::open_in(root, layout).await.unwrap();
+        assert_eq!(erased.stream_version(&on(&long, "x")).await.unwrap(), None);
+    }
 }

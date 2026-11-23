@@ -133,8 +133,50 @@ pub(crate) fn segment(value: &str) -> String {
     out
 }
 
+/// The longest name a file system takes for one path segment: `NAME_MAX` on Linux and macOS, and
+/// the component limit of NTFS.
+const MAX_NAME: usize = 255;
+
+/// How a tenant directory whose escaped name would be longer than [`MAX_NAME`] starts: it is this
+/// prefix and the SHA-256 of the tenant id. [`segment`] never writes `%` followed by anything but
+/// two hexadecimal digits, so no escaped name starts so, and every reader up to 0.10.0 refuses the
+/// directory as a name it cannot unescape rather than serve it as another tenant.
+pub(crate) const HASHED_TENANT: &str = "%%";
+
+/// The file in a hashed tenant directory that names its tenant: `{"tenant": <id>}`, written once,
+/// before anything else in the directory.
+pub(crate) const TENANT_NAME_FILE: &str = "tenant.json";
+
+/// The name of `tenant`'s directory under `tenants/`: its escaped id, as every release wrote it,
+/// when that fits one file name, and otherwise [`HASHED_TENANT`] and the SHA-256 of the id. A
+/// tenant id may be 512 bytes, which escaping can triple.
+pub(crate) fn tenant_segment(tenant: &str) -> String {
+    let escaped = segment(tenant);
+    if escaped.len() <= MAX_NAME {
+        escaped
+    } else {
+        format!("{HASHED_TENANT}{}", sha256_hex(tenant.as_bytes()))
+    }
+}
+
 pub(crate) fn tenant_dir(root: &Path, tenant: &str) -> PathBuf {
-    root.join("tenants").join(segment(tenant))
+    root.join("tenants").join(tenant_segment(tenant))
+}
+
+/// Write the file naming `tenant`'s directory when its name is a hash, before the caller writes
+/// anything else into it: a reader learns the tenant of such a directory from that file alone.
+///
+/// # Errors
+/// Returns what writing the file returns, and refuses a name file that names another tenant.
+pub(crate) fn name_tenant_dir(root: &Path, tenant: &str) -> Result<(), EventLogError> {
+    let name = tenant_segment(tenant);
+    if !name.starts_with(HASHED_TENANT) {
+        return Ok(());
+    }
+    write_once(
+        &root.join("tenants").join(name).join(TENANT_NAME_FILE),
+        &canonical(&serde_json::json!({ "tenant": tenant })),
+    )
 }
 
 /// The directory of a stream's event files in a store of `format`.

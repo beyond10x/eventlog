@@ -144,6 +144,7 @@ fn layout(root: &Path, findings: &mut Vec<Finding>) {
         }
         let known = match parts.as_slice() {
             ["store.json"] | ["tenants", _, "identity.json"] => true,
+            ["tenants", tenant, "tenant.json"] => tenant.starts_with(crate::layout::HASHED_TENANT),
             ["tenants", _, "streams", _, _, file] => is_json(file) && !file.starts_with('.'),
             ["tenants", _, "groups", shard, file] => {
                 shard.len() == 2 && is_json(file) && file.starts_with(*shard)
@@ -176,7 +177,7 @@ fn layout(root: &Path, findings: &mut Vec<Finding>) {
 /// Whether the blob file at `path` (relative to `root`), in the directory of tenant segment
 /// `tenant` and named `file`, is where the store puts the blob its name spells.
 fn blob_at_its_path(root: &Path, path: &Path, tenant: &str, file: &str, split: bool) -> bool {
-    let Ok(tenant) = history::unescape(tenant) else {
+    let Ok(tenant) = history::tenant_of(&root.join("tenants").join(tenant)) else {
         return false;
     };
     let stem = if split {
@@ -303,7 +304,7 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
     // blob is read once, in whichever form, by the comparison that needs its served bytes.
     let mut blobs_compared = BTreeSet::new();
     for path in files(base, findings) {
-        if let Some(blob) = blob_of(&path) {
+        if let Some(blob) = blob_of(base, &path) {
             // A blob the base holds in both forms is compared once: the comparison reads both.
             if blobs_compared.contains(&blob) {
                 continue;
@@ -360,7 +361,7 @@ fn immutability(base: &Path, root: &Path, findings: &mut Vec<Finding>) {
 
 /// For a base file that holds a blob — a raw file or a split blob — its tenant and digest. `None`
 /// for any other file.
-fn blob_of(path: &Path) -> Option<(String, String)> {
+fn blob_of(base: &Path, path: &Path) -> Option<(String, String)> {
     let parts: Vec<String> = path
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -378,7 +379,10 @@ fn blob_of(path: &Path) -> Option<(String, String)> {
         ),
         _ => return None,
     };
-    Some((history::unescape(tenant).ok()?, digest))
+    Some((
+        history::tenant_of(&base.join("tenants").join(tenant)).ok()?,
+        digest,
+    ))
 }
 
 /// Whether the tree at `root` still serves blob `(tenant, digest)` with the bytes the base

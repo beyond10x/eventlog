@@ -11,8 +11,16 @@
 //! <root>/tenants/<tenant>/blobs/<kk>/<digest>           content-addressed bytes
 //! <root>/tenants/<tenant>/split-blobs/<kk>/<digest>.json  eventlog-tree/2: a blob as a manifest
 //! <root>/tenants/<tenant>/texts/<hh>/<sha256 hex>       eventlog-tree/2: one text, stored once
+//! <root>/tenants/%%<sha256 hex>/tenant.json             {tenant}: a tenant too long for a name
 //! <root>/.lock                                          one writer per checkout; not history
 //! ```
+//!
+//! `<tenant>` is the tenant id escaped into one file name. A tenant id may be 512 bytes, which
+//! escaping can triple, past the 255 bytes a file system takes for a name: such a tenant's
+//! directory is named `%%` and the SHA-256 of its id instead, and holds `tenant.json`, written
+//! before anything else in it, naming the tenant. Every tenant whose escaped id fits keeps the
+//! directory every release wrote for it; Eventlog 0.10.0 and earlier refuse a store holding a
+//! hashed tenant directory as corrupt.
 //!
 //! `store.json` names the layout. `eventlog-tree/1` holds raw blob files only. `eventlog-tree/2`,
 //! the layout a new store is created in, may keep a blob that is a JSON document as a manifest
@@ -551,6 +559,7 @@ impl TreeEventStore {
         }
 
         let persisted = (|| {
+            layout::name_tenant_dir(&self.root, tenant.as_str())?;
             let format = layout::store_format(&self.root)?;
             let splits = format.splits();
             for (digest, bytes) in blobs {
@@ -1599,6 +1608,7 @@ impl EventStore for TreeEventStore {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let identity = state.engine.stream_identity(tenant).await?;
+                    layout::name_tenant_dir(&self.root, tenant.as_str())?;
                     write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
                     identity
                 }
@@ -1627,9 +1637,11 @@ impl EventStore for TreeEventStore {
                 state.unsettled = false;
                 return Err(error);
             }
-            let written = layout::store_format(&self.root).and_then(|format| {
-                split::write_blob(&self.root, tenant.as_str(), digest, bytes, format.splits())
-            });
+            let written = layout::name_tenant_dir(&self.root, tenant.as_str())
+                .and_then(|()| layout::store_format(&self.root))
+                .and_then(|format| {
+                    split::write_blob(&self.root, tenant.as_str(), digest, bytes, format.splits())
+                });
             if let Err(error) = written {
                 state.poisoned = true;
                 return Err(error);

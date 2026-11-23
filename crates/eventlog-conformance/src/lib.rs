@@ -1619,11 +1619,16 @@ fn incompressible(length: usize) -> String {
 }
 
 /// Every provider indexes a value of [`eventlog_core::MAX_INDEXED_VALUE_BYTES`] incompressible
-/// bytes and refuses one byte more with a typed error before writing anything. (PostgreSQL's
-/// own test also indexes it under a tenant of the longest accepted length.)
+/// bytes and refuses one byte more with a typed error before writing anything, under a tenant of
+/// the longest accepted length, [`eventlog_core::MAX_FIELD_LEN`] bytes, half of them bytes a file
+/// name must escape: every provider stores and reads such a tenant.
 async fn run_indexed_value_bound(store: &std::sync::Arc<dyn EventStore>) {
     let limit = eventlog_core::MAX_INDEXED_VALUE_BYTES;
-    let tenant = TenantId::new("tenant-bound").expect("valid tenant");
+    let mut name = String::from("tenant-bound-");
+    while name.len() < eventlog_core::MAX_FIELD_LEN {
+        name.push(if name.len() % 2 == 0 { '/' } else { 'b' });
+    }
+    let tenant = TenantId::new(name).expect("a tenant of the longest accepted length");
     let stream = StreamId::new(tenant.clone(), "item", "bound").expect("valid stream");
     let guard = |kind: String| {
         std::sync::Arc::new(WritesIndexedKind {

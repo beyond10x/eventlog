@@ -434,13 +434,28 @@ fn read_json(path: &Path) -> Result<Value, EventLogError> {
     serde_json::from_slice(&bytes).map_err(|_| corrupt("a file that is not JSON"))
 }
 
-fn tenant_of(directory: &Path) -> Result<String, EventLogError> {
-    unescape(
-        &directory
-            .file_name()
-            .ok_or_else(|| corrupt("tenant directory"))?
-            .to_string_lossy(),
-    )
+/// The tenant whose directory under `tenants/` is `directory`: its escaped id, or, for a directory
+/// named by a hash, the id its name file holds, which must hash to that name.
+pub(crate) fn tenant_of(directory: &Path) -> Result<String, EventLogError> {
+    let name = directory
+        .file_name()
+        .ok_or_else(|| corrupt("tenant directory"))?
+        .to_string_lossy()
+        .into_owned();
+    if !name.starts_with(crate::layout::HASHED_TENANT) {
+        return unescape(&name);
+    }
+    let file = directory.join(crate::layout::TENANT_NAME_FILE);
+    let value = read_json(&file)?;
+    let map = value
+        .as_object()
+        .ok_or_else(|| corrupt("a tenant name file"))?;
+    closed(map, &["tenant"], "a tenant name file")?;
+    let tenant = text(field(map, "tenant")?, "a tenant name file")?.to_owned();
+    if crate::layout::tenant_segment(&tenant) != name {
+        return Err(corrupt("a tenant directory whose name is not its tenant's"));
+    }
+    Ok(tenant)
 }
 
 /// Every group file name under `root`, for the change check a writer makes under the lock.
