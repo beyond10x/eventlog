@@ -30,6 +30,8 @@ const BLOB_INTEGRITY_CHECKSUM: &str =
 const BATCH_CHECKSUM: &str = "f5989b20d7de8babbd77d3427015b92a70f5f6275982f740616476873d09a7fa";
 const MD5_DIGEST_CHECKSUM: &str =
     "20d998c6771a5b4a4e03df9034ac4bab9479ae72ab908f2bae5ef045c7a6881c";
+const HASH_EXPRESSION_CHECKSUM: &str =
+    "41ca55d5a4e879d0928e0834e06f4503a01f5becde9712b891bde2c1b0eb282f";
 
 fn legacy_base_ddl(prefix: &str) -> String {
     format!(
@@ -223,8 +225,8 @@ fn owner_ddl() -> String {
     )
 }
 
-/// The current edition: the owner tables and the indexes of a projection table. A change to
-/// either is a new checksum, which every earlier binary refuses at `open` and `migrate`: the
+/// The current edition: the owner tables and the columns and indexes of a projection table. A
+/// change to either is a new checksum, which every earlier binary refuses at `open` and `migrate`: the
 /// cutover to a new projection shape is fenced by the ledger, not only by the per-table shape
 /// check a binary meets when it registers a projection.
 fn checksum() -> String {
@@ -245,6 +247,13 @@ fn batch_checksum() -> String {
 /// first 8 bytes of `md5(idx_N)`, which a PostgreSQL server in FIPS mode refuses to compute.
 fn md5_digest_checksum() -> String {
     MD5_DIGEST_CHECKSUM.into()
+}
+
+/// The edition pull request 72 wrote, never released: the current owner tables, the bytewise
+/// page index, and each field indexed by the expression `hashtextextended(idx_N, 0)`, with no
+/// stored digest column.
+fn hash_expression_checksum() -> String {
+    HASH_EXPRESSION_CHECKSUM.into()
 }
 
 /// The edition with blob integrity columns and atomic groups, before the batch record.
@@ -271,26 +280,34 @@ async fn exists<C: GenericClient>(client: &C, table: &str) -> Result<bool, Event
 /// whole list rather than seven per relation.
 ///
 /// Every relation is judged exactly as one at a time would be — a missing relation has the empty
-/// shape; then a rewrite rule, the relation kind and security, a trigger, policy, generated
-/// column or nondeterministic collation, and inheritance each refuse in that order — and its
-/// refusal is returned in its own slot, so a caller walking the list meets the same first error
-/// it met when each relation cost seven round trips.
+/// shape; then a rewrite rule, the relation kind and security, a trigger, policy, identity
+/// column, generated column (unless `generated` admits it) or nondeterministic collation, and
+/// inheritance each refuse in that order — and its refusal is returned in its own slot, so a
+/// caller walking the list meets the same first error it met when each relation cost seven round
+/// trips.
+///
+/// `Generated::Compared` admits a generated column, and the column's description then carries
+/// its generation kind beside its expression, so the shape equals another only when both
+/// generate the same column from the same expression. Only a projection table, compared with a
+/// temporary table built from its declaration, has one (its stored value digests).
 async fn shapes<C: GenericClient>(
     client: &C,
     tables: &[(String, &str)],
+    generated: Generated,
 ) -> Result<Vec<Result<Vec<String>, EventLogError>>, EventLogError> {
     let names: Vec<&str> = tables.iter().map(|(table, _)| table.as_str()).collect();
     let mut relations: Vec<Option<tokio_postgres::Row>> = (0..tables.len()).map(|_| None).collect();
     for row in client.query("SELECT n.ord, c.relkind::text, c.relrowsecurity, c.relforcerowsecurity, c.relpersistence::text, c.relispartition, \
             EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid), \
-            EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) OR EXISTS(SELECT FROM pg_policy WHERE polrelid=c.oid) OR EXISTS(SELECT FROM pg_attribute WHERE attrelid=c.oid AND (attgenerated<>'' OR attidentity<>'')) OR EXISTS(SELECT FROM pg_attribute a JOIN pg_collation co ON co.oid=a.attcollation WHERE a.attrelid=c.oid AND NOT co.collisdeterministic), \
-            EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) \
+            EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) OR EXISTS(SELECT FROM pg_policy WHERE polrelid=c.oid) OR EXISTS(SELECT FROM pg_attribute WHERE attrelid=c.oid AND attidentity<>'') OR EXISTS(SELECT FROM pg_attribute a JOIN pg_collation co ON co.oid=a.attcollation WHERE a.attrelid=c.oid AND NOT co.collisdeterministic), \
+            EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid), \
+            EXISTS(SELECT FROM pg_attribute WHERE attrelid=c.oid AND attgenerated<>'') \
             FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) JOIN pg_class c ON c.oid=to_regclass(n.name)", &[&names]).await.map_err(backend)? {
         let position = ordinal_slot(row.get(0), tables.len())?;
         relations[position] = Some(row);
     }
     let mut columns: Vec<Vec<String>> = vec![Vec::new(); tables.len()];
-    for row in client.query("SELECT n.ord, a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, COALESCE(pg_get_expr(d.adbin,d.adrelid),''), a.attcollation::text \
+    for row in client.query("SELECT n.ord, a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, COALESCE(pg_get_expr(d.adbin,d.adrelid),''), a.attcollation::text, a.attgenerated::text \
             FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) \
             JOIN pg_attribute a ON a.attrelid=to_regclass(n.name) \
             LEFT JOIN pg_attrdef d ON a.attrelid=d.adrelid AND a.attnum=d.adnum \
@@ -298,10 +315,13 @@ async fn shapes<C: GenericClient>(
         let position = ordinal_slot(row.get(0), tables.len())?;
         let prefix = tables[position].1;
         let default: String = row.get(4);
+        let kind: String = row.get(6);
         // PostgreSQL qualifies sequences when the temporary expected schema shadows search_path.
-        let default = default.replace(prefix, "OWNER").replace("pg_temp_", "");
+        // A generation expression names only columns of its own row, and the owner prefix may be
+        // spelled inside one of them, so it is kept as written.
+        let default = if kind.is_empty() { default.replace(prefix, "OWNER").replace("pg_temp_", "") } else { default };
         let default = if default.starts_with("nextval(") { "owned-sequence".to_owned() } else { default };
-        columns[position].push(format!("column:{}:{}:{}:{}:{}", row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, bool>(3), default, row.get::<_, String>(5)));
+        columns[position].push(format!("column:{}:{}:{}:{}:{}:{kind}", row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, bool>(3), default, row.get::<_, String>(5)));
     }
     let mut constraints: Vec<Vec<String>> = vec![Vec::new(); tables.len()];
     for row in client
@@ -365,6 +385,7 @@ async fn shapes<C: GenericClient>(
             table,
             prefix,
             relation.as_ref(),
+            generated,
             columns,
             constraints,
             indexes,
@@ -373,11 +394,21 @@ async fn shapes<C: GenericClient>(
     Ok(answers)
 }
 
+/// Whether a relation may have a generated column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Generated {
+    /// An owner table: a generated column is refused like a trigger.
+    Refused,
+    /// A projection table: a generated column is part of the compared shape.
+    Compared,
+}
+
 /// One relation's admission, in the order a single relation was always judged.
 fn judge(
     table: &str,
     prefix: &str,
     relation: Option<&tokio_postgres::Row>,
+    generated: Generated,
     columns: Vec<String>,
     constraints: Vec<String>,
     indexes: Vec<Result<String, EventLogError>>,
@@ -405,7 +436,8 @@ fn judge(
             "unsupported relation/security shape: {table}"
         )));
     }
-    if relation.get::<_, bool>(7) {
+    if relation.get::<_, bool>(7) || (generated == Generated::Refused && relation.get::<_, bool>(9))
+    {
         return Err(EventLogError::Invalid(format!(
             "unadmitted trigger, policy or generated column: {table}"
         )));
@@ -442,7 +474,9 @@ async fn compare(
         tables.push((format!("{prefix}_{suffix}"), prefix));
         tables.push((format!("eventlog_expected_{suffix}"), "eventlog_expected"));
     }
-    let mut shapes = shapes(transaction, &tables).await?.into_iter();
+    let mut shapes = shapes(transaction, &tables, Generated::Refused)
+        .await?
+        .into_iter();
     for suffix in suffixes {
         let table = format!("{prefix}_{suffix}");
         let (Some(actual), Some(expected)) = (shapes.next(), shapes.next()) else {
@@ -561,6 +595,7 @@ async fn blob_shape(
                 "eventlog_expected",
             ),
         ],
+        Generated::Refused,
     )
     .await?
     .into_iter();
@@ -741,10 +776,15 @@ pub(crate) async fn migrate_with_blob_migration(
         compare(&transaction, prefix, GROUP_ADDED).await?;
         if batches {
             compare(&transaction, prefix, BATCH_ADDED).await?;
-            // The 0.10.0 edition and `main`'s MD5 digest edition differ from the current one only
-            // in their projection tables' indexes, which `upgrade_registered_projections` moves
-            // below.
-            let editions = [checksum(), batch_checksum(), md5_digest_checksum()];
+            // The 0.10.0 edition, `main`'s MD5 digest edition and pull request 72's expression
+            // edition differ from the current one only in their projection tables' indexes and
+            // digest columns, which `upgrade_registered_projections` moves below.
+            let editions = [
+                checksum(),
+                batch_checksum(),
+                md5_digest_checksum(),
+                hash_expression_checksum(),
+            ];
             let recorded = version_among(
                 &transaction,
                 prefix,
@@ -990,21 +1030,85 @@ pub(crate) async fn permissions(client: &Client, prefix: &str) -> Result<(), Eve
     }
     Ok(())
 }
-/// Every column a projection table has, named and typed the way the catalog reports them.
+/// One column of a projection table, named and typed the way the catalog reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectionColumn {
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) required: bool,
+    /// The expression a stored generated column is computed from, as `pg_get_expr` prints it.
+    pub(crate) generated: Option<String>,
+}
+
+impl ProjectionColumn {
+    fn plain(name: String, kind: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            kind,
+            required,
+            generated: None,
+        }
+    }
+
+    /// The column's declaration in `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN`.
+    fn declaration(&self) -> String {
+        let required = if self.required { " NOT NULL" } else { "" };
+        let generated = self
+            .generated
+            .as_ref()
+            .map(|expression| format!(" GENERATED ALWAYS AS ({expression}) STORED"))
+            .unwrap_or_default();
+        format!("{} {}{required}{generated}", self.name, self.kind)
+    }
+}
+
+/// Every column a projection table with `fields` declared fields has, in order: the key, the
+/// body, each field's value, then each field's stored digest.
 ///
-/// The DDL below is built from this, and read-only capture admission compares an actual stored
-/// table against the same list. One description, so the shape that is created and the shape that
-/// is recognised cannot drift apart without a compiler error between them.
-pub(crate) fn projection_columns(spec: &ProjectionSpec) -> Vec<(String, &'static str, bool)> {
+/// The DDL below is built from this, projection admission compares a stored table against a
+/// temporary one built from it, read-only capture admission compares the catalog against the
+/// same list, and the ledger checksum covers it. One description, so the shape that is created and
+/// the shape that is recognised cannot drift apart without a compiler error between them. The
+/// digests follow every value, so a table `migrate` extends with `ADD COLUMN` has the column order
+/// of a fresh one.
+pub(crate) fn projection_columns(fields: usize) -> Vec<ProjectionColumn> {
     let mut columns = vec![
-        ("tenant_id".to_owned(), "text", true),
-        ("row_key".to_owned(), "text", true),
-        ("body".to_owned(), "jsonb", true),
+        ProjectionColumn::plain("tenant_id".to_owned(), "text", true),
+        ProjectionColumn::plain("row_key".to_owned(), "text", true),
+        ProjectionColumn::plain("body".to_owned(), "jsonb", true),
     ];
-    for position in 0..spec.indexed.len() {
-        columns.push((format!("idx_{position}"), "text", false));
+    for position in 0..fields {
+        columns.push(ProjectionColumn::plain(
+            format!("idx_{position}"),
+            "text",
+            false,
+        ));
+    }
+    for position in 0..fields {
+        columns.push(ProjectionColumn {
+            name: digest_column(position),
+            kind: "bigint",
+            required: false,
+            generated: Some(indexed_digest(&format!("idx_{position}"))),
+        });
     }
     columns
+}
+
+/// The stored digest of the `position`-th declared field's value.
+pub(crate) fn digest_column(position: usize) -> String {
+    format!("idx_{position}_digest")
+}
+
+/// The columns a projection row's writer and a rebuild's copy name: every column but the
+/// generated digests, which the server computes and refuses to be given.
+pub(crate) fn projection_value_columns(fields: usize) -> String {
+    projection_columns(fields)
+        .into_iter()
+        .filter(|column| column.generated.is_none())
+        .map(|column| column.name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The one name a declared field's index is created under.
@@ -1045,7 +1149,7 @@ fn bounded_index_name(table: &str, role: &str) -> String {
 /// - `(tenant_id, row_key COLLATE "C")` walks a page in byte order (`projection_page_sql`). The
 ///   primary key orders keys under the database collation, which on a non-C database is not
 ///   the order the shared pager reads; without this index each page sorted the tenant's rows.
-/// - `(tenant_id, indexed_digest(idx_N))` finds the candidates for a declared field's value
+/// - `(tenant_id, idx_N_digest)` finds the candidates for a declared field's value
 ///   (`projection_find_filter`).
 pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, String)> {
     let mut indexes = vec![(
@@ -1055,10 +1159,7 @@ pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, Str
     for position in 0..fields {
         indexes.push((
             projection_index(table, position),
-            format!(
-                "btree (tenant_id, {})",
-                indexed_digest(&format!("idx_{position}"))
-            ),
+            format!("btree (tenant_id, {})", digest_column(position)),
         ));
     }
     indexes
@@ -1067,7 +1168,8 @@ pub(crate) fn projection_indexes(table: &str, fields: usize) -> Vec<(String, Str
 /// The indexes of earlier editions that `migrate` drops: 0.10.0 and before indexed each field's
 /// value itself, `(tenant_id, idx_N)`, and a value too long for a B-tree entry aborted the append
 /// that wrote it; `main` after pull request 70 indexed the first 8 bytes of `md5(idx_N)`, which a
-/// server in FIPS mode refuses to compute.
+/// server in FIPS mode refuses to compute; pull request 72 indexed the expression
+/// `hashtextextended(idx_N, 0)`, which the planner matched on every find.
 fn retired_projection_indexes(fields: usize) -> Vec<String> {
     (0..fields)
         .flat_map(|position| {
@@ -1076,47 +1178,68 @@ fn retired_projection_indexes(fields: usize) -> Vec<String> {
                 format!(
                     "btree (tenant_id, substr(decode(md5(idx_{position}), 'hex'::text), 1, 8))"
                 ),
+                format!("btree (tenant_id, hashtextextended(idx_{position}, '0'::bigint))"),
             ]
         })
         .collect()
 }
 
 /// A fixed-size digest of an indexed value, as SQL over `value`: its 64-bit
-/// `hashtextextended(value, 0)`, written the way `pg_get_indexdef` prints it.
+/// `hashtextextended(value, 0)`, written the way `pg_get_expr` prints a generation expression.
 ///
-/// The index keys on this instead of the value, so every entry has one size whatever the
-/// value's length: PostgreSQL refuses a B-tree entry over about a third of a page, and a long
-/// indexed value aborted the append that wrote it (review L78). Two values can share the digest,
-/// so a lookup through it also compares the value itself (`projection_find_filter`).
+/// Each declared field's stored digest column is generated from this, and its index keys on
+/// that column instead of the value, so every entry has one size whatever the value's length:
+/// PostgreSQL refuses a B-tree entry over about a third of a page, and a long indexed value
+/// aborted the append that wrote it (review L78). The server computes it from the stored value,
+/// so no writer can store a digest that does not match. Two values can share the digest, so
+/// every row a lookup finds through it is checked against the value itself
+/// (`projection_find_filter`).
 ///
 /// `hashtextextended` is PostgreSQL's own text hash, the one hash partitioning stores: immutable,
-/// as an index expression must be, and kept stable across releases for that reason. Under a
+/// as a generation expression must be, and kept stable across releases for that reason. Under a
 /// deterministic collation, which admission requires of every column, it hashes the value's
 /// bytes. It runs no OpenSSL digest, so a server in FIPS mode computes it; that server refuses
-/// `md5()`, which the previous digest called. Planning it also costs less than the MD5 expression
-/// it replaces (KPI `postgres.projection_find.latency`).
+/// `md5()`, which an earlier digest called.
 pub(crate) fn indexed_digest(value: &str) -> String {
-    format!("hashtextextended({value}, '0'::bigint)")
+    format!("hashtextextended({value}, (0)::bigint)")
 }
 
-/// The rows of tenant `$1` whose `position`-th declared field holds `$2`, as a `WHERE` clause.
+/// The candidate rows of tenant `$1` for the value `$2` of the `position`-th declared field, as a
+/// `WHERE` clause: the rows whose stored digest equals the value's.
 ///
-/// The digest finds the candidates through the index; comparing the value itself keeps only the
-/// rows that hold it, since two values can share a digest.
+/// A candidate can hold another value with the same digest, so the caller compares each row's
+/// `idx_N` with the value. When one differs, the find runs again with
+/// `projection_find_checked_filter`, whose rows all hold the value: the first answer may be short,
+/// since a colliding row took one of the `LIMIT` places. The planner reads the parameter's digest
+/// as a constant and the column as a plain `bigint`: no expression to match while planning, and no
+/// value comparison while scanning (KPI `postgres.projection_find.latency`).
 pub(crate) fn projection_find_filter(position: usize) -> String {
-    let column = format!("idx_{position}");
     format!(
-        "tenant_id = $1 AND {} = {} AND {column} = $2",
-        indexed_digest(&column),
+        "tenant_id = $1 AND {} = {}",
+        digest_column(position),
         indexed_digest("$2::text")
     )
 }
 
-/// The projection shape the ledger checksum covers: the index columns of a one-field table.
+/// `projection_find_filter` with the value comparison in SQL: the rows that hold `$2`.
+pub(crate) fn projection_find_checked_filter(position: usize) -> String {
+    format!(
+        "{} AND idx_{position} = $2",
+        projection_find_filter(position)
+    )
+}
+
+/// The projection shape the ledger checksum covers: the columns and the index columns of a
+/// one-field table.
 fn projection_edition() -> String {
-    projection_indexes("owner_p_projection", 1)
-        .into_iter()
-        .map(|(_, columns)| columns)
+    projection_columns(1)
+        .iter()
+        .map(ProjectionColumn::declaration)
+        .chain(
+            projection_indexes("owner_p_projection", 1)
+                .into_iter()
+                .map(|(_, columns)| columns),
+        )
         .collect::<Vec<_>>()
         .join(";")
 }
@@ -1133,14 +1256,11 @@ pub(crate) async fn create_projection(
             "projection SQL identifier exceeds PostgreSQL's exact length limit".into(),
         ));
     }
-    let declarations: Vec<String> = projection_columns(spec)
-        .into_iter()
-        .map(|(name, kind, required)| {
-            let required = if required { " NOT NULL" } else { "" };
-            format!("{name} {kind}{required}")
-        })
-        .collect();
-    let columns = declarations.join(",");
+    let columns = projection_columns(spec.indexed.len())
+        .iter()
+        .map(ProjectionColumn::declaration)
+        .collect::<Vec<_>>()
+        .join(",");
     transaction
         .batch_execute(&format!(
             "CREATE TABLE IF NOT EXISTS {table} ({columns},PRIMARY KEY(tenant_id,row_key));"
@@ -1154,14 +1274,16 @@ pub(crate) async fn create_projection(
     compare_projection(transaction, prefix, &table, spec.indexed.len()).await
 }
 
-/// Drop every index of `retired_projection_indexes` the stored table has, then create every
-/// index of `projection_indexes` it lacks.
+/// Drop every index of `retired_projection_indexes` the stored table has, add every stored
+/// digest column it lacks, then create every index of `projection_indexes` it lacks.
 ///
 /// An index is matched by its definition, whatever its name: an existing table may hold one
 /// created under an older, truncated name, and creating it again would leave two where the
 /// admitted shape has one. The retired indexes go first, since a current one takes the same
-/// name. Each is built inside the migration transaction, which holds the table against writes
-/// until it commits.
+/// name. The digest columns are added in one `ALTER TABLE`, one rewrite of the table, and only
+/// beside a value column that exists: a table without it is refused by the comparison that
+/// follows. All of it runs inside the migration transaction, which holds the table against
+/// reads and writes until it commits.
 async fn install_projection_indexes(
     transaction: &Transaction<'_>,
     table: &str,
@@ -1185,15 +1307,45 @@ async fn install_projection_indexes(
             .find(|(_, stored)| stored.ends_with(&definition))
             .map(|(name, _)| name.clone())
     };
+    let present: Vec<String> = transaction
+        .query(
+            "SELECT attname::text FROM pg_attribute
+             WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped",
+            &[&table],
+        )
+        .await
+        .map_err(backend)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
     let retired = retired_projection_indexes(fields)
         .into_iter()
         .filter_map(|columns| has(&columns))
         .map(|index| format!("DROP INDEX {index};"));
+    let added: Vec<String> = (0..fields)
+        .filter(|position| {
+            present.contains(&format!("idx_{position}"))
+                && !present.contains(&digest_column(*position))
+        })
+        .filter_map(|position| {
+            projection_columns(fields)
+                .into_iter()
+                .find(|column| column.name == digest_column(position))
+        })
+        .map(|column| format!("ADD COLUMN {}", column.declaration()))
+        .collect();
+    let added = (!added.is_empty())
+        .then(|| format!("ALTER TABLE {table} {};", added.join(", ")))
+        .into_iter();
     let missing = projection_indexes(table, fields)
         .into_iter()
         .filter(|(_, columns)| has(columns).is_none())
         .map(|(index, columns)| format!("CREATE INDEX {index} ON {table} USING {columns};"));
-    let statements = retired.chain(missing).collect::<Vec<_>>().concat();
+    let statements = retired
+        .chain(added)
+        .chain(missing)
+        .collect::<Vec<_>>()
+        .concat();
     if !statements.is_empty() {
         transaction
             .batch_execute(&statements)
@@ -1252,7 +1404,11 @@ async fn compare_projection(
     table: &str,
     fields: usize,
 ) -> Result<(), EventLogError> {
-    let columns = super::joined(fields, |position| format!(", idx_{position} TEXT"));
+    let columns = projection_columns(fields)
+        .iter()
+        .map(ProjectionColumn::declaration)
+        .collect::<Vec<_>>()
+        .join(",");
     let indexes = projection_indexes("eventlog_expected_projection", fields)
         .into_iter()
         .map(|(_, columns)| {
@@ -1260,7 +1416,7 @@ async fn compare_projection(
         })
         .collect::<Vec<_>>()
         .concat();
-    transaction.batch_execute(&format!("CREATE TEMP TABLE eventlog_expected_projection (tenant_id TEXT NOT NULL,row_key TEXT NOT NULL,body JSONB NOT NULL{columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
+    transaction.batch_execute(&format!("CREATE TEMP TABLE eventlog_expected_projection ({columns},PRIMARY KEY(tenant_id,row_key));{indexes}")).await.map_err(backend)?;
     let answered = shapes(
         transaction,
         &[
@@ -1270,6 +1426,7 @@ async fn compare_projection(
                 "eventlog_expected",
             ),
         ],
+        Generated::Compared,
     )
     .await;
     transaction
@@ -1347,10 +1504,11 @@ async fn downgrade_blob_fixture(client: &Client, prefix: &str) {
 #[cfg(test)]
 mod blob_integrity_tests {
     use super::{
-        ATOMIC_GROUP_CHECKSUM, BATCH_CHECKSUM, BLOB_INTEGRITY_CHECKSUM, LEGACY_CHECKSUM,
-        MD5_DIGEST_CHECKSUM, SNAPSHOT_CHECKSUM, additions, atomic_group_checksum, base_ddl,
-        batch_checksum, blob_integrity_checksum, checksum, group_additions, legacy_checksum,
-        md5_digest_checksum, owner_ddl, snapshot_additions, snapshot_checksum,
+        ATOMIC_GROUP_CHECKSUM, BATCH_CHECKSUM, BLOB_INTEGRITY_CHECKSUM, HASH_EXPRESSION_CHECKSUM,
+        LEGACY_CHECKSUM, MD5_DIGEST_CHECKSUM, SNAPSHOT_CHECKSUM, additions, atomic_group_checksum,
+        base_ddl, batch_checksum, blob_integrity_checksum, checksum, group_additions,
+        hash_expression_checksum, legacy_checksum, md5_digest_checksum, owner_ddl,
+        snapshot_additions, snapshot_checksum,
     };
     use sha2::{Digest, Sha256};
 
@@ -1391,6 +1549,20 @@ mod blob_integrity_tests {
             MD5_DIGEST_CHECKSUM
         );
         assert_ne!(checksum(), MD5_DIGEST_CHECKSUM);
+        // Pull request 72's unreleased edition: the current owner DDL, the page index and the
+        // `hashtextextended(idx_0, 0)` expression index, no stored digest column.
+        assert_eq!(hash_expression_checksum(), HASH_EXPRESSION_CHECKSUM);
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(format!(
+                    "{}btree (tenant_id, row_key COLLATE \"C\");btree (tenant_id, hashtextextended(idx_0, '0'::bigint))",
+                    owner_ddl()
+                ))
+            ),
+            HASH_EXPRESSION_CHECKSUM
+        );
+        assert_ne!(checksum(), HASH_EXPRESSION_CHECKSUM);
     }
 }
 
@@ -1862,10 +2034,10 @@ mod projection_index_tests {
             "migration adds the missing indexes: {repaired:?}"
         );
         assert!(
-            repaired.iter().any(|index| index.ends_with(&format!(
-                " USING btree (tenant_id, {})",
-                indexed_digest("idx_1")
-            ))),
+            repaired
+                .iter()
+                .any(|index| index
+                    .ends_with(&format!(" USING btree (tenant_id, {})", digest_column(1)))),
             "{repaired:?}"
         );
         validate_projection(&mut sql, PREFIX, &LONG).await.unwrap();

@@ -1533,7 +1533,8 @@ impl EventStore for PostgresEventStore {
                 spec.validate()?;
                 let active=projection_table(&self.prefix,spec.name); let shadow=projection_table("eventlog_rebuild",spec.name);
                 transaction.execute(&format!("DELETE FROM {active} WHERE tenant_id=$1"), &[&tenant.as_str()]).await.map_err(backend)?;
-                transaction.execute(&format!("INSERT INTO {active} SELECT * FROM {shadow} WHERE tenant_id=$1"), &[&tenant.as_str()]).await.map_err(backend)?;
+                let columns = schema::projection_value_columns(spec.indexed.len());
+                transaction.execute(&format!("INSERT INTO {active} ({columns}) SELECT {columns} FROM {shadow} WHERE tenant_id=$1"), &[&tenant.as_str()]).await.map_err(backend)?;
             }
             ensure_callback_integrity(&callback_failed)?;
             transaction.execute(&format!("INSERT INTO {}_projection_cursors(projection,tenant_id,global_seq,updated_at) VALUES($1,$2,$3,$4) ON CONFLICT(projection,tenant_id) DO UPDATE SET global_seq=EXCLUDED.global_seq,updated_at=EXCLUDED.updated_at",self.prefix), &[&projector.name(),&tenant.as_str(),&position,&OffsetDateTime::now_utc()]).await.map_err(backend)?;
@@ -1590,27 +1591,40 @@ impl EventStore for PostgresEventStore {
             // `postgres.projection_find.latency` 1.86x).
             let prefix = &self.prefix;
             let declared = serde_json::json!(projection.indexed);
-            // Typed parameters: one round trip, no separate prepare (see `read_stream`).
-            let rows = client
-                .query_typed(
-                    &format!(
-                        "SELECT body FROM {table}
-                         WHERE {}
-                           AND NOT EXISTS (SELECT FROM {prefix}_projection_registry
-                                           WHERE projection_name = $4 AND indexed_fields <> $5)
-                         ORDER BY row_key LIMIT $3",
-                        schema::projection_find_filter(position)
-                    ),
-                    &[
-                        (&tenant.as_str(), Type::TEXT),
-                        (&value, Type::TEXT),
-                        (&to_i64(limit as u64)?, Type::INT8),
-                        (&projection.name, Type::TEXT),
-                        (&declared, Type::JSONB),
-                    ],
+            let find = |filter: String| {
+                format!(
+                    "SELECT body, idx_{position} FROM {table}
+                     WHERE {filter}
+                       AND NOT EXISTS (SELECT FROM {prefix}_projection_registry
+                                       WHERE projection_name = $4 AND indexed_fields <> $5)
+                     ORDER BY row_key LIMIT $3"
                 )
+            };
+            let limit = to_i64(limit as u64)?;
+            let parameters: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 5] = [
+                (&tenant.as_str(), Type::TEXT),
+                (&value, Type::TEXT),
+                (&limit, Type::INT8),
+                (&projection.name, Type::TEXT),
+                (&declared, Type::JSONB),
+            ];
+            // Typed parameters: one round trip, no separate prepare (see `read_stream`). The
+            // candidates come through the stored digest; a candidate holding another value means
+            // the answer may be short, and the checked statement alone answers.
+            let mut rows = client
+                .query_typed(&find(schema::projection_find_filter(position)), &parameters)
                 .await
                 .map_err(backend)?;
+            if !every_candidate_holds(&rows, value)? {
+                rows = client
+                    .query_typed(
+                        &find(schema::projection_find_checked_filter(position)),
+                        &parameters,
+                    )
+                    .await
+                    .map_err(backend)?;
+                checked(&rows, value)?;
+            }
             if rows.is_empty() {
                 let recorded = client
                     .query_opt(
@@ -1903,17 +1917,32 @@ impl ProjectionStore for PostgresProjections<'_, '_> {
             projection.validate()?;
             let table = projection_table(self.projection_prefix, projection.name);
             let limit = bounded_limit(limit);
-            let rows = self
-                .client
-                .query(
-                    &format!(
-                        "SELECT body FROM {table} WHERE {} ORDER BY row_key LIMIT $3",
-                        schema::projection_find_filter(position)
-                    ),
-                    &[&tenant.as_str(), &value, &to_i64(limit as u64)?],
+            let find = |filter: String| {
+                format!(
+                    "SELECT body, idx_{position} FROM {table} WHERE {filter} ORDER BY row_key LIMIT $3"
                 )
+            };
+            let limit = to_i64(limit as u64)?;
+            let parameters: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
+                [&tenant.as_str(), &value, &limit];
+            // As in `projection_find`: a candidate holding another value hands the answer to the
+            // checked statement.
+            let mut rows = self
+                .client
+                .query(&find(schema::projection_find_filter(position)), &parameters)
                 .await
                 .map_err(backend)?;
+            if !every_candidate_holds(&rows, value)? {
+                rows = self
+                    .client
+                    .query(
+                        &find(schema::projection_find_checked_filter(position)),
+                        &parameters,
+                    )
+                    .await
+                    .map_err(backend)?;
+                checked(&rows, value)?;
+            }
             Ok(rows.iter().map(|row| row.get(0)).collect())
         })
     }
@@ -1930,6 +1959,34 @@ impl PostgresProjections<'_, '_> {
             ));
         }
         Ok(())
+    }
+}
+
+/// Whether every row a digest lookup returned holds `value` in its second column, the declared
+/// field's value. A row holding another value shares the value's digest and is no answer.
+///
+/// The server sends text as UTF-8, its conversion into UTF-8 is one-to-one, and admission
+/// requires a deterministic collation, under which `=` is byte equality: this comparison keeps
+/// exactly the rows `idx_N = $2` keeps.
+fn every_candidate_holds(rows: &[Row], value: &str) -> Result<bool, EventLogError> {
+    for row in rows {
+        let held: Option<&str> = row.try_get(1).map_err(backend)?;
+        if held != Some(value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Refuse an answer of the checked lookup that holds a row without `value`: the server's
+/// comparison and this crate's disagree, and no answer is safer than a wrong one.
+fn checked(rows: &[Row], value: &str) -> Result<(), EventLogError> {
+    if every_candidate_holds(rows, value)? {
+        Ok(())
+    } else {
+        Err(EventLogError::Backend(
+            "a checked projection lookup returned a row without the value asked for".into(),
+        ))
     }
 }
 

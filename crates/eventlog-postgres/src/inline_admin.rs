@@ -18,7 +18,7 @@ use tokio_postgres::IsolationLevel;
 use crate::{
     ADVISORY_KEY, COLUMNS, PostgresEventStore, PostgresProjections, backend, capture,
     ensure_callback_integrity, poisoned, projection_table, publication_identity, read_event,
-    to_i64,
+    schema, to_i64,
 };
 
 /// Events one rebuild page reads and retains at a time: the store's bounded batch, and two in unit
@@ -320,7 +320,10 @@ impl PostgresEventStore {
                         transaction
                             .execute(
                                 &format!(
-                                    "INSERT INTO {active} SELECT * FROM {shadow} WHERE tenant_id=$1"
+                                    "INSERT INTO {active} ({columns}) SELECT {columns} FROM {shadow} WHERE tenant_id=$1",
+                                    columns = schema::projection_value_columns(
+                                        specification.indexed.len()
+                                    )
                                 ),
                                 &[&tenant.as_str()],
                             )
