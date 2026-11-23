@@ -2,10 +2,15 @@
 format: aep.planning-md/3
 id: story:test-step-fits-120-s
 kind: story
-status: draft
+status: active
 title: The workspace test step ends within 120 s and nextest enforces it
 summary: eventlog-file 175.6 s and eventlog-postgres up to 166.5 s; add the run-wide 120 s limit once it fits
-revision: 1
+relations:
+- serves: vision:O2
+revision: 3
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-23T19:44:59Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-11-23T19:44:59Z", actor: "human:timo", revision: 3}
 ---
 ## Outcome
 
