@@ -50,7 +50,7 @@ pub use pool::{
     PostgresConnectionAuthority, PostgresTransportAssurance,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio_postgres::{GenericClient, Row, Transaction};
+use tokio_postgres::{GenericClient, Row, Transaction, types::Type};
 
 /// Every envelope column, in the order [`read_event`] expects them.
 const COLUMNS: &str = "global_seq, tenant_id, stream_type, stream_id, version, event_id, \
@@ -59,11 +59,6 @@ const COLUMNS: &str = "global_seq, tenant_id, stream_type, stream_id, version, e
 
 /// The predicate that keeps a feed reader behind anything still in flight.
 const WATERMARK: &str = "committed_xid < pg_snapshot_xmin(pg_current_snapshot())";
-
-/// The watermark above the settlement floor of [`watermarked_source`]: a position at or below the
-/// floor was settled by `migrate` after a restore, whatever transaction id it carries.
-const SETTLED: &str =
-    "(global_seq <= settled_through OR committed_xid < pg_snapshot_xmin(pg_current_snapshot()))";
 
 /// A visible row whose transaction id this cluster has not handed out yet was not written here:
 /// a logical restore copied it from another cluster's clock.
@@ -599,15 +594,17 @@ impl EventStore for PostgresEventStore {
             let limit = bounded_limit(limit);
             let prefix = &self.prefix;
             let mut client = self.pool.acquire().await?;
+            // Typed parameters: parse, bind and execute in one round trip. `query` with a text
+            // statement prepares it first, a round trip of its own on every read.
             let rows = client
-                .query(
+                .query_typed(
                     &stream_page_sql(prefix),
                     &[
-                        &stream.tenant().as_str(),
-                        &stream.stream_type(),
-                        &stream.stream_id(),
-                        &to_i64(after_version)?,
-                        &to_i64(limit as u64)?,
+                        (&stream.tenant().as_str(), Type::TEXT),
+                        (&stream.stream_type(), Type::TEXT),
+                        (&stream.stream_id(), Type::TEXT),
+                        (&to_i64(after_version)?, Type::INT8),
+                        (&to_i64(limit as u64)?, Type::INT8),
                     ],
                 )
                 .await
@@ -770,19 +767,21 @@ impl EventStore for PostgresEventStore {
             let mut client = self.pool.acquire().await?;
             let transaction = client.transaction().await.map_err(backend)?;
             publication_gate(&transaction, &self.prefix, true).await?;
+            // Typed parameters: parse, bind and execute in one round trip, with no separate
+            // prepare (see `read_stream`).
             let rows = transaction
-                .query(
+                .query_typed(
                     &format!(
                         "SELECT {COLUMNS} FROM {}
-                         WHERE tenant_id = $1 AND global_seq > $2 AND {SETTLED}
+                         WHERE tenant_id = $1 AND global_seq > $2
                            AND (first_unsettled IS NULL OR global_seq < first_unsettled)
                          ORDER BY global_seq LIMIT $3",
                         watermarked_source(prefix)
                     ),
                     &[
-                        &tenant.as_str(),
-                        &to_i64(after_position)?,
-                        &to_i64(limit as u64 + 1)?,
+                        (&tenant.as_str(), Type::TEXT),
+                        (&to_i64(after_position)?, Type::INT8),
+                        (&to_i64(limit as u64 + 1)?, Type::INT8),
                     ],
                 )
                 .await
@@ -1428,7 +1427,7 @@ impl EventStore for PostgresEventStore {
                 .query(
                     &format!(
                         "SELECT {COLUMNS} FROM {}
-                         WHERE tenant_id = $1 AND global_seq > $2 AND {SETTLED}
+                         WHERE tenant_id = $1 AND global_seq > $2
                            AND (first_unsettled IS NULL OR global_seq < first_unsettled)
                          ORDER BY global_seq LIMIT $3",
                         watermarked_source(&prefix)
@@ -1527,7 +1526,7 @@ impl EventStore for PostgresEventStore {
             }
             // Rebuild the same contiguous eligible prefix used by feed and catch-up. An unrelated
             // transaction can hold xmin between two already-committed append XIDs.
-            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND {SETTLED} AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
+            let target:i64=transaction.query_one(&format!("SELECT COALESCE(MAX(global_seq),0) FROM {} WHERE tenant_id=$1 AND (first_unsettled IS NULL OR global_seq < first_unsettled)",watermarked_source(&self.prefix)), &[&tenant.as_str()]).await.map_err(backend)?.get(0);
             let mut position=0_i64; let mut applied=0_u64;
             loop {
                 let rows=transaction.query(&format!("SELECT {COLUMNS} FROM {}_events WHERE tenant_id=$1 AND global_seq>$2 AND global_seq<=$3 ORDER BY global_seq LIMIT $4",self.prefix), &[&tenant.as_str(),&position,&target,&to_i64(MAX_READ_LIMIT as u64)?]).await.map_err(backend)?;
@@ -1590,39 +1589,55 @@ impl EventStore for PostgresEventStore {
             let limit = bounded_limit(limit);
             let mut client = self.pool.acquire().await?;
             // `idx_N` is the N-th field of the registered declaration. A reader that swapped two
-            // field names would otherwise query the other field's column.
+            // field names would otherwise query the other field's column. The row statement reads
+            // nothing while the registry holds another declaration, so a found row was read under
+            // a matching or absent registration; only an empty answer asks the registry which one
+            // it was. A registry query ahead of every find cost a round trip each time (KPI
+            // `postgres.projection_find.latency` 1.86x).
             let prefix = &self.prefix;
-            let recorded = client
-                .query_opt(
-                    &format!(
-                        "SELECT indexed_fields FROM {prefix}_projection_registry
-                         WHERE projection_name = $1"
-                    ),
-                    &[&projection.name],
-                )
-                .await
-                .map_err(backend)?;
-            if let Some(recorded) = recorded.map(|row| row.get::<_, Value>(0))
-                && recorded != serde_json::json!(projection.indexed)
-            {
-                client.settled();
-                return Err(EventLogError::Invalid(format!(
-                    "projection {} is read with indexed fields {} but registered with {recorded}",
-                    projection.name,
-                    serde_json::json!(projection.indexed)
-                )));
-            }
+            let declared = serde_json::json!(projection.indexed);
+            // Typed parameters: one round trip, no separate prepare (see `read_stream`).
             let rows = client
-                .query(
+                .query_typed(
                     &format!(
                         "SELECT body FROM {table}
                          WHERE tenant_id = $1 AND idx_{position} = $2
+                           AND NOT EXISTS (SELECT FROM {prefix}_projection_registry
+                                           WHERE projection_name = $4 AND indexed_fields <> $5)
                          ORDER BY row_key LIMIT $3"
                     ),
-                    &[&tenant.as_str(), &value, &to_i64(limit as u64)?],
+                    &[
+                        (&tenant.as_str(), Type::TEXT),
+                        (&value, Type::TEXT),
+                        (&to_i64(limit as u64)?, Type::INT8),
+                        (&projection.name, Type::TEXT),
+                        (&declared, Type::JSONB),
+                    ],
                 )
                 .await
                 .map_err(backend)?;
+            if rows.is_empty() {
+                let recorded = client
+                    .query_opt(
+                        &format!(
+                            "SELECT indexed_fields FROM {prefix}_projection_registry
+                             WHERE projection_name = $1"
+                        ),
+                        &[&projection.name],
+                    )
+                    .await
+                    .map_err(backend)?;
+                client.settled();
+                if let Some(recorded) = recorded.map(|row| row.get::<_, Value>(0))
+                    && recorded != declared
+                {
+                    return Err(EventLogError::Invalid(format!(
+                        "projection {} is read with indexed fields {declared} but registered with {recorded}",
+                        projection.name
+                    )));
+                }
+                return Ok(Vec::new());
+            }
             client.settled();
             Ok(rows.iter().map(|row| row.get(0)).collect())
         })
@@ -2027,14 +2042,20 @@ fn stream_page_columns(fetch: &str) -> String {
 
 /// `read_stream`'s statement: at most `$5` events past version `$4`, plus the lookahead row
 /// [`stream_page_columns`] describes, in one observation.
+///
+/// The row number is computed at the same query level as the page, not in a derived table that
+/// is selected from again: the derived table cost about 0.13 ms of planning and execution per read
+/// (KPI `postgres.read_stream.latency` 1.26x). The plan is the same index scan under `WindowAgg`
+/// and `Limit`, and stops after `$5 + 1` rows.
 fn stream_page_sql(prefix: &str) -> String {
-    let columns = stream_page_columns("$5::int8");
+    let leading = COLUMNS.strip_suffix(", data").unwrap_or(COLUMNS);
     format!(
-        "SELECT {columns}
-         FROM (SELECT {COLUMNS}, row_number() OVER (ORDER BY version) AS n FROM {prefix}_events
-               WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3 AND version > $4
-               ORDER BY version LIMIT $5::int8 + 1) AS p
-         ORDER BY p.version"
+        "SELECT {leading}, CASE WHEN row_number() OVER w <= $5::int8 THEN data END AS data,
+                row_number() OVER w > $5::int8 AS lookahead
+         FROM {prefix}_events
+         WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3 AND version > $4
+         WINDOW w AS (ORDER BY version)
+         ORDER BY version LIMIT $5::int8 + 1"
     )
 }
 
@@ -2631,11 +2652,16 @@ async fn reserve_ordered(
 // The publication gate settles owner writers, but unrelated transactions can still hold xmin
 // between committed XIDs. Never publish a higher position past such a withheld lower position.
 // Positions at or below the settlement floor are settled; the watermark applies above it.
+//
+// `first_unsettled IS NULL OR global_seq < first_unsettled` is the whole row predicate. A row
+// above the floor that fails the watermark is itself a candidate for `first_unsettled`, so that
+// condition already excludes it, and a row at or below the floor is never one. Repeating the
+// watermark per row, as `global_seq <= floor OR <watermark>`, put the floor table into the
+// statement a second time; planning it cost about 0.4 ms per feed page (KPI
+// `postgres.read_feed_page.latency` 1.33x).
 fn watermarked_source(prefix: &str) -> String {
     format!(
         "{prefix}_events CROSS JOIN \
-         (SELECT COALESCE(MAX(settled_through), 0) AS settled_through \
-          FROM {prefix}_settlement_floor) AS settlement_floor CROSS JOIN \
          (SELECT MIN(global_seq) AS first_unsettled FROM {prefix}_events \
           WHERE NOT ({WATERMARK}) AND global_seq > \
           (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)) \
@@ -2821,7 +2847,7 @@ mod blob_migration_tests {
 
 #[cfg(test)]
 mod publication_boundary_tests {
-    use super::{COLUMNS, PostgresEventStore, SETTLED, watermarked_source};
+    use super::{COLUMNS, PostgresEventStore, watermarked_source};
 
     /// Every plan node of `plan` that reads `relation` sequentially.
     fn sequential_reads(plan: &serde_json::Value, relation: &str, found: &mut Vec<String>) {
@@ -2867,7 +2893,7 @@ mod publication_boundary_tests {
         .unwrap();
         let feed = format!(
             "SELECT {COLUMNS} FROM {}
-             WHERE tenant_id = 'tenant-3' AND global_seq > 8000 AND {SETTLED}
+             WHERE tenant_id = 'tenant-3' AND global_seq > 8000
                AND (first_unsettled IS NULL OR global_seq < first_unsettled)
              ORDER BY global_seq LIMIT 2",
             watermarked_source(&prefix)

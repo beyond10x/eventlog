@@ -464,8 +464,10 @@ fn feed_statement(prefix: &str) -> String {
     format!(
         "SELECT {COLUMNS} FROM {prefix}_events CROSS JOIN \
          (SELECT MIN(global_seq) AS first_unsettled FROM {prefix}_events \
-          WHERE NOT ({WATERMARK})) AS publication_prefix \
-         WHERE tenant_id = $1 AND global_seq > $2 AND {WATERMARK} \
+          WHERE NOT ({WATERMARK}) AND global_seq > \
+          (SELECT COALESCE(MAX(settled_through), 0) FROM {prefix}_settlement_floor)) \
+         AS publication_prefix \
+         WHERE tenant_id = $1 AND global_seq > $2 \
            AND (first_unsettled IS NULL OR global_seq < first_unsettled) \
          ORDER BY global_seq LIMIT $3"
     )

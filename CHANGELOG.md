@@ -262,6 +262,14 @@ under bare-version tags such as `0.1.0`.
 - File: an inline registration resumes the handle's verified view instead of opening and replaying
   the whole journal, and keeps that view for the next call (four registrations on a 128-frame store
   used to visit 518 extra frames).
+- PostgreSQL: `read_stream`, `read_feed` and `projection_find` send their statement with typed
+  parameters, one round trip instead of a prepare and an execute. `projection_find` checks the
+  registered declaration inside its row statement and asks the registry only when no row came
+  back; the feed reads the settlement floor once per statement; the stream page numbers its rows
+  without a derived table. Measured against 0.9.4 (KPI timing A/B, p50) these three reads had
+  become 1.33x to 1.86x slower through this release's fixes L34, L39 and L61; they are now
+  1.04x (`projection_find`, `read_feed`) and 1.16x (`read_stream`, whose body-less lookahead row
+  costs a window function). Results and refusals are unchanged.
 
 ### Documentation
 
