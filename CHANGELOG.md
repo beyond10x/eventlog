@@ -9,6 +9,9 @@ under bare-version tags such as `0.1.0`.
 
 - Core: `Projector::fingerprint`, an optional digest of a projector's configuration and version.
   The default, `None`, changes nothing except the tree store's kept state (below).
+- SQLite: `SqliteEventStore::restore_events_at` queues restored events with the global position
+  each takes, `positions` reads every event's position and the highest one ever assigned
+  (`EventPositions`), and `reserve_positions_through` keeps later appends above a position.
 
 ### Fixed
 
