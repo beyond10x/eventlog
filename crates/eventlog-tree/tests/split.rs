@@ -272,6 +272,79 @@ async fn a_raw_blob_merged_into_a_v2_store_reads_and_is_split_by_the_next_migrat
     assert_eq!(served(root, "sha256:late").await, Some(bytes));
 }
 
+/// An interrupted conversion, or a merge of a branch that had not migrated, can leave a blob in
+/// both forms holding the same bytes. The migration finishes it: the raw copy goes, and a second
+/// run has nothing left to do.
+async fn a_raw_copy_beside_its_equal_split_form_is_removed_by_the_next_migration(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let bytes = document("one", &body("one"));
+    write(root, layout, &[("sha256:one", bytes.clone())]).await;
+    assert_eq!(files_under(root, "split-blobs").len(), 1);
+    let shard = root.join("tenants/tenant-a/blobs/sh");
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join("sha256%3Aone"), &bytes).unwrap();
+    assert_eq!(served(root, "sha256:one").await, Some(bytes.clone()));
+
+    let planned = migrate(root, MigrationMode::DryRun).unwrap();
+    assert!(
+        planned.pending() && planned.blobs_split == 1 && planned.texts_added == 0,
+        "the raw copy beside an equal split form was not planned: {planned:?}"
+    );
+    let applied = migrate(root, MigrationMode::Apply).unwrap();
+    assert_eq!(applied.blobs_split, 1, "{applied:?}");
+    assert_eq!(applied.bytes_after, planned.bytes_after, "{applied:?}");
+    assert_eq!(files_under(root, "blobs"), [] as [PathBuf; 0]);
+    assert_eq!(files_under(root, "split-blobs").len(), 1);
+    assert_eq!(served(root, "sha256:one").await, Some(bytes));
+    assert_eq!(verify(root, None), Vec::new());
+    assert!(!migrate(root, MigrationMode::DryRun).unwrap().pending());
+}
+
+/// A key `put_blob` refuses names no blob. Deleting by one — here one whose first two bytes end
+/// inside a character, which the shard of its file name was once sliced from — is refused with
+/// the same reason before the engine or a file changes, and the store stays usable.
+async fn a_blob_key_put_refuses_is_refused_by_a_deletion_before_anything_changes(
+    layout: TreeLayout,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let key = "aé-blob";
+    assert!(!key.is_char_boundary(2), "the key must split a character");
+    let bytes = document("one", &body("one"));
+    write(root, layout, &[("sha256:one", bytes.clone())]).await;
+    let store = TreeEventStore::open(root).await.unwrap();
+    let refused_put = store
+        .put_blob(&tenant(), key, b"raw bytes")
+        .await
+        .expect_err("put_blob admitted a key it cannot store verbatim");
+
+    let refused = store
+        .delete_blob(&tenant(), key)
+        .await
+        .expect_err("a deletion by a key put_blob refuses went through");
+
+    assert_eq!(refused.to_string(), refused_put.to_string());
+    store
+        .append(
+            &StreamId::new(tenant(), "item", "y").unwrap(),
+            Expected::NoStream,
+            &[event("item.received", 1)],
+            &meta("two", &json!({})),
+        )
+        .await
+        .expect("the store stayed usable after the refusal");
+    assert_eq!(
+        store.get_blob(&tenant(), "sha256:one").await.unwrap(),
+        Some(bytes.clone())
+    );
+    drop(store);
+    assert_eq!(served(root, "sha256:one").await, Some(bytes));
+    assert_eq!(verify(root, None), Vec::new());
+}
+
 async fn a_blob_whose_two_forms_disagree_is_refused(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -396,6 +469,143 @@ async fn deleting_a_blob_removes_the_texts_only_it_named(layout: TreeLayout) {
     assert_eq!(served(root, "sha256:two").await, Some(two));
 }
 
+/// The manifest file of split blob `name` (`sha256:<name>`).
+fn manifest_of(root: &Path, name: &str) -> PathBuf {
+    let suffix = format!("%3A{name}.json");
+    files_under(root, "split-blobs")
+        .into_iter()
+        .find(|path| path.to_string_lossy().ends_with(&suffix))
+        .expect("no manifest")
+}
+
+/// For each fault put into the manifest of `broken` (`one` is the blob deleted, `two` another
+/// blob sharing a text with it), deleting `one` is refused as an incomplete cleanup, removes no
+/// file, and leaves the open store serving `one`.
+async fn a_manifest_fault_refuses_the_deletion_and_removes_nothing(
+    layout: TreeLayout,
+    broken: &str,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let shared = body("shared");
+    let one = serde_json::to_vec(&json!({ "a": shared, "b": body("own") })).unwrap();
+    let two = document("two", &shared);
+    write(
+        root,
+        layout,
+        &[("sha256:one", one.clone()), ("sha256:two", two.clone())],
+    )
+    .await;
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
+    let manifest = manifest_of(root, broken);
+    let good = fs::read(&manifest).unwrap();
+    let faults: [&[u8]; 3] = [
+        b"not json",
+        br#"{"blob":"x","parts":"not a list"}"#,
+        br#"{"blob":"x","parts":[{"text":"sha256:short"}]}"#,
+    ];
+    for fault in faults {
+        fs::write(&manifest, fault).unwrap();
+        let before = snapshot(root);
+        let refused = store
+            .delete_blob(&tenant(), "sha256:one")
+            .await
+            .expect_err("a deletion over a faulty manifest succeeded");
+        assert!(
+            refused.to_string().contains("incomplete blob cleanup"),
+            "{refused}"
+        );
+        assert_eq!(snapshot(root), before, "a file was removed");
+        assert_eq!(
+            store.get_blob(&tenant(), "sha256:one").await.unwrap(),
+            Some(one.clone()),
+            "the refused deletion left the store without the blob"
+        );
+    }
+    fs::write(&manifest, &good).unwrap();
+    store.delete_blob(&tenant(), "sha256:one").await.unwrap();
+    drop(store);
+    assert_eq!(served(root, "sha256:one").await, None);
+    assert_eq!(served(root, "sha256:two").await, Some(two));
+}
+
+async fn a_faulty_manifest_of_the_deleted_blob_refuses_the_deletion(layout: TreeLayout) {
+    a_manifest_fault_refuses_the_deletion_and_removes_nothing(layout, "one").await;
+}
+
+async fn a_faulty_manifest_of_another_blob_refuses_the_deletion(layout: TreeLayout) {
+    a_manifest_fault_refuses_the_deletion_and_removes_nothing(layout, "two").await;
+}
+
+/// Move the one file under `kind` into a sibling shard directory `zz`, as a restore that put it
+/// in the wrong place would.
+fn misplace(root: &Path, kind: &str) {
+    let files = files_under(root, kind);
+    assert_eq!(files.len(), 1, "{kind}: {files:?}");
+    let shard = files[0].parent().unwrap().parent().unwrap().join("zz");
+    fs::create_dir_all(&shard).unwrap();
+    fs::rename(&files[0], shard.join(files[0].file_name().unwrap())).unwrap();
+}
+
+async fn a_blob_file_outside_its_shard_is_refused_by_open_and_reported_by_verify(
+    layout: TreeLayout,
+) {
+    for (kind, bytes) in [
+        ("blobs", b"raw bytes, not JSON".to_vec()),
+        ("split-blobs", document("one", &body("one"))),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write(root, layout, &[("sha256:one", bytes)]).await;
+        assert_eq!(verify(root, None), Vec::new());
+        misplace(root, kind);
+        let findings = verify(root, None);
+        assert!(
+            findings.iter().any(|finding| finding.rule == "V1"
+                && finding.detail.contains("outside the path its digest names")),
+            "{kind}: {findings:?}"
+        );
+        let _ = fs::remove_dir_all(root.join(".cache"));
+        let refused = TreeEventStore::open(root)
+            .await
+            .err()
+            .expect("a store whose only copy of a blob is misplaced opened");
+        assert!(
+            refused
+                .to_string()
+                .contains("outside the path its digest names"),
+            "{kind}: {refused}"
+        );
+    }
+}
+
+async fn a_group_whose_blob_was_deleted_still_opens_and_verifies(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let group = eventlog_core::AppendGroup {
+        tenant: tenant(),
+        appends: vec![eventlog_core::StreamAppend {
+            stream: StreamId::new(tenant(), "item", "x").unwrap(),
+            expected: Expected::NoStream,
+            events: vec![event("item.received", 1)],
+        }],
+        meta: meta("one", &json!({})),
+    };
+    let store = TreeEventStore::open_in(root, layout).await.unwrap();
+    eventlog_core::AtomicEventStore::append_group_guarded_with_blobs(
+        &store,
+        &group,
+        std::sync::Arc::new(eventlog_core::NoGuard),
+        &[("sha256:one".to_owned(), b"raw bytes".to_vec())],
+    )
+    .await
+    .unwrap();
+    store.delete_blob(&tenant(), "sha256:one").await.unwrap();
+    drop(store);
+    assert_eq!(verify(root, None), Vec::new());
+    assert_eq!(served(root, "sha256:one").await, None);
+}
+
 async fn verify_reports_a_blob_the_head_serves_with_other_bytes_than_its_base(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("store");
@@ -426,9 +636,15 @@ each_layout!(
     a_v1_store_reads_and_writes_raw_blobs_as_before,
     a_dry_run_writes_nothing_and_an_apply_serves_every_blob_byte_for_byte,
     a_raw_blob_merged_into_a_v2_store_reads_and_is_split_by_the_next_migration,
+    a_raw_copy_beside_its_equal_split_form_is_removed_by_the_next_migration,
+    a_blob_key_put_refuses_is_refused_by_a_deletion_before_anything_changes,
     a_blob_whose_two_forms_disagree_is_refused,
     a_changed_text_is_refused_on_open_and_by_verify,
     a_v1_store_holding_split_files_and_an_unknown_format_are_refused_by_name,
     deleting_a_blob_removes_the_texts_only_it_named,
+    a_faulty_manifest_of_the_deleted_blob_refuses_the_deletion,
+    a_faulty_manifest_of_another_blob_refuses_the_deletion,
+    a_blob_file_outside_its_shard_is_refused_by_open_and_reported_by_verify,
+    a_group_whose_blob_was_deleted_still_opens_and_verifies,
     verify_reports_a_blob_the_head_serves_with_other_bytes_than_its_base,
 );

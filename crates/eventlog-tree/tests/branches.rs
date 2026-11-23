@@ -467,6 +467,30 @@ async fn a_second_handle_sees_the_first_handles_commit_before_it_writes(layout: 
     ));
 }
 
+async fn a_second_handle_adopts_the_tenant_identity_the_first_handle_wrote(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let first = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    let second = TreeEventStore::open_in(directory.path(), layout)
+        .await
+        .unwrap();
+    let tenant = TenantId::new("tenant-a").unwrap();
+    let written = first.stream_identity(&tenant).await.unwrap();
+    assert_eq!(
+        second.stream_identity(&tenant).await.unwrap(),
+        written,
+        "the second handle served an identity of its own"
+    );
+    assert_eq!(second.stream_identity(&tenant).await.unwrap(), written);
+    let other = StreamId::new(TenantId::new("tenant-b").unwrap(), "item", "y").unwrap();
+    assert_eq!(
+        second.stream_version(&other).await.unwrap(),
+        None,
+        "the second handle closed itself"
+    );
+}
+
 async fn a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds(layout: TreeLayout) {
     let directory = tempfile::tempdir().unwrap();
     {
@@ -1163,6 +1187,124 @@ async fn a_saved_feed_cursor_skips_nothing_after_a_tenant_erasure(layout: TreeLa
     .await;
 }
 
+const LIVE_VALUES: eventlog_core::ProjectionSpec = eventlog_core::ProjectionSpec {
+    name: "live_values",
+    indexed: &[],
+};
+
+/// An inline projector that skips redacted events and decodes every live one, refusing a live
+/// event that has no value: what a projector may rely on the redaction mark for.
+struct LiveValues;
+
+impl eventlog_core::Projector for LiveValues {
+    fn name(&self) -> &'static str {
+        "live_values"
+    }
+
+    fn projections(&self) -> &'static [eventlog_core::ProjectionSpec] {
+        &[LIVE_VALUES]
+    }
+
+    fn apply<'a>(
+        &'a self,
+        event: &'a eventlog_core::RecordedEvent,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            if event.is_redacted() {
+                return Ok(());
+            }
+            let value = event.data.get("value").and_then(serde_json::Value::as_i64);
+            let Some(value) = value else {
+                return Err(EventLogError::Invalid(format!(
+                    "a live event without a value: {}",
+                    event.data
+                )));
+            };
+            let key = format!("{}-{}", event.stream_id, event.version);
+            store
+                .upsert(
+                    &LIVE_VALUES,
+                    &event.tenant,
+                    &key,
+                    &json!({ "value": value }),
+                )
+                .await
+        })
+    }
+}
+
+/// A cold replay hands an inline projector each redacted event marked redacted, as the live store
+/// did, never its tombstone body as a live event: the store reopens, and the projection holds the
+/// live events only.
+async fn a_cold_replay_hands_an_inline_projector_a_redacted_event_as_redacted(layout: TreeLayout) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let projectors = || -> Vec<std::sync::Arc<dyn eventlog_core::Projector>> {
+        vec![std::sync::Arc::new(LiveValues)]
+    };
+    let store = TreeEventStore::open_in_with_inline(root, layout, projectors())
+        .await
+        .unwrap();
+    store
+        .append(
+            &stream("x"),
+            Expected::NoStream,
+            &[event("item.received", 1), event("item.indexed", 2)],
+            &meta("one", &json!({})),
+        )
+        .await
+        .unwrap();
+    store.redact(&stream("x"), 1, "erased").await.unwrap();
+    drop(store);
+    let _ = fs::remove_dir_all(root.join(".cache"));
+
+    let reopened = TreeEventStore::open_in_with_inline(root, layout, projectors())
+        .await
+        .expect("a cold replay refused a redacted event the projector skips");
+    assert!(reopened.replayed().await);
+    let tenant = TenantId::new("tenant-a").unwrap();
+    assert_eq!(
+        reopened
+            .projection_get(&LIVE_VALUES, &tenant, "x-1")
+            .await
+            .unwrap(),
+        None,
+        "the redacted event was projected as a live one"
+    );
+    assert_eq!(
+        reopened
+            .projection_get(&LIVE_VALUES, &tenant, "x-2")
+            .await
+            .unwrap(),
+        Some(json!({ "value": 2 }))
+    );
+    let events = reopened
+        .read_stream(&stream("x"), 0, 10)
+        .await
+        .unwrap()
+        .events;
+    assert!(events[0].is_redacted() && !events[1].is_redacted());
+    // The state folded this way is kept and read back like any other.
+    reopened
+        .append(
+            &stream("y"),
+            Expected::NoStream,
+            &[event("item.received", 3)],
+            &meta("two", &json!({})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .projection_get(&LIVE_VALUES, &tenant, "y-1")
+            .await
+            .unwrap(),
+        Some(json!({ "value": 3 })),
+        "the inline projector is not driven after the replay"
+    );
+}
+
 each_layout!(
     a_saved_feed_cursor_skips_nothing_after_another_handle_appends,
     a_saved_feed_cursor_skips_nothing_when_another_replay_kept_its_state,
@@ -1178,6 +1320,7 @@ each_layout!(
     a_merge_expectation_on_a_linear_stream_is_refused,
     an_event_file_edited_behind_the_store_is_refused_on_open,
     a_second_handle_sees_the_first_handles_commit_before_it_writes,
+    a_second_handle_adopts_the_tenant_identity_the_first_handle_wrote,
     a_redacted_body_stays_redacted_after_reopening_and_the_chain_holds,
     two_members_of_one_group_on_one_stream_chain_and_reopen,
     a_redaction_or_erasure_through_one_handle_is_not_served_by_another,
@@ -1185,4 +1328,5 @@ each_layout!(
     a_batch_read_sees_a_group_committed_beside_it_whole_or_not_at_all,
     an_append_its_caller_abandoned_in_the_engine_is_not_served_or_deduplicated,
     a_merge_retried_after_it_committed_returns_its_receipt,
+    a_cold_replay_hands_an_inline_projector_a_redacted_event_as_redacted,
 );

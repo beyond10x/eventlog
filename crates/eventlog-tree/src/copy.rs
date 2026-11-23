@@ -131,7 +131,7 @@ async fn refuse_before_writing(
         }
         for (digest, bytes) in &history.blobs {
             if let Some(held) = to.get_blob(&tenant, digest).await?
-                && held != *bytes
+                && *held != **bytes
             {
                 return Err(EventLogError::Invalid(format!(
                     "the copy target binds blob {digest} of tenant {name} to other bytes"

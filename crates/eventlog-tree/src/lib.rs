@@ -874,12 +874,25 @@ async fn replay_all(
     served: Option<&EventPositions>,
 ) -> Result<State, EventLogError> {
     let loaded = history::load(root)?;
+    // An inline projector is handed each event as the replay appends it, and a redacted event is
+    // appended with its tombstone body and marked redacted only after every group is in: the
+    // projector would take a redacted event for a live one. With any redaction in the history,
+    // the inline projectors are therefore driven afterwards, from the restored events.
+    let redacted = loaded
+        .tenants
+        .values()
+        .flat_map(|tenant| &tenant.groups)
+        .flat_map(|committed| committed.events.iter().flatten())
+        .any(|record| record.redacted.is_some());
+    let deferred = redacted && !inline.is_empty();
     let engine = Arc::new(SqliteEventStore::in_memory("tree").await?);
     for projector in &catch_up {
         engine.create_projections(Arc::clone(projector)).await?;
     }
-    for projector in &inline {
-        engine.register_inline(Arc::clone(projector)).await?;
+    if !deferred {
+        for projector in &inline {
+            engine.register_inline(Arc::clone(projector)).await?;
+        }
     }
     let mut heads: BTreeMap<StreamKey, BTreeSet<String>> = BTreeMap::new();
     let mut records = BTreeMap::new();
@@ -965,6 +978,11 @@ async fn replay_all(
         // one an event since erased held.
         engine.reserve_positions_through(next).await?;
     }
+    let engine = if deferred {
+        drive_inline_from_restored(&engine, &loaded, &inline, &catch_up).await?
+    } else {
+        engine
+    };
     // A parent is always replayed before its child, so removing parents as their children arrive
     // leaves exactly the events no other event follows.
     Ok(State {
@@ -984,6 +1002,35 @@ async fn replay_all(
         privacy: None,
         unsettled: false,
     })
+}
+
+/// An engine holding everything `replayed` holds, with `inline` registered and each of their
+/// projections folded from the restored events, redaction marks included, tenant by tenant.
+///
+/// Registration closes once an engine has appended, so the replayed engine is carried over through
+/// its image, as a kept state is ([`from_kept`]).
+async fn drive_inline_from_restored(
+    replayed: &SqliteEventStore,
+    loaded: &history::Loaded,
+    inline: &[Arc<dyn Projector>],
+    catch_up: &[Arc<dyn Projector>],
+) -> Result<Arc<SqliteEventStore>, EventLogError> {
+    let engine = Arc::new(SqliteEventStore::from_image("tree", replayed.image().await?).await?);
+    for projector in catch_up {
+        engine.create_projections(Arc::clone(projector)).await?;
+    }
+    for projector in inline {
+        engine.register_inline(Arc::clone(projector)).await?;
+    }
+    for tenant in loaded.tenants.keys() {
+        let tenant = TenantId::new(tenant.clone())?;
+        for projector in inline {
+            engine
+                .rebuild_inline_projection(projector.name(), &tenant)
+                .await?;
+        }
+    }
+    Ok(engine)
 }
 
 /// Append one committed group to the engine as its writer did, keeping its identities and
@@ -1079,15 +1126,16 @@ async fn replay(
 }
 
 /// The engine commits blob-bearing groups through its blob entry point, whose request fingerprint
-/// covers the bytes; a replay goes through the same one so a retry still matches.
-fn blob_group(group: AppendGroup, blobs: &[(String, Vec<u8>)]) -> BlobAppendGroup {
+/// covers the bytes; a replay goes through the same one so a retry still matches. The copy it
+/// makes lives only for this one group's append.
+fn blob_group(group: AppendGroup, blobs: &[(String, impl AsRef<[u8]>)]) -> BlobAppendGroup {
     BlobAppendGroup {
         group,
         blobs: blobs
             .iter()
             .map(|(digest, bytes)| BlobWrite {
                 digest: digest.clone(),
-                bytes: bytes.clone(),
+                bytes: bytes.as_ref().to_vec(),
             })
             .collect(),
     }
@@ -1520,28 +1568,42 @@ impl EventStore for TreeEventStore {
             let mut state = self.state.lock().await;
             // An identity another handle's erasure removed must not be handed out again.
             self.current(&mut state).await?;
-            let identity = state.engine.stream_identity(tenant).await?;
-            if !state.identities.contains(tenant.as_str()) {
-                let _lock = self.writer_lock().await?;
-                let path = identity_path(&self.root, tenant.as_str());
-                // Another writer may have named this tenant first; the replay after a merge would
-                // then refuse two identities, so the first one on disk wins here too.
-                if let Ok(bytes) = fs::read(&path) {
+            if state.identities.contains(tenant.as_str()) {
+                return state.engine.stream_identity(tenant).await;
+            }
+            // Under the writer lock, before the engine makes one up: another handle may have named
+            // this tenant since this one opened, and the first identity on disk is the tenant's
+            // (the replay after a merge would refuse two).
+            let _lock = self.writer_lock().await?;
+            let path = identity_path(&self.root, tenant.as_str());
+            let identity = match fs::read(&path) {
+                Ok(bytes) => {
                     let value: Value =
                         serde_json::from_slice(&bytes).map_err(|_| corrupt("tenant identity"))?;
                     let stored = value
                         .get("stream_identity")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| corrupt("tenant identity"))?;
-                    if stored != identity {
-                        state.poisoned = true;
-                        return Err(corrupt("another writer named this tenant's identity"));
+                        .ok_or_else(|| corrupt("tenant identity"))?
+                        .to_owned();
+                    // Refused only when this handle's engine already holds another identity.
+                    match state.engine.restore_stream_identity(tenant, &stored).await {
+                        Ok(()) => {}
+                        Err(EventLogError::Invalid(_)) => {
+                            state.poisoned = true;
+                            return Err(corrupt("another writer named this tenant's identity"));
+                        }
+                        Err(other) => return Err(other),
                     }
-                } else {
-                    write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
+                    stored
                 }
-                state.identities.insert(tenant.as_str().to_owned());
-            }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let identity = state.engine.stream_identity(tenant).await?;
+                    write_once(&path, &canonical(&json!({ "stream_identity": identity })))?;
+                    identity
+                }
+                Err(error) => return Err(backend(error)),
+            };
+            state.identities.insert(tenant.as_str().to_owned());
             Ok(identity)
         })
     }
@@ -1594,14 +1656,19 @@ impl EventStore for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
+            // A key `put_blob` refuses names no blob, and its file name would be derived from
+            // bytes no writer ever spelled: refuse it before anything is resolved or removed.
+            eventlog_core::validate_field("digest", digest)?;
             let _lock = self.writer_lock().await?;
             refresh(&self.root, &mut state).await?;
+            // A split blob takes with it every text no other blob of the tenant names, so a
+            // deleted blob's content is gone from the tree and not only its manifest. Every
+            // manifest is read before anything is removed: a fault refuses the whole deletion.
+            let deletion = split::plan_delete(&self.root, tenant.as_str(), digest)?;
             state.unsettled = true;
             let removed = async {
                 state.engine.delete_blob(tenant, digest).await?;
-                // A split blob takes with it every text no other blob of the tenant names, so a
-                // deleted blob's content is gone from the tree and not only its manifest.
-                if let Err(error) = split::delete_blob(&self.root, tenant.as_str(), digest) {
+                if let Err(error) = deletion.apply() {
                     state.poisoned = true;
                     return Err(error);
                 }

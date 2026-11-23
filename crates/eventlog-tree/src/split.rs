@@ -22,8 +22,8 @@
 //! refuses an expansion whose length or SHA-256 is not the one the manifest recorded.
 
 use crate::layout::{
-    backend, blob_path, canonical, corrupt, segment, sha256_hex, tenant_dir, write_atomic,
-    write_once,
+    backend, blob_path, canonical, corrupt, read_file, segment, sha256_hex, tenant_dir,
+    write_atomic, write_once,
 };
 use eventlog_core::EventLogError;
 use serde_json::{Map, Value, json};
@@ -285,6 +285,54 @@ pub(crate) fn expand_file(
     digest: &str,
     path: &Path,
 ) -> Result<Vec<u8>, EventLogError> {
+    expand_file_with(root, tenant, digest, path, &mut Texts::default())
+}
+
+/// The most bytes of text one [`Texts`] keeps. A text past the bound is read again by every
+/// manifest that names it, as it was before there was a cache; the bound keeps one observation of
+/// a store with many large texts from holding all of them at once.
+const TEXT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The texts one observation of a tenant has read, by SHA-256 hex, so a text a hundred manifests
+/// name is opened once and not a hundred times. Each manifest still checks its own expansion's
+/// length and SHA-256, so a cached text is held to every manifest that names it.
+#[derive(Default)]
+pub(crate) struct Texts {
+    held: BTreeMap<String, Vec<u8>>,
+    bytes: usize,
+}
+
+impl Texts {
+    /// Append the text `hex` of `tenant` to `out`, from the cache or else from its file.
+    fn append(
+        &mut self,
+        root: &Path,
+        tenant: &str,
+        hex: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EventLogError> {
+        if let Some(text) = self.held.get(hex) {
+            out.extend_from_slice(text);
+            return Ok(());
+        }
+        let text = read_file(&text_path(root, tenant, hex))
+            .map_err(|_| corrupt("a split blob whose text is missing"))?;
+        out.extend_from_slice(&text);
+        if self.bytes + text.len() <= TEXT_CACHE_BYTES {
+            self.bytes += text.len();
+            self.held.insert(hex.to_owned(), text);
+        }
+        Ok(())
+    }
+}
+
+fn expand_file_with(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+    path: &Path,
+    texts: &mut Texts,
+) -> Result<Vec<u8>, EventLogError> {
     let bytes = fs::read(path).map_err(backend)?;
     let manifest: Value =
         serde_json::from_slice(&bytes).map_err(|_| corrupt("a split blob that is not JSON"))?;
@@ -303,7 +351,7 @@ pub(crate) fn expand_file(
         .and_then(Value::as_array)
         .ok_or_else(|| corrupt("a split blob without parts"))?;
     let mut out = Vec::new();
-    expand(root, tenant, parts, &mut out)?;
+    expand(root, tenant, parts, &mut out, texts)?;
     if map.get("length").and_then(Value::as_u64) != Some(out.len() as u64)
         || map.get("sha256").and_then(Value::as_str)
             != Some(format!("sha256:{}", sha256_hex(&out)).as_str())
@@ -318,6 +366,7 @@ fn expand(
     tenant: &str,
     parts: &[Value],
     out: &mut Vec<u8>,
+    texts: &mut Texts,
 ) -> Result<(), EventLogError> {
     for part in parts {
         match part {
@@ -326,12 +375,10 @@ fn expand(
                 if let Some(reference) = map.get("text").and_then(Value::as_str) {
                     let hex = text_hex(reference)
                         .ok_or_else(|| corrupt("a split blob naming a text badly"))?;
-                    let text = fs::read(text_path(root, tenant, hex))
-                        .map_err(|_| corrupt("a split blob whose text is missing"))?;
-                    out.extend_from_slice(&text);
+                    texts.append(root, tenant, hex, out)?;
                 } else if let Some(nested) = map.get("hex").and_then(Value::as_array) {
                     let mut inner = Vec::new();
-                    expand(root, tenant, nested, &mut inner)?;
+                    expand(root, tenant, nested, &mut inner, texts)?;
                     push_hex(out, &inner);
                 } else {
                     return Err(corrupt("a split blob with an unknown part"));
@@ -343,30 +390,47 @@ fn expand(
     Ok(())
 }
 
-/// Every text a manifest's parts name.
-fn referenced(parts: &[Value], into: &mut BTreeSet<String>) {
+/// Every text a manifest's parts name, refusing a part that is not one a reader expands: a part
+/// this walk skipped could name a text it would then not count.
+fn referenced(parts: &[Value], into: &mut BTreeSet<String>) -> Result<(), &'static str> {
     for part in parts {
-        if let Value::Object(map) = part {
-            if let Some(hex) = map.get("text").and_then(Value::as_str).and_then(text_hex) {
-                into.insert(hex.to_owned());
+        match part {
+            Value::String(_) => {}
+            Value::Object(map) if map.len() == 1 => {
+                if let Some(reference) = map.get("text").and_then(Value::as_str) {
+                    into.insert(text_hex(reference).ok_or("a text named badly")?.to_owned());
+                } else if let Some(nested) = map.get("hex").and_then(Value::as_array) {
+                    referenced(nested, into)?;
+                } else {
+                    return Err("an unknown part");
+                }
             }
-            if let Some(nested) = map.get("hex").and_then(Value::as_array) {
-                referenced(nested, into);
-            }
+            _ => return Err("an unknown part"),
         }
     }
+    Ok(())
 }
 
-fn manifest_parts(path: &Path) -> Vec<Value> {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-        .and_then(|mut map| map.remove("parts"))
-        .and_then(|parts| match parts {
-            Value::Array(parts) => Some(parts),
-            _ => None,
-        })
-        .unwrap_or_default()
+/// Every text the manifest at `path` names. A manifest that cannot be read or decoded is an
+/// error, never an empty list: deleting by an empty list would keep a deleted blob's text, or
+/// remove a text a blob still names.
+fn manifest_texts(path: &Path) -> Result<BTreeSet<String>, EventLogError> {
+    let incomplete = |why: &str| {
+        backend(format!(
+            "incomplete blob cleanup: the split blob {} {why}; nothing was removed",
+            path.display()
+        ))
+    };
+    let bytes = fs::read(path).map_err(|error| incomplete(&format!("cannot be read ({error})")))?;
+    let map = serde_json::from_slice::<Map<String, Value>>(&bytes)
+        .map_err(|_| incomplete("is not a JSON object"))?;
+    let parts = map
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| incomplete("has no parts"))?;
+    let mut texts = BTreeSet::new();
+    referenced(parts, &mut texts).map_err(|why| incomplete(&format!("holds {why}")))?;
+    Ok(texts)
 }
 
 /// The bytes the tree holds for blob `digest` of `tenant`, in whichever form it holds them.
@@ -379,7 +443,17 @@ pub(crate) fn read_blob(
     tenant: &str,
     digest: &str,
 ) -> Result<Option<Vec<u8>>, EventLogError> {
-    let raw = match fs::read(blob_path(root, tenant, digest)) {
+    read_blob_with(root, tenant, digest, &mut Texts::default())
+}
+
+/// [`read_blob`], reading each text through `texts`.
+fn read_blob_with(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+    texts: &mut Texts,
+) -> Result<Option<Vec<u8>>, EventLogError> {
+    let raw = match read_file(&blob_path(root, tenant, digest)) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(backend(error)),
@@ -388,7 +462,7 @@ pub(crate) fn read_blob(
     if !manifest.exists() {
         return Ok(raw);
     }
-    let expanded = expand_file(root, tenant, digest, &manifest)?;
+    let expanded = expand_file_with(root, tenant, digest, &manifest, texts)?;
     match raw {
         Some(raw) if raw != expanded => Err(corrupt("a blob whose two forms disagree")),
         _ => Ok(Some(expanded)),
@@ -429,25 +503,60 @@ pub(crate) fn write_blob(
     }
 }
 
-/// Remove blob `digest` of `tenant` in both forms, and every text only it named.
-pub(crate) fn delete_blob(root: &Path, tenant: &str, digest: &str) -> Result<(), EventLogError> {
-    remove_if_present(&blob_path(root, tenant, digest))?;
+/// The files deleting one blob removes, resolved before any of them is: the blob in both forms
+/// and every text only it names.
+pub(crate) struct BlobDeletion {
+    files: Vec<PathBuf>,
+}
+
+impl BlobDeletion {
+    /// Remove every file of the plan.
+    pub(crate) fn apply(self) -> Result<(), EventLogError> {
+        for path in &self.files {
+            remove_if_present(path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve what deleting blob `digest` of `tenant` removes, reading every split-blob manifest of
+/// the tenant and removing nothing.
+///
+/// # Errors
+/// An incomplete-cleanup error when the blob's own manifest or any other manifest of the tenant
+/// cannot be read, decoded or walked, or the manifests cannot be listed: the set of texts still
+/// named is then unknown, so no text may be judged unused.
+pub(crate) fn plan_delete(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+) -> Result<BlobDeletion, EventLogError> {
+    let incomplete = |what: &str, error: &dyn std::fmt::Display| {
+        backend(format!(
+            "incomplete blob cleanup: {what} ({error}); nothing was removed"
+        ))
+    };
+    let mut files = vec![blob_path(root, tenant, digest)];
     let manifest = split_path(root, tenant, digest);
-    if !manifest.exists() {
-        return Ok(());
+    // `exists` answers false when the manifest cannot be looked up; that is not an absence.
+    let present = manifest
+        .try_exists()
+        .map_err(|error| incomplete("the split blob cannot be looked up", &error))?;
+    if !present {
+        return Ok(BlobDeletion { files });
     }
-    let mut named = BTreeSet::new();
-    referenced(&manifest_parts(&manifest), &mut named);
-    remove_if_present(&manifest)?;
-    for other in split_files(root, tenant)? {
-        let mut still = BTreeSet::new();
-        referenced(&manifest_parts(&other.1), &mut still);
-        named.retain(|hex| !still.contains(hex));
+    let mut named = manifest_texts(&manifest)?;
+    let others = split_files(root, tenant)
+        .map_err(|error| incomplete("the split blobs cannot be listed", &error))?;
+    for (_, other) in others {
+        if other != manifest {
+            let still = manifest_texts(&other)?;
+            named.retain(|hex| !still.contains(hex));
+        }
     }
-    for hex in named {
-        remove_if_present(&text_path(root, tenant, &hex))?;
-    }
-    Ok(())
+    files.push(manifest);
+    files.extend(named.iter().map(|hex| text_path(root, tenant, hex)));
+    Ok(BlobDeletion { files })
 }
 
 fn remove_if_present(path: &Path) -> Result<(), EventLogError> {
@@ -474,6 +583,10 @@ fn files_under(directory: &Path) -> Result<Vec<(String, PathBuf)>, EventLogError
 }
 
 /// Every split-blob manifest of `tenant`, with the digest its file name spells.
+///
+/// # Errors
+/// Refuses a manifest that is not at the path its digest names: every reader looks a blob up at
+/// that path only, so a file elsewhere would be skipped, and its blob silently missing.
 pub(crate) fn split_files(
     root: &Path,
     tenant: &str,
@@ -483,19 +596,34 @@ pub(crate) fn split_files(
         let Some(stem) = name.strip_suffix(".json") else {
             return Err(corrupt("a split blob file"));
         };
-        found.push((crate::history::unescape(stem)?, path));
+        let digest = crate::history::unescape(stem)?;
+        if split_path(root, tenant, &digest) != path {
+            return Err(corrupt(
+                "a split blob file outside the path its digest names",
+            ));
+        }
+        found.push((digest, path));
     }
     Ok(found)
 }
 
 /// Every raw blob file of `tenant`, with the digest its file name spells.
+///
+/// # Errors
+/// Refuses a blob file that is not at the path its digest names, as [`split_files`] does.
 pub(crate) fn raw_files(
     root: &Path,
     tenant: &str,
 ) -> Result<Vec<(String, PathBuf)>, EventLogError> {
     files_under(&tenant_dir(root, tenant).join("blobs"))?
         .into_iter()
-        .map(|(name, path)| Ok((crate::history::unescape(&name)?, path)))
+        .map(|(name, path)| {
+            let digest = crate::history::unescape(&name)?;
+            if blob_path(root, tenant, &digest) != path {
+                return Err(corrupt("a blob file outside the path its digest names"));
+            }
+            Ok((digest, path))
+        })
         .collect()
 }
 
@@ -517,8 +645,9 @@ pub(crate) fn tenant_blobs(
             .map(|(digest, _)| digest),
     );
     let mut blobs = BTreeMap::new();
+    let mut texts = Texts::default();
     for digest in digests {
-        if let Some(bytes) = read_blob(root, tenant, &digest)? {
+        if let Some(bytes) = read_blob_with(root, tenant, &digest, &mut texts)? {
             blobs.insert(digest, bytes);
         }
     }
@@ -548,16 +677,29 @@ pub(crate) fn convert(
         }
         write_once(&path, text)?;
     }
-    let manifest = split_path(root, tenant, digest);
-    write_once(&manifest, &cut.manifest)?;
-    if expand_file(root, tenant, digest, &manifest)? != bytes {
+    write_once(&split_path(root, tenant, digest), &cut.manifest)?;
+    drop_raw(root, tenant, digest, bytes)?;
+    Ok(written)
+}
+
+/// Remove the raw file of blob `digest` once its split form reads back as `bytes`, and make the
+/// removal durable. Finishes a conversion, and cleans up a raw copy an interrupted conversion or
+/// a merge left beside a split form that already serves the same bytes.
+pub(crate) fn drop_raw(
+    root: &Path,
+    tenant: &str,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), EventLogError> {
+    if expand_file(root, tenant, digest, &split_path(root, tenant, digest))? != bytes {
         return Err(corrupt("a split blob that does not read back"));
     }
-    remove_if_present(&blob_path(root, tenant, digest))?;
-    if let Some(directory) = blob_path(root, tenant, digest).parent() {
+    let raw = blob_path(root, tenant, digest);
+    remove_if_present(&raw)?;
+    if let Some(directory) = raw.parent() {
         crate::layout::sync_dir(directory)?;
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Rewrite `store.json` with `format`, keeping its identity.
@@ -688,6 +830,37 @@ mod tests {
             cut.texts.len(),
             2,
             "expected the shared body once and the damaged line as its own text"
+        );
+    }
+
+    /// One scan of a tenant whose split blobs all name one text opens that text once; every
+    /// manifest still expands to its own bytes.
+    #[test]
+    fn a_scan_opens_a_text_many_manifests_name_once() {
+        const BLOBS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let body = "a paragraph many records share\\n".repeat(100);
+        let mut expected = BTreeMap::new();
+        for index in 0..BLOBS {
+            let digest = format!("sha256:blob-{index:02}");
+            let bytes = format!(r#"{{"body":"{body}","n":{index}}}"#).into_bytes();
+            write_blob(root, "tenant-a", &digest, &bytes, true).unwrap();
+            expected.insert(digest, bytes);
+        }
+        let texts = files_under(&tenant_dir(root, "tenant-a").join("texts")).unwrap();
+        assert_eq!(texts.len(), 1, "the shared body was not one text");
+        let text = &texts[0].1;
+        crate::layout::FILE_READS.with(|reads| reads.borrow_mut().clear());
+
+        let served = tenant_blobs(root, "tenant-a").unwrap();
+
+        assert_eq!(served, expected);
+        let opened = crate::layout::FILE_READS.with(|reads| reads.borrow().get(text).copied());
+        assert_eq!(
+            opened,
+            Some(1),
+            "one scan read the text {BLOBS} manifests name more than once"
         );
     }
 

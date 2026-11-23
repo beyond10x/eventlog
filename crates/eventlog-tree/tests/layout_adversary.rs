@@ -39,10 +39,33 @@ fn files(root: &Path) -> Vec<PathBuf> {
 /// both append under the one layout that was published, and the store opens again and serves
 /// every append. A publish that replaced the first `store.json` would leave the first handle's
 /// events in a layout the store no longer declares.
+///
+/// Each round is a store of its own, and its time is almost all waiting for the disk to sync
+/// (about 0.5 s a round), so the rounds run on worker threads side by side: the same rounds and
+/// assertions, in a fraction of the wall time of running them one after another.
 #[test]
 fn two_handles_creating_one_store_in_different_layouts_both_open_and_agree() {
     const ROUNDS: usize = 300;
-    for round in 0..ROUNDS {
+    const WORKERS: usize = 16;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..WORKERS {
+            scope.spawn(|| {
+                loop {
+                    let round = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if round >= ROUNDS {
+                        break;
+                    }
+                    creation_race_round(round);
+                }
+            });
+        }
+    });
+}
+
+/// One round of [`two_handles_creating_one_store_in_different_layouts_both_open_and_agree`].
+fn creation_race_round(round: usize) {
+    {
         let directory = tempfile::tempdir().unwrap();
         let root = Arc::new(directory.path().join("store"));
         let barrier = Arc::new(Barrier::new(2));
