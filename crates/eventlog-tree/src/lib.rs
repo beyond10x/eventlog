@@ -291,7 +291,8 @@ impl TreeEventStore {
 
     /// Open the store at `root` with `inline` projectors registered before its history is
     /// replayed, so the replay runs once. [`TreeEventStore::open`] followed by
-    /// [`InlineProjectionAdmin::attach_inline_existing`] replays twice.
+    /// [`EventStore::create_projections`] and [`InlineProjectionAdmin::attach_inline_existing`],
+    /// which attaches only what the handle admitted, replays twice.
     ///
     /// # Errors
     /// As [`TreeEventStore::open`], and whatever a projector refuses during the replay.
@@ -1646,6 +1647,18 @@ impl InlineProjectionAdmin for TreeEventStore {
             if state.poisoned {
                 return Err(EventLogError::Closed);
             }
+            // Attachment is to projections admitted already; registering the projector for the
+            // replay below would create its tables, so a misspelled or never admitted projection
+            // would report success. The files keep no projection structure: what this handle
+            // admitted is what `create_projections` admitted on it. An engine holding exactly those
+            // admissions judges the attachment by the rules SQLite attaches by.
+            let admitted = SqliteEventStore::in_memory("tree").await?;
+            for admission in &state.catch_up {
+                admitted.create_projections(Arc::clone(admission)).await?;
+            }
+            admitted
+                .attach_inline_existing(Arc::clone(&projector))
+                .await?;
             // The engine freezes inline registration once it has served, and the replay that
             // loaded this history already has. So the engine is rebuilt from the files with the
             // projector registered before the replay, which is what attaching to existing history

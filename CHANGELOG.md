@@ -35,6 +35,8 @@ under bare-version tags such as `0.1.0`.
   refuses the retry.
 - Tree: an open requests file metadata once per history file instead of twice, and not at all
   for a directory.
+- Tree: `attach_inline_existing` refuses a projection that `create_projections` did not admit on
+  the handle, or admitted with another shape, instead of creating it and reporting success.
 
 ## 0.9.4 — 2026-11-11
 
