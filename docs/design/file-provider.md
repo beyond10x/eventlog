@@ -36,6 +36,8 @@ On reopen, an intent plus an exact matching frame prefix proves an uncommitted t
 truncated. A complete frame that had not reached manifest publication is also uncommitted.
 An unexplained suffix, including concatenated branch histories, refuses. There is no merge driver.
 An error after manifest publication can report `UnknownCommit`; resolve the original identity.
+A cleanup that fails after publication (object or snapshot disposal) reports `Committed`: the
+outcome is known, and the next commit that changes bindings or a reopen disposes again.
 
 An open handle checks that every subsequent history extends the exact head it observed. A
 longer fork is not accepted merely because its sequence increased. Privacy starts a new epoch;
@@ -326,8 +328,8 @@ frame the group commits. The barrier is therefore in exactly the same place it w
 manifest that publishes the frame — and what changed is how many frames the same work costs. The
 durability promise is unchanged in both directions: nothing of the batch is observable before that
 manifest, and a crash before it leaves object files no committed frame names, which the refusing
-transaction itself, the next committed transaction and the complete opener dispose of as
-unreferenced. A deduplicated group retry binds nothing, because the original commit already bound
+transaction itself, the next committed transaction that changes bindings and the complete opener
+dispose of as unreferenced. A deduplicated group retry binds nothing, because the original commit already bound
 it — and that is checked rather than assumed. A group's identity is its tenant, members and command
 meta and deliberately not its batch, so the batch the commit carried is **recorded in the group's
 own committed operation**, and a retry's batch is compared against that record.
@@ -357,7 +359,11 @@ after it was written — its transaction had nothing after it. A batch written i
 a member append, an inline projector or an admission guard may all refuse after the objects are
 on disk. So the refusing transaction disposes of the objects it wrote before it returns, by object
 identity rather than by what its rolled-back in-memory state references. The next committed
-transaction and the complete opener remain the disposers for objects a crash leaves behind.
+transaction that changes bindings (binds or unbinds a blob, or commits a privacy rewrite) and the
+complete opener remain the disposers for objects a crash leaves behind. A commit that binds nothing,
+such as an event-only append, a cursor or a projection row, leaves the live set unchanged and does
+not list or synchronize the object directory: that sweep would cost work proportional to unrelated
+blob storage on every append.
 
 **The guarded form.** `append_group_guarded_with_blobs` is the same commit under an admission
 guard, and it is on the `AtomicEventStore` port rather than on this provider because the caller it

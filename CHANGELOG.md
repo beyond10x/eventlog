@@ -18,6 +18,8 @@ under bare-version tags such as `0.1.0`.
 - SQLite: `SqliteEventStore::restore_events_at` queues restored events with the global position
   each takes, `positions` reads every event's position and the highest one ever assigned
   (`EventPositions`), and `reserve_positions_through` keeps later appends above a position.
+- Core: `EventLogError::Committed { cleanup }`, returned when a commit is published and its
+  outcome known but the cleanup after it failed. The command is not to be retried as failed.
 
 ### Changed
 
@@ -88,6 +90,55 @@ under bare-version tags such as `0.1.0`.
 - SQLite: the populated legacy blob migration walks its `(tenant_id, digest)` cursor with one
   row-value range on the primary key instead of an expanded `OR` that rescanned the tenant's
   earlier digests on every row. Transaction, byte-count and integrity checks are unchanged.
+- File: a deduplicated guarded retry of a blob-bearing group still runs its admission, but no
+  longer commits what that admission staged. A counter reservation made by the retry used to be
+  journaled with zero new events, so each retry charged the quota again; it is now rolled back,
+  as SQLite rolls it back, and the original receipt is returned.
+- File: forgetting a tenant the history does not hold no longer rewrites the journal or advances
+  its epoch, so other open handles keep working; leftover snapshot and object disposal still runs.
+- File: a redaction or tenant erasure drops the handle's capture view of the replaced history at
+  once, including when the rewrite fails after publishing, instead of keeping it in memory until a
+  later call.
+- File: `rebuild_projection` refuses, before clearing a row, a projector whose name or table an
+  attached inline projector owns ("rebuild requires a catch-up projection") unless it is that
+  attached instance itself; it used to replace inline rows with any supplied projector's results.
+  `run_catch_up` refuses a differently named projector over an inline table as well.
+- File: a delayed `save_snapshot_checked` of an older fold no longer replaces a newer cached
+  snapshot of the same generation; it returns true and keeps the newer one, so the replay point
+  never moves back. A cache of an earlier generation is still replaced at any revision.
+- File: a commit whose object or snapshot cleanup fails after publication returns
+  `EventLogError::Committed` instead of `UnknownCommit` (atomic content) or a plain backend error
+  (other writes, redaction, tenant erasure). The next commit that changes bindings, or a reopen,
+  retries the cleanup.
+
+### Performance
+
+- File: `read_feed` and catch-up start at the requested position instead of walking the store
+  from its first event. Paging 128 events in pages of 8 visits 143 events instead of 1,103, and an
+  idle catch-up poll visits none.
+- File: an idle `run_catch_up` poll whose cursor is already current commits nothing. Twenty idle
+  polls used to add twenty journal frames (369 to 7,901 bytes); a projector without a cursor still
+  records its first one.
+- File: opening a store reads, chains and replays its journal once instead of twice, under the
+  writer lock of that open; recovery, snapshot and object disposal and object hashing are unchanged.
+- File: a commit that binds or unbinds no blob no longer lists and synchronizes the blob directory.
+  Objects a crash leaves behind are disposed of by the next commit that changes bindings and by the
+  complete opener.
+- File: a blob batch finds digests it already binds through an index instead of scanning the batch,
+  so 1,024 distinct digests no longer cost 523,776 comparisons. A repeated digest with different
+  bytes still refuses the group.
+- File: `projection_find` reads an in-memory index by tenant, projection, field, value and row
+  key instead of every row of the projection, so a lookup of a value no row holds visits no row
+  (it used to evaluate the field of every row: 512 for 512 rows). The journal format is unchanged.
+- File: deciding which cached snapshots are live builds one set of generations instead of scanning
+  every generation per snapshot, so opening a store with 64 live snapshots no longer makes 2,080
+  comparisons.
+- File: `projection_list` seeks to the first key past its cursor instead of walking the rows from
+  the first key, so a page visits the rows it returns and at most one more (paging 512 rows by 32
+  used to evaluate 4,864).
+- File: an inline registration resumes the handle's verified view instead of opening and replaying
+  the whole journal, and keeps that view for the next call (four registrations on a 128-frame store
+  used to visit 518 extra frames).
 
 ### Documentation
 

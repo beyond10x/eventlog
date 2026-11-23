@@ -140,3 +140,92 @@ async fn a_handle_of_the_previous_epoch_never_serves_its_own_snapshot_after_reda
     let fresh = FileEventStore::open(directory.path()).await.unwrap();
     assert_eq!(fresh.load_snapshot(&stream("a")).await.unwrap(), None);
 }
+
+/// Review L25, the assertion of the shared exercise `run_snapshot_revision_is_monotonic`: within
+/// one generation a delayed save of an older fold keeps the newer cache, and a cache of an earlier
+/// generation, planted back after the redacting commit disposed of it, is replaced at any revision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delayed_older_save_never_moves_the_cached_revision_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).await.unwrap();
+    let events: Vec<_> = (1..=4).map(|value| event("item.counted", value)).collect();
+    store
+        .append(
+            &stream("m"),
+            Expected::NoStream,
+            &events,
+            &meta("monotonic", &json!({})),
+        )
+        .await
+        .unwrap();
+    let observed = store
+        .snapshot_generation(&stream("m"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .save_snapshot_checked(&stream("m"), &snapshot(3, "three"), &observed)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .save_snapshot_checked(&stream("m"), &snapshot(1, "one"), &observed)
+            .await
+            .unwrap(),
+        "an older fold of current history is not a stale observation"
+    );
+    assert_eq!(
+        store.load_snapshot(&stream("m")).await.unwrap(),
+        Some(snapshot(3, "three")),
+        "the replay point does not move back within a generation"
+    );
+    assert!(
+        store
+            .save_snapshot_checked(&stream("m"), &snapshot(4, "four"), &observed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream("m")).await.unwrap(),
+        Some(snapshot(4, "four"))
+    );
+
+    let cache = directory.path().join(".cache");
+    let files: Vec<_> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    let (path, bytes) = (files[0].clone(), std::fs::read(&files[0]).unwrap());
+    store
+        .append(
+            &stream("m"),
+            Expected::Exact(4),
+            &[event("item.counted", 5)],
+            &meta("monotonic-5", &json!({})),
+        )
+        .await
+        .unwrap();
+    store.redact(&stream("m"), 5, "erased").await.unwrap();
+    assert_eq!(store.load_snapshot(&stream("m")).await.unwrap(), None);
+    std::fs::write(&path, &bytes).unwrap();
+    let renewed = store
+        .snapshot_generation(&stream("m"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(renewed, observed);
+    assert!(
+        store
+            .save_snapshot_checked(&stream("m"), &snapshot(1, "renewed"), &renewed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.load_snapshot(&stream("m")).await.unwrap(),
+        Some(snapshot(1, "renewed")),
+        "a new generation replaces the previous generation's cache"
+    );
+}

@@ -781,6 +781,11 @@ pub enum EventLogError {
         report: BlobMigrationReport,
         cleanup: Box<EventLogError>,
     },
+    /// The commit is published and its outcome is known, but the cleanup after it failed (an
+    /// unreferenced object or cached snapshot was not removed). Do not retry the command as if it
+    /// failed; the next commit that changes bindings, or a reopen, retries the cleanup.
+    #[error("commit published, but cleanup after it failed: {cleanup}")]
+    Committed { cleanup: Box<EventLogError> },
 
     #[error("stream is at version {actual}, not {expected}")]
     Conflict { expected: u64, actual: u64 },

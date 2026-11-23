@@ -639,3 +639,67 @@ async fn a_resumed_handle_never_serves_a_cache_file_of_a_retired_generation() {
     assert!(reader.load_snapshot(&stream("a")).await.unwrap().is_none());
     assert_eq!(reader.stream_version(&stream("b")).await.unwrap(), Some(1));
 }
+
+fn committed_with_backend_cleanup(outcome: &Result<(), EventLogError>) -> bool {
+    matches!(
+        outcome,
+        Err(EventLogError::Committed { cleanup }) if matches!(**cleanup, EventLogError::Backend(_))
+    )
+}
+
+/// Review L56: a cleanup that fails after the commit is published reports the known commit, not
+/// a plain failure the caller would retry. The next commit that changes bindings, or a reopen,
+/// disposes of what the failed cleanup left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleanup_failure_after_publication_reports_a_known_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let store = FileEventStore::open(root).await.unwrap();
+    store.put_blob(&tenant(), "doomed", b"bytes").await.unwrap();
+    // A directory named like an object stops the disposal after the unbinding commit.
+    let blocker = root.join("blobs").join(eventlog_core::new_event_id());
+    fs::create_dir(&blocker).unwrap();
+    let outcome = store.delete_blob(&tenant(), "doomed").await;
+    assert!(
+        committed_with_backend_cleanup(&outcome),
+        "an unbinding published before its disposal failed reported {outcome:?}"
+    );
+    // The handle reopens completely after the error, and that opener disposes again once the
+    // obstruction is gone: the unbinding is in the history.
+    fs::remove_dir(&blocker).unwrap();
+    assert_eq!(store.get_blob(&tenant(), "doomed").await.unwrap(), None);
+    store.put_blob(&tenant(), "next", b"other").await.unwrap();
+    assert_eq!(
+        fs::read_dir(root.join("blobs")).unwrap().count(),
+        1,
+        "the unbound object was disposed of after the obstruction went"
+    );
+
+    store
+        .append(
+            &stream("p"),
+            Expected::NoStream,
+            &[event("item.created", 1)],
+            &meta("privacy", &json!({})),
+        )
+        .await
+        .unwrap();
+    let blocker = root.join(".cache").join("not-a-snapshot");
+    fs::create_dir_all(&blocker).unwrap();
+    let outcome = store.redact(&stream("p"), 1, "erased").await.map(|_| ());
+    assert!(
+        committed_with_backend_cleanup(&outcome),
+        "a rewrite published before its snapshot cleanup failed reported {outcome:?}"
+    );
+    fs::remove_dir(&blocker).unwrap();
+    let reopened = FileEventStore::open(root).await.unwrap();
+    assert!(
+        reopened
+            .read_stream(&stream("p"), 0, 10)
+            .await
+            .unwrap()
+            .events[0]
+            .is_redacted(),
+        "the rewrite is committed"
+    );
+}
