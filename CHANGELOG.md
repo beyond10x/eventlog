@@ -17,8 +17,8 @@ under bare-version tags such as `0.1.0`.
   once, including when the rewrite fails after publishing, instead of keeping it in memory until a
   later call.
 - File: `rebuild_projection` refuses, before clearing a row, a projector whose name or table an
-  attached inline projector owns ("rebuild requires a catch-up projection", as SQLite and
-  PostgreSQL refuse it); it used to replace inline rows with the supplied projector's results.
+  attached inline projector owns ("rebuild requires a catch-up projection") unless it is that
+  attached instance itself; it used to replace inline rows with any supplied projector's results.
   `run_catch_up` refuses a differently named projector over an inline table as well.
 
 ### Performance

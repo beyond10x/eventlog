@@ -2122,9 +2122,16 @@ impl EventStore for FileEventStore {
         let tenant = tenant.clone();
         Box::pin(self.transaction(move |tx| {
             Box::pin(async move {
-                // Refused before a row is cleared, as SQLite and PostgreSQL refuse it: an inline
-                // table is rebuilt by `rebuild_inline_projection`, with the attached projector.
-                if tx.driven_inline(projector.as_ref()) {
+                // Refused before a row is cleared: an inline table is rebuilt with the projector
+                // attached to it, through `rebuild_inline_projection` or by passing that very
+                // instance here (the complete rebuild a redaction requires). Any other projector
+                // over it — another name, or the same name in another instance — would leave rows
+                // of a configuration later appends do not run.
+                let attached = tx
+                    .inline
+                    .iter()
+                    .any(|inline| Arc::ptr_eq(inline, &projector));
+                if !attached && tx.driven_inline(projector.as_ref()) {
                     return Err(EventLogError::Invalid(
                         "rebuild requires a catch-up projection".into(),
                     ));
@@ -4132,15 +4139,18 @@ mod catch_up_ownership {
 
     /// The catch-up rebuild refuses a table an attached inline projector owns, under its own name
     /// or another's, before a row is cleared: it used to clear the inline rows and fold them with
-    /// the supplied projector, while later appends ran the attached one. The catch-up poll refuses
-    /// the table as well, and the inline rebuild still rebuilds it with the attached projector.
+    /// the supplied projector, while later appends ran the attached one. A second instance of the
+    /// attached projector's own type is refused too. The catch-up poll refuses the table as well;
+    /// the inline rebuild, and the catch-up rebuild given the attached instance itself, still
+    /// rebuild it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_catch_up_rebuild_refuses_a_table_an_inline_projector_owns() {
         let owner = TenantId::new("inline-owned").unwrap();
         let stream = StreamId::new(owner.clone(), "item", "one").unwrap();
         let directory = tempfile::tempdir().unwrap();
         let store = FileEventStore::open(directory.path()).await.unwrap();
-        store.register_inline(Arc::new(Tally)).await.unwrap();
+        let attached: Arc<dyn Projector> = Arc::new(Tally);
+        store.register_inline(attached.clone()).await.unwrap();
         store
             .append(
                 &stream,
@@ -4185,6 +4195,8 @@ mod catch_up_ownership {
             .await
             .unwrap();
         assert_eq!(rebuilt.applied, 1);
+        assert_eq!(inline_rows().await, before);
+        assert_eq!(store.rebuild_projection(attached, &owner).await.unwrap(), 1);
         assert_eq!(inline_rows().await, before);
     }
 }
