@@ -9,5 +9,27 @@ final-status-level = "slow"
 path = "junit.xml"
 
 [[profile.default.overrides]]
-filter = "binary_id(eventlog-postgres::conformance) | binary_id(eventlog-postgres::runtime_context)"
+filter = '''
+binary_id(eventlog-postgres::runtime_context)
+| (binary_id(eventlog-postgres::conformance) & (
+    test(=a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid)
+  | test(=a_reader_never_skips_an_event_that_committed_late)
+  | test(=a_restored_history_is_settled_by_migrate_and_refused_by_open_until_then)
+  | test(=contended_catch_up_reuses_the_same_settled_session)
+  | test(=empty_catch_up_reuses_the_same_settled_session)
+  | test(=hosted_schema_admission_refuses_rewrite_rules)
+  | test(=killed_projector_restarts_competing_workers_without_partial_view_or_cursor)
+  | test(=postgres_callback_blob_corruption_poison_rolls_back_every_owner)
+  | test(=rebuild_preserves_other_tenants_and_previous_view_on_failure)
+  | test(=registration_freezes_and_pool_refuses_bounded_overload)
+  | test(=shutdown_cancellation_preserves_public_pool_lifetimes)
+  | test(=the_inline_projection_exercise_passes_on_postgresql)
+  | test(=the_paging_rule_holds_on_postgresql)
+  | test(=the_projection_exercise_passes_on_postgresql)
+  | test(=the_shared_exercise_passes_on_postgresql)
+  | test(=unsettled_catch_up_rollback_never_recycles_a_session)
+  | test(=verified_tls_requires_matching_server_and_separate_application_role)
+))
+'''
 threads-required = "num-test-threads"
+priority = -100

@@ -44,13 +44,25 @@ impl PostgresConnectionAuthority for VerifiedTlsAuthority {
 }
 
 /// The watermark couples feed visibility across every connection in the instance
-/// (`pg_snapshot_xmin` is cluster-wide), so a test holding a transaction open while another
-/// asserts on its feed is a race by design. One at a time, deterministically.
-static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// (`pg_snapshot_xmin` is cluster-wide, across databases too), so a test that writes while
+/// another asserts on its feed is a race by design.
+///
+/// Every async case takes this lock. A case takes it for writing, and runs alone, when it reads
+/// the feed, catches up or rebuilds (the shared exercises `run`, `run_projections`,
+/// `run_inline_projections`, `run_paging` and `run_rebuild_isolation` among them), or uses the
+/// role `eventlog_test_application`, which another binary's case uses too. Every other case takes
+/// it for reading and runs beside the rest: it writes only under its own prefix and reads its
+/// own rows, and the cluster-wide state it reads (`pg_stat_activity`) it filters by a name of its
+/// own.
+///
+/// The lock orders the cases inside one `cargo test` process. Nextest runs each case in a
+/// process of its own, so `.config/nextest.toml` runs every case that takes it for writing with
+/// no other PostgreSQL test beside it; `tests/production_admission.rs` holds the two lists equal.
+static INSTANCE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 #[tokio::test]
 async fn rewrite_rules_are_rejected_on_every_durable_table() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: rewrite-rule admission requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -115,7 +127,7 @@ async fn rewrite_rules_are_rejected_on_every_durable_table() {
 async fn rewrite_rules_are_rejected_during_projection_migration_and_registration() {
     use eventlog_postgres::{PoolOptions, PostgresConfig};
     use std::sync::Arc;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: rewrite-rule projection admission requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -167,7 +179,7 @@ async fn rewrite_rules_are_rejected_during_projection_migration_and_registration
 
 #[tokio::test]
 async fn schema_admission_refuses_rules_that_suppress_command_receipts() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: schema rewrite-rule review requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -213,7 +225,7 @@ async fn schema_admission_refuses_rules_that_suppress_command_receipts() {
 async fn hosted_schema_admission_refuses_rewrite_rules() {
     use eventlog_postgres::{PoolOptions, PostgresConfig};
     use rustls::pki_types::pem::PemObject;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: hosted rewrite-rule review requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -258,7 +270,6 @@ async fn hosted_schema_admission_refuses_rewrite_rules() {
 async fn assert_catch_up_reuses_session(contended: bool) {
     use eventlog_core::CatchUpRunner;
     use std::sync::Arc;
-    let _exclusive = EXCLUSIVE.lock().await;
     let Some(url) = url() else {
         eprintln!("skipped: catch-up reuse requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -377,11 +388,13 @@ async fn assert_catch_up_reuses_session(contended: bool) {
 
 #[tokio::test]
 async fn empty_catch_up_reuses_the_same_settled_session() {
+    let _instance = INSTANCE.write().await;
     assert_catch_up_reuses_session(false).await;
 }
 
 #[tokio::test]
 async fn contended_catch_up_reuses_the_same_settled_session() {
+    let _instance = INSTANCE.write().await;
     assert_catch_up_reuses_session(true).await;
 }
 
@@ -394,7 +407,7 @@ async fn unsettled_catch_up_rollback_never_recycles_a_session() {
         sync::Arc,
         time::Duration,
     };
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: rollback response loss requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -551,7 +564,7 @@ async fn pool_observation_preserves_two_connections_and_four_waiters() {
             })
         }
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: pool observation requires EVENTLOG_TEST_POSTGRES_URL");
         return;
@@ -817,7 +830,7 @@ async fn store(prefix: &str) -> Option<PostgresEventStore> {
 
 #[tokio::test]
 async fn the_shared_exercise_passes_on_postgresql() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(store) = store("conformance").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -827,7 +840,7 @@ async fn the_shared_exercise_passes_on_postgresql() {
 
 #[tokio::test]
 async fn a_reader_never_skips_an_event_that_committed_late() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -893,7 +906,7 @@ async fn a_reader_never_skips_an_event_that_committed_late() {
 
 #[tokio::test]
 async fn the_projection_exercise_passes_on_postgresql() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(store) = store("projections").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -905,7 +918,7 @@ async fn the_projection_exercise_passes_on_postgresql() {
 
 #[tokio::test]
 async fn the_inline_projection_exercise_passes_on_postgresql() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(store) = store("inline").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -939,6 +952,7 @@ async fn an_8000_byte_indexed_value_under_the_longest_tenant_is_indexed_and_foun
             })
         }
     }
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("idx_large").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1010,7 +1024,7 @@ async fn drop_projection_tables(store: &PostgresEventStore, tables: &[&str]) {
 
 #[tokio::test]
 async fn the_paging_rule_holds_on_postgresql() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(store) = store("paging").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1022,7 +1036,7 @@ async fn the_paging_rule_holds_on_postgresql() {
 
 #[tokio::test]
 async fn the_claim_rule_holds_on_postgresql() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("claims").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1034,7 +1048,7 @@ async fn the_claim_rule_holds_on_postgresql() {
 /// module already had.
 #[tokio::test]
 async fn a_table_of_ours_that_somebody_else_made_is_refused_by_name() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1068,7 +1082,7 @@ async fn a_table_of_ours_that_somebody_else_made_is_refused_by_name() {
 
 #[tokio::test]
 async fn independent_first_appends_return_contract_outcomes() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1125,7 +1139,7 @@ async fn independent_first_appends_return_contract_outcomes() {
 
 #[tokio::test]
 async fn incomplete_companion_schema_is_refused_before_serving() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1167,7 +1181,7 @@ async fn incomplete_companion_schema_is_refused_before_serving() {
 
 #[tokio::test]
 async fn rebuild_preserves_other_tenants_and_previous_view_on_failure() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(store) = store("rebuild_isolation").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1179,7 +1193,7 @@ async fn rebuild_preserves_other_tenants_and_previous_view_on_failure() {
 
 #[tokio::test]
 async fn scope_reservations_are_atomic_and_confined() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("scope_atomic").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1215,6 +1229,7 @@ fn quota_guard(
 /// writes nothing — no row for an absent scope, no new row version for an existing one.
 #[tokio::test]
 async fn a_zero_delta_quota_check_writes_no_counter_rows() {
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("quota_read").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1309,6 +1324,7 @@ async fn count_round_trips(
 /// not three per scope: 64 scopes and one scope take the same number of round trips.
 #[tokio::test]
 async fn a_64_scope_reservation_takes_as_many_round_trips_as_one_scope() {
+    let _instance = INSTANCE.read().await;
     let Some(direct) = store("quota_trips").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1367,7 +1383,7 @@ async fn a_64_scope_reservation_takes_as_many_round_trips_as_one_scope() {
 #[tokio::test]
 async fn absent_deployment_scope_races_across_tenants_and_clients() {
     use eventlog_core::{AdmissionScope, Reservation};
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1474,7 +1490,7 @@ async fn registration_freezes_and_pool_refuses_bounded_overload() {
             })
         }
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1579,7 +1595,7 @@ async fn registration_freezes_and_pool_refuses_bounded_overload() {
 async fn verified_tls_requires_matching_server_and_separate_application_role() {
     use eventlog_postgres::{PoolOptions, PostgresConfig};
     use rustls::pki_types::pem::PemObject;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -1880,7 +1896,7 @@ impl PostgresConnectionAuthority for ReconnectingAuthority {
 #[tokio::test]
 async fn a_hosted_pool_refuses_a_reconnected_session_of_another_principal() {
     use eventlog_postgres::{PoolOptions, PostgresConfig};
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -2013,7 +2029,7 @@ async fn a_restored_history_is_settled_by_migrate_and_refused_by_open_until_then
             .unwrap();
         (row.get(0), row.get(1))
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -2309,7 +2325,7 @@ async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid()
             })
         }
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -2423,7 +2439,7 @@ async fn a_feed_cursor_cannot_pass_an_inflight_lower_position_with_a_newer_xid()
 
 #[tokio::test]
 async fn inline_failure_preserves_all_atomic_state_and_callback_authority() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("inline_atomic").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -2487,7 +2503,7 @@ async fn killed_projector_restarts_competing_workers_without_partial_view_or_cur
             .expect("child is killed before completion");
         return;
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let store = Arc::new(store("process_projector").await.expect("fixture"));
     client(&url)
         .await
@@ -2623,7 +2639,7 @@ async fn caught_reservation_cancellation_cannot_commit_an_unchecked_append() {
             })
         }
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -2787,7 +2803,7 @@ async fn missing_scope_bootstrap_is_atomic_across_independent_processes() {
         store.shutdown().await.expect("child shutdown");
         return;
     }
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     for index in 0..3_u8 {
         let prefix = format!("process_scope_{}", char::from(b'a' + index));
         store(&prefix)
@@ -2890,7 +2906,7 @@ async fn lost_commit_response_reconnects_to_exact_durable_receipt() {
             atomic::{AtomicBool, Ordering},
         },
     };
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -2996,7 +3012,7 @@ async fn lost_commit_response_reconnects_to_exact_durable_receipt() {
 #[tokio::test]
 async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refuse() {
     use eventlog_postgres::{PoolOptions, PostgresConfig};
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3062,7 +3078,7 @@ async fn legacy_populated_schema_migrates_atomically_and_unknown_checksums_refus
 
 #[tokio::test]
 async fn schema_admission_refuses_triggers_policies_generation_and_foreign_sequences() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3165,7 +3181,7 @@ async fn shutdown_cancellation_preserves_public_pool_lifetimes() {
         task::{Context, Poll, Waker},
         time::{Duration, Instant},
     };
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let url = url().expect("required real PostgreSQL review fixture");
     let prefix = "review_pool_shutdown";
     store(prefix).await.unwrap().shutdown().await.unwrap();
@@ -3284,7 +3300,7 @@ async fn public_queue_cancellation_and_broken_idle_reclaim_exact_capacity() {
         task::{Context, Poll, Waker},
         time::{Duration, Instant},
     };
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let url = url().expect("required real PostgreSQL review fixture");
     let prefix = "review_pool_queue";
     store(prefix).await.unwrap().shutdown().await.unwrap();
@@ -3431,7 +3447,7 @@ async fn public_queue_cancellation_and_broken_idle_reclaim_exact_capacity() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_history_and_repository_privacy_interleavings() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(adapter) = store("snapshot_races").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3512,7 +3528,7 @@ async fn snapshot_history_and_repository_privacy_interleavings() {
 }
 #[tokio::test]
 async fn committed_commands_survive_snapshot_storage_failure() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(adapter) = store("cache_failure").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3552,7 +3568,7 @@ async fn committed_commands_survive_snapshot_storage_failure() {
 }
 #[tokio::test]
 async fn loading_an_absent_aggregate_writes_no_storage_rows() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(adapter) = store("absent_reads").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3605,7 +3621,7 @@ async fn loading_an_absent_aggregate_writes_no_storage_rows() {
 }
 #[tokio::test]
 async fn a_delayed_older_snapshot_does_not_move_the_replay_point_back() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(adapter) = store("snapshot_monotonic").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3614,7 +3630,7 @@ async fn a_delayed_older_snapshot_does_not_move_the_replay_point_back() {
 }
 #[tokio::test]
 async fn snapshot_capture_waits_for_complete_tenant_erasure() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(adapter) = store("snapshot_erasure").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3679,7 +3695,7 @@ async fn snapshot_capture_waits_for_complete_tenant_erasure() {
 
 #[tokio::test]
 async fn concurrent_differing_blob_writers_have_one_winner() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(first) = store("blob_race").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3700,7 +3716,7 @@ async fn concurrent_differing_blob_writers_have_one_winner() {
 
 #[tokio::test]
 async fn postgres_blob_integrity_covers_all_read_boundaries_and_binding_controls() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("blob_integrity").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3773,7 +3789,7 @@ async fn postgres_callback_blob_corruption_poison_rolls_back_every_owner() {
         Arc,
         atomic::{AtomicU8, Ordering},
     };
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.write().await;
     let Some(store) = store("blob_callback").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -3991,7 +4007,7 @@ async fn postgres_callback_blob_corruption_poison_rolls_back_every_owner() {
 async fn postgres_blob_migration_is_exact_explicit_atomic_and_fenced() {
     use eventlog_core::{EventLogError, LegacyBlobMigration};
     use eventlog_postgres::{PoolOptions, PostgresConfig};
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(original) = store("blob_migration").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -4135,7 +4151,7 @@ async fn postgres_blob_migration_unknown_commit_has_no_report() {
             atomic::{AtomicBool, Ordering},
         },
     };
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -4224,7 +4240,7 @@ async fn review_wait_for_blob_insert_lock(sql: &tokio_postgres::Client, prefix: 
 #[tokio::test]
 async fn review_blob_deleted_after_ignored_insert_is_republished() {
     use std::sync::Arc;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let first = Arc::new(store("review_blob_delete").await.expect("explicit fixture"));
     let second = PostgresEventStore::connect(&url().unwrap(), "review_blob_delete")
         .await
@@ -4268,7 +4284,7 @@ async fn review_blob_deleted_after_ignored_insert_is_republished() {
 #[tokio::test]
 async fn review_blob_cancelled_insert_retires_connection_and_retries() {
     use std::sync::Arc;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let store = Arc::new(store("review_blob_cancel").await.expect("explicit fixture"));
     let sql = client(&url().unwrap()).await;
     sql.batch_execute("SELECT pg_advisory_lock(903152); CREATE OR REPLACE FUNCTION review_blob_cancel_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(903152); RETURN NEW; END $$; CREATE TRIGGER review_blob_cancel_pause BEFORE INSERT ON review_blob_cancel_blobs FOR EACH ROW EXECUTE FUNCTION review_blob_cancel_pause()").await.unwrap();
@@ -4304,7 +4320,7 @@ async fn review_blob_cancelled_insert_retires_connection_and_retries() {
 
 #[tokio::test]
 async fn review_blob_empty_content_and_conflict_rollback_reuse() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let first = store("review_blob_empty").await.expect("explicit fixture");
     let second = PostgresEventStore::connect(&url().unwrap(), "review_blob_empty")
         .await
@@ -4343,7 +4359,7 @@ async fn review_blob_empty_content_and_conflict_rollback_reuse() {
 async fn review2_postgres_admission_refuses_unenforced_check_and_unmigrated_legacy_shape() {
     use eventlog_core::EventLogError;
     use eventlog_postgres::{PoolOptions, PostgresConfig};
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(weakened) = store("reviewtwo_check").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -4420,7 +4436,7 @@ async fn review2_postgres_admission_refuses_unenforced_check_and_unmigrated_lega
 /// be a read. A write here costs a commit flush per page and serializes readers on the row.
 #[tokio::test]
 async fn resolving_an_existing_stream_identity_writes_nothing() {
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(store) = store("identity_read").await else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -4446,7 +4462,7 @@ async fn resolving_an_existing_stream_identity_writes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_first_resolutions_of_a_fresh_tenant_agree_on_one_identity() {
     const CALLERS: usize = 16;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
@@ -4514,7 +4530,7 @@ async fn concurrent_first_resolutions_of_a_fresh_tenant_agree_on_one_identity() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resolution_that_loses_the_first_insert_returns_the_winners_identity() {
     const LOSERS: usize = 4;
-    let _exclusive = EXCLUSIVE.lock().await;
+    let _instance = INSTANCE.read().await;
     let Some(url) = url() else {
         eprintln!("skipped: EVENTLOG_TEST_POSTGRES_URL is not set");
         return;
