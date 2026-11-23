@@ -13,6 +13,9 @@ under bare-version tags such as `0.1.0`.
   as SQLite rolls it back, and the original receipt is returned.
 - File: forgetting a tenant the history does not hold no longer rewrites the journal or advances
   its epoch, so other open handles keep working; leftover snapshot and object disposal still runs.
+- File: a redaction or tenant erasure drops the handle's capture view of the replaced history at
+  once, including when the rewrite fails after publishing, instead of keeping it in memory until a
+  later call.
 
 ### Performance
 

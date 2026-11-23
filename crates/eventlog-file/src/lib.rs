@@ -278,6 +278,13 @@ impl FileEventStore {
                 return Err(refusal);
             }
         };
+        // A privacy rewrite replaces the bytes a reader's view holds, so that view goes now,
+        // before publication starts: whether the rewrite then publishes, fails or leaves its
+        // outcome unknown, and even when this call is cancelled meanwhile, the handle keeps no
+        // copy of content the rewrite exists to remove.
+        if tx.privacy {
+            runtime.captured = None;
+        }
         let committed = blocking(move || {
             if !tx.pending.is_empty() {
                 tx.pending.push(Op::Watermark {
