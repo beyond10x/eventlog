@@ -68,99 +68,196 @@ async fn separately(store: &PostgresEventStore, reads: &[Read]) -> Vec<ReadResul
     answers
 }
 
+async fn sql() -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+        .await
+        .expect("fixture");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+/// What each row a slowed read returns costs on the server at least. `pg_sleep` never wakes
+/// early, so a slowed read has this floor on an idle machine and on a loaded one alike; load only
+/// adds to it.
+const ROW_SLEEP: Duration = Duration::from_millis(100);
+
+/// Puts the floor under every read of `prefix`'s events: the table moves aside, and a view of the
+/// same name returns its rows through a function that sleeps [`ROW_SLEEP`] per row. For reads
+/// only; [`fast_again`] puts the table back before the tables are dropped.
+async fn slow_down(sql: &tokio_postgres::Client, prefix: &str) {
+    let millis = ROW_SLEEP.as_millis();
+    sql.batch_execute(&format!(
+        "CREATE FUNCTION {prefix}_slow(v bigint) RETURNS boolean LANGUAGE plpgsql VOLATILE AS
+             $$ BEGIN PERFORM pg_sleep({millis} / 1000.0); RETURN v IS NOT NULL; END $$;
+         ALTER TABLE {prefix}_events RENAME TO {prefix}_events_fast;
+         CREATE VIEW {prefix}_events AS
+             SELECT * FROM {prefix}_events_fast WHERE {prefix}_slow(version);"
+    ))
+    .await
+    .expect("slowed events view");
+}
+
+async fn fast_again(sql: &tokio_postgres::Client, prefix: &str) {
+    sql.batch_execute(&format!(
+        "DROP VIEW {prefix}_events;
+         ALTER TABLE {prefix}_events_fast RENAME TO {prefix}_events;
+         DROP FUNCTION {prefix}_slow(bigint);"
+    ))
+    .await
+    .expect("events table back in place");
+}
+
+/// The deadline one read gets in the case below, on the client and as the statement timeout.
+const DEADLINE: Duration = Duration::from_secs(2);
+
+/// Reads in the batch below; together they sleep past [`DEADLINE`].
+const BATCH: u32 = 25;
+
+const _: () = assert!(ROW_SLEEP.as_millis() * BATCH as u128 > DEADLINE.as_millis());
+
 /// The trait's contract: `read_many` "returns the first read's error, as the separate call would
 /// have". A batch in which every separate read fits the store-operation deadline must not be
-/// refused for the batch's size. Here the deadline is short so the case stays small; under the
-/// default 10 s (statement timeout 5 s) the same refusal needs a proportionally larger batch.
+/// refused for the batch's size.
+///
+/// Every read sleeps [`ROW_SLEEP`] on the server, so the batch of [`BATCH`] reads takes at least
+/// 2.5 s, past the 2 s one read gets, on any machine: a store that holds the whole batch to one
+/// read's deadline, on the client or as the statement timeout, refuses it every time. Each read
+/// alone needs 0.1 s, and each fixed step of the batch (connection, BEGIN, prepare, COMMIT) gets
+/// the whole 2 s, so the time a loaded machine adds is measured against seconds, not against a
+/// read calibrated a moment earlier.
 #[tokio::test]
 async fn a_batch_of_reads_that_each_fit_the_deadline_is_not_refused_for_its_size() {
     let name = prefix("deadline");
     let setup = PostgresEventStore::connect(&url(), &name).await.unwrap();
     let t = tenant("adv-deadline");
-    let full = stream(&t, "item", "full");
+    let one = stream(&t, "item", "one");
     setup
         .append(
-            &full,
+            &one,
             Expected::NoStream,
-            &(0..1_000)
-                .map(|n| event("item.changed", n))
-                .collect::<Vec<_>>(),
-            &meta("full", &serde_json::json!({})),
+            &[event("item.changed", 0)],
+            &meta("one", &serde_json::json!({})),
         )
         .await
         .unwrap();
-
-    // Calibrate on this machine: the slowest separate full-page read, and the mean.
-    let mut slowest = Duration::ZERO;
-    let started = Instant::now();
-    for _ in 0..20 {
-        let one = Instant::now();
-        assert_eq!(
-            setup
-                .read_stream(&full, 0, 1_000)
-                .await
-                .unwrap()
-                .events
-                .len(),
-            1_000
-        );
-        slowest = slowest.max(one.elapsed());
-    }
-    let mean = started.elapsed() / 20;
-    let budget = (slowest * 5).max(Duration::from_millis(150));
-    let count = usize::try_from((budget * 6).as_nanos() / mean.as_nanos().max(1))
-        .unwrap()
-        .clamp(50, 2_000);
-    eprintln!("slowest {slowest:?}, mean {mean:?}, budget {budget:?}, {count} reads");
-
     let short = PostgresEventStore::connect_local(
         &url(),
         &name,
         PoolOptions {
-            statement_timeout: budget,
-            transaction_timeout: budget,
+            statement_timeout: DEADLINE,
+            transaction_timeout: DEADLINE,
             ..PoolOptions::default()
         },
     )
     .await
     .unwrap();
-    let reads: Vec<Read> = (0..count)
+    let sql = sql().await;
+    slow_down(&sql, &name).await;
+
+    let started = Instant::now();
+    let alone = short.read_stream(&one, 0, 1_000).await;
+    let alone_took = started.elapsed();
+    let reads: Vec<Read> = (0..BATCH)
         .map(|_| Read::Stream {
-            stream: full.clone(),
+            stream: one.clone(),
             after_version: 0,
             limit: 1_000,
         })
         .collect();
-    // What the trait's default does: each read in turn, each inside its own deadline.
-    let mut separate = Vec::with_capacity(count);
-    for read in &reads {
-        let Read::Stream {
-            stream,
-            after_version,
-            limit,
-        } = read
-        else {
-            unreachable!()
-        };
-        separate.push(ReadResult::Stream(
-            short
-                .read_stream(stream, *after_version, *limit)
-                .await
-                .expect("each separate read fits the deadline"),
-        ));
-    }
     let started = Instant::now();
-    match short.read_many(&reads).await {
-        Ok(batch) => assert!(batch == separate, "the batch answered differently"),
-        Err(error) => panic!(
-            "read_many refused {count} reads after {:?} with {error:?}, although each of them \
-             answers separately inside the {budget:?} deadline (slowest separate read {slowest:?})",
-            started.elapsed()
-        ),
-    }
+    let batch = short.read_many(&reads).await;
+    let batch_took = started.elapsed();
+    eprintln!("timing: one slowed read {alone_took:?}, read_many of {BATCH} {batch_took:?}");
+    fast_again(&sql, &name).await;
     short.shutdown().await.unwrap();
     setup.drop_tables().await.unwrap();
     setup.shutdown().await.unwrap();
+
+    let alone = alone.expect("one read fits the deadline on its own");
+    assert_eq!(alone.events.len(), 1);
+    assert!(
+        alone_took >= ROW_SLEEP,
+        "the slowed read took {alone_took:?}, under its {ROW_SLEEP:?} floor"
+    );
+    let separate = ReadResult::Stream(alone);
+    match batch {
+        Ok(answers) => {
+            assert_eq!(answers.len(), reads.len());
+            assert!(
+                answers.iter().all(|answer| *answer == separate),
+                "the batch answered differently from the separate read"
+            );
+        }
+        Err(error) => panic!(
+            "read_many refused {BATCH} reads after {batch_took:?} with {error:?}, although each \
+             of them answers separately inside the {DEADLINE:?} deadline (one took {alone_took:?})"
+        ),
+    }
+    assert!(
+        batch_took >= ROW_SLEEP * BATCH,
+        "the batch took {batch_took:?}, under its floor of {BATCH} slowed reads, so it never \
+         outlasted one read's deadline and proves nothing"
+    );
+}
+
+/// The other side of the same accounting: reads that miss their deadline separately are refused
+/// in a batch too. Each read of the six-event stream sleeps at least 0.6 s against a 0.3 s
+/// deadline, so three of them sleep at least 1.8 s against the 0.9 s the batch is given.
+#[tokio::test]
+async fn a_batch_of_reads_that_each_miss_the_deadline_is_refused_with_the_deadline() {
+    let name = prefix("missed");
+    let setup = PostgresEventStore::connect(&url(), &name).await.unwrap();
+    let t = tenant("adv-missed");
+    let long = stream(&t, "item", "long");
+    setup
+        .append(
+            &long,
+            Expected::NoStream,
+            &(0..6).map(|n| event("item.changed", n)).collect::<Vec<_>>(),
+            &meta("long", &serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+    let tight = Duration::from_millis(300);
+    let short = PostgresEventStore::connect_local(
+        &url(),
+        &name,
+        PoolOptions {
+            statement_timeout: tight,
+            transaction_timeout: tight,
+            ..PoolOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sql = sql().await;
+    slow_down(&sql, &name).await;
+
+    let alone = short.read_stream(&long, 0, 1_000).await;
+    let reads: Vec<Read> = (0..3)
+        .map(|_| Read::Stream {
+            stream: long.clone(),
+            after_version: 0,
+            limit: 1_000,
+        })
+        .collect();
+    let batch = short.read_many(&reads).await;
+    fast_again(&sql, &name).await;
+    short.shutdown().await.unwrap();
+    setup.drop_tables().await.unwrap();
+    setup.shutdown().await.unwrap();
+
+    assert!(
+        matches!(alone, Err(EventLogError::Deadline { .. })),
+        "a read that sleeps 0.6 s misses its {tight:?} deadline: {alone:?}"
+    );
+    assert!(
+        matches!(batch, Err(EventLogError::Deadline { .. })),
+        "three such reads miss the batch's {:?}: {batch:?}",
+        tight * 3
+    );
 }
 
 /// A guard that announces it holds the append's stream lock, then keeps it for `hold`.
