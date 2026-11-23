@@ -2742,11 +2742,25 @@ impl Inner {
                 "rebuild requires a catch-up projection".into(),
             ));
         }
+        // A host can hand in a projector assembled apart from registration. Its names are put into
+        // the maintenance SQL below, so every one is checked before the transaction starts.
+        let mut declared = BTreeSet::new();
+        for spec in projector.projections() {
+            spec.validate()?;
+            if !declared.insert(spec.name) {
+                return Err(EventLogError::Invalid(
+                    "duplicate projection in one rebuild".into(),
+                ));
+            }
+        }
         let mut connection = self.connection.lock().map_err(poisoned)?;
         let connection = &mut *connection;
         begin_immediate(connection)?;
         let callback_failed = Arc::new(AtomicBool::new(false));
         let result = (|| {
+            for spec in projector.projections() {
+                refuse_unadmitted_rebuild(connection, &self.prefix, spec)?;
+            }
             for spec in projector.projections() {
                 let shadow = projection_table(REBUILD_STAGING, spec.name);
                 let columns = joined(spec.indexed.len(), |position| {
@@ -3427,6 +3441,41 @@ fn changed_registration(prefix: &str, name: &str, recorded: &str) -> EventLogErr
         ));
     }
     EventLogError::Invalid("projection registration shape changed".into())
+}
+
+/// Refuse a rebuild of a projection this owner has not admitted with exactly this declaration.
+///
+/// A rebuild replaces the live rows from a staging table shaped by the supplied declaration. One
+/// that no registration created, or whose fields differ from the registered ones, would publish
+/// rows into a table of another shape, so it is refused before any staging table exists.
+fn refuse_unadmitted_rebuild(
+    connection: &Connection,
+    prefix: &str,
+    projection: &ProjectionSpec,
+) -> Result<(), EventLogError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT indexed_fields FROM {prefix}_projection_registry WHERE projection_name=?1"
+            ),
+            params![projection.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let declared = serde_json::to_string(projection.indexed)
+        .map_err(|_| EventLogError::Invalid("invalid projection shape".into()))?;
+    match recorded {
+        None => Err(EventLogError::Invalid(format!(
+            "projection {} is not registered on this owner; create it before a rebuild",
+            projection.name
+        ))),
+        Some(recorded) if recorded != declared => Err(EventLogError::Invalid(format!(
+            "projection {} is rebuilt with indexed fields {declared} but registered with {recorded}",
+            projection.name
+        ))),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Refuse a reader whose declared field order differs from the projection's registration.

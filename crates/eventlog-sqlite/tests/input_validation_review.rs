@@ -275,3 +275,87 @@ async fn a_persisted_repeated_declaration_names_its_repair_and_the_repair_captur
     );
 }
 
+#[tokio::test]
+async fn a_rebuild_refuses_an_unchecked_or_unadmitted_declaration_before_any_sql() {
+    const ADMITTED: ProjectionSpec = ProjectionSpec {
+        name: "shelf",
+        indexed: &["kind"],
+    };
+    const INJECTED: ProjectionSpec = ProjectionSpec {
+        name: "shelf(x); --",
+        indexed: &[],
+    };
+    const UNREGISTERED: ProjectionSpec = ProjectionSpec {
+        name: "elsewhere",
+        indexed: &["kind"],
+    };
+    const DRIFTED: ProjectionSpec = ProjectionSpec {
+        name: "shelf",
+        indexed: &["owner"],
+    };
+    let store = SqliteEventStore::in_memory("rebuild_checked")
+        .await
+        .unwrap();
+    let tenant = TenantId::new("tenant").unwrap();
+    let admitted = Arc::new(Declared {
+        name: "shelf",
+        specs: std::slice::from_ref(&ADMITTED),
+    });
+    store.create_projections(admitted.clone()).await.unwrap();
+    let stream = StreamId::new(tenant.clone(), "item", "one").unwrap();
+    store
+        .append(
+            &stream,
+            Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("command", &json!({})),
+        )
+        .await
+        .unwrap();
+    for (name, specs, expected) in [
+        (
+            "injected",
+            std::slice::from_ref(&INJECTED),
+            "projection name is lowercase ASCII, digits and underscores, not starting with a digit",
+        ),
+        (
+            "repeated",
+            &[ADMITTED, ADMITTED][..],
+            "duplicate projection in one rebuild",
+        ),
+        (
+            "unregistered",
+            std::slice::from_ref(&UNREGISTERED),
+            "projection elsewhere is not registered on this owner; create it before a rebuild",
+        ),
+        (
+            "drifted",
+            std::slice::from_ref(&DRIFTED),
+            r#"projection shelf is rebuilt with indexed fields ["owner"] but registered with ["kind"]"#,
+        ),
+    ] {
+        // A tenant without events reaches no projector write, whose own checks would otherwise
+        // refuse an invalid name only after the staging DDL ran with it.
+        let idle = TenantId::new("idle").unwrap();
+        for owner in [&idle, &tenant] {
+            let projector = Arc::new(Declared { name, specs });
+            assert_eq!(
+                invalid(store.rebuild_projection(projector, owner).await),
+                expected,
+                "{name} for {}",
+                owner.as_str()
+            );
+        }
+    }
+    assert_eq!(
+        store.rebuild_projection(admitted, &tenant).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .projection_find(&ADMITTED, &tenant, "kind", "book", 10)
+            .await
+            .unwrap(),
+        vec![json!({"kind": "book"})]
+    );
+}
