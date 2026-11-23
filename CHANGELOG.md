@@ -20,6 +20,9 @@ under bare-version tags such as `0.1.0`.
   attached inline projector owns ("rebuild requires a catch-up projection") unless it is that
   attached instance itself; it used to replace inline rows with any supplied projector's results.
   `run_catch_up` refuses a differently named projector over an inline table as well.
+- File: a delayed `save_snapshot_checked` of an older fold no longer replaces a newer cached
+  snapshot of the same generation; it returns true and keeps the newer one, so the replay point
+  never moves back. A cache of an earlier generation is still replaced at any revision.
 
 ### Performance
 

@@ -1869,6 +1869,17 @@ impl EventStore for FileEventStore {
                     return Ok(false);
                 }
                 let path = tx.snapshot_path(&stream);
+                // A delayed save of an older fold of the same history keeps the newer cache, so the
+                // replay point never moves back within a generation; a cache of an earlier
+                // generation is replaced at any revision.
+                if let Ok(bytes) = fs::read(&path)
+                    && let Ok((cached_generation, cached)) =
+                        serde_json::from_slice::<(String, Snapshot)>(&bytes)
+                    && cached_generation == generation
+                    && cached.version > snapshot.version
+                {
+                    return Ok(true);
+                }
                 fs::create_dir_all(tx.root.join(".cache")).map_err(backend)?;
                 directory(&tx.root.join(".cache"))?;
                 fs::write(
