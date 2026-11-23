@@ -611,7 +611,9 @@ impl Transaction {
         if undo.len() != self.pending.len() - mark || undo.iter().any(|u| matches!(u, Undo::Other))
         {
             // Left staged: a non-empty `pending` makes the caller's refusal drop this view.
-            return Err(backend("a rollback-only scope staged an operation it cannot undo"));
+            return Err(backend(
+                "a rollback-only scope staged an operation it cannot undo",
+            ));
         }
         for undo in undo.into_iter().rev() {
             match undo {
@@ -2253,9 +2255,7 @@ impl EventStore for FileEventStore {
                 let (owner, name) = (tenant.as_str().to_owned(), spec.name.to_owned());
                 let from = match after {
                     Some(after) => std::ops::Bound::Excluded((owner.clone(), name.clone(), after)),
-                    None => {
-                        std::ops::Bound::Included((owner.clone(), name.clone(), String::new()))
-                    }
+                    None => std::ops::Bound::Included((owner.clone(), name.clone(), String::new())),
                 };
                 let mut visited = 0_u64;
                 let page = tx
@@ -3980,7 +3980,8 @@ mod steady_state_cost {
         store
             .transaction(move |tx| {
                 Box::pin(async move {
-                    for (tenant, keys) in [(&before, &written), (&mine, &written), (&after, &written)]
+                    for (tenant, keys) in
+                        [(&before, &written), (&mine, &written), (&after, &written)]
                     {
                         for key in keys {
                             tx.record(Op::Row {
@@ -4004,7 +4005,12 @@ mod steady_state_cost {
         loop {
             let before = crate::cost::of(root).projection_rows_visited;
             let found = store
-                .projection_list(&eventlog_conformance::TALLY, &owner, cursor.as_deref(), page)
+                .projection_list(
+                    &eventlog_conformance::TALLY,
+                    &owner,
+                    cursor.as_deref(),
+                    page,
+                )
                 .await
                 .unwrap();
             calls += 1;
@@ -4093,7 +4099,15 @@ mod steady_state_cost {
             "a registration chained committed frames again"
         );
         let stream = StreamId::new(owner.clone(), "r0", "s0000").unwrap();
-        assert_eq!(store.read_stream(&stream, 0, 10).await.unwrap().events.len(), 1);
+        assert_eq!(
+            store
+                .read_stream(&stream, 0, 10)
+                .await
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
         assert_eq!(
             crate::cost::of(root).frames_chained - before,
             0,
@@ -4106,7 +4120,12 @@ mod steady_state_cost {
             .await
             .unwrap();
         for spec in &OWN_TABLES {
-            assert_eq!(registered.get(spec.name), Some(&Vec::new()), "{}", spec.name);
+            assert_eq!(
+                registered.get(spec.name),
+                Some(&Vec::new()),
+                "{}",
+                spec.name
+            );
         }
     }
 }

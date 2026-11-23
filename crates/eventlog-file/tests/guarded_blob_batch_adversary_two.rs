@@ -253,7 +253,11 @@ async fn file_deduplicated_guarded_retry_charges_no_reservation() {
         assert!(retry.deduplicated);
         assert_eq!(*seen.lock().unwrap(), [1, 2], "the retry ran its admission");
         let second = store
-            .append_group_guarded_with_blobs(&group("second"), quota, &[("second".to_owned(), b"two".to_vec())])
+            .append_group_guarded_with_blobs(
+                &group("second"),
+                quota,
+                &[("second".to_owned(), b"two".to_vec())],
+            )
             .await
             .expect("the retry left the quota where the first commit put it");
         assert!(!second.deduplicated);
