@@ -1,5 +1,4 @@
 [profile.dev]
-debug = false
 opt-level = 1
 
 [profile.dev.package."*"]

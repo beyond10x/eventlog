@@ -58,15 +58,22 @@ under bare-version tags such as `0.1.0`.
   was not migrated. No new grants.
 - Every provider indexes a projection row's indexed value of any length again: 0.10.0 refused
   one over 2,048 bytes with `EventLogError::IndexedValueTooLarge`, and nothing returns that now.
-  PostgreSQL indexes each declared field by a fixed-size digest of its value,
-  `(tenant_id, hashtextextended(idx_N, 0))`, instead of the value, and every lookup compares each
-  candidate row with the value itself, so 8,000 bytes under a 512-byte tenant are written and
-  found where the value index aborted the append. The digest runs on a server in FIPS mode, which
-  refuses `md5()`. Same schema edition and the same operator steps as the entry above: `migrate`
-  drops each registered projection table's `(tenant_id, idx_N)` index and builds the digest index
-  under the same name. A store a `main` build after pull request 70 migrated (an MD5 digest
-  index, `substr(decode(md5(idx_N), 'hex'), 1, 8)`) is refused by `open` the same way until
-  `migrate` runs; `migrate` replaces that index too, and the `main` build then refuses the schema.
+  PostgreSQL stores a fixed-size digest of each declared field's value in a column the server
+  generates, `idx_N_digest BIGINT GENERATED ALWAYS AS (hashtextextended(idx_N, 0)) STORED`, and
+  indexes `(tenant_id, idx_N_digest)` instead of the value. Every lookup compares each candidate
+  row with the value itself, and when a candidate holds another value with the same digest it
+  runs once more with the comparison in SQL, so 8,000 bytes under a 512-byte tenant are written
+  and found where the value index aborted the append. The digest runs on a server in FIPS mode,
+  which refuses `md5()`. Same schema edition and the same operator steps as the entry above:
+  `migrate` drops each registered projection table's `(tenant_id, idx_N)` index, adds the digest
+  columns and builds the digest index under the same name. Adding the columns rewrites each
+  projection table inside the migration transaction: reads and writes of that table wait until
+  it commits, for a time that grows with the table. A store a `main` build after pull request 70
+  migrated (an MD5 digest index, `substr(decode(md5(idx_N), 'hex'), 1, 8)`) or a build of pull
+  request 72 migrated (an index on the expression `hashtextextended(idx_N, 0)`, no digest
+  column) is refused by `open` the same way until `migrate` runs; `migrate` replaces that index
+  too, and that build then refuses the schema. Projection and capture admission accept a
+  generated column only as that digest, from that expression.
 - PostgreSQL: a consistent tenant capture holds the owner's publication gate only while its
   snapshot is fixed, not through its read, so appends, redactions and erasures under the owner
   prefix, other tenants' included, no longer wait for a capture read (review P11). A capture

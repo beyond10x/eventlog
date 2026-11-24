@@ -593,7 +593,7 @@ pub(crate) async fn admit_projection(
                     EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal)
                       OR EXISTS(SELECT FROM pg_policy WHERE polrelid=c.oid)
                       OR EXISTS(SELECT FROM pg_attribute WHERE attrelid=c.oid
-                                AND (attgenerated<>'' OR attidentity<>''))
+                                AND attidentity<>'')
                       OR EXISTS(SELECT FROM pg_attribute a JOIN pg_collation l
                                 ON l.oid=a.attcollation
                                 WHERE a.attrelid=c.oid AND NOT l.collisdeterministic),
@@ -620,13 +620,17 @@ pub(crate) async fn admit_projection(
     }
 
     // The column's collation decides which spellings of a key are one row. Anything but this
-    // database's own default is a different table wearing this one's name.
+    // database's own default is a different table wearing this one's name. A generated column is
+    // admitted only where the declaration has one (a field's stored digest), stored, from the
+    // same expression: any other expression or a plain column could hold a digest that does not
+    // match the value, and a find would miss the row.
     let columns = transaction
         .query(
             "SELECT a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull,
                     COALESCE(pg_get_expr(d.adbin,d.adrelid),''),
                     a.attcollation = 0 OR a.attcollation = (SELECT oid FROM pg_collation
-                        WHERE collname='default' AND collnamespace='pg_catalog'::regnamespace)
+                        WHERE collname='default' AND collnamespace='pg_catalog'::regnamespace),
+                    a.attgenerated::text
              FROM pg_attribute a LEFT JOIN pg_attrdef d
                  ON a.attrelid=d.adrelid AND a.attnum=d.adnum
              WHERE a.attrelid=to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped
@@ -635,16 +639,21 @@ pub(crate) async fn admit_projection(
         )
         .await
         .map_err(operational)?;
-    let expected = schema::projection_columns(specification);
+    let expected = schema::projection_columns(specification.indexed.len());
     if columns.len() != expected.len() {
         return Err(mismatch());
     }
-    for (row, (name, kind, required)) in columns.iter().zip(&expected) {
-        if row.get::<_, String>(0) != *name
-            || row.get::<_, String>(1) != *kind
-            || row.get::<_, bool>(2) != *required
-            || !row.get::<_, String>(3).is_empty()
+    for (row, column) in columns.iter().zip(&expected) {
+        let (expression, kind) = match &column.generated {
+            Some(expression) => (expression.as_str(), "s"),
+            None => ("", ""),
+        };
+        if row.get::<_, String>(0) != column.name
+            || row.get::<_, String>(1) != column.kind
+            || row.get::<_, bool>(2) != column.required
+            || row.get::<_, String>(3) != expression
             || !row.get::<_, bool>(4)
+            || row.get::<_, String>(5) != kind
         {
             return Err(mismatch());
         }

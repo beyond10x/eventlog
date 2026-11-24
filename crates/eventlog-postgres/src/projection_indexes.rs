@@ -20,6 +20,11 @@ const MD5_DIGEST_CHECKSUM: &str =
 /// its columns.
 const MD5_DIGEST_INDEX: &str = "btree (tenant_id, substr(decode(md5(idx_0), 'hex'::text), 1, 8))";
 
+/// The ledger checksum pull request 72 wrote: projection tables indexed by the expression
+/// `hashtextextended(idx_N, 0)`, with no stored digest column. Never released.
+const HASH_EXPRESSION_CHECKSUM: &str =
+    "41ca55d5a4e879d0928e0834e06f4503a01f5becde9712b891bde2c1b0eb282f";
+
 const ROWS: ProjectionSpec = ProjectionSpec {
     name: "keyed_rows",
     indexed: &["kind"],
@@ -237,8 +242,33 @@ async fn icu_database(url: &str) -> String {
     NAME.to_owned()
 }
 
-/// The digest index of `idx_0`, as `pg_get_indexdef` prints its columns.
-const DIGEST_INDEX: &str = "btree (tenant_id, hashtextextended(idx_0, '0'::bigint))";
+/// The digest index of `idx_0`, as `pg_get_indexdef` prints its columns: the stored digest column.
+const DIGEST_INDEX: &str = "btree (tenant_id, idx_0_digest)";
+
+/// The digest index of `idx_0` in the `HASH_EXPRESSION_CHECKSUM` edition: the expression itself.
+const HASH_EXPRESSION_INDEX: &str = "btree (tenant_id, hashtextextended(idx_0, '0'::bigint))";
+
+/// The digest columns of `table` as the catalog reports them: name, type, generation kind and
+/// generation expression.
+async fn digest_columns(sql: &Client, table: &str) -> Vec<String> {
+    sql.query(
+        "SELECT a.attname || ':' || format_type(a.atttypid, a.atttypmod) || ':' || a.attgenerated::text
+                || ':' || COALESCE(pg_get_expr(d.adbin, d.adrelid), '')
+         FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+         WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped
+           AND a.attname LIKE '%_digest'
+         ORDER BY a.attnum",
+        &[&table],
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get(0))
+    .collect()
+}
+
+/// The one digest column of a one-field table, as `digest_columns` prints it.
+const DIGEST_COLUMN: &str = "idx_0_digest:bigint:s:hashtextextended(idx_0, (0)::bigint)";
 
 /// Every SQL function the text `sql` calls: each identifier directly followed by `(`.
 fn called_functions(sql: &str) -> Vec<String> {
@@ -263,17 +293,29 @@ fn called_functions(sql: &str) -> Vec<String> {
 /// partitioning uses), which runs no OpenSSL digest and so stays available in FIPS mode.
 #[test]
 fn the_value_digest_calls_only_a_function_fips_mode_allows() {
-    let indexes: Vec<String> = schema::projection_indexes("owner_p_rows", 2)
+    let generated: Vec<String> = schema::projection_columns(2)
+        .into_iter()
+        .filter_map(|column| column.generated)
+        .collect();
+    assert_eq!(
+        generated.len(),
+        2,
+        "each declared field has a stored digest"
+    );
+    let shape: Vec<String> = schema::projection_indexes("owner_p_rows", 2)
         .into_iter()
         .map(|(_, columns)| columns)
+        .chain(generated)
+        .chain((0..2).flat_map(|position| {
+            [
+                schema::projection_find_filter(position),
+                schema::projection_find_checked_filter(position),
+            ]
+        }))
         .collect();
-    let mut called: Vec<String> = indexes
+    let mut called: Vec<String> = shape
         .iter()
         .map(String::as_str)
-        .chain([
-            schema::projection_find_filter(0).as_str(),
-            schema::projection_find_filter(1).as_str(),
-        ])
         .flat_map(called_functions)
         .collect();
     called.sort();
@@ -281,7 +323,7 @@ fn the_value_digest_calls_only_a_function_fips_mode_allows() {
     assert_eq!(
         called,
         ["hashtextextended"],
-        "the index expressions and the lookup call only the FIPS-safe hash: {indexes:?}"
+        "the digest columns, the indexes and the lookups call only the FIPS-safe hash: {shape:?}"
     );
 }
 
@@ -351,10 +393,16 @@ async fn the_previous_edition_migrates_its_projection_tables_and_fences_the_prev
             .unwrap();
     }
     sql.batch_execute(&format!(
-        "CREATE INDEX {table}_idx_0 ON {table} (tenant_id, idx_0)"
+        "ALTER TABLE {table} DROP COLUMN IF EXISTS idx_0_digest;
+         CREATE INDEX {table}_idx_0 ON {table} (tenant_id, idx_0)"
     ))
     .await
     .unwrap();
+    assert_eq!(
+        digest_columns(&sql, &table).await,
+        Vec::<String>::new(),
+        "the fixture holds 0.10.0's columns"
+    );
     sql.execute(
         &format!("UPDATE {prefix}_schema_version SET checksum=$1"),
         &[&RELEASE_0_10_0_CHECKSUM],
@@ -384,6 +432,11 @@ async fn the_previous_edition_migrates_its_projection_tables_and_fences_the_prev
         secondary_indexes(&sql, &table).await,
         current,
         "migrate moved a registered projection it was not given to the current indexes"
+    );
+    assert_eq!(
+        digest_columns(&sql, &table).await,
+        [DIGEST_COLUMN],
+        "migrate added the stored digest column"
     );
     schema::validate(&mut sql, prefix).await.unwrap();
     schema::validate_projection(&mut sql, prefix, &ROWS)
@@ -458,7 +511,8 @@ async fn the_md5_digest_edition_migrates_to_the_fips_safe_digest_and_is_fenced()
     // `main`'s state: its ledger checksum and the MD5 digest index under the field's index name.
     let index = schema::projection_index(&table, 0);
     sql.batch_execute(&format!(
-        "DROP INDEX {index}; CREATE INDEX {index} ON {table} USING {MD5_DIGEST_INDEX}"
+        "DROP INDEX IF EXISTS {index}; ALTER TABLE {table} DROP COLUMN IF EXISTS idx_0_digest;
+         CREATE INDEX {index} ON {table} USING {MD5_DIGEST_INDEX}"
     ))
     .await
     .unwrap();
@@ -486,6 +540,11 @@ async fn the_md5_digest_edition_migrates_to_the_fips_safe_digest_and_is_fenced()
         secondary_indexes(&sql, &table).await,
         current,
         "migrate moved a registered projection it was not given to the FIPS-safe digest"
+    );
+    assert_eq!(
+        digest_columns(&sql, &table).await,
+        [DIGEST_COLUMN],
+        "migrate added the stored digest column"
     );
     schema::validate(&mut sql, prefix).await.unwrap();
     schema::validate_projection(&mut sql, prefix, &ROWS)
@@ -661,6 +720,323 @@ async fn values_sharing_a_digest_are_told_apart_by_the_candidate_check() {
     }
     store.shutdown().await.unwrap();
     drop_owner(&sql, prefix, &[&ROWS]).await;
+}
+
+/// Story pg-projection-find-back-within-1-05, option B: a fresh projection table stores each
+/// declared field's digest in a column the server generates from the value, and indexes that
+/// column. No writer can store a digest that does not match its value: PostgreSQL refuses an
+/// explicit value for the column, in an insert and in an update.
+#[tokio::test]
+async fn a_projection_table_stores_each_value_digest_as_a_generated_column() {
+    let url = fixture();
+    let mut sql = connect(&url).await;
+    let prefix = "projkey_generated";
+    let table = projection_table(prefix, ROWS.name);
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+    schema::migrate(&mut sql, prefix, &[ROWS]).await.unwrap();
+    assert_eq!(digest_columns(&sql, &table).await, [DIGEST_COLUMN]);
+    assert_eq!(
+        secondary_indexes(&sql, &table).await,
+        [DIGEST_INDEX, "btree (tenant_id, row_key COLLATE \"C\")"]
+    );
+    for statement in [
+        format!(
+            "INSERT INTO {table} (tenant_id, row_key, body, idx_0, idx_0_digest)
+             VALUES ('tenant', 'forged', '{{}}', 'kind', 7)"
+        ),
+        format!("UPDATE {table} SET idx_0_digest = 7"),
+    ] {
+        let refused = sql.execute(&statement, &[]).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            Some(&tokio_postgres::error::SqlState::GENERATED_ALWAYS),
+            "{statement}: {refused}"
+        );
+    }
+    sql.execute(
+        &format!(
+            "INSERT INTO {table} (tenant_id, row_key, body, idx_0) VALUES ('tenant', 'row', '{{}}', $1)"
+        ),
+        &[&"kind"],
+    )
+    .await
+    .unwrap();
+    let stored: bool = sql
+        .query_one(
+            &format!(
+                "SELECT idx_0_digest = hashtextextended('kind', 0) FROM {table} WHERE row_key = 'row'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(stored, "the server stored the value's own digest");
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+}
+
+/// A store pull request 72 migrated — its ledger checksum and each projection table indexed by
+/// the expression `hashtextextended(idx_N, 0)`, without the stored digest column — is refused by
+/// `open` until `migrate` runs. `migrate` alone adds the generated column to every registered
+/// projection table, replaces the expression index under the same name, and moves the ledger to
+/// a checksum pull request 72's binary refuses.
+#[tokio::test]
+async fn the_hash_expression_edition_migrates_to_the_stored_digest_and_is_fenced() {
+    let url = fixture();
+    let mut sql = connect(&url).await;
+    let prefix = "projkey_hash_edition";
+    let table = projection_table(prefix, ROWS.name);
+    let tenant = TenantId::new("tenant").unwrap();
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+    schema::migrate(&mut sql, prefix, &[ROWS]).await.unwrap();
+    let current = secondary_indexes(&sql, &table).await;
+    assert_eq!(
+        current,
+        [DIGEST_INDEX, "btree (tenant_id, row_key COLLATE \"C\")"]
+    );
+    let large = incompressible(8_000, 0x3c6e_f372_fe94_f82b);
+    sql.execute(
+        &format!(
+            "INSERT INTO {table} (tenant_id, row_key, body, idx_0)
+                 SELECT 'tenant', 'row/' || n, jsonb_build_object('n', n), 'kind'
+                 FROM generate_series(1, 50) AS n
+             UNION ALL SELECT 'tenant', 'large', '{{}}', $1"
+        ),
+        &[&large],
+    )
+    .await
+    .unwrap();
+
+    // Pull request 72's state: no digest column, the expression index under the field's index
+    // name, its ledger checksum.
+    let index = schema::projection_index(&table, 0);
+    sql.batch_execute(&format!(
+        "DROP INDEX IF EXISTS {index}; ALTER TABLE {table} DROP COLUMN IF EXISTS idx_0_digest;
+         CREATE INDEX {index} ON {table} USING {HASH_EXPRESSION_INDEX}"
+    ))
+    .await
+    .unwrap();
+    sql.execute(
+        &format!("UPDATE {prefix}_schema_version SET checksum=$1"),
+        &[&HASH_EXPRESSION_CHECKSUM],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        secondary_indexes(&sql, &table).await,
+        [
+            HASH_EXPRESSION_INDEX,
+            "btree (tenant_id, row_key COLLATE \"C\")"
+        ],
+        "the fixture holds pull request 72's edition"
+    );
+    assert_eq!(digest_columns(&sql, &table).await, Vec::<String>::new());
+    assert_eq!(
+        schema::validate(&mut sql, prefix).await,
+        Err(EventLogError::Invalid(
+            "unknown PostgreSQL schema version/checksum".into()
+        )),
+        "an application open refuses pull request 72's edition until migrate runs"
+    );
+
+    schema::migrate(&mut sql, prefix, &[]).await.unwrap();
+    assert_eq!(
+        secondary_indexes(&sql, &table).await,
+        current,
+        "migrate moved a registered projection it was not given to the stored digest index"
+    );
+    assert_eq!(
+        digest_columns(&sql, &table).await,
+        [DIGEST_COLUMN],
+        "migrate added the stored digest column"
+    );
+    schema::validate(&mut sql, prefix).await.unwrap();
+    schema::validate_projection(&mut sql, prefix, &ROWS)
+        .await
+        .unwrap();
+    let ledger: String = sql
+        .query_one(
+            &format!("SELECT checksum FROM {prefix}_schema_version"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(
+        ledger, HASH_EXPRESSION_CHECKSUM,
+        "pull request 72's binary requires its own checksum, so it is refused on the migrated schema"
+    );
+    let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+    assert_eq!(
+        store
+            .projection_find(&ROWS, &tenant, "kind", "kind", 100)
+            .await
+            .unwrap()
+            .len(),
+        50,
+        "the migrated table answers the same lookup"
+    );
+    assert_eq!(
+        store
+            .projection_find(&ROWS, &tenant, "kind", &large, 10)
+            .await
+            .unwrap(),
+        [serde_json::json!({})],
+        "the 8,000-byte value is found through the stored digest"
+    );
+    store.shutdown().await.unwrap();
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+}
+
+/// A digest column that is not the generated one is a different table: a plain column a writer
+/// fills, or a generated column over another expression, can hold a digest that does not match
+/// the value, and the lookup would then miss the row with no candidate to check. Projection
+/// admission (`validate_projection`, run by every `open` that attaches a projection) and
+/// read-only capture admission both refuse it.
+#[tokio::test]
+async fn a_digest_column_the_server_does_not_generate_from_the_value_is_refused() {
+    let url = fixture();
+    let mut sql = connect(&url).await;
+    let prefix = "projkey_forged_digest";
+    let table = projection_table(prefix, ROWS.name);
+    let index = schema::projection_index(&table, 0);
+    for (case, column) in [
+        ("a plain column", "idx_0_digest BIGINT"),
+        (
+            "another expression",
+            "idx_0_digest BIGINT GENERATED ALWAYS AS (hashtextextended(idx_0, 1)) STORED",
+        ),
+    ] {
+        drop_owner(&sql, prefix, &[&ROWS]).await;
+        schema::migrate(&mut sql, prefix, &[ROWS]).await.unwrap();
+        // The control: the shape `migrate` built is admitted by both.
+        schema::validate_projection(&mut sql, prefix, &ROWS)
+            .await
+            .unwrap();
+        {
+            let transaction = sql.transaction().await.unwrap();
+            crate::capture::admit_projection(&transaction, prefix, &ROWS)
+                .await
+                .unwrap();
+        }
+        sql.batch_execute(&format!(
+            "ALTER TABLE {table} DROP COLUMN idx_0_digest;
+             ALTER TABLE {table} ADD COLUMN {column};
+             CREATE INDEX {index} ON {table} (tenant_id, idx_0_digest)"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            secondary_indexes(&sql, &table).await,
+            [DIGEST_INDEX, "btree (tenant_id, row_key COLLATE \"C\")"],
+            "{case}: the indexes are the admitted ones"
+        );
+        assert_eq!(
+            schema::validate_projection(&mut sql, prefix, &ROWS).await,
+            Err(EventLogError::Invalid(format!(
+                "incompatible PostgreSQL projection: {table}"
+            ))),
+            "{case}: projection admission refuses it"
+        );
+        let transaction = sql.transaction().await.unwrap();
+        assert_eq!(
+            crate::capture::admit_projection(&transaction, prefix, &ROWS).await,
+            Err(eventlog_core::CaptureError::ProjectionUnavailable {
+                projection: ROWS.name.to_owned(),
+                reason: eventlog_core::ProjectionCaptureRefusal::PhysicalShapeMismatch,
+            }),
+            "{case}: capture admission refuses it"
+        );
+        drop(transaction);
+    }
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+}
+
+/// Review L78 and option B: the find checks each candidate's value after the digest index
+/// returned it. When rows holding a colliding value sort first and fill the limit, the checked
+/// candidates alone would be short or empty; the find must still return the rows holding the
+/// value asked for, in `projection_find` and in a guard's `find`.
+#[tokio::test]
+async fn a_digest_collision_that_fills_the_limit_still_returns_the_value_asked_for() {
+    let url = fixture();
+    let mut sql = connect(&url).await;
+    let prefix = "digest_crowd";
+    let table = projection_table(prefix, ROWS.name);
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+    schema::migrate(&mut sql, prefix, &[ROWS]).await.unwrap();
+    let [asked, colliding] = DIGEST_TWINS;
+    sql.execute(
+        &format!(
+            "INSERT INTO {table} (tenant_id, row_key, body, idx_0) VALUES
+                 ('crowd', 'a/1', jsonb_build_object('kind', $2::text), $2),
+                 ('crowd', 'a/2', jsonb_build_object('kind', $2::text), $2),
+                 ('crowd', 'b/1', jsonb_build_object('kind', $1::text, 'n', 1), $1),
+                 ('crowd', 'b/2', jsonb_build_object('kind', $1::text, 'n', 2), $1)"
+        ),
+        &[&asked, &colliding],
+    )
+    .await
+    .unwrap();
+    let tenant = TenantId::new("crowd").unwrap();
+    let store = PostgresEventStore::connect(&url, prefix).await.unwrap();
+    let first = serde_json::json!({ "kind": asked, "n": 1 });
+    let second = serde_json::json!({ "kind": asked, "n": 2 });
+    for (limit, expected) in [
+        (1, vec![first.clone()]),
+        (2, vec![first.clone(), second.clone()]),
+        (3, vec![first.clone(), second.clone()]),
+    ] {
+        assert_eq!(
+            store
+                .projection_find(&ROWS, &tenant, "kind", asked, limit)
+                .await
+                .unwrap(),
+            expected,
+            "projection_find with limit {limit}"
+        );
+    }
+    let guard = std::sync::Arc::new(FindsKind {
+        tenant: tenant.clone(),
+        value: asked,
+        found: std::sync::Mutex::default(),
+    });
+    let crowded = std::sync::Arc::new(FindsFirst(guard.clone()));
+    let stream = eventlog_core::StreamId::new(tenant.clone(), "item", "crowd").unwrap();
+    store
+        .append_guarded(
+            &stream,
+            eventlog_core::Expected::NoStream,
+            &[eventlog_conformance::event("item.received", 1)],
+            &eventlog_conformance::meta("crowd", &serde_json::json!({})),
+            crowded,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *guard.found.lock().unwrap(),
+        [first],
+        "a guard's find with limit 1"
+    );
+    store.shutdown().await.unwrap();
+    drop_owner(&sql, prefix, &[&ROWS]).await;
+}
+
+/// A guard that looks `FindsKind`'s value up with a limit of one.
+struct FindsFirst(std::sync::Arc<FindsKind>);
+
+impl eventlog_core::Guard for FindsFirst {
+    fn check<'a>(
+        &'a self,
+        store: &'a mut dyn eventlog_core::ProjectionStore,
+    ) -> eventlog_core::BoxFuture<'a, Result<(), EventLogError>> {
+        Box::pin(async move {
+            let rows = store
+                .find(&ROWS, &self.0.tenant, "kind", self.0.value, 1)
+                .await?;
+            *self.0.found.lock().unwrap() = rows;
+            Ok(())
+        })
+    }
 }
 
 #[test]

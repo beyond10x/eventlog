@@ -104,7 +104,8 @@ The test step needs `cargo-nextest` 0.9.143 or later. `.config/nextest.toml` end
 runs 60 s, and the gate then prints the run's ten slowest tests from nextest's JUnit report
 (`target/nextest/default/junit.xml`). The folder's budget for the whole step is 120 s; the step
 does not fit it yet on this host (story `test-step-fits-120-s`), so the run-wide limit is not set.
-Test builds carry no debug information and are optimized (`.cargo/config.toml`: `opt-level = 1`
+Test builds carry no debug information (the host's `~/.cargo/config.toml` sets
+`debug = false` for every build) and are optimized (`.cargo/config.toml`: `opt-level = 1`
 for the workspace, `2` for dependencies): unoptimized hashing made the two in-memory
 `remembered_content` tests run 12 to 18 s, optimized they run 1 to 2 s. Most of the step's time
 is file and database I/O, which the build profile does not change.
