@@ -1611,18 +1611,21 @@ impl EventStore for PostgresEventStore {
             // Typed parameters: one round trip, no separate prepare (see `read_stream`). The
             // candidates come through the stored digest; a candidate holding another value means
             // the answer may be short, and the checked statement alone answers.
-            let mut rows = client
-                .query_typed(&find(schema::projection_find_filter(position)), &parameters)
+            let mut rows = find_rows(
+                &mut client,
+                &find(schema::projection_find_filter(position)),
+                &parameters,
+            )
+            .await
+            .map_err(backend)?;
+            if !every_candidate_holds(&rows, value)? {
+                rows = find_rows(
+                    &mut client,
+                    &find(schema::projection_find_checked_filter(position)),
+                    &parameters,
+                )
                 .await
                 .map_err(backend)?;
-            if !every_candidate_holds(&rows, value)? {
-                rows = client
-                    .query_typed(
-                        &find(schema::projection_find_checked_filter(position)),
-                        &parameters,
-                    )
-                    .await
-                    .map_err(backend)?;
                 checked(&rows, value)?;
             }
             if rows.is_empty() {
@@ -1650,6 +1653,30 @@ impl EventStore for PostgresEventStore {
             client.settled();
             Ok(rows.iter().map(|row| row.get(0)).collect())
         })
+    }
+}
+
+async fn find_rows(
+    client: &mut pool::Lease,
+    sql: &str,
+    parameters: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type); 5],
+) -> Result<Vec<Row>, tokio_postgres::Error> {
+    let arguments: [&(dyn tokio_postgres::types::ToSql + Sync); 5] =
+        std::array::from_fn(|index| parameters[index].0);
+    match client.statements().get(sql).cloned() {
+        Some(Some(statement)) => client.query(&statement, &arguments).await,
+        Some(None) => {
+            let types: Vec<Type> = parameters.iter().map(|(_, kind)| kind.clone()).collect();
+            let statement = client.prepare_typed(sql, &types).await?;
+            client
+                .statements()
+                .insert(sql.to_owned(), Some(statement.clone()));
+            client.query(&statement, &arguments).await
+        }
+        None => {
+            client.statements().insert(sql.to_owned(), None);
+            client.query_typed(sql, parameters).await
+        }
     }
 }
 
