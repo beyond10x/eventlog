@@ -727,6 +727,7 @@ impl Pool {
             });
             Ok(Connection {
                 client,
+                statements: std::collections::HashMap::new(),
                 driver: Some(driver),
                 transport,
                 cancel,
@@ -846,6 +847,11 @@ impl Lease {
     pub(crate) fn settled(&mut self) {
         self.reusable = true;
     }
+    pub(crate) fn statements(
+        &mut self,
+    ) -> &mut std::collections::HashMap<String, Option<tokio_postgres::Statement>> {
+        &mut self.client.as_mut().expect("connected lease").statements
+    }
 }
 impl Deref for Lease {
     type Target = Client;
@@ -961,6 +967,7 @@ impl Drop for RetiredOccupancy {
 
 struct Connection {
     client: Client,
+    statements: std::collections::HashMap<String, Option<tokio_postgres::Statement>>,
     /// The task that polls `transport`; joined before a retirement is accounted.
     driver: Option<tokio::task::JoinHandle<()>>,
     transport: DriverSlot,
