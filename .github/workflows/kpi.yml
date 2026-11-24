@@ -5,6 +5,19 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base:
+        description: Timing A/B base revision (a sha or tag); empty skips the timing job
+        required: false
+        default: ''
+      head:
+        description: Timing A/B head revision; the base again gives an A/A run
+        required: false
+        default: HEAD
+      rounds:
+        description: Interleaved rounds per side; empty takes kpi/kpis.json's value
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -87,10 +100,10 @@ jobs:
   timing:
     name: KPI timing
     needs: classify
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.classify.outputs.code != 'false' }}
+    if: ${{ !cancelled() && ((github.event_name == 'pull_request' && needs.classify.outputs.code != 'false') || (github.event_name == 'workflow_dispatch' && inputs.base != '')) }}
     continue-on-error: true
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
@@ -125,16 +138,26 @@ jobs:
         id: scope
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             target/release/eventlog-kpi ci-scope --base "$BASE" --head HEAD
           fi
-      - name: Timing A/B against the pull request base
+      - name: Timing A/B against the pull request base, or the dispatched revisions
         if: steps.scope.outputs.run == 'true'
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ inputs.base || github.event.pull_request.base.sha }}
+          HEAD_REV: ${{ inputs.head || 'HEAD' }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
           cp target/release/eventlog-kpi "$RUNNER_TEMP/eventlog-kpi"
-          "$RUNNER_TEMP/eventlog-kpi" ab --base "$BASE" --head HEAD
+          nproc
+          cat /proc/loadavg
+          set -- ab --base "$BASE" --head "$HEAD_REV"
+          if [ -n "$ROUNDS" ]; then set -- "$@" --rounds "$ROUNDS"; fi
+          "$RUNNER_TEMP/eventlog-kpi" "$@"
+          cat /proc/loadavg
