@@ -22,6 +22,10 @@ on:
         description: Run the PostgreSQL plan-time split of the projection find instead of the timing A/B; true runs it
         required: false
         default: ''
+      attribute:
+        description: Run the PostgreSQL plan-time attribution of the projection find, pure SQL, instead of every other job; true runs it
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -51,7 +55,7 @@ jobs:
   counters:
     name: KPI counters
     needs: classify
-    if: ${{ !cancelled() && needs.classify.outputs.code != 'false' }}
+    if: ${{ !cancelled() && inputs.attribute != 'true' && needs.classify.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -104,7 +108,7 @@ jobs:
   timing:
     name: KPI timing
     needs: classify
-    if: ${{ !cancelled() && ((github.event_name == 'pull_request' && needs.classify.outputs.code != 'false') || (github.event_name == 'workflow_dispatch' && inputs.base != '' && inputs.split != 'true')) }}
+    if: ${{ !cancelled() && inputs.attribute != 'true' && ((github.event_name == 'pull_request' && needs.classify.outputs.code != 'false') || (github.event_name == 'workflow_dispatch' && inputs.base != '' && inputs.split != 'true')) }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -168,7 +172,7 @@ jobs:
 
   split:
     name: KPI plan split
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.split == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.split == 'true' && inputs.attribute != 'true' }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -203,3 +207,29 @@ jobs:
       - name: Stop PostgreSQL
         if: ${{ always() }}
         run: sh scripts/kpi-plan-split.sh stop
+
+  attribution:
+    name: KPI plan attribution
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.attribute == 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Self-check of the summary
+        run: sh scripts/kpi-plan-attribution-summary-test.sh
+      - name: Start PostgreSQL with pg_stat_statements
+        run: sh scripts/kpi-plan-attribution.sh start
+      - name: Create and load the tables of both revisions
+        run: sh scripts/kpi-plan-attribution.sh setup
+      - name: EXPLAIN of each variant
+        run: sh scripts/kpi-plan-attribution.sh explain
+      - name: Rounds
+        run: sh scripts/kpi-plan-attribution.sh rounds 8
+      - name: Summary
+        run: sh scripts/kpi-plan-attribution-summary.sh "$RUNNER_TEMP/attribution/rounds.tsv"
+      - name: Stop PostgreSQL
+        if: ${{ always() }}
+        run: sh scripts/kpi-plan-attribution.sh stop
