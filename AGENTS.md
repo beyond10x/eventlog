@@ -172,6 +172,12 @@ The runner is `crates/eventlog-kpi` (`publish = false`).
   machine. `eventlog-kpi ab --base <rev> --head <rev>` builds both revisions with the current
   runner, runs them interleaved for several rounds on the same machine and fails when a median
   is worse than `ab.max_ratio`. The baseline's timings are the recording machine's, for reading.
+- No KPI round runs on the shared workstation `next`: no `eventlog-kpi ab`, `timings` or `record`,
+  no pgbench, no profile taken for its times, at any load (Timo's rule of 2026-11-11). Timings
+  there run beside other sessions' builds and decide nothing, in either direction. An A/B or an
+  A/A (the same revision as base and head, the noise floor of the procedure) runs in the
+  `KPI / KPI timing` job on a CI runner: on a pull request against its base, or by
+  `workflow_dispatch` with the inputs `base`, `head` and `rounds`.
 - Counters inside a provider (`eventlog-file`, `eventlog-sqlite`, `eventlog-tree`, module `kpi`)
   compile only with their non-default `kpi-counters` feature, enabled by the runner's `counters`
   feature; no product build carries them. A change that rewrites a counted path keeps its
