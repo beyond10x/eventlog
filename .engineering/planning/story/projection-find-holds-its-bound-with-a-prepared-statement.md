@@ -13,6 +13,8 @@ scope:
 - confidence: cited
   path: CHANGELOG.md
 - confidence: cited
+  path: crates/eventlog-postgres/examples/production-proof/required.rs
+- confidence: cited
   path: crates/eventlog-postgres/src/find_statements.rs
 - confidence: cited
   path: crates/eventlog-postgres/src/lib.rs
@@ -32,7 +34,7 @@ scope:
   path: docs/design/projection-value-digest.md
 - confidence: cited
   path: kpi/baseline.json
-revision: 7
+revision: 9
 ---
 ## Outcome
 
@@ -94,14 +96,16 @@ rounds:
 
 G1: the prepared statement under `force_custom_plan`, on head's statement, end to end, is at most
 1.03x of the unprepared 0.10.0 shape. The spike meets it at pgbench level (P1/E0 0.895). A
-pgbench-level run cannot see the client's work, so G1 stays provisional until a scratch branch V1
-(the prepared find only) is dispatched 4 times through `KPI / KPI timing` with `base` = the 0.10.0
-tag and its median is at most 1.03.
+pgbench-level run cannot see the client's work, so G1 stays provisional until variant V1 is
+measured. V1 is owned by the kit story, not by this one: `story:projection-find-measurement-kit`,
+acceptance line 14 (the prepared find only, on a scratch branch, 4 dispatched 20-round runs with
+`base` = the 0.10.0 tag, median of the `postgres.projection_find.latency` p50 ratio at most
+1.03). This story starts when that line is met.
 
-- G1 passes: build design sections 1-9 and follow section 10 steps 5 to 7.
-- G1 fails: nothing of sections 1-4 is built; the fallback is decision D5, the owner's, filed as
+- V1 passes: build design sections 1-9 and follow section 10 steps 5 to 7.
+- V1 fails: nothing of sections 1-4 is built; the fallback is decision D5, the owner's, filed as
   `decision-blocker:find-fallback-if-the-prepared-gate-fails`. The bound is not touched. The kit
-  story is not affected.
+  story stays valid.
 
 ## Acceptance
 
@@ -109,33 +113,67 @@ Each line is observable alone. Commit 3 is the product commit; baseline step 3b 
 commit of the `kpi/baseline.json` uploaded by the `record` dispatch of the kit story, never "in
 the same commit".
 
-1. The in-crate tests 1-9 and U1-U3 of design section 6 ran against PostgreSQL and none skipped:
-   the test step sets `EVENTLOG_TEST_POSTGRES_URL` and `EVENTLOG_REQUIRE_POSTGRES` (without the URL
-   these tests return early, so a green run proves nothing), and each test runs under 60 s.
-2. The tests this story adds take at most 10 s of the test step and none exceeds 60 s.
-3. `KPI counters` after step 3b: `postgres.projection_find.parses` is 0, re-recorded in the
-   separate baseline commit 3b.
-4. `KPI counters`: `postgres.projection_find.round_trips` is 100.
-5. `KPI counters`: `postgres.projection_find_skewed.tuples_read` equals the value the kit recorded.
-6. Acceptance A/B, 4 dispatched 20-round `KPI timing` runs, `base` = the 0.10.0 tag: the median of
-   the head/0.10.0 ratio of `postgres.projection_find.latency` p50 is at most 1.05.
-7. The same ratio of the product commit against the kit commit (`base` = the kit commit), as the
-   median of the same 4 runs, is at most 0.95, so the prepared statement is what moves the number
-   (the spike gave 0.78 for P1/E1).
-8. Each of `postgres.projection_find_skewed.latency`, `postgres.atomic_group_large.latency`,
-   `postgres.batch_append.throughput`, `postgres.group_blobs.latency`,
-   `postgres.read_stream.latency` and `postgres.read_feed_page.latency`, against the kit commit
-   (`base` = the kit commit), has a median ratio over the 4 runs within 1.05 (for the throughput id,
-   at least 1/1.05). The median is stated for each id and each run URL is recorded in the pull
-   request. The `ab` command's default `REGRESSED` means above 1.5; this story's threshold is the
-   stated 1.05, so a `REGRESSED`-free run is not enough.
-9. Rustdoc names the dedicated-session requirement, the 64-text cap and the new session setting:
-   present, checked by name in the rustdoc of the touched items.
-10. `CHANGELOG.md` `[Unreleased]` carries the entry with the measured ratio and the sentence that
-    +7 to +10 us of planning stays. The 0.11.0 tag itself is the owner's word and not part of the
-    acceptance.
+Dispatches: 8 in total, each a 20-round `KPI / KPI timing` run with `head` = the product commit,
+each URL named in the pull request. Group A is 4 runs with `base` = the 0.10.0 tag (line 8). Group
+B is 4 runs with `base` = the kit commit (lines 9 and 10).
 
-Fail on line 6 or 7: the bound is not touched; back to D5.
+1. The step that runs the in-crate tests fails when a test in the new modules skips, and the step
+   is green. Mechanism, named once: the `Persistence proof` job of
+   `.github/workflows/persistence-proof.yml` sets `EVENTLOG_TEST_POSTGRES_URL` at job level and
+   runs `bash scripts/gate.sh --production-proof`, which runs every workspace test binary with
+   `EVENTLOG_REQUIRE_POSTGRES=1` (`crates/eventlog-postgres/examples/production-proof.rs`); each
+   new DB test of design section 6 (tests 1-9 and U1-U3) starts with the repository's skip guard,
+   which fails instead of returning early when that variable is set and the URL is missing
+   (`crates/eventlog-postgres/src/pool.rs:1449`). The local default lane (`cargo nextest run
+   --workspace`) sets neither variable.
+2. The new tests are named in `required_cases()`
+   (`crates/eventlog-postgres/examples/production-proof/required.rs`), so the job reports one that
+   is absent as missing.
+3. No test this story adds takes more than 60 s (the nextest lane kills at 60 s,
+   `.config/nextest.toml`, and prints the ten slowest).
+4. The tests this story adds take at most 10 s in total.
+5. `KPI counters` after step 3b: `postgres.projection_find.parses` is 0, re-recorded in the
+   separate baseline commit 3b.
+6. `KPI counters`: `postgres.projection_find.round_trips` is 100.
+7. `KPI counters`: `postgres.projection_find_skewed.tuples_read` equals the value the kit recorded in
+   its step 1b.
+8. Group A: the median over its 4 runs of the head/0.10.0 ratio of
+   `postgres.projection_find.latency` p50 is at most 1.05.
+9. Group B: the median over its 4 runs of the product/kit-commit ratio of
+   `postgres.projection_find.latency` p50 is at most 0.95, so the prepared statement is what moves
+   the number (the spike gave 0.78 for P1/E1).
+10. Each of the six ids below is judged separately, as its own check, in group B against the kit
+   commit: the median over the 4 runs is within 1.05 (for the throughput id, at least 1/1.05).
+   For this story the threshold is 1.05; `REGRESSED` in the `ab` command's default means above
+   1.5, so a run without `REGRESSED` is not enough.
+   - `postgres.projection_find_skewed.latency`
+   - `postgres.atomic_group_large.latency`
+   - `postgres.batch_append.throughput`
+   - `postgres.group_blobs.latency`
+   - `postgres.read_stream.latency`
+   - `postgres.read_feed_page.latency`
+11. The dedicated-session requirement, the 64-text cap and the new session setting are documented
+    on named items. Under D1 default A (no new public item): the requirement on the existing
+    public docs of `eventlog_postgres::PostgresConnectionAuthority::connect` and
+    `eventlog_postgres::PostgresConfig::caller_owned` (`crates/eventlog-postgres/src/pool.rs`);
+    the 64-text cap on the module docs of `crate::statement_cache`
+    (`crates/eventlog-postgres/src/statement_cache.rs`, private); the new setting
+    (`plan_cache_mode = force_custom_plan`) on the docs of `crate::pool::session_configuration`.
+    Check: `slot cargo doc --no-deps -p eventlog-postgres --document-private-items` ends without a
+    warning, and `grep -n 'dedicated session' crates/eventlog-postgres/src/pool.rs`,
+    `grep -n '64' crates/eventlog-postgres/src/statement_cache.rs` and
+    `grep -n 'force_custom_plan' crates/eventlog-postgres/src/pool.rs` each find the doc comment
+    on the named item (no CI step runs `cargo doc`, so this is run when the story is closed).
+12. `CHANGELOG.md` `[Unreleased]` carries an entry that states the measured ratio of line 8 (the
+    median of group A).
+13. The same entry carries the sentence that +7 to +10 us of planning stays.
+
+The 0.11.0 tag itself is the owner's word and not part of the acceptance.
+
+Pull request checklist (recorded in the pull request body, not acceptance lines): the median for
+each id of line 10 over its 4 runs, and every dispatch URL of groups A and B.
+
+Fail on line 8 or 9: the bound is not touched; back to D5.
 
 Out of scope, named on purpose: the transaction-scoped `ProjectionStore::find`
 (`crates/eventlog-postgres/src/lib.rs:1896-1950`) still prepares and closes per call (three Syncs
@@ -148,7 +186,7 @@ per find) and the bound does not cover it.
   under `#[cfg(test)]` only. B: a field on `PoolChurn` with an ESS change. C: a new public struct
   and accessor.
 - D3, plan-mode scope. Default A: session-wide `force_custom_plan`, gated on the
-  `postgres.atomic_group_large.latency` A/B (acceptance line 8). If it fails, or if the kit's
+  `postgres.atomic_group_large.latency` A/B (acceptance line 10). If it fails, or if the kit's
   fixture gate G2 fails, the owner accepts the measured cost or takes D5.
 - D4, where the bound lives. Default A: the dispatched 20-round runs; the PR timing job stays
   informational; `ab_max_ratio` stays null. B: `ab_max_ratio: 1.05` on
@@ -165,11 +203,14 @@ Files the design names (section 9): `crates/eventlog-postgres/src/statement_cach
 `crates/eventlog-postgres/src/pool.rs`, `crates/eventlog-postgres/src/lib.rs`,
 `crates/eventlog-postgres/src/find_statements.rs` (new, `#[cfg(test)]`),
 `crates/eventlog-postgres/src/projection_indexes.rs` (existing find tests),
-`crates/eventlog-postgres/src/schema.rs`, `crates/eventlog-postgres/tests/`, `CHANGELOG.md`,
-`docs/design/projection-find-planning.md`, `docs/design/projection-value-digest.md`. The KPI
-surfaces (`crates/eventlog-kpi/src`, `.github/workflows/kpi.yml`, `kpi/kpis.json`, `AGENTS.md`)
-belong to the kit story; this story touches `kpi/baseline.json` only in step 3b. No schema, ledger
-or migration change; no ESS change under D2 A.
+`crates/eventlog-postgres/src/schema.rs` (read for the digest function; no schema change),
+`crates/eventlog-postgres/tests/`,
+`crates/eventlog-postgres/examples/production-proof/required.rs` (the new test names, line 2),
+`CHANGELOG.md`, `docs/design/projection-find-planning.md`,
+`docs/design/projection-value-digest.md`. The KPI surfaces (`crates/eventlog-kpi/src`,
+`.github/workflows/kpi.yml`, `kpi/kpis.json`, `AGENTS.md`) belong to the kit story; this story
+touches `kpi/baseline.json` only in step 3b. No schema, ledger or migration change; no ESS change
+under D2 A.
 
 Every implementation brief names: the 60 s per-test bound and the 120 s test-step budget; the
 10-minute job limit; no new Python in anything that stays in the repository; scripts that measure

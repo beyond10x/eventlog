@@ -5,7 +5,12 @@ kind: story
 status: draft
 title: SQLite and file projection_find timings hold an A/A run
 summary: Two A/A runs gave 2.443 and 2.170 for sqlite and file find in one run and 0.99 in the other
-revision: 1
+scope:
+- confidence: cited
+  path: crates/eventlog-kpi
+- confidence: cited
+  path: kpi/kpis.json
+revision: 2
 ---
 ## Outcome
 
