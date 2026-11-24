@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:projection-find-measurement-kit
 kind: story
-status: draft
+status: active
 title: 'KPI measurement kit for projection_find: skewed fixture, five ids, a CI record path'
 summary: Skewed fixture, five ids, a CI record path and the variants G, U and V1; commit 1 is red UNRECORDED until baseline step 1b
 relations:
@@ -19,7 +19,10 @@ scope:
   path: kpi/baseline.json
 - confidence: cited
   path: kpi/kpis.json
-revision: 8
+revision: 11
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-24T15:20:26Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"test_result":5}}}
+- {from: "proposed", to: "active", at: "2026-11-24T15:20:26Z", actor: "human:timo", revision: 11, decided_on: {"recorded":{"test_result":5}}}
 ---
 ## Outcome
 
@@ -180,3 +183,24 @@ Every implementation brief names: the 60 s per-test bound and the 120 s test-ste
 10-minute job limit; no new Python in anything that stays in the repository (the record path and
 CI steps are Rust or POSIX sh); scripts that measure or wait start without the `slot` prefix;
 nothing runs on the shared workstation for timing.
+
+## Measured on the runner
+
+Pull request: https://github.com/beyond10x/eventlog/pull/79 (draft). Commit 1 `32668a6c`, baseline step 1b `c8e4a884`, head `d7cc0d26`.
+
+Head against head, 20 rounds, on the CI runner (ratio of p50, head over base; limit 1.50):
+
+| run | head | `postgres.projection_find_skewed.latency` | `postgres.atomic_group_large.latency` |
+| --- | --- | --- | --- |
+| https://github.com/beyond10x/eventlog/actions/runs/45405997907 | `c8e4a884` | 1.007 | 0.993 |
+| https://github.com/beyond10x/eventlog/actions/runs/45411894378 | `d7cc0d26` | 1.020 | 1.004 |
+
+The A/A against the 0.10.0 tag (https://github.com/beyond10x/eventlog/actions/runs/45402541977, base `c0f961dc`, head `c8e4a884`) printed 1.073 and 0.993, so both new scenarios run on 0.10.0. Observed, not a pass or fail.
+
+Skewed fixture on the runner (PostgreSQL 17.6), same lines in every `KPI counters` run:
+
+- E1, custom plan: Index Scan on the digest index, estimated 8 rows, actual 10 rows, 10 tuples read, 8 blocks.
+- E2, forced generic plan: Index Scan on the primary key, estimated 155 rows, actual 10 rows, 25,000 tuples read, 420 blocks, 2,500 x E1.
+- E3, recorded only: after 6 executions under `plan_cache_mode = auto`, 0 generic and 6 custom plans; `auto` did not flip on this fixture.
+
+Recorded counters (1b): `postgres.projection_find_skewed.tuples_read` 10, `postgres.projection_find.round_trips` 100, `postgres.projection_find.parses` 8. The large group of 6,500 streams ran in about 1.27 s and the chunked statement executed 7 times.

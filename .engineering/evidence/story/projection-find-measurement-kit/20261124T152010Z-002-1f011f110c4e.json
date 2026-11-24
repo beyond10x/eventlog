@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T15:20:10Z",
+  "actor": "human:timo",
+  "artifact": "story:projection-find-measurement-kit",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/eventlog/actions/runs/45405997907",
+    "reference": "head vs head c8e4a884, 20 rounds: skewed 1.007, large 0.993 (acceptance 4)"
+  }
+}

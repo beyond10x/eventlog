@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T15:20:10Z",
+  "actor": "human:timo",
+  "artifact": "story:projection-find-measurement-kit",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/eventlog/actions/runs/45400932091",
+    "reference": "record dispatch artifact kpi-baseline with the 3 counters: tuples_read 10, round_trips 100, parses 8 (acceptance 5, 7); re-checked by https://github.com/beyond10x/eventlog/actions/runs/45411855568"
+  }
+}

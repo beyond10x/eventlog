@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T15:20:10Z",
+  "actor": "human:timo",
+  "artifact": "story:projection-find-measurement-kit",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/eventlog/actions/runs/45411846939",
+    "reference": "PR 79 head d7cc0d26: KPI counters, KPI timing and real-backends green; E1 10 tuples, E2 25000 tuples (2500x), E3 auto stays custom (acceptance 2, 3, 6, 9)"
+  }
+}
