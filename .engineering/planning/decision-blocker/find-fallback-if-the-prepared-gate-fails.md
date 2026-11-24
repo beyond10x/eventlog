@@ -2,12 +2,14 @@
 format: aep.planning-md/3
 id: decision-blocker:find-fallback-if-the-prepared-gate-fails
 kind: decision-blocker
-status: open
+status: cleared
 title: 'Which fallback if the prepared-find gate G1 fails: client digest, C-collated row_key, or both'
 relations:
 - blocks: story:projection-find-holds-its-bound-with-a-prepared-statement
 withholds: metric_observation
-revision: 3
+revision: 4
+transitions:
+- {from: "open", to: "cleared", at: "2026-11-24T17:37:58Z", actor: "agent:eventlog", revision: 4}
 ---
 ## Question
 
