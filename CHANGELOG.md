@@ -89,6 +89,21 @@ under bare-version tags such as `0.1.0`.
   (10,000 reads under one second, groups of up to 20,000 events), in a release build and prints
   their times. The debug test step no longer runs `batch_timing` (`test = false`); the gate still
   lints it. The KPI counters CI job runs the slow lane.
+- PostgreSQL: `projection_find` reuses a prepared statement on each pooled connection from its
+  second use. The server plans the statement on every call as before and no longer parses and
+  analyses it. The planning cost of the new projection indexes (+7 to +10 us per find: the page
+  index and the server-side digest call) stays; it is paid for by the work the prepared statement
+  removes. Every pooled session now sets `plan_cache_mode = force_custom_plan`, so a prepared
+  statement is planned for its own parameter values on each execution and never goes generic.
+  This overrides a role-level value, as the pool's other session settings do. The batched
+  statements of an append or a group over more than 5,000 items are planned per chunk instead of
+  possibly switching to a generic plan. Each connection keeps at most 64 prepared find
+  statements; a store with more distinct find statements runs the extra ones unprepared. A
+  caller-owned connection must be a dedicated session, not one behind a transaction-mode or
+  statement-mode pooler, because prepared statements are named per process (documented on
+  `PostgresConnectionAuthority::connect` and `PostgresConfig::caller_owned`). A session that
+  refuses named statements keeps answering without the speed-up. `ProjectionStore::find` inside a
+  transaction still prepares and closes its statement on each call.
 
 ### Deprecated
 

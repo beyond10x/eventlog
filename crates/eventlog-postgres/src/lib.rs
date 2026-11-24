@@ -35,6 +35,8 @@ mod atomic_group;
 mod capture;
 #[cfg(test)]
 mod capture_pages;
+#[cfg(test)]
+mod find_statements;
 mod inline_admin;
 mod pool;
 #[cfg(test)]
@@ -44,6 +46,7 @@ mod receipt_snapshot;
 #[cfg(test)]
 mod registration_deadline;
 mod schema;
+mod statement_cache;
 #[cfg(test)]
 mod verify_content_once;
 use pool::Pool;
@@ -1608,21 +1611,24 @@ impl EventStore for PostgresEventStore {
                 (&projection.name, Type::TEXT),
                 (&declared, Type::JSONB),
             ];
-            // Typed parameters: one round trip, no separate prepare (see `read_stream`). The
-            // candidates come through the stored digest; a candidate holding another value means
-            // the answer may be short, and the checked statement alone answers.
-            let mut rows = client
-                .query_typed(&find(schema::projection_find_filter(position)), &parameters)
-                .await
-                .map_err(backend)?;
+            // Typed parameters, one round trip per find (see `read_stream`): the first use of a
+            // statement text on a connection is unprepared, from the second use on the
+            // connection's prepared statement is bound and executed. The candidates come through
+            // the stored digest; a candidate holding another value means the answer may be short,
+            // and the checked statement alone answers.
+            let mut rows = find_rows(
+                &mut client,
+                &find(schema::projection_find_filter(position)),
+                &parameters,
+            )
+            .await?;
             if !every_candidate_holds(&rows, value)? {
-                rows = client
-                    .query_typed(
-                        &find(schema::projection_find_checked_filter(position)),
-                        &parameters,
-                    )
-                    .await
-                    .map_err(backend)?;
+                rows = find_rows(
+                    &mut client,
+                    &find(schema::projection_find_checked_filter(position)),
+                    &parameters,
+                )
+                .await?;
                 checked(&rows, value)?;
             }
             if rows.is_empty() {
@@ -1651,6 +1657,100 @@ impl EventStore for PostgresEventStore {
             Ok(rows.iter().map(|row| row.get(0)).collect())
         })
     }
+}
+
+/// The five parameters of a find statement, each with the type it is sent as.
+type FindParameters<'p> = [(&'p (dyn tokio_postgres::types::ToSql + Sync), Type); 5];
+
+/// A failed prepare: the driver's error, or a code a test injected in its place.
+enum PrepareFailure {
+    Driver(tokio_postgres::Error),
+    #[cfg(test)]
+    Injected(&'static str),
+}
+
+impl PrepareFailure {
+    fn code(&self) -> Option<&str> {
+        match self {
+            Self::Driver(error) => sqlstate(error),
+            #[cfg(test)]
+            Self::Injected(code) => Some(code),
+        }
+    }
+
+    fn into_error(self) -> EventLogError {
+        match self {
+            Self::Driver(error) => backend(error),
+            #[cfg(test)]
+            Self::Injected(code) => EventLogError::Backend(format!("injected SQLSTATE {code}")),
+        }
+    }
+}
+
+fn sqlstate(error: &tokio_postgres::Error) -> Option<&str> {
+    error.code().map(tokio_postgres::error::SqlState::code)
+}
+
+/// Runs one find statement on the connection `lease` holds, through the connection's prepared
+/// statement when it has one (`statement_cache`): the first use of the text is unprepared, the
+/// second prepares and executes, later uses bind and execute, one round trip each. A text past
+/// the cache's cap, and a connection whose session refuses named statements, run unprepared.
+///
+/// A prepared statement the server reports stale, or one the session no longer has, is dropped
+/// and the same text runs once unprepared: the failed attempt failed at Bind and read nothing, so
+/// the retry reads a fresh snapshot, and the registry guard in the text is evaluated again. Any
+/// other error is returned as the unprepared path returns it, and leaves the lease unsettled.
+async fn find_rows(
+    lease: &mut pool::Lease,
+    sql: &str,
+    parameters: &FindParameters<'_>,
+) -> Result<Vec<Row>, EventLogError> {
+    use statement_cache::{Execution, Step};
+    let statement = match lease.statements().step(sql) {
+        Step::Unprepared => return lease.query_typed(sql, parameters).await.map_err(backend),
+        Step::Use(statement) => statement,
+        Step::Prepare => {
+            let types = parameters.each_ref().map(|(_, kind)| kind.clone());
+            match prepare_find(lease, sql, &types).await {
+                Ok(statement) => {
+                    lease.statements().prepared(sql, statement.clone());
+                    statement
+                }
+                Err(failure) if statement_cache::refuses_prepare(failure.code()) => {
+                    lease.statements().refuse();
+                    return lease.query_typed(sql, parameters).await.map_err(backend);
+                }
+                Err(failure) => return Err(failure.into_error()),
+            }
+        }
+    };
+    let arguments = parameters.each_ref().map(|(argument, _)| *argument);
+    let error = match lease.query(&statement, &arguments).await {
+        Ok(rows) => return Ok(rows),
+        Err(error) => error,
+    };
+    match statement_cache::classify_execution(sqlstate(&error)) {
+        Execution::Stale => lease.statements().stale(sql),
+        Execution::Refused => lease.statements().refuse(),
+        Execution::Other => return Err(backend(error)),
+    }
+    drop(statement);
+    lease.query_typed(sql, parameters).await.map_err(backend)
+}
+
+async fn prepare_find(
+    lease: &mut pool::Lease,
+    sql: &str,
+    types: &[Type; 5],
+) -> Result<tokio_postgres::Statement, PrepareFailure> {
+    #[cfg(test)]
+    if let Some(code) = lease.take_injected_prepare_failure() {
+        return Err(PrepareFailure::Injected(code));
+    }
+    lease
+        .prepare_typed(sql, types)
+        .await
+        .map_err(PrepareFailure::Driver)
 }
 
 /// A projection's view of the transaction it is running in.

@@ -5,11 +5,12 @@ story:pg-projection-find-back-within-1-05 and `docs/design/projection-value-dige
 it keeps. The independent review of the first version is
 `docs/design/projection-find-planning-review.md` (finding ids F1-F7 below).
 
-Status: design v2, no code written. Written 2026-11-24 10:45 CET. The CI spike for the build gate
-G1 (section 0.4) is in: run 45368249583 on branch `ci/plan-prepared-spike` (**reported**), prepared
-+ `force_custom_plan` against the unprepared 0.10.0 shape P1/E0 0.895, so G1 is met at pgbench level
-and stays provisional until variant V1 (section 10, step 4b). Nothing of the product change (steps
-5 to 7) is built until V1 passes.
+Status: design v3, the product change built (section 10, step 5; build notes in section 11).
+Design v2 was written 2026-11-24 10:45 CET. The CI spike for the build gate G1 (section 0.4) was
+run 45368249583 on branch `ci/plan-prepared-spike` (**reported**), prepared + `force_custom_plan`
+against the unprepared 0.10.0 shape P1/E0 0.895, so G1 was met at pgbench level and provisional
+until variant V1 (section 10, step 4b). V1 passed: median 0.973 of the `postgres.projection_find`
+p50 against 0.10.0 over 4 CI runs (limit 1.03), so the product change was built.
 Supersedes design v1, which is not kept in the repository. Source: `origin/main` 6e72772a, read with
 `git show origin/main:<path>` (no repository edit, no build, no run). Paths are relative to the
 repository root. Inputs: v1, the adversary review of v1, and the CI attribution run 45365255371
@@ -236,7 +237,7 @@ implemented as a neutral `StatementCache` (F6: no projection concept in the gene
   through the driver's public API (`prepare.rs:57-92`: `prepare` returns after its own response).
   Steady state is Bind, Execute, Sync: one round trip (**verified** from the driver's
   `query(&Statement)`; the 1.00 per find is a counter, 5.4).
-- Bound: at most 64 entries per connection (a constant, not a knob). A 65th distinct text is not
+- Bound: at most 64 entries per connection (a constant, not a knob; section 11 for texts seen once). A 65th distinct text is not
   cached and runs through `query_typed` (no eviction, so no `Close` churn). Distinct texts are
   projections x indexed fields x 2 variants. The cap is a silent performance cliff for a store
   with more than 64 distinct texts (F7). Taken: it is documented in the rustdoc and pinned by a
@@ -530,9 +531,12 @@ statistics flush; the repository already has the `EXPLAIN ANALYZE` counter patte
 ### 5.4 Counters that guard the prepared path (F1)
 
 - `postgres.projection_find.round_trips` (counter, tolerance 0, direction lower): the counting proxy
-  over the `projected` fixture, one warm-up find ignored, then 8 finds; the value is the average x
-  100 rounded (100 = 1.00). The cold path is 100 for the first find and 200 for the one that
-  prepares; the counter is defined for the warm state only.
+  over the `projected` fixture, two warm-up finds ignored (the first runs unprepared and records
+  the text, the second prepares: section 1), then 8 finds; the value is the average x 100 rounded
+  (100 = 1.00). The cold path is 100 for the first find and 200 for the one that prepares; the
+  counter is defined for the warm state only. v2 said one warm-up find, which put the prepare
+  inside the window (variant V1 read 113 and 1, CI run 45434221837); section 11 gives the reason
+  for two and why the cache keeps its second-use rule.
 - `postgres.projection_find.parses` (counter, tolerance 0, direction lower): the number of Parse
   messages in the same 8 warm finds. Expected 0. `Framing::feed` already splits frames and sees the
   type byte (`pg.rs`); it returns a second count for `P`. The existing unit test
@@ -756,8 +760,8 @@ Forks. Each has a default; the one that is not reversible or not covered by the 
 2. Does any statement of the adapter other than the six chunked ones change plan under
    `force_custom_plan`, and does the large-group A/B cover the slowest (the head-lock statement)?
 3. Can the Parse counter pass while the cache is refused (a refused connection that never reaches
-   the warm state in the counter's 8 finds)? The counter's warm-up find and the 8 that follow must
-   include the prepare, so it must not.
+   the warm state in the counter's 8 finds)? The counter's two warm-up finds, the second of which
+   prepares, come before the 8, so a refused connection reads 8 parses and the gate goes red.
 
 ## 9. Cost
 
@@ -808,3 +812,44 @@ budget; the 10-minute job limit (`slot --timeout` up to 30 minutes for a job tha
 Python in anything that stays in the repository (the record path and CI steps are Rust or POSIX
 sh); scripts that measure or wait start without the `slot` prefix; and that nothing runs on the
 shared workstation for timing.
+
+## 11. Build notes (v3)
+
+What the code does where this document left a choice, and the one statement of v2 it changes.
+
+- **Warm-up of the protocol counters: two finds, the cache keeps its second-use rule.** V1 showed
+  that one warm-up find is not enough: the second find prepares, so it ran inside the 8-find
+  window and the counters read `round_trips` 113 and `parses` 1. Two ways to fix it. (a) Prepare on
+  first use. Rejected: it adds a prepare round trip to the first find on every connection, and a
+  connection that serves one find (a short-lived process, a pool connection that sees one find)
+  pays 2 round trips where 0.10.0 pays 1; the only gain is a counter that needs one fewer
+  warm-up find. (b) Warm the connection before the window with the number of finds that reaches
+  the warm state, which is what "defined for the warm state only" (5.4) already says. Taken:
+  `WARMUP_FINDS = 2` in `crates/eventlog-kpi/src/counter.rs`. The counter is not weakened: the
+  window still holds 8 finds, each must be one round trip and no parse, so a refused cache, an
+  evict loop or a cache that never prepares reads 8 parses and fails the gate. On a library that
+  prepares nothing the two extra warm-up finds change no count.
+- **The sequence of one find.** `find_rows` in `lib.rs` asks the connection's cache what to do
+  with the statement text (`Step`), runs it, and classifies a failed prepared execution on the
+  SQLSTATE before `backend()` flattens it: 0A000, 42703 and 42P01 forget the statement
+  (`stale`), 26000 and 08P01 refuse the connection, anything else is returned as the unprepared
+  path returns it. A failed prepare refuses the connection only on 0A000, 08P01, 42P05 and 26000;
+  57014, 55P03, 53300, a closed connection and a missing table are returned and refuse nothing.
+  The classification is two pure functions in `statement_cache.rs`, tested without a database.
+- **The cache is generic over its statement type.** `StatementCache<S>` holds an
+  `Entry<S>` per text; the pool instantiates it with `tokio_postgres::Statement`, and the unit
+  tests U1-U3 use an integer, because a `Statement` cannot be built without a connection.
+- **Capacity.** At most 64 remembered texts per connection. A prepared statement is never evicted: a
+  text that arrives when all 64 are prepared is not recorded, runs unprepared every time and
+  closes nothing (test 9). A text seen once holds no server state, so a new text replaces one of
+  those when the cache is full; the adversary read of the build found that counting them against
+  the cap let 64 one-off texts keep every later hot text from ever being prepared.
+- **Refusal clears the cache.** `refuse` drops every entry; the dropped statements send their
+  `Close` on the connection's next operation, which is a no-op for a session that lost them.
+- **Test seam for a code the server does not raise on demand.** SQLSTATE 42P05 at prepare cannot
+  be provoked on a session the driver names statements for, and `tokio_postgres::Error` cannot be
+  built outside the driver. A `cfg(test)` hook on the pool (`fail_next_prepare`) makes the next
+  prepare fail as if the server had answered the code; the classification and the refusal then run
+  as for a real error. Every other case of test 7 is real: a prepare that waits for a lock past
+  `lock_timeout` (55P03, a deadline) and `DEALLOCATE ALL` (26000 at Bind).
+- **Counts exist only under `cfg(test)`** (D2 A): prepare attempts, prepared, evicted, refused.
