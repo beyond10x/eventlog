@@ -3,10 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Failure, Measured, Outcome,
-    environment, timing,
-};
+use crate::{Failure, Measured, Outcome, environment, timing};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -255,6 +252,52 @@ impl Baseline {
         std::fs::write(path, text)?;
         Ok(())
     }
+
+    /// Writes this baseline over the file at `path` by replacing only its revision, its
+    /// recording time and its counters in the file's own text. Everything else, the timings
+    /// above all, keeps the digits it was written with: a parse and a rewrite of a long decimal
+    /// can land one unit in the last place off, and a record that adds counters has no reason to
+    /// move a timing.
+    pub fn write_counters_into(&self, path: &Path) -> Outcome<()> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| Failure(format!("{}: {error}", path.display())))?;
+        std::fs::write(path, self.splice_counters(&text)?)?;
+        Ok(())
+    }
+
+    fn splice_counters(&self, text: &str) -> Outcome<String> {
+        let text = replace_string_field(text, "revision", &self.revision)?;
+        let text = replace_string_field(&text, "recorded_at", &self.recorded_at)?;
+        let opening = "\n  \"counters\": ";
+        let start = text
+            .find(opening)
+            .ok_or_else(|| Failure("the baseline has no counters object".to_owned()))?
+            + opening.len();
+        let closing = ",\n  \"timings\"";
+        let end = text[start..]
+            .find(closing)
+            .ok_or_else(|| Failure("the baseline has no timings after its counters".to_owned()))?
+            + start;
+        let block = serde_json::to_string_pretty(&self.counters)?.replace('\n', "\n  ");
+        Ok(format!("{}{block}{}", &text[..start], &text[end..]))
+    }
+}
+
+fn replace_string_field(text: &str, key: &str, value: &str) -> Outcome<String> {
+    let opening = format!("\n  \"{key}\": \"");
+    let start = text
+        .find(&opening)
+        .ok_or_else(|| Failure(format!("the baseline has no {key} line")))?
+        + opening.len();
+    let length = text[start..]
+        .find('"')
+        .ok_or_else(|| Failure(format!("the baseline's {key} line is not closed")))?;
+    let quoted = serde_json::to_string(value)?;
+    Ok(format!(
+        "{}{quoted}{}",
+        &text[..start - 1],
+        &text[start + length + 1..]
+    ))
 }
 
 #[cfg(test)]
@@ -302,11 +345,38 @@ mod tests {
     }
 
     #[test]
-    fn a_baseline_rewrite_keeps_every_recorded_float_digit() {
-        for text in ["989.6550000000001", "93.80199999999999", "0.1", "1085.0"] {
-            let value: f64 = serde_json::from_str(text).expect("a float");
-            assert_eq!(serde_json::to_string(&value).expect("text"), text);
-        }
+    fn a_counters_only_write_changes_the_revision_the_time_and_the_counters_and_no_other_digit() {
+        let before = r#"{
+  "format": "eventlog-kpi-baseline/1",
+  "revision": "old",
+  "recorded_at": "then",
+  "environment": { "cpu": "c" },
+  "counters": {
+    "x.settled": 100.0
+  },
+  "timings": {
+    "x.latency": {
+      "p50": 93.80199999999999,
+      "p95": 989.6550000000001
+    }
+  },
+  "timing_rounds": 3
+}
+"#;
+        let mut next = previous();
+        next.revision = "new".to_owned();
+        next.recorded_at = "now".to_owned();
+        next.counters =
+            BTreeMap::from([("x.new".to_owned(), 8.0), ("x.settled".to_owned(), 100.0)]);
+        let after = next.splice_counters(before).expect("a splice");
+        let expected = before
+            .replace("\"old\"", "\"new\"")
+            .replace("\"then\"", "\"now\"")
+            .replace(
+                "\"x.settled\": 100.0\n  }",
+                "\"x.new\": 8.0,\n    \"x.settled\": 100.0\n  }",
+            );
+        assert_eq!(after, expected);
     }
 
     #[test]

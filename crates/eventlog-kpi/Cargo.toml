@@ -27,7 +27,7 @@ eventlog-sqlite.workspace = true
 eventlog-tree.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_json.workspace = true
 stats_alloc = { version = "=0.1.10", optional = true }
 tempfile.workspace = true
 time.workspace = true

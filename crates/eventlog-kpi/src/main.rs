@@ -294,7 +294,7 @@ fn record_counters(root: &Path, work: &Path) -> Outcome<ExitCode> {
     let counters = measure_counters(work)?;
     definitions.require_known(counters.values.keys(), definition::Kind::Counter)?;
     let baseline = definition::Baseline::with_counters(root, &definitions, &counters, &previous);
-    baseline.write(&baseline_path(root))?;
+    baseline.write_counters_into(&baseline_path(root))?;
     compare::print_record(&definitions, &baseline, &counters);
     println!(
         "eventlog-kpi: wrote {} (counters only; timings untouched)",
