@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T10:02:50Z",
+  "actor": "human:timo",
+  "artifact": "story:projection-find-holds-its-bound-with-a-prepared-statement",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "metric_observation",
+    "source": "CI spike run 45368249583 (branch ci/plan-prepared-spike, commit 7900bc51, pgbench -r, 8 rounds): E0 0.114 ms, E1 0.131, P0 0.092, P1 0.102; P1/E0 0.895 (0.832..0.912), P1/P0 1.109, P1/E1 0.779; P2 auto goes generic 1.21x of E0, exec 0.014 -> 0.098 ms; skewed fixture custom 0.0128 ms / 4 blocks, forced generic 2.043 ms / 417 blocks (160x); G1 met at pgbench level, provisional",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/45368249583"
+  }
+}
