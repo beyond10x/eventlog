@@ -117,7 +117,8 @@ fn session_configuration(schema: &str, options: &PoolOptions) -> String {
     format!(
         "SET search_path TO {schema}; SET default_transaction_isolation = 'read committed'; \
          SET default_transaction_read_only = off; SET statement_timeout = {}; \
-         SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
+         SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}; \
+         SET plan_cache_mode = force_generic_plan",
         server_millis(options.statement_timeout),
         server_millis(options.lock_timeout),
         server_millis(options.transaction_timeout)
@@ -1098,7 +1099,8 @@ mod tests {
             session_configuration("hosted", &options),
             "SET search_path TO hosted; SET default_transaction_isolation = 'read committed'; \
              SET default_transaction_read_only = off; SET statement_timeout = 1; \
-             SET lock_timeout = 1; SET idle_in_transaction_session_timeout = 3"
+             SET lock_timeout = 1; SET idle_in_transaction_session_timeout = 3; \
+             SET plan_cache_mode = force_generic_plan"
         );
         let defaults = session_configuration("hosted", &PoolOptions::default());
         assert!(
