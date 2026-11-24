@@ -302,6 +302,14 @@ mod tests {
     }
 
     #[test]
+    fn a_baseline_rewrite_keeps_every_recorded_float_digit() {
+        for text in ["989.6550000000001", "93.80199999999999", "0.1", "1085.0"] {
+            let value: f64 = serde_json::from_str(text).expect("a float");
+            assert_eq!(serde_json::to_string(&value).expect("text"), text);
+        }
+    }
+
+    #[test]
     fn the_definitions_file_holds_the_projection_find_measurement_kit() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let definitions = Definitions::load(&root.join("kpi/kpis.json")).expect("kpi/kpis.json");
