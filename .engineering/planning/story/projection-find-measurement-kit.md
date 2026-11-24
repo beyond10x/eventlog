@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:projection-find-measurement-kit
 kind: story
-status: active
+status: implemented
 title: 'KPI measurement kit for projection_find: skewed fixture, five ids, a CI record path'
 summary: Skewed fixture, five ids, a CI record path and the variants G, U and V1; commit 1 is red UNRECORDED until baseline step 1b
 relations:
@@ -19,10 +19,11 @@ scope:
   path: kpi/baseline.json
 - confidence: cited
   path: kpi/kpis.json
-revision: 12
+revision: 13
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-24T15:41:03Z", actor: "agent:eventlog", revision: 10, decided_on: {"recorded":{"test_result":5}}}
 - {from: "proposed", to: "active", at: "2026-11-24T15:41:03Z", actor: "agent:eventlog", revision: 11, decided_on: {"recorded":{"test_result":5}}}
+- {from: "active", to: "implemented", at: "2026-11-24T17:37:58Z", actor: "agent:eventlog", revision: 13, decided_on: {"recorded":{"test_result":15}}}
 ---
 ## Outcome
 
