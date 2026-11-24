@@ -196,12 +196,13 @@ The runner is `crates/eventlog-kpi` (`publish = false`).
 - Allocation counts use `stats_alloc` (the workspace forbids the `unsafe` a counting allocator
   needs), linked only with `counters`.
 - PostgreSQL KPIs run only with `EVENTLOG_TEST_POSTGRES_URL` set and say so when skipped.
-- An improvement beyond tolerance is reported, not ratcheted. Re-record it as its own commit after
-  the change, never on the workstation: dispatch `KPI` with `record` on the branch ref. Its
-  `KPI record` job runs `eventlog-kpi record --counters` on the runner (counters only: no timing
-  is rewritten, and a counter still within its tolerance keeps its value) and uploads
-  `kpi/baseline.json` as the artifact `kpi-baseline`. Download it, read the diff, commit the file.
-  Never edit the baseline by hand and never re-record to absorb a regression. The full
+- An improvement beyond tolerance is reported, not ratcheted. Never record on the workstation: a
+  new counter is added by dispatching `KPI` with `record` on the branch ref. Its `KPI record` job
+  runs `eventlog-kpi record --counters` on the runner (counters only: no timing is rewritten, a
+  counter already recorded keeps its value and only counters the baseline lacks are added) and
+  uploads `kpi/baseline.json` as the artifact `kpi-baseline`. Download it, read the diff, commit the
+  file as its own commit. Never edit the baseline by hand and never re-record to absorb a
+  regression; ratcheting an improvement is a decision of its own, taken in a change that names it. The full
   `record` (with timings) writes the recording machine's timings, for reading only, and is not run
   on the workstation either.
 - CI: `.github/workflows/kpi.yml` has two gating jobs (and `KPI / KPI record`, dispatched only,

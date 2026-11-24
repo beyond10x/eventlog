@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Failure, Measured, Outcome,
-    compare::{Verdict, judge_counter},
     environment, timing,
 };
 
@@ -198,27 +197,19 @@ impl Baseline {
     }
 
     /// The counters to write. A counter this run did not measure keeps its previous value.
-    /// With `settled`, a counter whose previous value still judges `Ok` against the measurement
-    /// keeps that value too, so a re-record moves only what moved beyond its tolerance.
+    /// With `only_new`, a counter that already has a recorded value keeps it, whatever this run
+    /// measured, so a re-record adds the counters the baseline lacks and moves nothing else.
     fn merged_counters(
         definitions: &Definitions,
         counters: &Measured,
         previous: Option<&Self>,
-        settled: bool,
+        only_new: bool,
     ) -> BTreeMap<String, f64> {
         let mut recorded = BTreeMap::new();
         for kpi in definitions.of_kind(Kind::Counter) {
             let before = previous.and_then(|p| p.counters.get(&kpi.id)).copied();
             match (counters.values.get(&kpi.id).copied(), before) {
-                (Some(now), Some(before))
-                    if settled
-                        && judge_counter(
-                            kpi.direction,
-                            kpi.tolerance.unwrap_or(Tolerance { pct: 0.0, abs: 0.0 }),
-                            before,
-                            now,
-                        ) == Verdict::Ok =>
-                {
+                (Some(_), Some(before)) if only_new => {
                     recorded.insert(kpi.id.clone(), before);
                 }
                 (Some(now), _) => {
@@ -237,10 +228,10 @@ impl Baseline {
     /// The previous baseline with its counters re-measured and nothing else rewritten: the
     /// timings, their round count and the environment they were recorded in stay as they were.
     /// Counters are deterministic work counts, so the machine that measured them does not matter,
-    /// while a timing recorded on one machine is never mixed with another's. A counter within
-    /// its tolerance of the new measurement keeps its recorded value; a new one, or one that moved
-    /// beyond its tolerance, takes the measurement. Only the revision the counters were measured
-    /// on and the time move with them.
+    /// while a timing recorded on one machine is never mixed with another's. A counter that is
+    /// already recorded keeps its value (an improvement is ratcheted, and a regression absorbed,
+    /// only by a decision of its own); a counter the baseline lacks takes the measurement. Only the
+    /// revision the counters were measured on and the time move with them.
     pub fn with_counters(
         root: &Path,
         definitions: &Definitions,
@@ -326,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn record_counters_adds_and_moves_counters_and_rewrites_no_timing() {
+    fn record_counters_adds_new_counters_and_moves_no_recorded_value_or_timing() {
         let mut measured = Measured::default();
         measured.put("x.settled", 101.0);
         measured.put("x.moved", 90.0);
@@ -334,11 +325,11 @@ mod tests {
         let next = Baseline::with_counters(Path::new("."), &definitions(), &measured, &previous());
         assert!(
             (next.counters["x.settled"] - 100.0).abs() < f64::EPSILON,
-            "within tolerance"
+            "a recorded counter keeps its value"
         );
         assert!(
-            (next.counters["x.moved"] - 90.0).abs() < f64::EPSILON,
-            "beyond tolerance"
+            (next.counters["x.moved"] - 100.0).abs() < f64::EPSILON,
+            "an improvement beyond tolerance is not ratcheted"
         );
         assert!(
             (next.counters["x.new"] - 8.0).abs() < f64::EPSILON,

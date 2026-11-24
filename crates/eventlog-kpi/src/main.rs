@@ -147,8 +147,9 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         rounds: usize,
         /// Measure the counters only and rewrite no timing: the baseline's timings, their round
-        /// count and its environment stay as recorded. A counter still within its tolerance of
-        /// the measurement keeps its value. This is what the CI `record` dispatch runs.
+        /// count and its environment stay as recorded. A counter already recorded keeps its
+        /// value; only counters the baseline lacks are added. This is what the CI `record`
+        /// dispatch runs.
         #[arg(long)]
         counters: bool,
     },
