@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T15:20:10Z",
+  "actor": "agent:eventlog",
+  "artifact": "story:projection-find-measurement-kit",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/eventlog/actions/runs/45411894378",
+    "reference": "head vs head d7cc0d26, 20 rounds: skewed 1.020, large 1.004 (acceptance 4)"
+  }
+}

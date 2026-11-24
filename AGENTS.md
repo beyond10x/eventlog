@@ -165,9 +165,17 @@ The runner is `crates/eventlog-kpi` (`publish = false`).
 - **Counters** are deterministic work counts on small fixtures: bytes read and written
   (`/proc/self/io`), SQLite VM steps, fold calls, feed map visits, blob-directory entries, Tree
   group files and digests, snapshot-generation rows, allocation bytes, PostgreSQL round trips
-  (a counting proxy), write transactions (transaction ids) and buffers (`EXPLAIN ANALYZE`).
-  `bash scripts/gate.sh --kpi` compares each with the baseline and fails on a regression beyond
-  its tolerance. This is the gate.
+  (a counting proxy, which also counts `Parse` messages and each prepared statement's `Execute`
+  messages), write transactions (transaction ids), buffers (`EXPLAIN ANALYZE`) and tuples read
+  (`pg_stat_user_tables` and `pg_stat_user_indexes` deltas, read after the store's backends have
+  exited). `bash scripts/gate.sh --kpi` compares each with the baseline and fails on a regression
+  beyond its tolerance. This is the gate.
+- The skewed-tenant fixture (`crates/eventlog-kpi/src/skewed.rs`) guards `projection_find` against
+  a generic plan: it checks on every run, from `EXPLAIN (ANALYZE, BUFFERS)` of a prepared copy of
+  the statement, that a custom plan reads a handful of tuples (E1) and a forced generic plan walks
+  the tenant (E2), and fails the run, not as a regression, when either does not hold. The large
+  atomic group (`large_group.rs`) is above five `STATEMENT_BATCH` items so that a prepared
+  statement's sixth execution is reached; the counters job asserts it from the proxy.
 - **Timings** (latency p50/p95, batch throughput) are never compared with a number from another
   machine. `eventlog-kpi ab --base <rev> --head <rev>` builds both revisions with the current
   runner, runs them interleaved for several rounds on the same machine and fails when a median
@@ -182,16 +190,23 @@ The runner is `crates/eventlog-kpi` (`publish = false`).
   compile only with their non-default `kpi-counters` feature, enabled by the runner's `counters`
   feature; no product build carries them. A change that rewrites a counted path keeps its
   counter call in the rewritten code. The PostgreSQL `EXPLAIN` KPIs run a copy of the library's
-  feed and capture-preflight statements (`crates/eventlog-kpi/src/counter.rs`); a change to
-  either statement changes the copy in the same commit.
+  feed and capture-preflight statements (`crates/eventlog-kpi/src/counter.rs`) and of the find
+  statement (`crates/eventlog-kpi/src/skewed.rs`); a change to any of them changes the copy in the
+  same commit.
 - Allocation counts use `stats_alloc` (the workspace forbids the `unsafe` a counting allocator
   needs), linked only with `counters`.
 - PostgreSQL KPIs run only with `EVENTLOG_TEST_POSTGRES_URL` set and say so when skipped.
-- An improvement beyond tolerance is reported, not ratcheted. Re-record in the same change, on a
-  quiet machine with a disposable PostgreSQL:
-  `cargo run --release --locked -p eventlog-kpi --features counters -- record`. Never edit the
-  baseline by hand and never re-record to absorb a regression.
-- CI: `.github/workflows/kpi.yml` has two jobs. `KPI / KPI counters` runs the counters with a
+- An improvement beyond tolerance is reported, not ratcheted. Never record on the workstation: a
+  new counter is added by dispatching `KPI` with `record` on the branch ref. Its `KPI record` job
+  runs `eventlog-kpi record --counters` on the runner (counters only: no timing is rewritten, a
+  counter already recorded keeps its value and only counters the baseline lacks are added) and
+  uploads `kpi/baseline.json` as the artifact `kpi-baseline`. Download it, read the diff, commit the
+  file as its own commit. Never edit the baseline by hand and never re-record to absorb a
+  regression; ratcheting an improvement is a decision of its own, taken in a change that names it. The full
+  `record` (with timings) writes the recording machine's timings, for reading only, and is not run
+  on the workstation either.
+- CI: `.github/workflows/kpi.yml` has two gating jobs (and `KPI / KPI record`, dispatched only,
+  above). `KPI / KPI counters` runs the counters with a
   PostgreSQL service on every pull request and push to `main`; it is the one meant to become a
   required check. `KPI / KPI timing` runs the A/B against the base on a pull request; it is
   informational (`continue-on-error`) and never a required check. In both, a change of only
@@ -228,6 +243,11 @@ source publication follows the release completion boundary below.
 
 Read the RFC before changing storage behaviour: its physical schema is normative and this repository
 does not contain it.
+
+Every `aep` write sets `AEP_ACTOR`. `aep` records `human:$USER` when it is unset, and that puts a
+person's login into a public planning record. Run `AEP_ACTOR=agent:eventlog aep plan artifact
+<verb>` for every write (`new`, `move`, `evidence`, `body`, `relate`, `scope`). Prose names a role
+("the owner"), never a person.
 
 ## Public source
 

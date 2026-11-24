@@ -29,9 +29,11 @@ mod definition;
 mod environment;
 mod fixture;
 mod hooks;
+mod large_group;
 mod pg;
 mod proc_io;
 mod scope;
+mod skewed;
 mod timing;
 
 use std::{
@@ -144,6 +146,12 @@ enum Command {
         /// Timing rounds in this process; the baseline keeps the median of the rounds.
         #[arg(long, default_value_t = 3)]
         rounds: usize,
+        /// Measure the counters only and rewrite no timing: the baseline's timings, their round
+        /// count and its environment stay as recorded. A counter already recorded keeps its
+        /// value; only counters the baseline lacks are added. This is what the CI `record`
+        /// dispatch runs.
+        #[arg(long)]
+        counters: bool,
     },
     /// Measure every counter and compare it with `kpi/baseline.json`; non-zero on regression.
     Check,
@@ -188,7 +196,13 @@ fn main() -> ExitCode {
             .join("kpi-work")
     });
     let result = match cli.command {
-        Command::Record { rounds } => record(&root, &work, rounds),
+        Command::Record { rounds, counters } => {
+            if counters {
+                record_counters(&root, &work)
+            } else {
+                record(&root, &work, rounds)
+            }
+        }
         Command::Check => check(&root, &work),
         Command::Timings { rounds, json } => print_timings(&work, rounds, json),
         Command::Ab { base, head, rounds } => ab::run(&root, &work, base, &head, rounds),
@@ -266,6 +280,26 @@ fn record(root: &Path, work: &Path, rounds: usize) -> Outcome<ExitCode> {
     baseline.write(&baseline_path(root))?;
     compare::print_record(&definitions, &baseline, &counters);
     println!("eventlog-kpi: wrote {}", baseline_path(root).display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn record_counters(root: &Path, work: &Path) -> Outcome<ExitCode> {
+    let definitions = definition::Definitions::load(&definitions_path(root))?;
+    let previous = definition::Baseline::load(&baseline_path(root))?;
+    ensure(
+        postgres_url().is_some(),
+        "record --counters needs EVENTLOG_TEST_POSTGRES_URL: a baseline written without the \
+         PostgreSQL counters would keep stale values for them",
+    )?;
+    let counters = measure_counters(work)?;
+    definitions.require_known(counters.values.keys(), definition::Kind::Counter)?;
+    let baseline = definition::Baseline::with_counters(root, &definitions, &counters, &previous);
+    baseline.write_counters_into(&baseline_path(root))?;
+    compare::print_record(&definitions, &baseline, &counters);
+    println!(
+        "eventlog-kpi: wrote {} (counters only; timings untouched)",
+        baseline_path(root).display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
