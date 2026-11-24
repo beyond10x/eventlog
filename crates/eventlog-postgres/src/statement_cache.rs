@@ -10,13 +10,15 @@
 //! - The first use of a text on a connection runs unprepared and is only remembered; the second
 //!   use prepares it and executes it prepared. A connection that serves one find never pays the
 //!   extra prepare round trip.
-//! - At most [`CAPACITY`] distinct texts are remembered per connection, 64. A prepared statement
-//!   is never evicted to make room: eviction closes a statement, and that close lands on the
-//!   next, unrelated operation of the connection. A text that arrives when 64 are remembered and
-//!   all 64 are prepared is never cached and always runs unprepared; past the cap a store pays
-//!   the parse on every call of the extra texts, silently, and the documentation of the pool says
-//!   so. A text seen once holds no server state, so a new text replaces one of those: 64
-//!   one-off texts never keep a hot text from being prepared.
+//! - At most [`CAPACITY`] statements are prepared per connection, 64. A prepared statement is
+//!   never evicted to make room: eviction closes a statement, and that close lands on the next,
+//!   unrelated operation of the connection. A text whose second use arrives when 64 are prepared
+//!   is never prepared and always runs unprepared; past the cap a store pays the parse on every
+//!   call of the extra texts, silently, and the documentation of the pool says so.
+//! - At most [`CAPACITY`] texts that were used once are remembered, apart from the prepared ones.
+//!   They hold no server state. When that set is full, a new text replaces the newest of them, so
+//!   the older ones keep their place and reach their second use, and 64 one-off texts never keep
+//!   a hot text from being prepared: it takes the slot of the newest one-off text.
 //! - A statement the server reports stale (a changed result type, a dropped object) is forgotten
 //!   and its text starts again as first use.
 //! - A connection whose server session does not keep named statements is refused for good: after
@@ -34,11 +36,6 @@ pub(crate) enum Step<S> {
     Prepare,
     /// Run this statement.
     Use(S),
-}
-
-enum Entry<S> {
-    Seen,
-    Prepared(S),
 }
 
 /// How an error of a prepared statement's execution is handled.
@@ -84,7 +81,10 @@ pub(crate) struct Counts {
 }
 
 pub(crate) struct StatementCache<S> {
-    entries: HashMap<String, Entry<S>>,
+    prepared: HashMap<String, S>,
+    /// Texts used once, each with the order in which it was first used.
+    seen: HashMap<String, u64>,
+    next_order: u64,
     refused: bool,
     #[cfg(test)]
     counts: Counts,
@@ -93,7 +93,9 @@ pub(crate) struct StatementCache<S> {
 impl<S> Default for StatementCache<S> {
     fn default() -> Self {
         Self {
-            entries: HashMap::new(),
+            prepared: HashMap::new(),
+            seen: HashMap::new(),
+            next_order: 0,
             refused: false,
             #[cfg(test)]
             counts: Counts::default(),
@@ -107,31 +109,32 @@ impl<S: Clone> StatementCache<S> {
         if self.refused {
             return Step::Unprepared;
         }
-        match self.entries.get(sql) {
-            Some(Entry::Prepared(statement)) => Step::Use(statement.clone()),
-            Some(Entry::Seen) => {
-                #[cfg(test)]
-                {
-                    self.counts.prepare_attempts += 1;
-                }
-                Step::Prepare
+        if let Some(statement) = self.prepared.get(sql) {
+            return Step::Use(statement.clone());
+        }
+        if self.seen.contains_key(sql) {
+            if self.prepared.len() >= CAPACITY {
+                return Step::Unprepared;
             }
-            None => {
-                if self.entries.len() >= CAPACITY {
-                    let seen_once = self.entries.iter().find_map(|(text, entry)| {
-                        matches!(entry, Entry::Seen).then(|| text.clone())
-                    });
-                    match seen_once {
-                        Some(text) => {
-                            self.entries.remove(&text);
-                        }
-                        None => return Step::Unprepared,
-                    }
-                }
-                self.entries.insert(sql.to_owned(), Entry::Seen);
-                Step::Unprepared
+            #[cfg(test)]
+            {
+                self.counts.prepare_attempts += 1;
+            }
+            return Step::Prepare;
+        }
+        if self.seen.len() >= CAPACITY {
+            let newest = self
+                .seen
+                .iter()
+                .max_by_key(|(_, order)| **order)
+                .map(|(text, _)| text.clone());
+            if let Some(text) = newest {
+                self.seen.remove(&text);
             }
         }
+        self.seen.insert(sql.to_owned(), self.next_order);
+        self.next_order += 1;
+        Step::Unprepared
     }
 
     /// `sql` was prepared as `statement`.
@@ -140,8 +143,8 @@ impl<S: Clone> StatementCache<S> {
         {
             self.counts.prepared += 1;
         }
-        self.entries
-            .insert(sql.to_owned(), Entry::Prepared(statement));
+        self.seen.remove(sql);
+        self.prepared.insert(sql.to_owned(), statement);
     }
 
     /// The server reported the statement of `sql` stale. The text starts again as first use.
@@ -150,7 +153,8 @@ impl<S: Clone> StatementCache<S> {
         {
             self.counts.evicted += 1;
         }
-        self.entries.remove(sql);
+        self.prepared.remove(sql);
+        self.seen.remove(sql);
     }
 
     /// The session does not keep named statements. Final for this connection.
@@ -160,7 +164,8 @@ impl<S: Clone> StatementCache<S> {
             self.counts.refused += 1;
         }
         self.refused = true;
-        self.entries.clear();
+        self.prepared.clear();
+        self.seen.clear();
     }
 
     #[cfg(test)]
@@ -175,10 +180,7 @@ impl<S: Clone> StatementCache<S> {
 
     #[cfg(test)]
     pub(crate) fn prepared_texts(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| matches!(entry, Entry::Prepared(_)))
-            .count()
+        self.prepared.len()
     }
 }
 
@@ -241,7 +243,37 @@ mod tests {
         cache.prepared(hot, 1);
         assert!(is_use(&cache.step(hot), 1));
         assert_eq!(cache.prepared_texts(), 1);
-        assert!(cache.entries.len() <= CAPACITY);
+        assert!(cache.seen.len() <= CAPACITY);
+    }
+
+    #[test]
+    fn the_older_texts_seen_once_keep_their_place_and_reach_their_second_use() {
+        let mut cache = StatementCache::<u32>::default();
+        let texts = texts(CAPACITY + 3);
+        for text in &texts {
+            assert!(matches!(cache.step(text), Step::Unprepared));
+        }
+        assert_eq!(cache.seen.len(), CAPACITY);
+        for text in texts.iter().take(CAPACITY - 1) {
+            assert!(matches!(cache.step(text), Step::Prepare), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_text_whose_second_use_finds_64_prepared_is_never_prepared() {
+        let mut cache = StatementCache::<u32>::default();
+        let texts = texts(CAPACITY + 1);
+        for (n, text) in texts.iter().take(CAPACITY).enumerate() {
+            cache.step(text);
+            assert!(matches!(cache.step(text), Step::Prepare));
+            cache.prepared(text, u32::try_from(n).unwrap());
+        }
+        let beyond = &texts[CAPACITY];
+        for _ in 0..4 {
+            assert!(matches!(cache.step(beyond), Step::Unprepared));
+        }
+        assert_eq!(cache.counts().prepare_attempts, CAPACITY);
+        assert_eq!(cache.prepared_texts(), CAPACITY);
     }
 
     #[test]

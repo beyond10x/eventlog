@@ -180,6 +180,8 @@ pub fn required_cases() -> Vec<RequiredCase> {
         "statement_cache::tests::warm_up_then_prepare_then_use",
         "statement_cache::tests::the_65th_text_is_not_cached_and_nothing_is_evicted",
         "statement_cache::tests::texts_seen_once_never_keep_a_hot_text_from_being_prepared",
+        "statement_cache::tests::the_older_texts_seen_once_keep_their_place_and_reach_their_second_use",
+        "statement_cache::tests::a_text_whose_second_use_finds_64_prepared_is_never_prepared",
         "statement_cache::tests::texts_that_differ_only_in_their_tail_have_their_own_slots",
         "statement_cache::tests::refused_is_final_for_the_connection",
         "statement_cache::tests::a_stale_text_starts_again_as_first_use",

@@ -225,8 +225,8 @@ implemented as a neutral `StatementCache` (F6: no projection concept in the gene
   re-parsed", sql-prepare page). Parameter types are passed explicitly as today (`TEXT, TEXT, INT8,
   TEXT, JSONB`, `lib.rs:1607-1613`) through `prepare_typed`. **verified** (code and quote).
 - Shape (crate-private, new private module `statement_cache.rs`, no projection or pool types in
-  it): `struct StatementCache { entries: HashMap<String, Entry>, refused: bool }`,
-  `enum Entry { Seen, Prepared(Statement) }`. A pure state machine with one entry point that, given
+  it): `struct StatementCache { prepared: HashMap<String, Statement>, seen: HashMap<String, u64>,
+  refused: bool }`. A pure state machine with one entry point that, given
   the SQL text, says: run unprepared and record `Seen`; prepare now; use this statement; or the
   connection is refused. The driver calls stay in `lib.rs`. No lock: a `Connection` has exactly one
   owner at a time (`pool.rs:496, 831`). The state machine has unit tests without a database (6).
@@ -237,8 +237,9 @@ implemented as a neutral `StatementCache` (F6: no projection concept in the gene
   through the driver's public API (`prepare.rs:57-92`: `prepare` returns after its own response).
   Steady state is Bind, Execute, Sync: one round trip (**verified** from the driver's
   `query(&Statement)`; the 1.00 per find is a counter, 5.4).
-- Bound: at most 64 entries per connection (a constant, not a knob; section 11 for texts seen once). A 65th distinct text is not
-  cached and runs through `query_typed` (no eviction, so no `Close` churn). Distinct texts are
+- Bound: at most 64 prepared statements per connection (a constant, not a knob; section 11 for
+  texts seen once). A 65th distinct text is not
+  prepared and runs through `query_typed` (no eviction, so no `Close` churn). Distinct texts are
   projections x indexed fields x 2 variants. The cap is a silent performance cliff for a store
   with more than 64 distinct texts (F7). Taken: it is documented in the rustdoc and pinned by a
   test (6, test 9). Not taken: production counters or an LRU (disposition table, 8.2).
@@ -836,14 +837,20 @@ What the code does where this document left a choice, and the one statement of v
   path returns it. A failed prepare refuses the connection only on 0A000, 08P01, 42P05 and 26000;
   57014, 55P03, 53300, a closed connection and a missing table are returned and refuse nothing.
   The classification is two pure functions in `statement_cache.rs`, tested without a database.
-- **The cache is generic over its statement type.** `StatementCache<S>` holds an
-  `Entry<S>` per text; the pool instantiates it with `tokio_postgres::Statement`, and the unit
-  tests U1-U3 use an integer, because a `Statement` cannot be built without a connection.
-- **Capacity.** At most 64 remembered texts per connection. A prepared statement is never evicted: a
-  text that arrives when all 64 are prepared is not recorded, runs unprepared every time and
-  closes nothing (test 9). A text seen once holds no server state, so a new text replaces one of
-  those when the cache is full; the adversary read of the build found that counting them against
-  the cap let 64 one-off texts keep every later hot text from ever being prepared.
+- **The cache is generic over its statement type.** `StatementCache<S>` holds a map of prepared
+  statements and a map of texts used once; the pool instantiates it with
+  `tokio_postgres::Statement`, and the unit tests U1-U3 use an integer, because a `Statement`
+  cannot be built without a connection.
+- **Capacity.** At most 64 prepared statements per connection, and apart from them at most 64
+  texts used once. A prepared statement is never evicted: a text whose second use finds 64
+  prepared is never prepared, runs unprepared every time and closes nothing (test 9). A text used
+  once holds no server state. The adversary read of the build found that counting those against
+  the one cap let 64 one-off texts keep every later hot text from ever being prepared; a first
+  build that replaced an arbitrary one-off text made the number of prepared statements at the
+  cap depend on hash order, and CI's Persistence proof showed 63 where the test expected 64. The
+  set of texts used once now replaces its newest member when it is full, so the older ones keep
+  their place and reach their second use, and the number prepared after a cycle over more than 64
+  texts is 64 every time.
 - **Refusal clears the cache.** `refuse` drops every entry; the dropped statements send their
   `Close` on the connection's next operation, which is a no-op for a session that lost them.
 - **Test seam for a code the server does not raise on demand.** SQLSTATE 42P05 at prepare cannot
