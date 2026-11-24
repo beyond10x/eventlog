@@ -1,7 +1,7 @@
 {
   "format": "eventlog-kpi-baseline/1",
-  "revision": "17828fc28fd2a2fe7a9790731d827df64ea4ec28",
-  "recorded_at": "2026-11-22T23:56:59.391018354Z",
+  "revision": "d4b8a3a3406788dca5604e9e0e46bdef018cd456",
+  "recorded_at": "2026-11-24T13:16:43.874823361Z",
   "environment": {
     "cpu": "Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz",
     "cpus": 20,
@@ -32,6 +32,9 @@
     "postgres.feed_one_row.buffers": 1103.0,
     "postgres.feed_one_row.rows_filtered": 39936.0,
     "postgres.open.round_trips": 1085.0,
+    "postgres.projection_find.parses": 8.0,
+    "postgres.projection_find.round_trips": 100.0,
+    "postgres.projection_find_skewed.tuples_read": 10.0,
     "postgres.projection_page.cursor_present": 0.0,
     "sqlite.absent_reads.generation_rows": 100.0,
     "sqlite.append.bytes_written": 24760.0,
