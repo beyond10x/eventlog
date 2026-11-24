@@ -66,7 +66,7 @@ start() {
     psql -c 'SHOW shared_preload_libraries'
     psql -c 'SHOW pg_stat_statements.track'
     psql -c 'SHOW pg_stat_statements.track_planning'
-    psql -c "SELECT 'collate=' || datcollate || ' ctype=' || datctype || ' provider=' || datlocprovider FROM pg_database WHERE datname = 'postgres'"
+    psql -c "SELECT 'collate=' || datcollate || ' ctype=' || datctype || ' provider=' || datlocprovider::text FROM pg_database WHERE datname = 'postgres'"
     psql -c 'SHOW plan_cache_mode'
     docker exec "$CONTAINER" pgbench --version
 }
