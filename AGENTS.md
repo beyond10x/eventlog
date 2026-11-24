@@ -244,6 +244,11 @@ source publication follows the release completion boundary below.
 Read the RFC before changing storage behaviour: its physical schema is normative and this repository
 does not contain it.
 
+Every `aep` write sets `AEP_ACTOR`. `aep` records `human:$USER` when it is unset, and that puts a
+person's login into a public planning record. Run `AEP_ACTOR=agent:eventlog aep plan artifact
+<verb>` for every write (`new`, `move`, `evidence`, `body`, `relate`, `scope`). Prose names a role
+("the owner"), never a person.
+
 ## Public source
 
 This repository is public. Gates provides bot-authenticated delivery operations; organization

@@ -21,8 +21,8 @@ scope:
   path: kpi/kpis.json
 revision: 11
 transitions:
-- {from: "draft", to: "proposed", at: "2026-11-24T15:20:26Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"test_result":5}}}
-- {from: "proposed", to: "active", at: "2026-11-24T15:20:26Z", actor: "human:timo", revision: 11, decided_on: {"recorded":{"test_result":5}}}
+- {from: "draft", to: "proposed", at: "2026-11-24T15:41:03Z", actor: "agent:eventlog", revision: 10, decided_on: {"recorded":{"test_result":5}}}
+- {from: "proposed", to: "active", at: "2026-11-24T15:41:03Z", actor: "agent:eventlog", revision: 11, decided_on: {"recorded":{"test_result":5}}}
 ---
 ## Outcome
 
