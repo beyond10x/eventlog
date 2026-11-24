@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T09:48:15Z",
+  "actor": "human:timo",
+  "artifact": "story:projection-find-holds-its-bound-with-a-prepared-statement",
+  "kind": "story",
+  "revision": 2,
+  "change": {
+    "change": "evidence",
+    "kind": "review",
+    "source": "independent adversary review of design v1: approve-with-changes, findings F1-F7, taken as listed in design 8.2",
+    "reference": "docs/design/projection-find-planning-review.md"
+  }
+}

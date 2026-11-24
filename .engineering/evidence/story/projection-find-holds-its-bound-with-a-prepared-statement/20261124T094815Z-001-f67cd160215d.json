@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T09:48:15Z",
+  "actor": "human:timo",
+  "artifact": "story:projection-find-holds-its-bound-with-a-prepared-statement",
+  "kind": "story",
+  "revision": 2,
+  "change": {
+    "change": "evidence",
+    "kind": "metric_observation",
+    "source": "CI attribution run 45365255371 (branch ci/plan-attribution head f885cdf3): planning per find base 37.0 us, head 44.5 us; extra index +4.0 us; hashtextextended +3.1 us",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/45365255371"
+  }
+}
