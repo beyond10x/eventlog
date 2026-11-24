@@ -5,9 +5,11 @@ story:pg-projection-find-back-within-1-05 and `docs/design/projection-value-dige
 it keeps. The independent review of the first version is
 `docs/design/projection-find-planning-review.md` (finding ids F1-F7 below).
 
-Status: design v2, no code written. Written 2026-11-24 10:45 CET. The build gate G1 (section 0.4)
-is open: the CI spike that decides it is run 45368249583 on branch `ci/plan-prepared-spike`, and its
-numbers are not in. Nothing below the gate is built until they are (section 10, step 1).
+Status: design v2, no code written. Written 2026-11-24 10:45 CET. The CI spike for the build gate
+G1 (section 0.4) is in: run 45368249583 on branch `ci/plan-prepared-spike` (**reported**), prepared
++ `force_custom_plan` against the unprepared 0.10.0 shape P1/E0 0.895, so G1 is met at pgbench level
+and stays provisional until variant V1 (section 10, step 4b). Nothing of the product change (steps
+5 to 7) is built until V1 passes.
 Supersedes design v1, which is not kept in the repository. Source: `origin/main` 6e72772a, read with
 `git show origin/main:<path>` (no repository edit, no build, no run). Paths are relative to the
 repository root. Inputs: v1, the adversary review of v1, and the CI attribution run 45365255371
@@ -536,9 +538,11 @@ statistics flush; the repository already has the `EXPLAIN ANALYZE` counter patte
   type byte (`pg.rs`); it returns a second count for `P`. The existing unit test
   (`framing_counts_syncs_and_queries_across_arbitrary_splits`) gains a Parse assertion over all
   splits. Deterministic, no timing, same file as the round-trip counter. Baseline: 8 on head
-  before the change (one Parse per find), **re-recorded to 0 in the product commit** (the
-  repository's rule: an improvement beyond tolerance is re-recorded in the same change,
-  `AGENTS.md` "The KPI gate"). The guard exists from that commit on; a refused or disabled cache
+  before the change (one Parse per find), **re-recorded to 0 in baseline step 3b**, a separate commit
+  after the product commit (the repository's rule is that an improvement beyond tolerance is
+  re-recorded with the change, `AGENTS.md` "The KPI gate"; the baseline file is written only by the
+  CI record path, so the re-recording is its own commit, as in section 10). The guard exists from
+  step 3b on; a refused or disabled cache
   returns the counter to 8 and the gate goes red.
 
 ### 5.5 Red proof before the change, CI only, never on the shared workstation
@@ -781,17 +785,23 @@ All proof on CI. No KPI round, `pgbench`, `ab`, `timings` or `record` on the sha
 
 | # | Step | CI-only proof |
 |---|---|---|
-| 1 | **Spike result.** Read the spike, CI run 45368249583 on branch `ci/plan-prepared-spike`, open when this was written (prepared + `force_custom_plan` vs extended end to end; the skewed fixture under `auto` and `force_generic_plan`). Decide G1 and G2 (0.4). If the spike is pgbench-level, dispatch scratch branch V1 4 times (`base` = 0.10.0 tag, `rounds=20`). | The run URLs and the numbers in the story. G1 pass: median at most 1.03. G1 fail: stop, D5 goes to the owner, nothing below starts. |
-| 2 | **Story.** One story with the acceptance lines of this section, the 0.3 wording, the transaction-scoped find named as out of scope. Plan critics approve it, implementation starts as soon as they do. | The story artifact in `.engineering/planning/` validated; critic results recorded. |
-| 3 | **Commit 1: KPI cases and the CI record path, against unchanged head.** The skewed fixture with E1/E2 asserted, `tuples_read`, `round_trips`, `parses` (8), `postgres.atomic_group_large.latency`, `record --counters` (counters only: it rewrites no timing of the recording machine, F5.7) and a `record` dispatch input that runs it on the CI runner and uploads `kpi/baseline.json`; a human commits the file (the workflow keeps `contents: read`). | `KPI counters` green on the branch after the recorded baseline is committed (it is red `UNRECORDED` before: `compare.rs`); E1/E2 pass; one A/A on 0.10.0 passes (new scenarios run there); one A/A head vs head gives the noise floor of the new timings. |
-| 4 | **Red-capable proof.** Variants G and U as scratch branches, draft pull requests, never merged (5.5). | G: `KPI counters` red on `tuples_read`, dispatched A/B REGRESSED on the skewed id. U: the result recorded and worded as 5.5 says. The run URLs go into the pull request. |
-| 5 | **Commit 3: the implementation** (sections 1-4, tests 1-9, U1-U3, docs). Re-record `parses` to 0 through the CI record path in the same commit. | In-crate tests green in the nextest step (each under 60 s, step under 120 s, ten slowest printed); `KPI counters`: `parses` 0, `round_trips` 100, `tuples_read` at commit 1's value. |
-| 6 | **Acceptance A/B.** 4 `workflow_dispatch` runs of `KPI / KPI timing`: `base` = 0.10.0 tag, `head` = the product commit, `rounds` = 20. | Median over the 4 runs of the head/0.10.0 ratio of `postgres.projection_find.latency` p50 at most **1.05**; the skewed id and `postgres.atomic_group_large.latency` against commit 1 (`base` = commit 1) within 1.05 (the D3 gate), and `postgres.batch_append.throughput`, `postgres.group_blobs.latency`, `postgres.read_stream.latency`, `postgres.read_feed_page.latency` not REGRESSED against commit 1. Fail: the bound is not touched; back to D5. |
+| 1 | **Spike result.** Read the spike, CI run 45368249583 on branch `ci/plan-prepared-spike` (open when this section was written; its numbers are now **reported** in the product story: P1/E0 0.895 at pgbench level, so G1 is provisional) (prepared + `force_custom_plan` vs extended end to end; the skewed fixture under `auto` and `force_generic_plan`). Decide G1 and G2 (0.4). The spike is pgbench-level, so G1 is provisional until V1 (step 4b). | The run URLs and the numbers in the story. G1 pass: median at most 1.03 (V1, step 4b). G1 fail: D5 goes to the owner and only steps 5 to 7 (the product change, its A/B and the release) do not start; the kit (steps 3 and 4) stays valid. |
+| 2 | **Stories.** Two, split at the gate: `story:projection-find-measurement-kit` (steps 3 and 4, baseline step 1b; valid whether G1 passes or fails) and `story:projection-find-holds-its-bound-with-a-prepared-statement` (steps 5 to 7, baseline step 3b; depends on the kit; blocked by the D5 decision-blocker only). One observable per acceptance line, the 0.3 wording, the transaction-scoped find named as out of scope. Plan critics approve them, implementation starts as soon as they do. | The story artifacts in `.engineering/planning/` validated; critic results recorded. |
+| 3 | **Commit 1: KPI cases and the CI record path, against unchanged head.** The skewed fixture with E1/E2 asserted, `tuples_read`, `round_trips`, `parses` (8), `postgres.atomic_group_large.latency`, `record --counters` (counters only: it rewrites no timing of the recording machine, F5.7) and a `record` dispatch input that runs it on the CI runner and uploads `kpi/baseline.json`; a human commits the file (the workflow keeps `contents: read`). | `KPI counters` green on the branch after baseline step 1b, a separate commit of the uploaded `kpi/baseline.json` (commit 1 itself is red `UNRECORDED` by design: `compare.rs:161`, `:21`); E1/E2 pass; one A/A on 0.10.0 passes (new scenarios run there); one A/A head vs head gives the noise floor of the new timings. |
+| 4 | **Red-capable proof.** Variants G and U (V1 is step 4b) as scratch branches, draft pull requests, never merged (5.5); variant U's cache is a throwaway on its scratch branch. | G: `KPI counters` red on `tuples_read`, dispatched A/B REGRESSED on the skewed id. U: the result recorded and worded as 5.5 says. The run URLs go into the pull request. |
+| 4b | **Build gate V1.** The third throwaway of the family on a scratch branch, never merged: head's find prepared per connection under `force_custom_plan`, nothing else. Dispatch 4 times (`base` = 0.10.0 tag, `head` = V1, `rounds=20`). Owned by the kit story. | Median over the 4 runs of the ratio of `postgres.projection_find.latency` p50 at most 1.03; the run URLs go into the pull request. Fail: D5 to the owner, steps 5 to 7 do not start. |
+| 5 | **Commit 3: the implementation** (sections 1-4, tests 1-9, U1-U3, docs). Re-record `parses` to 0 through the CI record path as baseline step 3b, a separate commit after the product commit. | In-crate tests green in the nextest step (each under 60 s, step under 120 s, ten slowest printed); `KPI counters`: `parses` 0, `round_trips` 100, `tuples_read` at commit 1's value. |
+| 6 | **Acceptance A/B.** 8 `workflow_dispatch` runs of `KPI / KPI timing` in two groups of 4, `head` = the product commit, `rounds` = 20: group A with `base` = 0.10.0 tag, group B with `base` = commit 1 (the kit commit; the product/kit ratio of `postgres.projection_find.latency` at most 0.95 so the prepared statement is what moves the number, and the ids below). | Median over the 4 runs of the head/0.10.0 ratio of `postgres.projection_find.latency` p50 at most **1.05**; the skewed id and `postgres.atomic_group_large.latency` against commit 1 (`base` = commit 1) within 1.05 (the D3 gate), and `postgres.batch_append.throughput`, `postgres.group_blobs.latency`, `postgres.read_stream.latency`, `postgres.read_feed_page.latency` not REGRESSED against commit 1. Fail: the bound is not touched; back to D5. |
 | 7 | **Release 0.11.0.** CHANGELOG under the 0.3 wording with the measured ratio filled in; pull request body names the +7 to +10 us planning that stays. | Required checks green, the run URLs of steps 4 and 6 in the pull request. The tag is a publication: it waits for the owner's word, not taken on default. |
 
-Order of commits on the branch: (1) KPI cases and record path against unchanged head, shown green;
-(2) the variants shown red, on scratch branches; (3) the product change. Each commit builds and
-gates on its own.
+Order of commits on the branch: (1) KPI cases and record path against unchanged head, red
+`UNRECORDED` by design; (1b) the recorded baseline, a separate commit of the file the `record`
+dispatch uploaded, after which commit 1 is shown green; (2) the variants G, U and V1 (steps 4 and
+4b), on scratch branches; (3) the product change; (3b) the baseline re-recorded for `parses`, a
+separate commit. Commit 1 is red `UNRECORDED` until 1b. The variants G, U and V1 are red or
+throwaway by design on scratch branches and are never merged (G is red on `KPI counters` and on the
+A/B by design). Every other commit on the branch builds and gates on its own. Commits 1 and 1b and
+the variants belong to the kit story, 3 and 3b to the product story.
 
 Every implementation brief for this work names: the 60 s per-test bound and the 120 s test-step
 budget; the 10-minute job limit (`slot --timeout` up to 30 minutes for a job that needs it); no new
