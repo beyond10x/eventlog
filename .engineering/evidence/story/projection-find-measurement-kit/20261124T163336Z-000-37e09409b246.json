@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T16:33:36Z",
+  "actor": "agent:eventlog",
+  "artifact": "story:projection-find-measurement-kit",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "KPI timing dispatch, variant G, ref main, base e7d74bd2, rounds 20, skewed latency ratio 10.041 REGRESSED",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/45436993150"
+  }
+}

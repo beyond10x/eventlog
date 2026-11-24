@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-24T16:24:22Z",
+  "actor": "agent:eventlog",
+  "artifact": "story:projection-find-measurement-kit",
+  "kind": "story",
+  "revision": 12,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "KPI counters, variant U, draft pull request 82, green, E3 auto did not flip",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/45435137528"
+  }
+}

@@ -19,7 +19,7 @@ scope:
   path: kpi/baseline.json
 - confidence: cited
   path: kpi/kpis.json
-revision: 11
+revision: 12
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-24T15:41:03Z", actor: "agent:eventlog", revision: 10, decided_on: {"recorded":{"test_result":5}}}
 - {from: "proposed", to: "active", at: "2026-11-24T15:41:03Z", actor: "agent:eventlog", revision: 11, decided_on: {"recorded":{"test_result":5}}}
@@ -204,3 +204,46 @@ Skewed fixture on the runner (PostgreSQL 17.6), same lines in every `KPI counter
 - E3, recorded only: after 6 executions under `plan_cache_mode = auto`, 0 generic and 6 custom plans; `auto` did not flip on this fixture.
 
 Recorded counters (1b): `postgres.projection_find_skewed.tuples_read` 10, `postgres.projection_find.round_trips` 100, `postgres.projection_find.parses` 8. The large group of 6,500 streams ran in about 1.27 s and the chunked statement executed 7 times.
+
+## Variants measured on the runner
+
+Three scratch variants, each a small diff on the kit commit `e7d74bd2`, each with a draft pull request that is never merged. Every number is from a CI run (PostgreSQL 17.6); nothing was measured on the workstation.
+
+| variant | branch | head | draft pull request |
+| --- | --- | --- | --- |
+| G, find prepared on every call, `force_generic_plan` | `scratch/find-variant-g` | `83f72892` | https://github.com/beyond10x/eventlog/pull/81 |
+| U, per-connection cache, prepared on the first find, no `plan_cache_mode` line | `scratch/find-variant-u` | `8f39be90` | https://github.com/beyond10x/eventlog/pull/82 |
+| V1, per-connection cache, prepared on the second find, `force_custom_plan` | `scratch/find-variant-v1` | `7f0fbe9e` | https://github.com/beyond10x/eventlog/pull/80 |
+
+### Line 11, variant G, `KPI counters`
+
+https://github.com/beyond10x/eventlog/actions/runs/45434567681 (pull request 81): red. `postgres.projection_find_skewed.tuples_read` 10 against the baseline 10, now 25,000 per find, REGRESSED (+249,900 percent). `postgres.projection_find.round_trips` 100 to 300, REGRESSED as well.
+
+### Line 12, variant G, `KPI / KPI timing`, 20 rounds
+
+`ref` = `main`, `base` = `e7d74bd2`, `head` = `83f72892`: https://github.com/beyond10x/eventlog/actions/runs/45436993150
+
+`postgres.projection_find_skewed.latency` base p50 245.9, head p50 2469.0, ratio 10.041, limit 1.50, REGRESSED.
+
+The first G dispatch, on `ref` = `scratch/find-variant-g` (the kit plus the variant), printed the same verdict: https://github.com/beyond10x/eventlog/actions/runs/45434560173, ratio 8.736, REGRESSED.
+
+### Line 13, variant U and E3
+
+- `KPI counters` verdict of U: green, https://github.com/beyond10x/eventlog/actions/runs/45435137528 (pull request 82). `postgres.projection_find_skewed.tuples_read` 10, unchanged; `postgres.projection_find.parses` 8 to 0 (IMPROVED), `round_trips` 100.
+- A/B ratio of U on `postgres.projection_find_skewed.latency`, 20 rounds, `base` = `e7d74bd2`, `head` = `8f39be90`, `ref` = `scratch/find-variant-u`: https://github.com/beyond10x/eventlog/actions/runs/45435121913, base p50 341.8, head p50 307.6, ratio 0.900, ok. The same run printed `postgres.projection_find.latency` 0.592.
+- E3, same step of the same run and of every `KPI counters` run: after 6 executions under `plan_cache_mode = auto`, 0 generic and 6 custom plans; `auto` did not flip on this fixture. U is therefore not a red proof, as the design says, and is not claimed as one; G and E2 are.
+
+### Line 14, variant V1, build gate G1
+
+Four dispatched 20-round `KPI / KPI timing` runs, `base` = `c0f961dc65f519b643ccdadb12621597aaca4754` (the 0.10.0 tag), `head` = `7f0fbe9e573904b72da910b7ce9b83bf0fc0047c`. Ratio of the p50 of `postgres.projection_find.latency`, head over base:
+
+| run | `ref` | base p50 | head p50 | ratio |
+| --- | --- | --- | --- | --- |
+| https://github.com/beyond10x/eventlog/actions/runs/45434103754 | `main` | 383.9 | 375.3 | 0.978 |
+| https://github.com/beyond10x/eventlog/actions/runs/45434113973 | `scratch/find-variant-v1` | 287.9 | 278.6 | 0.968 |
+| https://github.com/beyond10x/eventlog/actions/runs/45435149655 | `scratch/find-variant-g` | 389.6 | 383.0 | 0.983 |
+| https://github.com/beyond10x/eventlog/actions/runs/45435156461 | `scratch/find-variant-u` | 170.8 | 156.3 | 0.915 |
+
+Median of the four ratios: 0.973. The limit is 1.03: line 14 holds, G1 is met, and the product story may start. The four runs used four different `ref` values only because the workflow's concurrency group is per ref and the runs were started together; every ref carries the same kit workflow and runner, and `ab` builds both sides from `base` and `head` with that runner.
+
+Notes for the product story, observed in the V1 `KPI counters` runs (https://github.com/beyond10x/eventlog/actions/runs/45434221837, pull request 80, red by design): with a prepare on the second find, the counter window of 8 warm finds holds the one extra prepare round trip, so `postgres.projection_find.round_trips` reads 113 instead of 100 (REGRESSED) and `postgres.projection_find.parses` reads 1 instead of 8. The product change must warm the connection before the counted window, or the counters read the cold second find. This does not touch the timing result.
