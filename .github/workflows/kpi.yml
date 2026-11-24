@@ -18,6 +18,11 @@ on:
         description: Interleaved rounds per side; empty takes kpi/kpis.json's value
         required: false
         default: ''
+      record:
+        description: Record the counters on this runner and upload kpi/baseline.json as an artifact; the counters and timing jobs do not run
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -47,7 +52,7 @@ jobs:
   counters:
     name: KPI counters
     needs: classify
-    if: ${{ !cancelled() && needs.classify.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.classify.outputs.code != 'false' && !inputs.record }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -97,10 +102,57 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: bash scripts/gate.sh --slow
 
+  record:
+    name: KPI record
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.record }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --cpus 2 --memory 1g --pids-limit 256
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 12
+    env:
+      EVENTLOG_TEST_POSTGRES_URL: postgresql://postgres@127.0.0.1:5432/postgres
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: kpi-runner
+          save-if: false
+      - name: Build the KPI runner
+        run: cargo build --release --locked -p eventlog-kpi --features counters
+      - name: Record the counters, timings untouched
+        run: target/release/eventlog-kpi record --counters
+      - name: What the record changed
+        run: git diff -- kpi/baseline.json
+      - name: Upload kpi/baseline.json
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: kpi-baseline
+          path: kpi/baseline.json
+          if-no-files-found: error
+          retention-days: 30
+
   timing:
     name: KPI timing
     needs: classify
-    if: ${{ !cancelled() && ((github.event_name == 'pull_request' && needs.classify.outputs.code != 'false') || (github.event_name == 'workflow_dispatch' && inputs.base != '')) }}
+    if: ${{ !cancelled() && !inputs.record && ((github.event_name == 'pull_request' && needs.classify.outputs.code != 'false') || (github.event_name == 'workflow_dispatch' && inputs.base != '')) }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 60

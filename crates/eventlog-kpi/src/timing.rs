@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Outcome, ensure,
     fixture::{self, Place, Provider, ROWS},
+    large_group, skewed,
 };
 
 /// The p50 and p95 of one KPI's samples (microseconds, or events per second for throughput).
@@ -212,6 +213,15 @@ async fn provider_round(
     }
     round.latency(provider, "projection_find", &samples);
     store.discard().await;
+
+    // Skewed tenants and a large atomic group (PostgreSQL only; a seeded table and 6,500 streams
+    // are too much to repeat for every provider, and the plan question is PostgreSQL's).
+    if let (Provider::Postgres, Some(url)) = (provider, url) {
+        let samples = skewed::time_finds(scratch, url).await?;
+        round.latency(provider, "projection_find_skewed", &samples);
+        let samples = large_group::time_groups(scratch, url).await?;
+        round.latency(provider, "atomic_group_large", &samples);
+    }
     Ok(())
 }
 

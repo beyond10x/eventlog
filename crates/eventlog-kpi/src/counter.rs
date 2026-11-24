@@ -24,8 +24,9 @@ use serde_json::json;
 use crate::{
     Measured, Outcome, ensure,
     fixture::{self, Place, Provider, ROWS, SEEDED_ROWS, Store},
-    hooks, pg,
+    hooks, large_group, pg,
     proc_io::Snapshot,
+    skewed,
 };
 
 pub async fn measure(scratch: &Path, url: Option<&str>, measured: &mut Measured) -> Outcome<()> {
@@ -594,6 +595,50 @@ async fn postgres(scratch: &Path, url: &str, measured: &mut Measured) -> Outcome
     )
     .await?;
     measured.put_count("postgres.capture_preflight.buffers", plan.buffers);
+    store.discard().await;
+
+    // The guards of a prepared projection_find: its protocol (warm), the skewed fixture's
+    // tuples and plan conditions, and the large group's chunked statement.
+    projection_find_protocol(scratch, url, measured).await?;
+    skewed::counters(scratch, url, measured).await?;
+    large_group::assert_chunked(scratch, url).await?;
+    Ok(())
+}
+
+/// Finds in the protocol's warm state, the average of this many.
+const WARM_FINDS: u64 = 8;
+
+/// `postgres.projection_find.round_trips` (the average of [`WARM_FINDS`] warm finds, times 100)
+/// and `postgres.projection_find.parses` (the `Parse` messages in them), through the counting
+/// proxy over the 1,001-row fixture. One find first, ignored: the cold path parses and may
+/// prepare, and the counters are defined for the warm state.
+async fn projection_find_protocol(
+    scratch: &Path,
+    url: &str,
+    measured: &mut Measured,
+) -> Outcome<()> {
+    let place = Place::new(Provider::Postgres, scratch, Some(url))?;
+    fixture::projected(&place).await?.close().await;
+    let proxy = pg::Proxy::start(url).await?;
+    let store = place.open_at(Some(&proxy.url)).await?;
+    let tenant = fixture::tenant()?;
+    for round in 0..=WARM_FINDS {
+        if round == 1 {
+            proxy.take();
+            proxy.take_parses();
+        }
+        let found = store
+            .events()
+            .projection_find(&ROWS, &tenant, "kind", "item", 10)
+            .await?;
+        ensure(found.len() == 10, "projection_find returned the ten items")?;
+    }
+    let round_trips = proxy.take();
+    measured.put_count(
+        "postgres.projection_find.round_trips",
+        (round_trips * 100 + WARM_FINDS / 2) / WARM_FINDS,
+    );
+    measured.put_count("postgres.projection_find.parses", proxy.take_parses());
     store.discard().await;
     Ok(())
 }
