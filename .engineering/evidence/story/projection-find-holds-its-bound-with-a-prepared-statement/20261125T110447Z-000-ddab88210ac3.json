@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-25T11:04:47Z",
+  "actor": "agent:eventlog",
+  "artifact": "story:projection-find-holds-its-bound-with-a-prepared-statement",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "KPI timing dispatch, group A, ref scratch/find-variant-u, base 0.10.0, head be54a2dc, rounds 20, find latency ratio 0.978",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/45597184669"
+  }
+}

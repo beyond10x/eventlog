@@ -11,7 +11,17 @@ relations:
 - supersedes: story:pg-projection-find-back-within-1-05
 scope:
 - confidence: cited
+  path: .github/workflows/kpi.yml
+- confidence: cited
+  path: AGENTS.md
+- confidence: cited
   path: CHANGELOG.md
+- confidence: cited
+  path: crates/eventlog-kpi/src/compare.rs
+- confidence: cited
+  path: crates/eventlog-kpi/src/definition.rs
+- confidence: cited
+  path: crates/eventlog-kpi/src/main.rs
 - confidence: cited
   path: crates/eventlog-postgres/examples/production-proof/required.rs
 - confidence: cited
@@ -34,7 +44,7 @@ scope:
   path: docs/design/projection-value-digest.md
 - confidence: cited
   path: kpi/baseline.json
-revision: 9
+revision: 11
 ---
 ## Outcome
 
@@ -215,3 +225,38 @@ under D2 A.
 Every implementation brief names: the 60 s per-test bound and the 120 s test-step budget; the
 10-minute job limit; no new Python in anything that stays in the repository; scripts that measure
 or wait start without the `slot` prefix; nothing runs on the shared workstation for timing.
+
+## Measured
+
+Measured on the CI runner (PostgreSQL 17.6), 8 `workflow_dispatch` runs of `KPI / KPI timing`, 20 rounds each, `head` = `be54a2dc` (the product commits plus baseline step 3b). Nothing was measured on the workstation. Run URLs are `https://github.com/beyond10x/eventlog/actions/runs/<id>`.
+
+Group A, `base` = 0.10.0 tag `c0f961dc`, ratio head/base of the p50 of `postgres.projection_find.latency`:
+
+| Run | `ref` | base p50 (us) | head p50 (us) | ratio |
+| --- | --- | --- | --- | --- |
+| 45597161111 | `main` | 380.5 | 376.1 | 0.988 |
+| 45597166908 | `scratch/find-variant-v1` | 390.8 | 380.3 | 0.973 |
+| 45597176653 | `scratch/find-variant-g` | 382.1 | 375.0 | 0.981 |
+| 45597184669 | `scratch/find-variant-u` | 289.7 | 283.3 | 0.978 |
+
+Median 0.9795 (limit 1.05). Line 8 holds.
+
+Group B, `base` = kit commit `e7d74bd2`, ratio product/kit:
+
+| Run | `ref` | find p50 base / head (us) | find | skewed find | atomic_group_large | batch_append | group_blobs | read_stream | read_feed_page |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 45597190946 | `perf/find-measurement-kit` | 408.7 / 382.5 | 0.936 | 0.922 | 1.009 | 0.998 | 1.008 | 0.991 | 0.999 |
+| 45597196581 | `plan/find-kit-implemented` | 407.9 / 372.4 | 0.913 | 0.912 | 1.011 | 0.999 | 0.994 | 0.983 | 0.993 |
+| 45597201828 | `plan/find-variants-recorded` | 181.4 / 155.7 | 0.859 | 0.788 | 1.011 | 0.988 | 1.011 | 1.020 | 1.021 |
+| 45597207155 | `perf/find-prepared-statement` | 330.9 / 297.5 | 0.899 | 0.889 | 1.005 | 1.014 | 0.998 | 0.989 | 1.002 |
+| Median | | | 0.906 | 0.9005 | 1.010 | 0.9985 | 1.003 | 0.990 | 1.0005 |
+
+Line 9 holds (0.906 against at most 0.95). Line 10 holds for each of the six ids: the largest median is 1.010 (`postgres.atomic_group_large.latency`, limit 1.05) and the throughput median 0.9985 is above 1/1.05. Absolute p50 values differ between runs because each run lands on its own runner; only the ratio inside a run is compared.
+
+The `KPI counters` job on the scratch refs of runs 45597166908 and 45597176653 is red by design (their variants regress `round_trips` and `tuples_read`); it does not touch the timing job, which succeeded in all 8 runs.
+
+Counters on `be54a2dc` (pull request run 45597043056, `KPI counters`): `postgres.projection_find.parses` 0 (recorded 0), `postgres.projection_find.round_trips` 100, `postgres.projection_find_skewed.tuples_read` 10; green.
+
+Baseline step 3b needed `eventlog-kpi record --counters --ratchet <ids>` (commit `73595b56`): the CI record path kept every recorded counter, so the first record dispatch (run 45585547025) changed only the revision and the time. The second (run 45592619683, `ratchet` = `postgres.projection_find.parses`) wrote `parses` 8 to 0 and nothing else.
+
+Tests (Persistence proof, run 45597042892): the nine database tests of `find_statements` and the ten unit tests of `statement_cache` pass in the `eventlog-postgres` lib binary (79 tests, 18.06 s against 60 tests in 17.37 s before this story), the production proof reports 0 skipped. The libtest output prints no per-test time, so the 10 s total of line 4 is read from the binary's wall time.

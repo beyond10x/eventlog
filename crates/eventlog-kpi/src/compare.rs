@@ -34,7 +34,7 @@ impl Verdict {
 }
 
 /// How much worse `now` is than `baseline`, signed so that positive is worse.
-fn worse_by(direction: Direction, baseline: f64, now: f64) -> f64 {
+pub(crate) fn worse_by(direction: Direction, baseline: f64, now: f64) -> f64 {
     match direction {
         Direction::Lower => now - baseline,
         Direction::Higher => baseline - now,

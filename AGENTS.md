@@ -202,7 +202,9 @@ The runner is `crates/eventlog-kpi` (`publish = false`).
   counter already recorded keeps its value and only counters the baseline lacks are added) and
   uploads `kpi/baseline.json` as the artifact `kpi-baseline`. Download it, read the diff, commit the
   file as its own commit. Never edit the baseline by hand and never re-record to absorb a
-  regression; ratcheting an improvement is a decision of its own, taken in a change that names it. The full
+  regression; ratcheting an improvement is a decision of its own, taken in a change that names it:
+  the `record` dispatch input `ratchet` (`--ratchet <id,...>`) names the recorded counters that
+  take the runner's measurement, and the job fails for an id measured worse than recorded. The full
   `record` (with timings) writes the recording machine's timings, for reading only, and is not run
   on the workstation either.
 - CI: `.github/workflows/kpi.yml` has two gating jobs (and `KPI / KPI record`, dispatched only,

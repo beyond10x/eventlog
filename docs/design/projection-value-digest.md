@@ -17,9 +17,11 @@ does not change the event log, a blob, a snapshot or any other owner table.
 Measured before this design (pull request 72, story evidence): 0.10.0 311 us, the
 `hashtextextended(idx_N, 0)` expression index 369 us (1.19x) through the store; at the database
 the expression and a stored column are about 2 us apart, and the value comparison in the `WHERE`
-clause costs about 14 % on its own. A cached prepared statement is slower (its generic plan walks
-the primary key). A digest computed by the client misses rows on a database whose encoding is not
-UTF-8, so the server computes it.
+clause costs about 14 % on its own. A cached prepared statement under the server's default plan
+mode is slower (its generic plan walks the primary key); the find that ships prepares once per
+connection under `plan_cache_mode = force_custom_plan`, so it is planned for its value on every
+call and no longer parsed (`projection-find-planning.md`). A digest computed by the client misses
+rows on a database whose encoding is not UTF-8, so the server computes it.
 
 ## Physical shape
 
@@ -69,9 +71,15 @@ WHERE tenant_id = $1 AND idx_N_digest = hashtextextended($2::text, 0)
 ORDER BY row_key LIMIT $3
 ```
 
-The statement is sent unnamed with typed parameters, as now, so it is planned with the
-parameter values: `hashtextextended($2::text, 0)` folds to a constant and the planner sees a
-plain `bigint` equality on an index column, with no expression to match.
+The statement is sent with typed parameters and planned with the parameter values:
+`hashtextextended($2::text, 0)` folds to a constant and the planner sees a plain `bigint` equality
+on an index column, with no expression to match. `projection_find` sends it unnamed on the first
+use of its text on a pooled connection and prepares it on the second; from then on the connection
+binds and executes the prepared statement, and the session setting `plan_cache_mode =
+force_custom_plan` keeps every execution planned for its own parameter values, never a generic
+plan. The statement cache, its 64-text cap, its handling of a stale or lost statement and the
+dedicated-session requirement are in `projection-find-planning.md`. A guard's `find` inside an
+append's transaction still prepares and closes its statement on each call.
 
 The candidate check runs in Rust: each returned row's `idx_N` is compared with the value asked
 for. The client receives text in UTF-8; the server's conversion into UTF-8 is one-to-one, and a

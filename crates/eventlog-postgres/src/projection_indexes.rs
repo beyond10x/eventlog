@@ -34,7 +34,7 @@ fn fixture() -> String {
     std::env::var("EVENTLOG_TEST_POSTGRES_URL").expect("assigned PostgreSQL fixture")
 }
 
-async fn connect(url: &str) -> Client {
+pub(super) async fn connect(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = connection.await;
@@ -58,7 +58,7 @@ fn with_database(url: &str, database: &str) -> String {
     }
 }
 
-async fn drop_owner(sql: &Client, prefix: &str, projections: &[&ProjectionSpec]) {
+pub(super) async fn drop_owner(sql: &Client, prefix: &str, projections: &[&ProjectionSpec]) {
     let statement = schema::every_table()
         .iter()
         .map(|suffix| format!("{prefix}_{suffix}"))

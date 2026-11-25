@@ -23,6 +23,10 @@ on:
         type: boolean
         required: false
         default: false
+      ratchet:
+        description: With record, comma-separated ids of recorded counters that take the runner's measurement; an id measured worse than recorded fails the job
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -138,7 +142,12 @@ jobs:
       - name: Build the KPI runner
         run: cargo build --release --locked -p eventlog-kpi --features counters
       - name: Record the counters, timings untouched
-        run: target/release/eventlog-kpi record --counters
+        env:
+          RATCHET: ${{ inputs.ratchet }}
+        run: |
+          set -- record --counters
+          if [ -n "$RATCHET" ]; then set -- "$@" --ratchet "$RATCHET"; fi
+          target/release/eventlog-kpi "$@"
       - name: What the record changed
         run: git diff -- kpi/baseline.json
       - name: Upload kpi/baseline.json

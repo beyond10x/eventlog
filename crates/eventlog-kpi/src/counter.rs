@@ -608,10 +608,17 @@ async fn postgres(scratch: &Path, url: &str, measured: &mut Measured) -> Outcome
 /// Finds in the protocol's warm state, the average of this many.
 const WARM_FINDS: u64 = 8;
 
+/// Finds before the window. The library runs the first find of a statement text on a connection
+/// unprepared and prepares it in the second (`statement_cache`), so the second is the one that
+/// costs a prepare round trip and the third is the first in the warm state. The same two finds
+/// are the cold path on a library that prepares nothing, where they change no count.
+const WARMUP_FINDS: u64 = 2;
+
 /// `postgres.projection_find.round_trips` (the average of [`WARM_FINDS`] warm finds, times 100)
 /// and `postgres.projection_find.parses` (the `Parse` messages in them), through the counting
-/// proxy over the 1,001-row fixture. One find first, ignored: the cold path parses and may
-/// prepare, and the counters are defined for the warm state.
+/// proxy over the 1,001-row fixture. [`WARMUP_FINDS`] finds first, ignored: the cold path parses
+/// and prepares, and the counters are defined for the warm state, where a prepared find is one
+/// round trip and no parse.
 async fn projection_find_protocol(
     scratch: &Path,
     url: &str,
@@ -622,8 +629,8 @@ async fn projection_find_protocol(
     let proxy = pg::Proxy::start(url).await?;
     let store = place.open_at(Some(&proxy.url)).await?;
     let tenant = fixture::tenant()?;
-    for round in 0..=WARM_FINDS {
-        if round == 1 {
+    for round in 0..WARMUP_FINDS + WARM_FINDS {
+        if round == WARMUP_FINDS {
             proxy.take();
             proxy.take_parses();
         }

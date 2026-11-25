@@ -1,4 +1,5 @@
 //! Bounded leases. A cancelled transaction never returns its connection to the idle list.
+use crate::statement_cache::StatementCache;
 use eventlog_core::{BoxFuture, EventLogError};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10,7 +11,7 @@ use std::{
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot};
 use tokio_postgres::{
-    CancelToken, Client, Config, NoTls,
+    CancelToken, Client, Config, NoTls, Statement,
     config::{Host, SslMode},
     error::SqlState,
 };
@@ -112,12 +113,23 @@ struct HostedAdmission {
     share: usize,
 }
 
-/// The settings every new physical session gets before a lease hands it out.
+/// The settings every new physical session gets before a lease hands it out, on a built-in and
+/// on a caller-owned connection alike.
+///
+/// `plan_cache_mode = force_custom_plan` keeps every prepared statement of the session planned
+/// with its own parameter values at each execution. `projection_find` holds a prepared statement
+/// per connection (`crate::statement_cache`); under the server's default, `auto`, a statement
+/// that ran five times may switch to a generic plan chosen from the parameters of those five
+/// runs, and for a find in a skewed tenant a generic plan walks the tenant's primary key instead
+/// of the value's index. The setting overrides a role-level `plan_cache_mode` of the host, as the
+/// other settings here override theirs. `RESET ALL` or `DISCARD ALL` on a session reverts it
+/// silently: results stay correct, only the plan choice returns to the server's default.
 fn session_configuration(schema: &str, options: &PoolOptions) -> String {
     format!(
         "SET search_path TO {schema}; SET default_transaction_isolation = 'read committed'; \
          SET default_transaction_read_only = off; SET statement_timeout = {}; \
-         SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}",
+         SET lock_timeout = {}; SET idle_in_transaction_session_timeout = {}; \
+         SET plan_cache_mode = force_custom_plan",
         server_millis(options.statement_timeout),
         server_millis(options.lock_timeout),
         server_millis(options.transaction_timeout)
@@ -173,6 +185,16 @@ pub trait PostgresConnectionAuthority: Send + Sync + 'static {
     /// Creates one client/driver pair under the supplied pool connection deadline.
     ///
     /// The pool independently enforces the same deadline and owns the returned driver.
+    ///
+    /// Each returned connection must be a dedicated session, not one served through a
+    /// transaction-mode or statement-mode pooler. The adapter resolves its unqualified tables
+    /// through a `search_path` it sets once per session, and it keeps up to 64 prepared
+    /// statements, named `s0`, `s1` and so on from a counter of the process, on every connection.
+    /// Two processes behind a multiplexing pooler can give two different statements one name, and
+    /// a bind of that name then runs the other process's statement. A proxy that pins a session
+    /// to a client for as long as the client holds a named statement pins every pool connection
+    /// for good. The pool also sets `plan_cache_mode = force_custom_plan` on the session, besides
+    /// the settings of `PoolOptions`, and it overrides a role-level value.
     fn connect(
         &self,
         timeout: Duration,
@@ -355,6 +377,14 @@ impl PostgresConfig {
     /// `Verified` authorities remain eligible for hosted admission; `Isolated` authorities remain
     /// confined to local/migration constructors.
     ///
+    /// Every connection the authority returns must be a dedicated session, not a transaction-mode
+    /// or statement-mode pooled one (see [`PostgresConnectionAuthority::connect`]): the adapter
+    /// keeps up to 64 prepared statements per connection, and the pool sets `search_path`,
+    /// `default_transaction_isolation`, `default_transaction_read_only`, `statement_timeout`,
+    /// `lock_timeout`, `idle_in_transaction_session_timeout` and
+    /// `plan_cache_mode = force_custom_plan` on it, overriding the role's own values. A session
+    /// that refuses named statements still serves every operation, without their speed-up.
+    ///
     /// # Errors
     /// Refuses an invalid schema or owner prefix.
     pub fn caller_owned(
@@ -486,6 +516,8 @@ pub(crate) struct Pool {
     connect_attempts: AtomicUsize,
     #[cfg(test)]
     fail_shutdown: AtomicBool,
+    #[cfg(test)]
+    prepare_failure: Mutex<Option<&'static str>>,
 }
 
 #[derive(Default)]
@@ -548,6 +580,8 @@ impl Pool {
             connect_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             fail_shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            prepare_failure: Mutex::new(None),
         }))
     }
     /// Hold every physical session opened from now on to the principal hosted open admitted and
@@ -727,6 +761,7 @@ impl Pool {
             });
             Ok(Connection {
                 client,
+                statements: StatementCache::default(),
                 driver: Some(driver),
                 transport,
                 cancel,
@@ -826,6 +861,13 @@ impl Pool {
     pub(crate) fn fail_next_shutdown(&self) {
         self.fail_shutdown.store(true, Ordering::Release);
     }
+
+    /// The next prepare of a find on any connection of this pool fails as if the server had
+    /// answered `code`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_prepare(&self, code: &'static str) {
+        *self.prepare_failure.lock().unwrap() = Some(code);
+    }
 }
 
 pub(crate) struct Lease {
@@ -845,6 +887,16 @@ impl Lease {
     }
     pub(crate) fn settled(&mut self) {
         self.reusable = true;
+    }
+    /// The prepared statements of the connection this lease holds. They are statements of its
+    /// server session and end with it; the cache never moves to another connection.
+    pub(crate) fn statements(&mut self) -> &mut StatementCache<Statement> {
+        &mut self.client.as_mut().expect("connected lease").statements
+    }
+    /// Makes the next prepare of a find fail as if the server had answered `code`.
+    #[cfg(test)]
+    pub(crate) fn take_injected_prepare_failure(&self) -> Option<&'static str> {
+        self.pool.prepare_failure.lock().unwrap().take()
     }
 }
 impl Deref for Lease {
@@ -961,6 +1013,9 @@ impl Drop for RetiredOccupancy {
 
 struct Connection {
     client: Client,
+    /// Declared after `client`, so the client drops first and a dropped statement finds no
+    /// client to send its close to.
+    statements: StatementCache<Statement>,
     /// The task that polls `transport`; joined before a retirement is accounted.
     driver: Option<tokio::task::JoinHandle<()>>,
     transport: DriverSlot,
@@ -1098,13 +1153,14 @@ mod tests {
             session_configuration("hosted", &options),
             "SET search_path TO hosted; SET default_transaction_isolation = 'read committed'; \
              SET default_transaction_read_only = off; SET statement_timeout = 1; \
-             SET lock_timeout = 1; SET idle_in_transaction_session_timeout = 3"
+             SET lock_timeout = 1; SET idle_in_transaction_session_timeout = 3; \
+             SET plan_cache_mode = force_custom_plan"
         );
         let defaults = session_configuration("hosted", &PoolOptions::default());
         assert!(
             defaults.contains("statement_timeout = 5000;")
                 && defaults.contains("lock_timeout = 2000;")
-                && defaults.ends_with("idle_in_transaction_session_timeout = 10000"),
+                && defaults.ends_with("SET plan_cache_mode = force_custom_plan"),
             "{defaults}"
         );
     }
