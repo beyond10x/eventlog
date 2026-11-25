@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-conformance"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "eventlog-core",
  "serde",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "eventlog-capture-types",
  "serde",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-file"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "eventlog-conformance",
  "eventlog-core",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-kpi"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "clap",
  "eventlog-conformance",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-postgres"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "clap",
  "eventlog-conformance",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-sqlite"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "eventlog-capture-types",
  "eventlog-conformance",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "eventlog-tree"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "eventlog-conformance",
  "eventlog-core",

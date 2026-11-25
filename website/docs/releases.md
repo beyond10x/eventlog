@@ -6,6 +6,56 @@ Each section summarizes one release, newest first. Its release notes and
 [`CHANGELOG.md`](https://github.com/beyond10x/eventlog/blob/main/CHANGELOG.md) record the exact
 changes.
 
+## 0.11.0 — November 25, 2026
+
+This release brings a new PostgreSQL schema edition and a new Tree group file format. It has
+breaking changes:
+
+- PostgreSQL stores a digest of each indexed value in a generated column,
+  `idx_N_digest BIGINT GENERATED ALWAYS AS (hashtextextended(idx_N, 0)) STORED`, and indexes it.
+  The digest also runs on a server in FIPS mode, which refuses `md5()`.
+- Every provider indexes an indexed projection value of any length again.
+  `EventLogError::IndexedValueTooLarge` is no longer returned.
+  `eventlog_core::MAX_INDEXED_VALUE_BYTES` is deprecated.
+- Every PostgreSQL projection table gains the index `<table>_key_c`. On a database that is not
+  C-collated, a projection page walks this index in byte order.
+- PostgreSQL `migrate` rewrites every projection table inside its transaction. Reads and writes
+  of a table wait until it commits, for a time that grows with the table.
+- Eventlog 0.10.0 refuses a PostgreSQL schema that 0.11.0 migrated. Eventlog 0.11.0 refuses a
+  schema that was not migrated. No new grants are needed.
+- A PostgreSQL tenant capture holds the owner's publication gate only while its snapshot is
+  fixed. Appends, redactions and erasures no longer wait for a capture read.
+- A capture whose tenant was erased or had an event redacted during its read is refused with
+  `CaptureError::TenantIdentityMissing` or `CaptureError::RedactedHistory`.
+- SQLite: `RestoredEvent` has the new field `redacted`. A struct literal adds `redacted: None`.
+- SQLite: `SqliteEventStore::group_fingerprint` and `restore_group_fingerprint` are new.
+- A new Tree store writes group files in the format `eventlog-tree/group/2`. This format keeps the
+  request fingerprint of an atomic group. Eventlog 0.10.0 refuses it.
+- A Tree group retry after a redaction or a blob deletion gets its original receipt after a
+  reopen.
+- Tree `migrate(root, MigrationMode::Apply)` moves an existing store to `eventlog-tree/group/2`.
+  `MigrationReport` has three new fields.
+- A Tree group that was redacted, or whose blob was deleted, before the migration gets no
+  fingerprint.
+- Tree stores a tenant whose escaped name is longer than 255 bytes under `tenants/%%<digest>`.
+  Eventlog 0.10.0 refuses such a store.
+- Tree serves history that a `git checkout`, `pull` or `merge` added while a handle was open only
+  after `TreeEventStore::reload` or a reopen. `reload` is new.
+- Tree `copy` hands a redacted event to an inline projector as redacted.
+- PostgreSQL `projection_find` reuses a prepared statement on each pooled connection from its
+  second use, and every pooled session sets `plan_cache_mode = force_custom_plan`. A caller-owned
+  connection must be a dedicated session, not one behind a transaction-mode or statement-mode
+  pooler. Median `projection_find` latency measured on CI is 0.98 of 0.10.0's (4 runs; the bound
+  is 1.05) and 0.906 of the commit before the change.
+
+To upgrade a PostgreSQL owner, stop every 0.10.0 binary of the owner. Run
+`PostgresEventStore::migrate` with the migration role. Then start 0.11.0.
+
+To upgrade a Tree store, first upgrade every binary that reads it. Then run `migrate` once on the
+store.
+
+Read the [0.11.0 release notes](https://github.com/beyond10x/eventlog/releases/tag/0.11.0).
+
 ## 0.10.0 — November 23, 2026
 
 This release fixes the findings of the 0.9.4 review, adds a KPI gate and has breaking changes:

@@ -19,7 +19,7 @@ from trusted authority, and Eventlog enforces the storage boundary.
 - **PostgreSQL:** a server-backed provider with explicit hosted-role and TLS admission.
 
 [Compare the providers](providers.md), then [run the quickstart](quickstart.md).
-The current release is [0.10.0](releases.md).
+The current release is [0.11.0](releases.md).
 
 ## Learn the contract
 

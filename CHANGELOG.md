@@ -5,6 +5,8 @@ under bare-version tags such as `0.1.0`.
 
 ## [Unreleased]
 
+## 0.11.0 — 2026-11-25
+
 ### Breaking
 
 - PostgreSQL: a new schema edition (projection indexes, see Changed). Eventlog 0.10.0 refuses a
