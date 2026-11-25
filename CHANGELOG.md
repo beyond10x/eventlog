@@ -103,7 +103,8 @@ under bare-version tags such as `0.1.0`.
   statement-mode pooler, because prepared statements are named per process (documented on
   `PostgresConnectionAuthority::connect` and `PostgresConfig::caller_owned`). A session that
   refuses named statements keeps answering without the speed-up. `ProjectionStore::find` inside a
-  transaction still prepares and closes its statement on each call.
+  transaction still prepares and closes its statement on each call. Median latency against 0.10.0:
+  0.98 of its p50 over 4 CI runs of 20 rounds (runs 0.973 to 0.988; the bound is 1.05).
 
 ### Deprecated
 

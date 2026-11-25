@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-25T10:58:43Z",
+  "actor": "agent:eventlog",
+  "artifact": "story:projection-find-holds-its-bound-with-a-prepared-statement",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Persistence proof on be54a2dc, find_statements and statement_cache tests pass, 0 skipped",
+    "reference": "https://github.com/beyond10x/eventlog/actions/runs/45597042892"
+  }
+}
