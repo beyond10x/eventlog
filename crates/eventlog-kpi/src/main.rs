@@ -152,6 +152,11 @@ enum Command {
         /// dispatch runs.
         #[arg(long)]
         counters: bool,
+        /// With `--counters`: the ids of recorded counters that take this run's measurement, a
+        /// ratchet of an improvement named by the change that records it. A measurement worse
+        /// than the recorded value is refused.
+        #[arg(long, requires = "counters", value_delimiter = ',')]
+        ratchet: Vec<String>,
     },
     /// Measure every counter and compare it with `kpi/baseline.json`; non-zero on regression.
     Check,
@@ -196,9 +201,13 @@ fn main() -> ExitCode {
             .join("kpi-work")
     });
     let result = match cli.command {
-        Command::Record { rounds, counters } => {
+        Command::Record {
+            rounds,
+            counters,
+            ratchet,
+        } => {
             if counters {
-                record_counters(&root, &work)
+                record_counters(&root, &work, &ratchet)
             } else {
                 record(&root, &work, rounds)
             }
@@ -283,7 +292,7 @@ fn record(root: &Path, work: &Path, rounds: usize) -> Outcome<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn record_counters(root: &Path, work: &Path) -> Outcome<ExitCode> {
+fn record_counters(root: &Path, work: &Path, ratchet: &[String]) -> Outcome<ExitCode> {
     let definitions = definition::Definitions::load(&definitions_path(root))?;
     let previous = definition::Baseline::load(&baseline_path(root))?;
     ensure(
@@ -293,7 +302,8 @@ fn record_counters(root: &Path, work: &Path) -> Outcome<ExitCode> {
     )?;
     let counters = measure_counters(work)?;
     definitions.require_known(counters.values.keys(), definition::Kind::Counter)?;
-    let baseline = definition::Baseline::with_counters(root, &definitions, &counters, &previous);
+    let baseline =
+        definition::Baseline::with_counters(root, &definitions, &counters, &previous, ratchet)?;
     baseline.write_counters_into(&baseline_path(root))?;
     compare::print_record(&definitions, &baseline, &counters);
     println!(

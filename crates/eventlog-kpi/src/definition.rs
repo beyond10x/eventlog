@@ -229,21 +229,50 @@ impl Baseline {
     /// already recorded keeps its value (an improvement is ratcheted, and a regression absorbed,
     /// only by a decision of its own); a counter the baseline lacks takes the measurement. Only the
     /// revision the counters were measured on and the time move with them.
+    ///
+    /// `ratchet` names the counters whose recorded value takes this run's measurement: the
+    /// decision of its own. Each must be a defined counter that is recorded and measured, and
+    /// its measurement must not be worse than the recorded value in the counter's direction, so
+    /// a ratchet never absorbs a regression.
     pub fn with_counters(
         root: &Path,
         definitions: &Definitions,
         counters: &Measured,
         previous: &Self,
-    ) -> Self {
-        Self {
+        ratchet: &[String],
+    ) -> Outcome<Self> {
+        let mut recorded = Self::merged_counters(definitions, counters, Some(previous), true);
+        for id in ratchet {
+            let kpi = definitions
+                .get(id)
+                .filter(|kpi| kpi.kind == Kind::Counter)
+                .ok_or_else(|| Failure(format!("--ratchet {id}: not a defined counter")))?;
+            let now =
+                counters.values.get(id).copied().ok_or_else(|| {
+                    Failure(format!("--ratchet {id}: this run did not measure it"))
+                })?;
+            let before = previous.counters.get(id).copied().ok_or_else(|| {
+                Failure(format!(
+                    "--ratchet {id}: not recorded yet, so nothing to ratchet"
+                ))
+            })?;
+            if crate::compare::worse_by(kpi.direction, before, now) > 0.0 {
+                return Err(Failure(format!(
+                    "--ratchet {id}: measured {now} is worse than the recorded {before}; a \
+                     ratchet never absorbs a regression"
+                )));
+            }
+            recorded.insert(id.clone(), now);
+        }
+        Ok(Self {
             format: BASELINE_FORMAT.to_owned(),
             revision: environment::revision(root),
             recorded_at: environment::now(),
             environment: previous.environment.clone(),
-            counters: Self::merged_counters(definitions, counters, Some(previous), true),
+            counters: recorded,
             timings: previous.timings.clone(),
             timing_rounds: previous.timing_rounds,
-        }
+        })
     }
 
     pub fn write(&self, path: &Path) -> Outcome<()> {
@@ -400,7 +429,9 @@ mod tests {
         measured.put("x.settled", 101.0);
         measured.put("x.moved", 90.0);
         measured.put("x.new", 8.0);
-        let next = Baseline::with_counters(Path::new("."), &definitions(), &measured, &previous());
+        let next =
+            Baseline::with_counters(Path::new("."), &definitions(), &measured, &previous(), &[])
+                .expect("a record without a ratchet");
         assert!(
             (next.counters["x.settled"] - 100.0).abs() < f64::EPSILON,
             "a recorded counter keeps its value"
@@ -421,5 +452,43 @@ mod tests {
         assert!((next.timings["x.latency"].p95 - 22.0).abs() < f64::EPSILON);
         assert_eq!(next.timing_rounds, 3);
         assert_eq!(next.environment.cpu, "a recording machine");
+    }
+
+    #[test]
+    fn a_ratchet_takes_the_measurement_of_the_named_counter_only_and_never_a_regression() {
+        fn ratchet(measured: &Measured, ids: &[&str]) -> Outcome<Baseline> {
+            let ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+            Baseline::with_counters(Path::new("."), &definitions(), measured, &previous(), &ids)
+        }
+
+        let mut measured = Measured::default();
+        measured.put("x.settled", 40.0);
+        measured.put("x.moved", 90.0);
+        measured.put("x.new", 8.0);
+
+        let next = ratchet(&measured, &["x.settled"]).expect("an improvement is ratcheted");
+        assert!((next.counters["x.settled"] - 40.0).abs() < f64::EPSILON);
+        assert!(
+            (next.counters["x.moved"] - 100.0).abs() < f64::EPSILON,
+            "a counter that is not named keeps its value"
+        );
+
+        measured.put("x.settled", 101.0);
+        let refused = ratchet(&measured, &["x.settled"]).expect_err("a regression is not absorbed");
+        assert!(
+            refused.0.contains("never absorbs a regression"),
+            "{}",
+            refused.0
+        );
+
+        for (id, why) in [
+            ("x.latency", "not a defined counter"),
+            ("x.unmeasured", "did not measure"),
+            ("x.new", "not recorded yet"),
+            ("x.nowhere", "not a defined counter"),
+        ] {
+            let refused = ratchet(&measured, &[id]).expect_err(id);
+            assert!(refused.0.contains(why), "{id}: {}", refused.0);
+        }
     }
 }
